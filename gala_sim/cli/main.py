@@ -18,6 +18,7 @@ from gala_sim.timing.memory import NativeRamulator2Binding, Ramulator2Backend
 from gala_sim.timing.resources import ResourceUsage
 from gala_sim.tools.cycle_preflight import run_cycle_preflight, write_cycle_preflight
 from gala_sim.tools.preflight import run_native_preflight
+from gala_sim.adapters.native_reference import run_native_reference
 from gala_sim.trace import TraceReader, validate_trace
 
 
@@ -39,6 +40,11 @@ def _parser() -> argparse.ArgumentParser:
     native.add_argument("--config", type=Path, required=True)
     native.add_argument("--freeze", type=Path, required=True)
     native.add_argument("--output", type=Path, required=True)
+    reference = commands.add_parser("native-reference")
+    reference.add_argument("--config", type=Path, required=True)
+    reference.add_argument("--freeze", type=Path, required=True)
+    reference.add_argument("--preflight", type=Path, required=True)
+    reference.add_argument("--output", type=Path, required=True)
     trace = commands.add_parser("trace-validate")
     trace.add_argument("--trace", type=Path, required=True)
     replay = commands.add_parser("cycle-replay")
@@ -144,6 +150,13 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(json.dumps(report.as_dict(), sort_keys=True))
             return 0 if report.status == "passed" else 2
+        if args.command == "native-reference":
+            config = load_config(args.config)
+            freeze = json.loads(args.freeze.read_text(encoding="utf-8"))
+            preflight = json.loads(args.preflight.read_text(encoding="utf-8"))
+            result = run_native_reference(config, freeze, preflight, args.output)
+            print(json.dumps(result, sort_keys=True))
+            return 0
         trace = TraceReader().read(args.trace, validate=False, mmap_mode="r")
         if args.command == "trace-validate":
             validate_trace(trace)

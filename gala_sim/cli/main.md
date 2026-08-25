@@ -6,6 +6,8 @@
 
 `gala-sim native-preflight --config <yaml> --freeze <json> --output <dir>` 验证冻结身份并执行官方短训练门。成功返回 0；门控或运行失败返回 2，并在输出目录写入状态记录。
 
+`native-reference --config <yaml> --freeze <json> --preflight <json> --output <dir>` 只在预检通过后运行官方完整训练并写出质量、GPU 参考和状态文件。
+
 其余入口为 `config-check`、`cycle-preflight`、`trace-validate`、`cycle-replay` 和 `ablation`。
 
 ## Internal Helpers
