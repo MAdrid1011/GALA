@@ -12,6 +12,7 @@ from typing import Any
 import numpy as np
 
 from gala_sim.config import GalaConfig
+from gala_sim.identity import sha256_tree
 from gala_sim.metrics import QualityConfig, measure_quality
 from gala_sim.trace import DeviceTraceSink, Trace, TraceReader, TraceWriter
 
@@ -36,6 +37,7 @@ def _bind_trace_identity(trace: Trace, run: PreparedRun, model_commit: str) -> T
             "model_commit": model_commit,
             "model": run.model_name,
             "dataset": run.dataset_name,
+            "dataset_manifest_sha256": sha256_tree(run.dataset_root),
         },
     )
 
