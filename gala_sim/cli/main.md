@@ -1,6 +1,6 @@
 # main.py
 
-提供配置、原生预检、trace 校验、周期重放和消融的机器可读命令行入口。
+提供配置、原生预检、trace 校验、周期重放和消融的机器可读命令行入口。包级入口使用懒加载，避免 `python -m gala_sim.cli.main` 污染输出。
 
 ## External Interface
 
