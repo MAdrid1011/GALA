@@ -45,6 +45,7 @@ class TraceSession:
     _pending_gradients: dict[int, list[int]] = field(default_factory=dict, init=False)
     _gaussian_ids: list[int] = field(default_factory=list, init=False)
     _query_capture_allowed: bool = field(default=False, init=False)
+    _audit: dict[str, int] = field(default_factory=dict, init=False)
     _installed: bool = field(default=False, init=False)
     _originals: list[tuple[Any, str, Any]] = field(default_factory=list, init=False)
 
@@ -59,8 +60,14 @@ class TraceSession:
         import xray_gaussian_rasterization_voxelization as extension
 
         self._decoder = load_buffer_decoder()
-        self._patch(extension.GaussianRasterizer, "forward", self._wrap_query_forward)
-        self._patch(extension.GaussianVoxelizer, "forward", self._wrap_query_forward)
+        self._patch(
+            extension.GaussianRasterizer, "forward",
+            lambda original: self._wrap_query_forward(original, "raster"),
+        )
+        self._patch(
+            extension.GaussianVoxelizer, "forward",
+            lambda original: self._wrap_query_forward(original, "voxel"),
+        )
         self._patch(extension._C, "rasterize_gaussians", self._wrap_rasterize)
         self._patch(extension._C, "voxelize_gaussians", self._wrap_voxelize)
         self._patch(extension._C, "rasterize_gaussians_backward", self._wrap_rasterize_backward)
@@ -88,6 +95,7 @@ class TraceSession:
             "state_record_bytes": self.state_record_bytes,
             "trace_chunk_events": self.chunk_events,
             "trace_capture_status": "real_extension_buffers",
+            "capture_audit": dict(sorted(self._audit.items())),
         })
         TraceWriter().write(trace, self.output_root)
         return trace
@@ -127,12 +135,18 @@ class TraceSession:
             return result
         return wrapped
 
-    def _wrap_query_forward(self, original: Any) -> Any:
+    def _wrap_query_forward(self, original: Any, query_kind: str) -> Any:
         def wrapped(rasterizer: Any, *args: Any, **kwargs: Any) -> Any:
             previous = self._query_capture_allowed
             import torch
 
             self._query_capture_allowed = bool(torch.is_grad_enabled())
+            self._audit_increment(f"official_{query_kind}_query_calls")
+            if self._query_capture_allowed:
+                self._audit_increment(f"captured_{query_kind}_query_calls")
+                self._audit_increment("captured_query_calls")
+            else:
+                self._audit_increment(f"excluded_no_grad_{query_kind}_query_calls")
             try:
                 return original(rasterizer, *args, **kwargs)
             finally:
@@ -195,6 +209,7 @@ class TraceSession:
 
     def _capture_raster(self, args: tuple[Any, ...], result: tuple[Any, ...]) -> None:
         rendered, _, _, geometry, binning, image = result
+        self._audit_increment("cuda_relation_candidates", int(rendered))
         means = args[0]
         height, width = int(args[10]), int(args[11])
         self._capture_query(
@@ -208,6 +223,7 @@ class TraceSession:
 
     def _capture_voxel(self, args: tuple[Any, ...], result: tuple[Any, ...]) -> None:
         rendered, _, _, _, _, geometry, binning, image = result
+        self._audit_increment("cuda_relation_candidates", int(rendered))
         means = args[0]
         dimensions = tuple(int(value) for value in args[6:9])
         self._capture_query(
@@ -274,6 +290,7 @@ class TraceSession:
             ), dependencies=candidate_by_gaussian[gaussian_index])
             relation_events[gaussian_index] = relation
             relation_ids[gaussian_index] = relation_id
+        self._audit_increment("cuda_valid_relations", len(relation_events))
         self._emit_query_close(query_id, tuple(relation_events.values()))
         for gaussian_index, relation in relation_events.items():
             gaussian_id = self._gaussian_ids[gaussian_index]
@@ -335,6 +352,8 @@ class TraceSession:
         context = self._contexts.get(buffer_pointer)
         if context is None:
             return
+        self._audit_increment("captured_backward_calls")
+        self._audit_increment("captured_backward_relations", len(context.consumer_events))
         for gaussian_index, consumer in context.consumer_events.items():
             gaussian_id = self._gaussian_ids[gaussian_index] if gaussian_index < len(self._gaussian_ids) else context.gaussian_ids[0]
             adjoint = self._builder.emit(TraceEvent(
@@ -357,6 +376,8 @@ class TraceSession:
 
     def _capture_update(self, model: Any) -> None:
         self._ensure_gaussians(int(model.get_xyz.shape[0]))
+        self._audit_increment("optimizer_steps")
+        self._audit_increment("optimizer_updated_gaussians", len(self._gaussian_ids))
         for index, gaussian_id in enumerate(self._gaussian_ids):
             dependencies = tuple(self._pending_gradients.get(gaussian_id, ()))
             self._builder.emit(TraceEvent(
@@ -388,3 +409,8 @@ class TraceSession:
             self._next_gaussian += 1
         if len(self._gaussian_ids) > count:
             self._gaussian_ids = self._gaussian_ids[:count]
+
+    def _audit_increment(self, name: str, amount: int = 1) -> None:
+        if amount < 0:
+            raise ValueError("capture audit increments must be non-negative")
+        self._audit[name] = self._audit.get(name, 0) + int(amount)
