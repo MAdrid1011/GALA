@@ -14,6 +14,17 @@ from gala_sim.trace import Trace, TraceWriter
 from .buffer_decoder import load_buffer_decoder
 
 
+RASTER_TEMPLATE_ID = 1
+VOXEL_TEMPLATE_ID = 2
+UPDATE_TEMPLATE_ID = 3
+MODIFICATION_TEMPLATE_ID = 4
+FIELD_POSITION = 1 << 0
+FIELD_DENSITY = 1 << 1
+FIELD_SCALE = 1 << 2
+FIELD_ROTATION = 1 << 3
+STATE_FIELD_MASK = FIELD_POSITION | FIELD_DENSITY | FIELD_SCALE | FIELD_ROTATION
+
+
 @dataclass
 class _QueryContext:
     query_id: int
@@ -24,6 +35,8 @@ class _QueryContext:
     consumer_events: dict[int, int]
     cache_events: dict[int, tuple[int, int]]
     buffer_pointer: int
+    template_id: int
+    field_mask: int
 
 
 @dataclass
@@ -219,6 +232,8 @@ class TraceSession:
             lambda: self._decoder.raster_valid_masks(
                 geometry, binning, int(means.shape[0]), int(rendered), height, width
             ),
+            template_id=RASTER_TEMPLATE_ID,
+            field_mask=STATE_FIELD_MASK,
         )
 
     def _capture_voxel(self, args: tuple[Any, ...], result: tuple[Any, ...]) -> None:
@@ -233,21 +248,25 @@ class TraceSession:
             lambda: self._decoder.voxel_valid_masks(
                 geometry, binning, int(means.shape[0]), int(rendered), *dimensions
             ),
+            template_id=VOXEL_TEMPLATE_ID,
+            field_mask=STATE_FIELD_MASK,
         )
 
     def _capture_query(
         self, means: Any, geometry: Any, binning: Any, image: Any, rendered: int,
         image_elements: int, point_list_fn: Callable[[], Any], point_keys_fn: Callable[[], Any],
         valid_masks_fn: Callable[[], Any],
+        *, template_id: int, field_mask: int,
     ) -> None:
         query_id = self._next_query
         self._next_query += 1
         gaussian_count = int(means.shape[0])
         self._ensure_gaussians(gaussian_count)
         if rendered <= 0:
-            self._emit_query_close(query_id, ())
+            self._emit_query_close(query_id, (), template_id=template_id, field_mask=field_mask)
             self._contexts[int(binning.data_ptr())] = _QueryContext(
-                query_id, (), {}, {}, {}, {}, {}, int(binning.data_ptr())
+                query_id, (), {}, {}, {}, {}, {}, int(binning.data_ptr()),
+                template_id, field_mask,
             )
             return
         point_list = point_list_fn().detach().cpu().numpy().astype(np.int64, copy=False)
@@ -266,6 +285,7 @@ class TraceSession:
                 state_version=self._state_version,
                 resource_class=int(ResourceClass.RELATION),
                 address_token=int(key), data_bytes=self.relation_candidate_bytes,
+                template_id=template_id, field_mask=field_mask,
                 flags=1 if mask_nonzero else 0,
             ))
             candidate_by_gaussian.setdefault(gaussian_index, []).append(candidate_event)
@@ -287,11 +307,15 @@ class TraceSession:
                 gaussian_id=gaussian_id, state_version=self._state_version,
                 relation_id=relation_id, resource_class=int(ResourceClass.RELATION),
                 address_token=gaussian_id * self.state_record_bytes,
+                template_id=template_id, field_mask=field_mask,
             ), dependencies=candidate_by_gaussian[gaussian_index])
             relation_events[gaussian_index] = relation
             relation_ids[gaussian_index] = relation_id
         self._audit_increment("cuda_valid_relations", len(relation_events))
-        self._emit_query_close(query_id, tuple(relation_events.values()))
+        self._emit_query_close(
+            query_id, tuple(relation_events.values()),
+            template_id=template_id, field_mask=field_mask,
+        )
         for gaussian_index, relation in relation_events.items():
             gaussian_id = self._gaussian_ids[gaussian_index]
             request = self._builder.emit(TraceEvent(
@@ -302,6 +326,7 @@ class TraceSession:
                 resource_class=int(ResourceClass.CACHE),
                 address_token=gaussian_id * self.state_record_bytes,
                 data_bytes=self.state_record_bytes,
+                template_id=template_id, field_mask=field_mask,
             ), dependencies=[relation])
             returned = self._builder.emit(TraceEvent(
                 iteration_id=self._iteration,
@@ -310,6 +335,7 @@ class TraceSession:
                 resource_class=int(ResourceClass.CACHE),
                 address_token=gaussian_id * self.state_record_bytes,
                 data_bytes=self.state_record_bytes,
+                template_id=template_id, field_mask=field_mask,
             ), dependencies=[request])
             forward = self._builder.emit(TraceEvent(
                 iteration_id=self._iteration,
@@ -317,6 +343,7 @@ class TraceSession:
                 gaussian_id=gaussian_id, state_version=self._state_version,
                 relation_id=relation_ids[gaussian_index], resource_class=int(ResourceClass.ISSUE),
                 address_token=gaussian_id * self.state_record_bytes,
+                template_id=template_id, field_mask=field_mask,
             ), dependencies=[relation, returned])
             forward_events[gaussian_index] = forward
             cache_events[gaussian_index] = (request, returned)
@@ -325,6 +352,7 @@ class TraceSession:
             primitive_kind=int(PrimitiveKind.QUERY_REDUCTION), query_id=query_id,
             state_version=self._state_version, reduction_key=query_id,
             resource_class=int(ResourceClass.QUERY),
+            template_id=template_id,
         ), dependencies=tuple(forward_events.values()))
         for gaussian_index, forward in forward_events.items():
             gaussian_id = self._gaussian_ids[gaussian_index]
@@ -334,18 +362,23 @@ class TraceSession:
                 gaussian_id=gaussian_id, state_version=self._state_version,
                 relation_id=relation_ids[gaussian_index], consumer_id=query_id,
                 resource_class=int(ResourceClass.QUERY),
+                template_id=template_id,
             ), dependencies=[reduction])
         self._contexts[int(binning.data_ptr())] = _QueryContext(
             query_id, tuple(self._gaussian_ids[index] for index in forward_events),
             relation_events, relation_ids, forward_events, consumer_events, cache_events,
-            int(binning.data_ptr()),
+            int(binning.data_ptr()), template_id, field_mask,
         )
 
-    def _emit_query_close(self, query_id: int, dependencies: tuple[int, ...]) -> None:
+    def _emit_query_close(
+        self, query_id: int, dependencies: tuple[int, ...],
+        *, template_id: int, field_mask: int,
+    ) -> None:
         self._builder.emit(TraceEvent(
             iteration_id=self._iteration,
             primitive_kind=int(PrimitiveKind.QUERY_CLOSE), query_id=query_id,
             state_version=self._state_version, resource_class=int(ResourceClass.RELATION),
+            template_id=template_id, field_mask=field_mask,
         ), dependencies=dependencies)
 
     def _capture_backward(self, buffer_pointer: int, *, voxel: bool) -> None:
@@ -363,6 +396,7 @@ class TraceSession:
                 relation_id=context.relation_ids[gaussian_index],
                 resource_class=int(ResourceClass.ISSUE),
                 address_token=gaussian_id * self.state_record_bytes,
+                template_id=context.template_id, field_mask=context.field_mask,
             ), dependencies=[consumer])
             gradient = self._builder.emit(TraceEvent(
                 iteration_id=self._iteration,
@@ -371,6 +405,7 @@ class TraceSession:
                 relation_id=context.relation_ids[gaussian_index],
                 reduction_key=gaussian_id, resource_class=int(ResourceClass.QUERY),
                 address_token=gaussian_id * self.state_record_bytes,
+                template_id=context.template_id, field_mask=context.field_mask,
             ), dependencies=[adjoint])
             self._pending_gradients.setdefault(gaussian_id, []).append(gradient)
 
@@ -387,6 +422,7 @@ class TraceSession:
                 resource_class=int(ResourceClass.UPDATE),
                 address_token=gaussian_id * self.state_record_bytes,
                 data_bytes=self.state_record_bytes,
+                template_id=UPDATE_TEMPLATE_ID, field_mask=STATE_FIELD_MASK,
             ), dependencies=dependencies)
         self._pending_gradients.clear()
         self._state_version += 1
@@ -399,6 +435,7 @@ class TraceSession:
             resource_class=int(ResourceClass.UPDATE),
             address_token=int(gaussian_id) * self.state_record_bytes,
             data_bytes=self.state_record_bytes,
+            template_id=MODIFICATION_TEMPLATE_ID, field_mask=STATE_FIELD_MASK,
         ))
 
     def _ensure_gaussians(self, count: int) -> None:

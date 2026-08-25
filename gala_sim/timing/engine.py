@@ -5,6 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 import heapq
 
+from gala_sim.clamp import FusionIssueScheduler, TaskKind, TaskPacket
 from gala_sim.clamp.events import PrimitiveKind
 from gala_sim.trace.model import Trace
 from gala_sim.trace.validator import validate_trace
@@ -57,6 +58,12 @@ class CycleEngine:
             raise ValueError(f"unknown cycle policy: {policy}")
         self.config = config
         self.policy = policy
+        self.issue_scheduler = FusionIssueScheduler(
+            candidate_lanes=config.candidate_lanes,
+            forward_ports=config.modules["fusion_issue"].ports,
+            consumer_ports=config.modules["fusion_issue"].ports,
+            adjoint_ports=config.modules["fusion_issue"].ports,
+        )
         counters = {name: CounterBlock() for name in config.modules}
         self.modules = {
             "relation_constructor": RelationConstructor("relation_constructor", config.modules["relation_constructor"], counters["relation_constructor"]),
@@ -92,23 +99,65 @@ class CycleEngine:
             return candidates
         if residency_enabled:
             if query_enabled:
-                return sorted(candidates, key=lambda event_id: (
+                base_order = sorted(candidates, key=lambda event_id: (
                     0 if PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
                     in {PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN} else 1,
                     int(trace.events[event_id]["query_id"]),
                     int(trace.events[event_id]["gaussian_id"]), event_id,
                 ))
+                return self._schedule_fusion(trace, base_order)
             return sorted(candidates, key=lambda event_id: (
                 0 if PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
                 in {PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN} else 1,
                 int(trace.events[event_id]["gaussian_id"]), event_id,
             ))
         if query_enabled:
-            return sorted(candidates, key=lambda event_id: (
+            base_order = sorted(candidates, key=lambda event_id: (
                 int(trace.events[event_id]["query_id"]),
                 int(trace.events[event_id]["relation_id"]), event_id,
             ))
+            return self._schedule_fusion(trace, base_order)
         return candidates
+
+    def _schedule_fusion(self, trace: Trace, base_order: list[int]) -> list[int]:
+        fusion_ids = [event_id for event_id in base_order if PrimitiveKind(
+            int(trace.events[event_id]["primitive_kind"])
+        ) in {
+            PrimitiveKind.FORWARD, PrimitiveKind.CONSUMER, PrimitiveKind.ADJOINT,
+        }]
+        packets = [self._task_packet(trace, event_id) for event_id in fusion_ids]
+        scheduled = [packet.event_id for packet in self.issue_scheduler.forecast(packets)]
+        scheduled_iter = iter(scheduled)
+        scheduled_set = set(fusion_ids)
+        return [
+            next(scheduled_iter) if event_id in scheduled_set else event_id
+            for event_id in base_order
+        ]
+
+    @staticmethod
+    def _task_packet(trace: Trace, event_id: int) -> TaskPacket:
+        row = trace.events[event_id]
+        kind = PrimitiveKind(int(row["primitive_kind"]))
+        task_kind = {
+            PrimitiveKind.FORWARD: TaskKind.FORWARD,
+            PrimitiveKind.CONSUMER: TaskKind.CONSUMER,
+            PrimitiveKind.ADJOINT: TaskKind.ADJOINT,
+        }[kind]
+        relation_id = int(row["relation_id"])
+        query_id = int(row["query_id"])
+        gaussian_id = int(row["gaussian_id"])
+        reduction_key = int(row["reduction_key"])
+        return TaskPacket(
+            event_id=event_id,
+            query_id=max(query_id, 0),
+            gaussian_id=max(gaussian_id, 0),
+            reduction_key=max(reduction_key, relation_id, event_id),
+            resource=int(row["resource_class"]),
+            state_version=int(row["state_version"]),
+            template_id=int(row["template_id"]),
+            address_token=int(row["address_token"]),
+            task_kind=task_kind,
+        )
 
     def _mechanism_flags(self) -> tuple[bool, bool]:
         """Return query-order and semantic-residency flags for this run."""
@@ -232,19 +281,22 @@ class CycleEngine:
                 if stage == 0 and not all(int(dep) in completed for dep in deps):
                     continue
                 candidates.append((event_id, stage))
-            issued = 0
+            fusion_issued = 0
             issued_modules: dict[str, int] = {}
             ordered_ids = self._ordered_candidates(trace, [item[0] for item in candidates])
             ordered = [(event_id, dict(candidates)[event_id]) for event_id in ordered_ids]
             for event_id, stage in ordered:
-                if issued >= self.config.candidate_lanes:
-                    break
                 row = trace.events[event_id]
                 kind = PrimitiveKind(int(row["primitive_kind"]))
                 stages = self._stages_for(kind)
                 module_name = stages[stage]
                 module = self.modules[module_name]
                 timing = module.timing
+                if module_name == "fusion_issue" and stage == 0:
+                    if fusion_issued >= self.config.candidate_lanes:
+                        module.counters.port_stalls += 1
+                        self.stalls.append(StallRecord(cycle, module_name, "candidate_width", (event_id,)))
+                        continue
                 if not module.accepts_kind(kind):
                     raise CycleConfigurationError(f"{module_name} does not accept {kind.name}")
                 if issued_modules.get(module_name, 0) >= timing.ports:
@@ -335,7 +387,8 @@ class CycleEngine:
                 module.counters.busy_cycles += timing.latency
                 issued_modules[module_name] = issued_modules.get(module_name, 0) + 1
                 next_stage[event_id] = None
-                issued += 1
+                if module_name == "fusion_issue" and stage == 0:
+                    fusion_issued += 1
                 progressed = True
             if not progressed:
                 next_points = [point for point in (in_flight[0][0] if in_flight else None,
