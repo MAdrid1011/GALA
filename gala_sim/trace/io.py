@@ -46,7 +46,9 @@ def _write_array_if_needed(array: np.ndarray, path: Path) -> None:
 
 
 class TraceReader:
-    def read(self, root: Path, *, validate: bool = True) -> Trace:
+    def read(
+        self, root: Path, *, validate: bool = True, mmap_mode: str | None = None
+    ) -> Trace:
         root = Path(root)
         metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
         if metadata.get("schema_version") != TRACE_SCHEMA_VERSION:
@@ -57,9 +59,9 @@ class TraceReader:
                if key not in {"schema_version", "event_schema_version"}},
         }
         trace = Trace(
-            events=np.load(root / "events.npy", allow_pickle=False),
-            dependencies=np.load(root / "dependencies.npy", allow_pickle=False),
-            payload=np.load(root / "payload.npy", allow_pickle=False),
+            events=np.load(root / "events.npy", mmap_mode=mmap_mode, allow_pickle=False),
+            dependencies=np.load(root / "dependencies.npy", mmap_mode=mmap_mode, allow_pickle=False),
+            payload=np.load(root / "payload.npy", mmap_mode=mmap_mode, allow_pickle=False),
             metadata=event_metadata,
         )
         if validate:

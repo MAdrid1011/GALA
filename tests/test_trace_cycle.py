@@ -100,7 +100,9 @@ def test_disk_chunked_builder_streams_all_columns(tmp_path: Path) -> None:
     assert validate_trace(trace).event_count == 3
     assert (tmp_path / "chunks").exists() is False
     TraceWriter().write(trace, tmp_path)
-    assert TraceReader().read(tmp_path).event_count == 3
+    loaded = TraceReader().read(tmp_path, mmap_mode="r")
+    assert loaded.event_count == 3
+    assert isinstance(loaded.events, np.memmap)
 
 
 def test_sink_handoff_rebases_chunk_offsets() -> None:

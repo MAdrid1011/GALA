@@ -175,6 +175,7 @@ def validate_trace(trace: Trace) -> TraceValidationReport:
         value != 0 for value in reads_by_key.values()
     ):
         raise TraceValidationError("trace ends with an outstanding cache request")
+    _validate_capture_audit(trace, counts)
     return TraceValidationReport(
         event_count=len(events),
         dependency_count=int(trace.dependencies.size),
@@ -183,3 +184,63 @@ def validate_trace(trace: Trace) -> TraceValidationReport:
         gaussian_count=len({int(value) for value in events["gaussian_id"] if int(value) >= 0}),
         update_count=counts.get(PrimitiveKind.UPDATE_COMMIT.name, 0),
     )
+
+
+def _validate_capture_audit(trace: Trace, counts: dict[str, int]) -> None:
+    audit = trace.metadata.get("capture_audit")
+    if audit is None:
+        return
+    if not isinstance(audit, dict) or any(
+        not isinstance(key, str) or not isinstance(value, int) or value < 0
+        for key, value in audit.items()
+    ):
+        raise TraceValidationError("capture audit metadata is malformed")
+
+    event_matches = {
+        "cuda_relation_candidates": PrimitiveKind.RELATION_CANDIDATE,
+        "cuda_valid_relations": PrimitiveKind.RELATION,
+        "captured_query_calls": PrimitiveKind.QUERY_CLOSE,
+        "captured_backward_relations": PrimitiveKind.ADJOINT,
+        "optimizer_updated_gaussians": PrimitiveKind.UPDATE_COMMIT,
+    }
+    for audit_name, primitive_kind in event_matches.items():
+        expected = int(audit.get(audit_name, 0))
+        actual = int(counts.get(primitive_kind.name, 0))
+        if expected != actual:
+            raise TraceValidationError(
+                f"capture audit {audit_name}={expected} does not match "
+                f"{primitive_kind.name} events={actual}"
+            )
+
+    relation_count = int(counts.get(PrimitiveKind.RELATION.name, 0))
+    for primitive_kind in (
+        PrimitiveKind.CACHE_REQUEST,
+        PrimitiveKind.CACHE_RETURN,
+        PrimitiveKind.FORWARD,
+        PrimitiveKind.CONSUMER,
+        PrimitiveKind.ADJOINT,
+        PrimitiveKind.GRADIENT_REDUCTION,
+    ):
+        actual = int(counts.get(primitive_kind.name, 0))
+        if actual != relation_count:
+            raise TraceValidationError(
+                f"captured {primitive_kind.name} events={actual} do not match "
+                f"valid relations={relation_count}"
+            )
+
+    captured_queries = int(audit.get("captured_query_calls", 0))
+    captured_by_kind = sum(
+        int(audit.get(name, 0))
+        for name in ("captured_raster_query_calls", "captured_voxel_query_calls")
+    )
+    if captured_by_kind != captured_queries:
+        raise TraceValidationError("captured query audit totals are inconsistent")
+    if int(counts.get(PrimitiveKind.QUERY_REDUCTION.name, 0)) != captured_queries:
+        raise TraceValidationError("query reduction count does not match captured queries")
+
+    for query_kind in ("raster", "voxel"):
+        official = int(audit.get(f"official_{query_kind}_query_calls", 0))
+        captured = int(audit.get(f"captured_{query_kind}_query_calls", 0))
+        excluded = int(audit.get(f"excluded_no_grad_{query_kind}_query_calls", 0))
+        if official != captured + excluded:
+            raise TraceValidationError(f"official {query_kind} query audit totals are inconsistent")

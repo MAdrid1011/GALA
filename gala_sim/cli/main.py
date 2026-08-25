@@ -64,7 +64,7 @@ def main(argv: list[str] | None = None) -> int:
                               "pending": [] if config.ready else "configuration_pending"},
                              sort_keys=True))
             return 0 if config.ready else 2
-        trace = TraceReader().read(args.trace)
+        trace = TraceReader().read(args.trace, mmap_mode="r")
         validate_trace(trace)
         if args.command == "trace-validate":
             print(json.dumps({"events": trace.event_count, "status": "passed"}, sort_keys=True))

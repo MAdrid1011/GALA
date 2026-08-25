@@ -97,7 +97,7 @@ class R2GaussianChestAdapter:
                 + (completed.stderr[-3000:] or completed.stdout[-3000:])
             )
         try:
-            trace = TraceReader().read(trace_root)
+            trace = TraceReader().read(trace_root, mmap_mode="r")
             validate_trace(trace)
         except (OSError, ValueError, RuntimeError) as error:
             raise TraceCaptureUnavailable(f"captured trace failed validation: {error}") from error
