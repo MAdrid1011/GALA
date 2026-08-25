@@ -35,10 +35,10 @@ class StallRecord:
     module: str
     reason: str
     event_ids: tuple[int, ...]
+    count: int = 1
 
 
 @dataclass(frozen=True)
 class ModuleOutput:
     event_id: int
     completion_cycle: int
-

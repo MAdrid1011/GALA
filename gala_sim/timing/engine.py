@@ -75,6 +75,26 @@ class CycleEngine:
             "shared_sram": SharedSram("shared_sram", config.modules["shared_sram"], counters["shared_sram"]),
         }
         self.stalls: list[StallRecord] = []
+        self._stall_index: dict[tuple[int, str, str], int] = {}
+        self._stall_cycle: int | None = None
+
+    def _record_stall(self, cycle: int, module: str, reason: str, event_id: int) -> None:
+        if self._stall_cycle != cycle:
+            self._stall_index.clear()
+            self._stall_cycle = cycle
+        key = (cycle, module, reason)
+        index = self._stall_index.get(key)
+        if index is None:
+            self._stall_index[key] = len(self.stalls)
+            self.stalls.append(StallRecord(cycle, module, reason, (event_id,)))
+            return
+        previous = self.stalls[index]
+        event_ids = previous.event_ids
+        if len(event_ids) < self.config.candidate_lanes:
+            event_ids = (*event_ids, event_id)
+        self.stalls[index] = StallRecord(
+            cycle, module, reason, event_ids, previous.count + 1
+        )
 
     def _stages_for(self, kind: PrimitiveKind) -> tuple[str, ...]:
         if kind in {PrimitiveKind.RELATION_CANDIDATE, PrimitiveKind.RELATION, PrimitiveKind.QUERY_CLOSE}:
@@ -205,10 +225,19 @@ class CycleEngine:
         if not self.config.modules:
             raise CycleConfigurationError("cycle modules are not configured")
         completed: dict[int, int] = {}
-        pending = set(int(item) for item in trace.events["event_id"])
-        next_stage: dict[int, int | None] = {
-            int(item): 0 for item in trace.events["event_id"]
-        }
+        remaining_dependencies: dict[int, int] = {}
+        dependents: dict[int, list[int]] = {}
+        ready: list[tuple[int, int]] = []
+        for row in trace.events:
+            event_id = int(row["event_id"])
+            dependencies = trace.dependency_ids(row)
+            remaining_dependencies[event_id] = int(dependencies.size)
+            for dependency in dependencies:
+                dependents.setdefault(int(dependency), []).append(event_id)
+            if dependencies.size == 0:
+                ready.append((event_id, 0))
+        heapq.heapify(ready)
+        remaining_events = len(trace.events)
         in_flight: list[tuple[int, int, int, str]] = []
         module_busy_until = {name: 0 for name in self.modules}
         module_inflight = {name: 0 for name in self.modules}
@@ -226,7 +255,11 @@ class CycleEngine:
         closed_queries: set[int] = set()
         memory_requests = 0
         cycle = 0
-        while pending or in_flight:
+        ready_scan_window = max(
+            self.config.candidate_lanes,
+            sum(module.timing.ports for module in self.modules.values()),
+        )
+        while remaining_events or in_flight:
             progressed = False
             while in_flight and in_flight[0][0] <= cycle:
                 finish, event_id, stage, module_name = heapq.heappop(in_flight)
@@ -260,11 +293,14 @@ class CycleEngine:
                     for state, key in cache_keys_by_query.get(query_id, []):
                         state.close(key)
                 if stage + 1 < len(stages):
-                    next_stage[event_id] = stage + 1
+                    heapq.heappush(ready, (event_id, stage + 1))
                 else:
                     completed[event_id] = finish
-                    next_stage[event_id] = None
-                    pending.remove(event_id)
+                    remaining_events -= 1
+                    for dependent in dependents.get(event_id, ()):
+                        remaining_dependencies[dependent] -= 1
+                        if remaining_dependencies[dependent] == 0:
+                            heapq.heappush(ready, (dependent, 0))
                 if (PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
                         is PrimitiveKind.RELATION_CANDIDATE):
                     relation_seed_inflight -= 1
@@ -272,15 +308,10 @@ class CycleEngine:
                         raise CycleConfigurationError("negative relation seed FIFO occupancy")
                 progressed = True
             candidates: list[tuple[int, int]] = []
-            for event_id in sorted(pending):
-                stage = next_stage[event_id]
-                if stage is None:
-                    continue
-                row = trace.events[event_id]
-                deps = trace.dependency_ids(row)
-                if stage == 0 and not all(int(dep) in completed for dep in deps):
-                    continue
-                candidates.append((event_id, stage))
+            for _ in range(ready_scan_window):
+                if not ready:
+                    break
+                candidates.append(heapq.heappop(ready))
             fusion_issued = 0
             issued_modules: dict[str, int] = {}
             ordered_ids = self._ordered_candidates(trace, [item[0] for item in candidates])
@@ -295,34 +326,38 @@ class CycleEngine:
                 if module_name == "fusion_issue" and stage == 0:
                     if fusion_issued >= self.config.candidate_lanes:
                         module.counters.port_stalls += 1
-                        self.stalls.append(StallRecord(cycle, module_name, "candidate_width", (event_id,)))
+                        self._record_stall(cycle, module_name, "candidate_width", event_id)
+                        heapq.heappush(ready, (event_id, stage))
                         continue
                 if not module.accepts_kind(kind):
                     raise CycleConfigurationError(f"{module_name} does not accept {kind.name}")
                 if issued_modules.get(module_name, 0) >= timing.ports:
                     module.counters.port_stalls += 1
-                    self.stalls.append(StallRecord(cycle, module_name, "port", (event_id,)))
+                    self._record_stall(cycle, module_name, "port", event_id)
+                    heapq.heappush(ready, (event_id, stage))
                     continue
                 if module_busy_until[module_name] > cycle:
                     module.counters.queue_stalls += 1
-                    self.stalls.append(StallRecord(cycle, module_name, "initiation_interval", (event_id,)))
+                    self._record_stall(cycle, module_name, "initiation_interval", event_id)
+                    heapq.heappush(ready, (event_id, stage))
                     continue
                 if module_inflight[module_name] >= timing.queue_capacity:
                     module.counters.queue_stalls += 1
-                    self.stalls.append(StallRecord(cycle, module_name, "queue_capacity", (event_id,)))
+                    self._record_stall(cycle, module_name, "queue_capacity", event_id)
+                    heapq.heappush(ready, (event_id, stage))
                     continue
                 if (kind is PrimitiveKind.RELATION_CANDIDATE
                         and relation_seed_inflight >= self.config.relation_seed_fifo_entries):
                     module.counters.queue_stalls += 1
-                    self.stalls.append(StallRecord(cycle, module_name, "seed_fifo", (event_id,)))
+                    self._record_stall(cycle, module_name, "seed_fifo", event_id)
+                    heapq.heappush(ready, (event_id, stage))
                     continue
                 bank_key = (module_name, cycle, module.bank(int(row["address_token"])))
                 if bank_key in bank_busy:
                     module.counters.bank_conflicts += 1
-                    self.stalls.append(StallRecord(cycle, module_name, "bank", (event_id,)))
+                    self._record_stall(cycle, module_name, "bank", event_id)
+                    heapq.heappush(ready, (event_id, stage))
                     continue
-                if int(row["dependency_count"]) > timing.queue_capacity:
-                    raise CycleConfigurationError(f"event dependency footprint exceeds {module_name} queue")
                 if kind is PrimitiveKind.CACHE_REQUEST and stage == 0:
                     data_bytes = int(row["data_bytes"])
                     if data_bytes <= 0:
@@ -337,7 +372,8 @@ class CycleEngine:
                             lookup = state.request(key, remaining_uses=1)
                         except CacheBackpressure:
                             module.counters.queue_stalls += 1
-                            self.stalls.append(StallRecord(cycle, module_name, "cache_capacity", (event_id,)))
+                            self._record_stall(cycle, module_name, "cache_capacity", event_id)
+                            heapq.heappush(ready, (event_id, stage))
                             continue
                         cache_event_state[event_id] = (state, key, lookup)
                         cache_keys_by_query.setdefault(int(row["query_id"]), []).append((state, key))
@@ -386,7 +422,6 @@ class CycleEngine:
                 module.counters.accepted += 1
                 module.counters.busy_cycles += timing.latency
                 issued_modules[module_name] = issued_modules.get(module_name, 0) + 1
-                next_stage[event_id] = None
                 if module_name == "fusion_issue" and stage == 0:
                     fusion_issued += 1
                 progressed = True
@@ -396,7 +431,7 @@ class CycleEngine:
                                                         if module_busy_until[name] > cycle), default=None))
                                if point is not None and point > cycle]
                 if not next_points:
-                    blocked = tuple(sorted(pending))[:8]
+                    blocked = tuple(event_id for event_id, _ in ready[:8])
                     raise CycleConfigurationError(f"deadlock at cycle {cycle}, pending={blocked}")
                 cycle = min(next_points)
             else:

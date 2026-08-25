@@ -16,10 +16,12 @@
 - Chest 1 迭代 grad-gated smoke 产生 1,048,191 个结构化事件并通过 `validate_trace`；与未插桩官方运行的 `vol_pred.npy` 逐元素一致，PSNR/SSIM 输出一致。
 - Trace validator 已对真实事件链执行候选→关系→关闭、关系→缓存→前向→归约→消费者→伴随→梯度以及梯度→更新提交的前置依赖检查；capture audit 同时记录官方调用、排除的 `no_grad` 调用、CUDA 候选和有效关系计数。
 - 事件、依赖和 payload 三列均支持磁盘 chunk 合并为最终 mmap 文件；同路径 writer 不再重复截断，避免正式长任务在 `finish()` 阶段聚合整份数组。
+- 周期内核已改为依赖计数反向唤醒和有界就绪窗口，不再逐周期扫描全部 pending 事件；在真实 1,048,191-event trace 上两次 `variant:0000` smoke 均为 997,127 周期，停顿记录按同周期/模块/原因合并。
+- 语义驻留状态已接入 `variant:0001` 的逐请求目录、容量反压、填充、读完成和释放路径；实验 smoke 完成且未凭空产生命中。
 
 ## 当前入口
 
-首个组合仍停在输入与工具链之后。`configs/architecture/gala.yaml` 中的 `relation.seed_fifo_entries`、各模块时序、trace chunk 容量尚未由权威设计或模块微基准冻结，因此正式周期运行必须拒绝并标记 `failed_preflight`。
+首个组合仍停在正式 Base ASIC 之前。`configs/architecture/gala.yaml` 中的 `relation.seed_fifo_entries`、各模块时序、trace chunk 容量和 Ramulator 2 逐请求绑定尚未由权威设计或模块微基准冻结；当前周期 smoke 使用显式实验 timing，只能验证内核行为，正式运行必须拒绝并标记 `failed_preflight`。
 
 R²-Gaussian 的官方 CUDA 扩展仍没有导出完整 CLAMP 关系、消费者、伴随和更新事件缓冲区；当前旁路只读官方返回的 CUDA work buffer，并在官方 Python 调用边界映射这些事件。该旁路尚未证明长程增密 ID 稳定性、所有真实队列操作和正式 30k 训练的流式最终存储，因此不能视为正式 trace 闭环。
 

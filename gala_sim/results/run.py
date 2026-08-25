@@ -51,7 +51,7 @@ class RunOutputWriter:
     def _write_stalls(self, result: CycleResult) -> None:
         rows = [
             {"cycle": item.cycle, "module": item.module, "reason": item.reason,
-             "event_ids": list(item.event_ids)}
+             "event_ids": list(item.event_ids), "count": item.count}
             for item in result.stalls
         ]
         try:
@@ -61,6 +61,6 @@ class RunOutputWriter:
             raise RuntimeError("pyarrow is required to write stalls.parquet") from error
         table = pa.Table.from_pylist(rows, schema=pa.schema([
             ("cycle", pa.int64()), ("module", pa.string()), ("reason", pa.string()),
-            ("event_ids", pa.list_(pa.int64())),
+            ("event_ids", pa.list_(pa.int64())), ("count", pa.int64()),
         ]))
         pq.write_table(table, self.root / "stalls.parquet")
