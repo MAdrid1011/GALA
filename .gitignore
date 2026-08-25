@@ -13,6 +13,9 @@ checkpoints/
 traces/
 results/
 runs/
+records/
+artifacts/
+logs/
 *.arrow
 *.parquet
 *.npy
@@ -20,6 +23,15 @@ runs/
 *.pt
 *.pth
 *.ckpt
+*.log
+*.coverage
+.coverage.*
+htmlcov/
+*.o
+*.so
+*.a
+*.dylib
+compile_commands.json
 
 # Keep the simulator's versioned results package; root-level result artifacts remain ignored.
 !gala_sim/results/
