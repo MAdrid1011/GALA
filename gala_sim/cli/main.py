@@ -8,7 +8,7 @@ from pathlib import Path
 import sys
 
 from gala_sim.ablation import run_matrix
-from gala_sim.config import load_config
+from gala_sim.config import load_config, pending_parameters
 from gala_sim.results import AblationRow, write_ablation_csv
 from gala_sim.results.run import RunOutputWriter
 from gala_sim.timing import CycleConfig, CycleEngine, ModuleTiming
@@ -61,7 +61,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.command == "config-check":
             config = load_config(args.config)
             print(json.dumps({"sha256": config.sha256, "ready": config.ready,
-                              "pending": [] if config.ready else "configuration_pending"},
+                              "pending": pending_parameters(config.parameters)},
                              sort_keys=True))
             return 0 if config.ready else 2
         trace = TraceReader().read(args.trace, mmap_mode="r")
