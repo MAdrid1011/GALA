@@ -59,7 +59,8 @@ class NativeRamulator2Binding:
     """Own one independent native Ramulator 2 simulation instance."""
 
     def __init__(self, bridge_library: Path, configuration: Path, *,
-                 expected_bridge_sha256: str, version: str, commit: str) -> None:
+                 expected_bridge_sha256: str, version: str, commit: str,
+                 ramulator_library_sha256: str, build_manifest_sha256: str) -> None:
         self.bridge_library = Path(bridge_library).resolve()
         self.configuration = Path(configuration).resolve()
         if sha256_file(self.bridge_library) != expected_bridge_sha256:
@@ -83,20 +84,42 @@ class NativeRamulator2Binding:
             self._raise_native("invalid Ramulator transaction size")
         self._transaction_bytes = int(transaction_bytes)
         self._expected_bridge_sha256 = expected_bridge_sha256
+        self._ramulator_library_sha256 = ramulator_library_sha256
+        self._build_manifest_sha256 = build_manifest_sha256
 
     @classmethod
     def from_build_manifest(cls, manifest_path: Path, configuration: Path) -> "NativeRamulator2Binding":
-        manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
+        manifest_path = Path(manifest_path).resolve()
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         if not isinstance(manifest, dict) or manifest.get("schema_version") != (
             "gala-ramulator2-bridge-build-v1"
         ):
             raise MissingMemoryBackend("Ramulator bridge build manifest is invalid")
-        return cls(
-            Path(str(manifest["bridge_library"])), configuration,
-            expected_bridge_sha256=str(manifest["bridge_library_sha256"]),
-            version=str(manifest["ramulator_version"]),
-            commit=str(manifest["ramulator_commit"]),
-        )
+        try:
+            bridge_library = Path(str(manifest["bridge_library"]))
+            bridge_sha256 = str(manifest["bridge_library_sha256"])
+            ramulator_library = Path(str(manifest["ramulator_library"]))
+            ramulator_sha256 = str(manifest["ramulator_library_sha256"])
+            if sha256_file(bridge_library) != bridge_sha256:
+                raise MissingMemoryBackend(
+                    "Ramulator bridge SHA-256 does not match build manifest"
+                )
+            if sha256_file(ramulator_library) != ramulator_sha256:
+                raise MissingMemoryBackend(
+                    "Ramulator library SHA-256 does not match build manifest"
+                )
+            return cls(
+                bridge_library, configuration,
+                expected_bridge_sha256=bridge_sha256,
+                version=str(manifest["ramulator_version"]),
+                commit=str(manifest["ramulator_commit"]),
+                ramulator_library_sha256=ramulator_sha256,
+                build_manifest_sha256=sha256_file(manifest_path),
+            )
+        except (KeyError, OSError) as error:
+            raise MissingMemoryBackend(
+                "Ramulator bridge build manifest is incomplete"
+            ) from error
 
     def metadata(self) -> dict[str, Any]:
         return {
@@ -105,6 +128,8 @@ class NativeRamulator2Binding:
             "commit": self._commit,
             "config_sha256": sha256_file(self.configuration),
             "bridge_sha256": self._expected_bridge_sha256,
+            "ramulator_library_sha256": self._ramulator_library_sha256,
+            "build_manifest_sha256": self._build_manifest_sha256,
             "transaction_bytes": self._transaction_bytes,
             **self._configuration_metadata,
         }
@@ -140,6 +165,8 @@ class NativeRamulator2Binding:
             expected_bridge_sha256=self._expected_bridge_sha256,
             version=self._version,
             commit=self._commit,
+            ramulator_library_sha256=self._ramulator_library_sha256,
+            build_manifest_sha256=self._build_manifest_sha256,
         )
 
     def close(self) -> None:
