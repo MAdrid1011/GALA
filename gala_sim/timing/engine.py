@@ -12,6 +12,7 @@ from gala_sim.trace.validator import validate_trace
 from .config import CycleConfig
 from .modules import (
     BidirectionalQueryUnit,
+    CacheBackpressure,
     ComputePod,
     CounterBlock,
     FusionIssueUnit,
@@ -20,6 +21,8 @@ from .modules import (
     ReconstructionUpdateUnit,
     SharedSram,
     StallRecord,
+    CacheLookup,
+    SemanticCacheState,
 )
 
 
@@ -84,12 +87,10 @@ class CycleEngine:
         return ("fusion_issue", "compute_pod")
 
     def _ordered_candidates(self, trace: Trace, candidates: list[int]) -> list[int]:
-        variant_bits = self.policy.removeprefix("variant:") if self.policy.startswith("variant:") else None
-        query_enabled = variant_bits is not None and (variant_bits[0] == "1" or variant_bits[2] == "1")
-        residency_enabled = variant_bits is not None and (variant_bits[1] == "1" or variant_bits[3] == "1")
-        if self.policy == "base" or self.policy == "variant:0000":
+        query_enabled, residency_enabled = self._mechanism_flags()
+        if not query_enabled and not residency_enabled:
             return candidates
-        if self.policy in {"residency", "residency_oracle"} or residency_enabled:
+        if residency_enabled:
             if query_enabled:
                 return sorted(candidates, key=lambda event_id: (
                     0 if PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
@@ -102,19 +103,53 @@ class CycleEngine:
                 in {PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN} else 1,
                 int(trace.events[event_id]["gaussian_id"]), event_id,
             ))
-        if self.policy in {"query", "query_oracle"} or query_enabled:
+        if query_enabled:
             return sorted(candidates, key=lambda event_id: (
                 int(trace.events[event_id]["query_id"]),
                 int(trace.events[event_id]["relation_id"]), event_id,
             ))
-        if self.policy == "full":
-            return sorted(candidates, key=lambda event_id: (
-                0 if PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
-                in {PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN} else 1,
-                int(trace.events[event_id]["query_id"]),
-                int(trace.events[event_id]["gaussian_id"]), event_id,
-            ))
         return candidates
+
+    def _mechanism_flags(self) -> tuple[bool, bool]:
+        """Return query-order and semantic-residency flags for this run."""
+        if self.policy in {"base", "variant:0000"}:
+            return False, False
+        if self.policy in {"query", "query_oracle"}:
+            return True, False
+        if self.policy in {"residency", "residency_oracle"}:
+            return False, True
+        if self.policy == "full":
+            return True, True
+        bits = self.policy.removeprefix("variant:")
+        return bits[0] == "1" or bits[2] == "1", bits[3] == "1"
+
+    def _residency_states(self) -> dict[int, SemanticCacheState]:
+        if self.config.cache_instances is None:
+            raise CycleConfigurationError(
+                "semantic residency requires cache resource parameters"
+            )
+        if any(value is None for value in (
+            self.config.cache_capacity_per_instance,
+            self.config.cache_directory_banks,
+            self.config.cache_sector_bytes,
+        )):
+            raise CycleConfigurationError(
+                "semantic residency requires complete cache resource parameters"
+            )
+        return {
+            instance: SemanticCacheState.create(
+                capacity=self.config.cache_capacity_per_instance,
+                directory_banks=self.config.cache_directory_banks,
+                sector_bytes=self.config.cache_sector_bytes,
+            )
+            for instance in range(self.config.cache_instances)
+        }
+
+    def _cache_instance(self, gaussian_id: int) -> int:
+        instances = self.config.cache_instances
+        if instances is None:
+            raise CycleConfigurationError("cache instance count is not configured")
+        return gaussian_id % instances
 
     def run(self, trace: Trace) -> CycleResult:
         validate_trace(trace)
@@ -130,6 +165,17 @@ class CycleEngine:
         module_inflight = {name: 0 for name in self.modules}
         relation_seed_inflight = 0
         bank_busy: dict[tuple[str, int, int], int] = {}
+        residency_enabled = self._mechanism_flags()[1]
+        cache_states = (
+            self._residency_states()
+            if residency_enabled and self.config.cache_instances is not None
+            else {}
+        )
+        cache_fill_done: dict[tuple[int, tuple[int, int]], int] = {}
+        cache_event_state: dict[int, tuple[SemanticCacheState, tuple[int, int], CacheLookup]] = {}
+        cache_keys_by_query: dict[int, list[tuple[SemanticCacheState, tuple[int, int]]]] = {}
+        closed_queries: set[int] = set()
+        memory_requests = 0
         cycle = 0
         while pending or in_flight:
             progressed = False
@@ -142,6 +188,28 @@ class CycleEngine:
                         f"negative in-flight count for {module_name}"
                     )
                 stages = self._stages_for(PrimitiveKind(int(trace.events[event_id]["primitive_kind"])))
+                kind = PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
+                if kind is PrimitiveKind.CACHE_REQUEST and stage == 0 and event_id in cache_event_state:
+                    state, key, lookup = cache_event_state[event_id]
+                    if lookup is CacheLookup.MISS:
+                        state.fill_complete(key, remaining_uses=1)
+                        if int(trace.events[event_id]["query_id"]) in closed_queries:
+                            state.close(key)
+                if cache_states and kind is PrimitiveKind.CACHE_RETURN and stage == len(stages) - 1:
+                    request_ids = trace.dependency_ids(trace.events[event_id])
+                    if len(request_ids) != 1 or int(request_ids[0]) not in cache_event_state:
+                        raise CycleConfigurationError(
+                            f"cache return {event_id} has no captured request state"
+                        )
+                    state, key, _ = cache_event_state[int(request_ids[0])]
+                    state.complete_read(key)
+                    if int(trace.events[event_id]["query_id"]) in closed_queries:
+                        state.close(key)
+                if kind is PrimitiveKind.QUERY_CLOSE and stage == len(stages) - 1:
+                    query_id = int(trace.events[event_id]["query_id"])
+                    closed_queries.add(query_id)
+                    for state, key in cache_keys_by_query.get(query_id, []):
+                        state.close(key)
                 if stage + 1 < len(stages):
                     next_stage[event_id] = stage + 1
                 else:
@@ -209,15 +277,52 @@ class CycleEngine:
                         raise CycleConfigurationError(
                             f"{kind.name} event {event_id} has no explicit transfer size"
                         )
-                    memory_done = self.config.memory.submit(
-                        address=int(row["address_token"]),
-                        size_bytes=data_bytes,
-                        is_write=False,
-                        arrival_cycle=cycle,
-                    )
-                    if memory_done > cycle + timing.latency:
-                        module.counters.memory_wait_cycles += memory_done - cycle - timing.latency
-                    completion = max(cycle + module.service_cycles(), memory_done)
+                    if cache_states:
+                        instance = self._cache_instance(int(row["gaussian_id"]))
+                        state = cache_states[instance]
+                        key = (int(row["gaussian_id"]), int(row["state_version"]))
+                        try:
+                            lookup = state.request(key, remaining_uses=1)
+                        except CacheBackpressure:
+                            module.counters.queue_stalls += 1
+                            self.stalls.append(StallRecord(cycle, module_name, "cache_capacity", (event_id,)))
+                            continue
+                        cache_event_state[event_id] = (state, key, lookup)
+                        cache_keys_by_query.setdefault(int(row["query_id"]), []).append((state, key))
+                        if int(row["query_id"]) in closed_queries:
+                            state.close(key)
+                        if lookup is CacheLookup.HIT:
+                            completion = cycle + module.service_cycles()
+                        else:
+                            if lookup is CacheLookup.MISS:
+                                memory_done = self.config.memory.submit(
+                                    address=int(row["address_token"]),
+                                    size_bytes=data_bytes,
+                                    is_write=False,
+                                    arrival_cycle=cycle,
+                                )
+                                memory_requests += 1
+                                cache_fill_done[(instance, key)] = memory_done
+                            else:
+                                memory_done = cache_fill_done.get((instance, key))
+                                if memory_done is None:
+                                    raise CycleConfigurationError(
+                                        f"merged cache request {event_id} has no fill completion"
+                                    )
+                            if memory_done > cycle + timing.latency:
+                                module.counters.memory_wait_cycles += memory_done - cycle - timing.latency
+                            completion = max(cycle + module.service_cycles(), memory_done)
+                    else:
+                        memory_done = self.config.memory.submit(
+                            address=int(row["address_token"]),
+                            size_bytes=data_bytes,
+                            is_write=False,
+                            arrival_cycle=cycle,
+                        )
+                        memory_requests += 1
+                        if memory_done > cycle + timing.latency:
+                            module.counters.memory_wait_cycles += memory_done - cycle - timing.latency
+                        completion = max(cycle + module.service_cycles(), memory_done)
                 else:
                     completion = cycle + module.service_cycles()
                 heapq.heappush(in_flight, (completion, event_id, stage, module_name))
@@ -243,9 +348,17 @@ class CycleEngine:
                 cycle = min(next_points)
             else:
                 cycle += 1
+        module_counters = {name: module.counters.as_dict() for name, module in self.modules.items()}
+        if cache_states:
+            cache_totals: dict[str, int] = {key: 0 for key in next(iter(cache_states.values())).counters}
+            for state in cache_states.values():
+                for key, value in state.counters.items():
+                    cache_totals[key] += value
+            module_counters["semantic_cache"].update(cache_totals)
+        module_counters["semantic_cache"]["memory_requests"] = memory_requests
         return CycleResult(
             total_cycles=max(completed.values(), default=0),
-            module_counters={name: module.counters.as_dict() for name, module in self.modules.items()},
+            module_counters=module_counters,
             stalls=tuple(self.stalls),
             completion_cycles=completed,
             event_counts={kind.name: int((trace.events["primitive_kind"] == int(kind)).sum())

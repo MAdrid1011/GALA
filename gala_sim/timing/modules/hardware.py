@@ -86,13 +86,14 @@ class SemanticCacheState:
     sector_bytes: int
     active: dict[tuple[int, int], dict[str, int | bool]]
     pending: dict[tuple[int, int], int]
+    closing_pending: set[tuple[int, int]]
     counters: dict[str, int]
 
     @classmethod
     def create(cls, *, capacity: int, directory_banks: int, sector_bytes: int) -> "SemanticCacheState":
         if min(capacity, directory_banks, sector_bytes) <= 0:
             raise ValueError("semantic cache resources must be positive")
-        return cls(capacity, directory_banks, sector_bytes, {}, {}, {
+        return cls(capacity, directory_banks, sector_bytes, {}, {}, set(), {
             "directory_hits": 0, "directory_misses": 0, "miss_merges": 0,
             "multicast_reads": 0, "fills": 0, "releases": 0,
         })
@@ -103,6 +104,7 @@ class SemanticCacheState:
         if key in self.active:
             record = self.active[key]
             record["active_reads"] = int(record["active_reads"]) + 1
+            record["remaining_uses"] = int(record["remaining_uses"]) + 1
             self.counters["directory_hits"] += 1
             return CacheLookup.HIT
         if key in self.pending:
@@ -120,10 +122,11 @@ class SemanticCacheState:
         if waiters is None:
             raise ValueError("cache fill has no pending miss")
         self.active[key] = {
-            "remaining_uses": remaining_uses,
+            "remaining_uses": waiters,
             "active_reads": waiters,
-            "closing": False,
+            "closing": key in self.closing_pending,
         }
+        self.closing_pending.discard(key)
         self.counters["fills"] += 1
 
     def begin_multicast(self, key: tuple[int, int], destinations: int) -> None:
@@ -143,8 +146,11 @@ class SemanticCacheState:
             raise ValueError("cache remaining-use count became negative")
 
     def close(self, key: tuple[int, int]) -> bool:
+        if key in self.pending:
+            self.closing_pending.add(key)
+            return False
         if key not in self.active:
-            raise ValueError("cannot close a non-resident cache key")
+            return False
         self.active[key]["closing"] = True
         if (int(self.active[key]["active_reads"]) == 0
                 and int(self.active[key]["remaining_uses"]) == 0):

@@ -33,10 +33,22 @@ class CycleConfig:
     clock_frequency_hz: int
     relation_seed_fifo_entries: int
     candidate_lanes: int
+    cache_instances: int | None = None
+    cache_capacity_per_instance: int | None = None
+    cache_directory_banks: int | None = None
+    cache_sector_bytes: int | None = None
+    cache_multicast_destinations: int | None = None
 
     def __post_init__(self) -> None:
         if min(self.clock_frequency_hz, self.relation_seed_fifo_entries, self.candidate_lanes) <= 0:
             raise ValueError("cycle clock, seed FIFO, and candidate lanes must be positive")
+        optional_cache_values = (
+            self.cache_instances, self.cache_capacity_per_instance,
+            self.cache_directory_banks, self.cache_sector_bytes,
+            self.cache_multicast_destinations,
+        )
+        if any(value is not None and value <= 0 for value in optional_cache_values):
+            raise ValueError("optional cache timing values must be positive")
         required = {
             "relation_constructor", "fusion_issue", "semantic_cache", "compute_pod",
             "bidirectional_query", "reconstruction_update", "shared_sram",
@@ -77,4 +89,9 @@ class CycleConfig:
             config.require_ready()
         return cls(modules=modules, memory=memory, clock_frequency_hz=frequency,
                    relation_seed_fifo_entries=seed_fifo,
-                   candidate_lanes=int(config.value("issue.candidate_lanes")))
+                   candidate_lanes=int(config.value("issue.candidate_lanes")),
+                   cache_instances=int(config.value("cache.instances")),
+                   cache_capacity_per_instance=int(config.value("cache.active_records_per_instance")),
+                   cache_directory_banks=int(config.value("cache.directory_banks_per_instance")),
+                   cache_sector_bytes=int(config.value("cache.sector_bytes")),
+                   cache_multicast_destinations=int(config.value("cache.multicast_destinations")))

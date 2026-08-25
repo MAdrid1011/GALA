@@ -150,6 +150,51 @@ def test_cache_transfer_requires_memory_size_and_pairing() -> None:
     assert result.module_counters["semantic_cache"]["memory_wait_cycles"] >= 0
 
 
+def test_semantic_residency_variant_merges_repeated_state_reads() -> None:
+    builder = TraceBuilder()
+    first_request = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_REQUEST), query_id=0,
+        gaussian_id=7, state_version=0, address_token=448, data_bytes=64,
+        resource_class=int(ResourceClass.CACHE),
+    ))
+    first_return = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_RETURN), query_id=0,
+        gaussian_id=7, state_version=0, address_token=448, data_bytes=64,
+        resource_class=int(ResourceClass.CACHE),
+    ), dependencies=[first_request])
+    second_request = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_REQUEST), query_id=1,
+        gaussian_id=7, state_version=0, address_token=448, data_bytes=64,
+        resource_class=int(ResourceClass.CACHE),
+    ), dependencies=[first_return])
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_RETURN), query_id=1,
+        gaussian_id=7, state_version=0, address_token=448, data_bytes=64,
+        resource_class=int(ResourceClass.CACHE),
+    ), dependencies=[second_request])
+    trace = builder.finish()
+    config = CycleConfig(
+        modules={name: ModuleTiming(latency=1, initiation_interval=1,
+                                    queue_capacity=8, ports=1, banks=2)
+                 for name in (
+                     "relation_constructor", "fusion_issue", "semantic_cache",
+                     "compute_pod", "bidirectional_query", "reconstruction_update",
+                     "shared_sram",
+                 )},
+        memory=_Memory(), clock_frequency_hz=500_000_000,
+        relation_seed_fifo_entries=8, candidate_lanes=3,
+        cache_instances=1, cache_capacity_per_instance=2,
+        cache_directory_banks=2, cache_sector_bytes=64,
+        cache_multicast_destinations=1,
+    )
+    base = CycleEngine(config, policy="variant:0000").run(trace)
+    residency = CycleEngine(config, policy="variant:0001").run(trace)
+    assert base.module_counters["semantic_cache"]["memory_requests"] == 2
+    assert residency.module_counters["semantic_cache"]["memory_requests"] == 1
+    assert residency.module_counters["semantic_cache"]["directory_misses"] == 1
+    assert residency.module_counters["semantic_cache"]["directory_hits"] == 1
+
+
 def test_cycle_engine_applies_module_queue_and_seed_fifo_backpressure() -> None:
     builder = TraceBuilder()
     builder.emit(TraceEvent(
