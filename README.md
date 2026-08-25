@@ -14,3 +14,13 @@ gala-sim native-preflight \
 ```
 
 目标 GPU 存在外部计算进程时，该命令写出 `failed_preflight` 且不启动训练。预检通过只允许进入论文配置训练，不构成正式时间或质量结果。
+
+预检通过后才可运行官方参考路径：
+
+```bash
+gala-sim native-reference \
+  --config configs/architecture/gala.yaml \
+  --freeze <input-freeze.json> \
+  --preflight <preflight.json> \
+  --output <native-reference-output>
+```
