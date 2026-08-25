@@ -12,7 +12,7 @@ from gala_sim.config import load_config
 from gala_sim.results import AblationRow, write_ablation_csv
 from gala_sim.results.run import RunOutputWriter
 from gala_sim.timing import CycleConfig, CycleEngine, ModuleTiming
-from gala_sim.timing.recorded_memory import RecordedMemoryBackend
+from gala_sim.timing.memory import RecordedMemoryBackend
 from gala_sim.trace import TraceReader, validate_trace
 
 

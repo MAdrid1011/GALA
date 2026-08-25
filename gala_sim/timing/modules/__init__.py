@@ -1,6 +1,7 @@
 """One implementation per hardware-contract module."""
 
 from .base import CounterBlock, ModuleOutput, StallRecord
+from .protocol import AcceptResult, CycleModule, EventBatch, ModuleOutputs
 from .hardware import (
     BidirectionalQueryUnit,
     CacheBackpressure,
@@ -15,7 +16,8 @@ from .hardware import (
 )
 
 __all__ = [
-    "CounterBlock", "ModuleOutput", "StallRecord", "RelationConstructor", "FusionIssueUnit",
+    "CounterBlock", "ModuleOutput", "StallRecord", "AcceptResult", "CycleModule",
+    "EventBatch", "ModuleOutputs", "RelationConstructor", "FusionIssueUnit",
     "CacheBackpressure", "CacheLookup", "SemanticCacheState",
     "GaussianSemanticCache", "ComputePod", "BidirectionalQueryUnit", "ReconstructionUpdateUnit",
     "SharedSram",

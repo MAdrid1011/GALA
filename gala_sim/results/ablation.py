@@ -27,11 +27,14 @@ class AblationRow:
     status: str
 
 
-def validate_full_variant(base_cycles: int, full_cycles: int, entry_bits: str) -> None:
+def validate_full_variant(base_cycles: int, full_cycles: int, entry_bits: str,
+                          *, complete_cycles: int | None = None) -> None:
     if entry_bits != "1111":
         raise ValueError("full GALA consistency check requires the 1111 row")
     if base_cycles <= 0 or full_cycles <= 0:
         raise ValueError("cycle counts must be positive")
+    if complete_cycles is not None and full_cycles != complete_cycles:
+        raise ValueError("1111 cycles differ from the complete GALA entry")
 
 
 def write_ablation_csv(rows: Iterable[AblationRow], path: Path) -> None:

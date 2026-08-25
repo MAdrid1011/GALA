@@ -8,6 +8,10 @@ dependencies = ["PyYAML>=6.0", "numpy>=1.24"]
 [project.scripts]
 gala-sim = "gala_sim.cli:main"
 
+[project.optional-dependencies]
+quality = ["scikit-image>=0.21", "lpips>=0.1.4"]
+parquet = ["pyarrow>=12"]
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]

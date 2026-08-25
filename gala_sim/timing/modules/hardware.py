@@ -2,13 +2,14 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 
 from gala_sim.clamp.events import PrimitiveKind
 from gala_sim.timing.config import ModuleTiming
 
 from .base import CounterBlock, ModuleOutput
+from .protocol import AcceptResult, EventBatch, ModuleOutputs
 
 
 @dataclass
@@ -16,6 +17,7 @@ class HardwareModule:
     name: str
     timing: ModuleTiming
     counters: CounterBlock
+    _wakeup: int | None = field(default=None, init=False, repr=False)
 
     def accepts_kind(self, kind: PrimitiveKind) -> bool:
         return True
@@ -29,6 +31,25 @@ class HardwareModule:
     def complete(self, event_id: int, cycle: int) -> ModuleOutput:
         self.counters.completed += 1
         return ModuleOutput(event_id, cycle)
+
+    def next_wakeup(self) -> int | None:
+        return self._wakeup
+
+    def accept(self, batch: EventBatch, cycle: int) -> AcceptResult:
+        accepted = batch.event_ids[: self.timing.ports]
+        rejected = batch.event_ids[self.timing.ports:]
+        self.counters.accepted += len(accepted)
+        self.counters.port_stalls += len(rejected)
+        self._wakeup = cycle + self.timing.initiation_interval if accepted else self._wakeup
+        return AcceptResult(accepted, rejected, "port" if rejected else None)
+
+    def advance(self, cycle: int) -> ModuleOutputs:
+        if self._wakeup is not None and self._wakeup <= cycle:
+            self._wakeup = None
+        return ModuleOutputs(())
+
+    def snapshot_counters(self) -> CounterBlock:
+        return self.counters
 
 
 class RelationConstructor(HardwareModule):

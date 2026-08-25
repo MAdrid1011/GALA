@@ -171,7 +171,7 @@ class CycleEngine:
                     continue
                 if int(row["dependency_count"]) > timing.queue_capacity:
                     raise CycleConfigurationError(f"event dependency footprint exceeds {module_name} queue")
-                if kind in {PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN} and stage == 0:
+                if kind is PrimitiveKind.CACHE_REQUEST and stage == 0:
                     data_bytes = int(row["data_bytes"])
                     if data_bytes <= 0:
                         raise CycleConfigurationError(
@@ -180,7 +180,7 @@ class CycleEngine:
                     memory_done = self.config.memory.submit(
                         address=int(row["address_token"]),
                         size_bytes=data_bytes,
-                        is_write=kind is PrimitiveKind.CACHE_RETURN,
+                        is_write=False,
                         arrival_cycle=cycle,
                     )
                     if memory_done > cycle + timing.latency:

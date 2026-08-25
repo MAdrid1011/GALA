@@ -2,6 +2,7 @@
 
 from .events import EVENT_SCHEMA_VERSION, PrimitiveKind, ResourceClass, TraceEvent
 from .builder import TraceBuilder
+from .tasks import FusionIssueScheduler, IssueDecision, QueryState, TaskKind, TaskPacket
 
 __all__ = [
     "EVENT_SCHEMA_VERSION",
@@ -9,4 +10,5 @@ __all__ = [
     "ResourceClass",
     "TraceEvent",
     "TraceBuilder",
+    "FusionIssueScheduler", "IssueDecision", "QueryState", "TaskKind", "TaskPacket",
 ]
