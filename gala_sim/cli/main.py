@@ -126,9 +126,9 @@ def main(argv: list[str] | None = None) -> int:
             write_cycle_preflight(report, args.output)
             print(json.dumps(report.as_dict(), sort_keys=True))
             return 0 if report.status == "passed" else 2
-        trace = TraceReader().read(args.trace, mmap_mode="r")
-        validate_trace(trace)
+        trace = TraceReader().read(args.trace, validate=False, mmap_mode="r")
         if args.command == "trace-validate":
+            validate_trace(trace)
             print(json.dumps({"events": trace.event_count, "status": "passed"}, sort_keys=True))
             return 0
         gala_config = load_config(args.config)

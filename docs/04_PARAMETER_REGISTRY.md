@@ -95,7 +95,22 @@ FMA、EXP、LOG、RCP、SQRT、SRAM、CAM、互连和寄存器流水延迟不写
 
 近似函数系数存放在独立只读表中，表文件包含生成脚本、定义域、误差扫描和哈希。禁止在 kernel 中散布系数。
 
-## 6. 运行策略参数
+## 6. 质量参数
+
+统一质量口径使用下列参数；首个 Chest 参考结果验收前必须冻结，且不得在查看 GALA 功能重放结果后调整。
+
+| 配置路径 | 默认值 | 单位 | 来源 |
+| --- | ---: | --- | --- |
+| `quality.data_min` | 待冻结 | scalar | Chest 数据清单参考体范围 |
+| `quality.data_max` | 待冻结 | scalar | Chest 数据清单参考体范围 |
+| `quality.ssim_window` | 待冻结 | voxel | 统一质量协议 |
+| `quality.ssim_sigma` | 待冻结 | voxel | 统一质量协议 |
+| `quality.lpips_slices` | 待冻结 | index list per axis | 三个正交方向的预注册切片 |
+| `quality.lpips_network` | 待冻结 | model name | 统一质量协议 |
+
+缺少任一值时，质量入口必须拒绝生成正式 `quality.json`，不得回退到模型官方指标或隐式默认值。
+
+## 7. 运行策略参数
 
 | 配置路径 | 默认值 | 单位 | 作用 |
 | --- | ---: | --- | --- |
@@ -109,7 +124,7 @@ FMA、EXP、LOG、RCP、SQRT、SRAM、CAM、互连和寄存器流水延迟不写
 
 自动调优只允许在首个真实样例上搜索 trace chunk 和软件缓冲参数。调优目标是减少主机同步与内存峰值，不改变任何硬件参数、事件内容或周期结果。冻结值记录在运行环境配置中。
 
-## 7. 参数审计
+## 8. 参数审计
 
 持续集成执行以下静态检查。
 

@@ -12,8 +12,10 @@ from typing import Any
 import numpy as np
 
 from gala_sim.config import GalaConfig
-from gala_sim.trace import DeviceTraceSink, TraceReader, validate_trace
+from gala_sim.metrics import QualityConfig, measure_quality
+from gala_sim.trace import DeviceTraceSink, TraceReader
 
+from .chest import load_chest_manifest
 from .protocol import PreparedRun, ReferenceArtifact, TraceArtifact
 
 
@@ -37,6 +39,7 @@ class R2GaussianChestAdapter:
             source_root=self.source_root.resolve(),
             dataset_root=self.dataset_root.resolve(),
             config_sha256=config.sha256,
+            quality_config=QualityConfig.from_gala(config),
             seed=0,
             official_command=("python", "train.py", "-s", str(self.dataset_root), "-m", str(self.output_root)),
         )
@@ -63,7 +66,7 @@ class R2GaussianChestAdapter:
         return ReferenceArtifact(
             output_root=self.output_root,
             volume_path=volume_candidates[-1],
-            metrics=_read_latest_metrics(self.output_root),
+            metrics=_read_metrics(run, volume_candidates[-1], self.output_root),
             gpu_reference={
                 "wall_seconds": elapsed,
                 "command": list(run.official_command),
@@ -98,7 +101,6 @@ class R2GaussianChestAdapter:
             )
         try:
             trace = TraceReader().read(trace_root, mmap_mode="r")
-            validate_trace(trace)
         except (OSError, ValueError, RuntimeError) as error:
             raise TraceCaptureUnavailable(f"captured trace failed validation: {error}") from error
         try:
@@ -106,6 +108,7 @@ class R2GaussianChestAdapter:
         except (BufferError, RuntimeError, ValueError) as error:
             raise TraceCaptureUnavailable(f"trace sink handoff failed: {error}") from error
         reference = self._reference_from_output(
+            run,
             gpu_reference={
                 "wall_seconds": elapsed,
                 "command": list(command),
@@ -119,14 +122,16 @@ class R2GaussianChestAdapter:
     def replay_reductions(self, run: PreparedRun, order: Any) -> ReferenceArtifact:
         raise TraceCaptureUnavailable("functional replay requires a validated trace and reduction order")
 
-    def _reference_from_output(self, *, gpu_reference: dict[str, Any]) -> ReferenceArtifact:
+    def _reference_from_output(
+        self, run: PreparedRun, *, gpu_reference: dict[str, Any]
+    ) -> ReferenceArtifact:
         volume_candidates = sorted(self.output_root.glob("point_cloud/iteration_*/vol_pred.npy"))
         if not volume_candidates:
             raise TraceCaptureUnavailable("trace-enabled run produced no reconstructed volume")
         return ReferenceArtifact(
             output_root=self.output_root,
             volume_path=volume_candidates[-1],
-            metrics=_read_latest_metrics(self.output_root),
+            metrics=_read_metrics(run, volume_candidates[-1], self.output_root),
             gpu_reference=gpu_reference,
         )
 
@@ -190,3 +195,16 @@ def _read_latest_metrics(root: Path) -> dict[str, float]:
             if isinstance(data.get(key), (int, float)):
                 metrics[key] = float(data[key])
     return metrics
+
+
+def _read_metrics(run: PreparedRun, volume_path: Path, output_root: Path) -> dict[str, float]:
+    dataset = load_chest_manifest(run.dataset_root)
+    reference = np.load(dataset.volume_path, mmap_mode="r", allow_pickle=False)
+    candidate = np.load(volume_path, mmap_mode="r", allow_pickle=False)
+    quality = measure_quality(reference, candidate, run.quality_config)
+    return {
+        "psnr": quality.psnr,
+        "ssim": quality.ssim,
+        "lpips": quality.lpips,
+        **_read_latest_metrics(output_root),
+    }

@@ -1,5 +1,42 @@
 schema_version: gala-config-v1
 parameters:
+  quality:
+    data_min:
+      value: null
+      unit: scalar
+      source: chest-data-manifest-pending-freeze
+      scope: quality
+      status: pending
+    data_max:
+      value: null
+      unit: scalar
+      source: chest-data-manifest-pending-freeze
+      scope: quality
+      status: pending
+    ssim_window:
+      value: null
+      unit: voxel
+      source: unified-quality-protocol-pending-freeze
+      scope: quality
+      status: pending
+    ssim_sigma:
+      value: null
+      unit: voxel
+      source: unified-quality-protocol-pending-freeze
+      scope: quality
+      status: pending
+    lpips_slices:
+      value: null
+      unit: index_list_per_axis
+      source: unified-quality-protocol-pending-freeze
+      scope: quality
+      status: pending
+    lpips_network:
+      value: null
+      unit: model_name
+      source: unified-quality-protocol-pending-freeze
+      scope: quality
+      status: pending
   clock:
     frequency:
       value: 500000000

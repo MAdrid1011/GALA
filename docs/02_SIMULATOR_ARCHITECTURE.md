@@ -126,4 +126,4 @@ class CycleModule(Protocol):
 | `functional-replay` | 按选定周期顺序重放归约并输出质量 | 不重新捕获关系 |
 | `campaign` | 串联参考、追踪、十六项消融和质量汇总 | 不允许跳过验收门 |
 
-同一个经过校验的 trace 可以用于十六项消融，从而避免重复运行昂贵的模型前向和反向。trace 只有在模型提交、数据校验值、训练配置、适配器版本和 CLAMP schema 完全一致时才能复用。稳定 Gaussian ID、父子 lineage、跨迭代 `UPDATE_END` 依赖和状态版本级缓存驻留均由 validator 校验；查询关闭不会释放缓存，只有真实写入的更新结束才释放旧版本。
+同一个经过校验的 trace 可以用于十六项消融，从而避免重复运行昂贵的模型前向和反向。trace 只有在模型提交、数据校验值、训练配置、适配器版本和 CLAMP schema 完全一致时才能复用。稳定 Gaussian ID、父子 lineage、跨迭代 `UPDATE_END` 依赖和状态版本级缓存驻留均由 validator 校验；查询关闭不会释放缓存，只有真实写入的更新结束才释放旧版本。周期入口对同一份 mmap trace 只执行一次结构校验，随后用 NumPy 压缩反向依赖索引重放十六个变体。

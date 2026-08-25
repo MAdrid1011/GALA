@@ -33,13 +33,18 @@ def main(argv: list[str] | None = None) -> int:
     )
     session.install()
     original_argv = sys.argv
+    completed = False
     try:
         sys.argv = [str(args.train_script), *args.train_args]
         runpy.run_path(str(args.train_script), run_name="__main__")
+        completed = True
     finally:
         session.restore()
-        session.finish()
-        sys.argv = original_argv
+        try:
+            if completed:
+                session.finish()
+        finally:
+            sys.argv = original_argv
     return 0
 
 

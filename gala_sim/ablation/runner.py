@@ -23,12 +23,19 @@ def _policy(variant: AblationVariant) -> str:
 def run_matrix(trace: Trace, config: CycleConfig) -> tuple[AblationRun, ...]:
     validate_trace(trace)
     runs = tuple(
-        AblationRun(variant, CycleEngine(_run_config(config), policy=_policy(variant)).run(trace))
+        AblationRun(
+            variant,
+            CycleEngine(_run_config(config), policy=_policy(variant)).run(
+                trace, validate_input=False
+            ),
+        )
                  for variant in all_variants())
     validate_matrix([run.variant.bits for run in runs])
     full = next(run for run in runs if run.variant.bits == "1111")
     if full.result.total_cycles != CycleEngine(
-            _run_config(config), policy="variant:1111").run(trace).total_cycles:
+            _run_config(config), policy="variant:1111").run(
+                trace, validate_input=False
+            ).total_cycles:
         raise AssertionError("full GALA entry and 1111 ablation cycles differ")
     event_counts = {tuple(sorted(run.result.event_counts.items())) for run in runs}
     if len(event_counts) != 1:

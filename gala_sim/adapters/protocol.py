@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Protocol
 
+from gala_sim.metrics import QualityConfig
 from gala_sim.trace import Trace
 
 
@@ -16,6 +17,7 @@ class PreparedRun:
     source_root: Path
     dataset_root: Path
     config_sha256: str
+    quality_config: QualityConfig
     seed: int
     official_command: tuple[str, ...]
 

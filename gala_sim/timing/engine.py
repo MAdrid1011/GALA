@@ -5,6 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 import heapq
 
+import numpy as np
+
 from gala_sim.clamp import FusionIssueScheduler, TaskKind, TaskPacket
 from gala_sim.clamp.events import PrimitiveKind
 from gala_sim.trace.model import Trace
@@ -49,6 +51,43 @@ class _InFlight:
     completion_cycle: int
     event_id: int
     module: str
+
+
+@dataclass
+class _DependencyIndex:
+    """Compressed reverse edges and mutable unsatisfied counts for one trace."""
+
+    remaining: np.ndarray
+    offsets: np.ndarray
+    dependents: np.ndarray
+
+    @classmethod
+    def from_trace(cls, trace: Trace) -> "_DependencyIndex":
+        event_count = trace.event_count
+        remaining = np.asarray(
+            trace.events["dependency_count"], dtype=np.uint32
+        ).copy()
+        reverse_counts = np.zeros(event_count, dtype=np.uint64)
+        if trace.dependencies.size:
+            np.add.at(reverse_counts, trace.dependencies, 1)
+        offsets = np.empty(event_count + 1, dtype=np.uint64)
+        offsets[0] = 0
+        np.cumsum(reverse_counts, out=offsets[1:])
+        dependents = np.empty(trace.dependencies.size, dtype=np.uint64)
+        cursors = offsets[:-1].copy()
+        for row in trace.events:
+            event_id = int(row["event_id"])
+            for raw_dependency in trace.dependency_ids(row):
+                dependency = int(raw_dependency)
+                position = int(cursors[dependency])
+                dependents[position] = event_id
+                cursors[dependency] += 1
+        return cls(remaining, offsets, dependents)
+
+    def for_event(self, event_id: int):
+        begin = int(self.offsets[event_id])
+        end = int(self.offsets[event_id + 1])
+        return self.dependents[begin:end]
 
 
 class CycleEngine:
@@ -237,22 +276,18 @@ class CycleEngine:
             raise CycleConfigurationError("cache instance count is not configured")
         return gaussian_id % instances
 
-    def run(self, trace: Trace) -> CycleResult:
-        validate_trace(trace)
+    def run(self, trace: Trace, *, validate_input: bool = True) -> CycleResult:
+        """Run a trace; only callers that just validated it may disable validation."""
+        if validate_input:
+            validate_trace(trace)
         if not self.config.modules:
             raise CycleConfigurationError("cycle modules are not configured")
         completed: dict[int, int] = {}
-        remaining_dependencies: dict[int, int] = {}
-        dependents: dict[int, list[int]] = {}
-        ready: list[tuple[int, int]] = []
-        for row in trace.events:
-            event_id = int(row["event_id"])
-            dependencies = trace.dependency_ids(row)
-            remaining_dependencies[event_id] = int(dependencies.size)
-            for dependency in dependencies:
-                dependents.setdefault(int(dependency), []).append(event_id)
-            if dependencies.size == 0:
-                ready.append((event_id, 0))
+        dependency_index = _DependencyIndex.from_trace(trace)
+        ready = [
+            (int(event_id), 0)
+            for event_id in np.flatnonzero(dependency_index.remaining == 0)
+        ]
         heapq.heapify(ready)
         remaining_events = len(trace.events)
         in_flight: list[tuple[int, int, int, str]] = []
@@ -339,9 +374,15 @@ class CycleEngine:
                 else:
                     completed[event_id] = finish
                     remaining_events -= 1
-                    for dependent in dependents.get(event_id, ()):
-                        remaining_dependencies[dependent] -= 1
-                        if remaining_dependencies[dependent] == 0:
+                    for raw_dependent in dependency_index.for_event(event_id):
+                        dependent = int(raw_dependent)
+                        remaining = int(dependency_index.remaining[dependent])
+                        if remaining <= 0:
+                            raise CycleConfigurationError(
+                                f"dependency count underflow at event {dependent}"
+                            )
+                        dependency_index.remaining[dependent] = remaining - 1
+                        if remaining == 1:
                             heapq.heappush(ready, (dependent, 0))
                 if (PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
                         is PrimitiveKind.RELATION_CANDIDATE):

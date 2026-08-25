@@ -16,6 +16,7 @@ from gala_sim.clamp import (
 from gala_sim.adapters.trace_capture import FIELD_DENSITY
 from gala_sim.ablation import run_matrix
 from gala_sim.timing import CycleConfig, CycleEngine, ModuleTiming
+from gala_sim.timing.engine import _DependencyIndex
 from gala_sim.timing.memory import Ramulator2Backend, RecordedMemoryBackend
 from gala_sim.config import load_config
 from gala_sim.trace import NumpyChunkSink, TraceReader, TraceWriter, TraceValidationError, validate_trace
@@ -88,6 +89,27 @@ def test_chunked_trace_builder_preserves_global_offsets() -> None:
     assert trace.event_count == 3
     assert trace.dependency_ids(trace.events[2]).tolist() == [1]
     assert validate_trace(trace).event_count == 3
+
+
+def test_dependency_index_uses_compressed_stable_reverse_edges() -> None:
+    builder = TraceBuilder()
+    root = builder.emit(TraceEvent(primitive_kind=int(PrimitiveKind.RELATION)))
+    left = builder.emit(
+        TraceEvent(primitive_kind=int(PrimitiveKind.RELATION)), dependencies=[root]
+    )
+    right = builder.emit(
+        TraceEvent(primitive_kind=int(PrimitiveKind.RELATION)), dependencies=[root]
+    )
+    builder.emit(
+        TraceEvent(primitive_kind=int(PrimitiveKind.QUERY_CLOSE), query_id=0),
+        dependencies=[left, right],
+    )
+    index = _DependencyIndex.from_trace(builder.finish())
+    assert index.remaining.tolist() == [0, 1, 1, 2]
+    assert index.offsets.tolist() == [0, 2, 3, 4, 4]
+    assert index.for_event(root).tolist() == [left, right]
+    assert index.for_event(left).tolist() == [3]
+    assert index.for_event(right).tolist() == [3]
 
 
 def test_disk_chunked_builder_streams_all_columns(tmp_path: Path) -> None:
@@ -521,9 +543,21 @@ def test_production_cycle_config_cannot_bypass_unfrozen_parameters() -> None:
         CycleConfig.from_gala(config, _Memory())
 
 
-def test_ablation_runner_uses_one_trace_for_all_variants() -> None:
-    runs = run_matrix(_trace(), _config())
+def test_ablation_runner_uses_one_validation_for_all_variants(monkeypatch) -> None:
+    import gala_sim.ablation.runner as runner
+
+    validation_calls = 0
+    original_validate = runner.validate_trace
+
+    def counted_validate(trace):
+        nonlocal validation_calls
+        validation_calls += 1
+        return original_validate(trace)
+
+    monkeypatch.setattr(runner, "validate_trace", counted_validate)
+    runs = runner.run_matrix(_trace(), _config())
     assert len(runs) == 16
+    assert validation_calls == 1
     assert runs[0].variant.bits == "0000"
     assert runs[-1].variant.bits == "1111"
     assert runs[-1].result.policy == "variant:1111"

@@ -26,14 +26,7 @@ class TraceValidationReport:
 
 def validate_trace(trace: Trace) -> TraceValidationReport:
     events = trace.events
-    ids = [int(value) for value in events["event_id"]]
-    if ids != list(range(len(ids))):
-        raise TraceValidationError("event_id must be a dense capture-order sequence")
-    if len(set(ids)) != len(ids):
-        raise TraceValidationError("event_id is not unique")
-    known = set(ids)
     counts: dict[str, int] = defaultdict(int)
-    kinds: dict[int, PrimitiveKind] = {}
     relation_event_by_id: dict[int, int] = {}
     relation_events_by_query: dict[int, set[int]] = defaultdict(set)
     forward_events_by_query: dict[int, set[int]] = defaultdict(set)
@@ -50,14 +43,18 @@ def validate_trace(trace: Trace) -> TraceValidationReport:
 
     # Decode the frozen event kind table first so dependency checks can be
     # expressed in terms of the actual preceding primitive, not just IDs.
-    for row in events:
+    for expected_event_id, row in enumerate(events):
         event_id = int(row["event_id"])
+        if event_id != expected_event_id:
+            raise TraceValidationError("event_id must be a dense capture-order sequence")
         try:
             kind = PrimitiveKind(int(row["primitive_kind"]))
         except ValueError as error:
             raise TraceValidationError(f"unknown primitive kind at event {event_id}") from error
-        kinds[event_id] = kind
         counts[kind.name] += 1
+
+    def kind_for_event(event_id: int) -> PrimitiveKind:
+        return PrimitiveKind(int(events[event_id]["primitive_kind"]))
 
     def dependencies_for(row: object) -> list[int]:
         begin = int(row["dependency_begin"])
@@ -65,7 +62,7 @@ def validate_trace(trace: Trace) -> TraceValidationReport:
         return [int(dep) for dep in trace.dependencies[begin:end]]
 
     def dependency_kinds_for(row: object) -> list[PrimitiveKind]:
-        return [kinds[dependency] for dependency in dependencies_for(row)]
+        return [kind_for_event(dependency) for dependency in dependencies_for(row)]
 
     def require_dependency_kind(row: object, expected: PrimitiveKind) -> None:
         if expected not in dependency_kinds_for(row):
@@ -85,7 +82,7 @@ def validate_trace(trace: Trace) -> TraceValidationReport:
     split_child_events: dict[int, set[int]] = defaultdict(set)
     for row in events:
         event_id = int(row["event_id"])
-        kind = kinds[event_id]
+        kind = kind_for_event(event_id)
         begin = int(row["dependency_begin"])
         end = begin + int(row["dependency_count"])
         payload_begin = int(row["payload_offset"])
@@ -95,7 +92,7 @@ def validate_trace(trace: Trace) -> TraceValidationReport:
         if payload_begin < 0 or payload_end > trace.payload.size:
             raise TraceValidationError(f"payload range is invalid at event {event_id}")
         dependencies = trace.dependencies[begin:end]
-        if any(int(dep) not in known or int(dep) >= event_id for dep in dependencies):
+        if dependencies.size and bool((dependencies >= event_id).any()):
             raise TraceValidationError(f"dependency is not a prior event at event {event_id}")
         query_id = int(row["query_id"])
         relation_id = int(row["relation_id"])
@@ -128,7 +125,7 @@ def validate_trace(trace: Trace) -> TraceValidationReport:
             relation_events_by_query[query_id].add(event_id)
             if counts[PrimitiveKind.RELATION_CANDIDATE.name] > 0:
                 if dependencies.size == 0 or any(
-                    kinds[dependency] is not PrimitiveKind.RELATION_CANDIDATE
+                    kind_for_event(int(dependency)) is not PrimitiveKind.RELATION_CANDIDATE
                     for dependency in dependencies
                 ):
                     raise TraceValidationError(
@@ -150,7 +147,7 @@ def validate_trace(trace: Trace) -> TraceValidationReport:
                 expected_relations = relation_events_by_query[query_id]
                 actual_relations = {
                     dependency for dependency in dependencies
-                    if kinds[dependency] is PrimitiveKind.RELATION
+                    if kind_for_event(int(dependency)) is PrimitiveKind.RELATION
                 }
                 if actual_relations != expected_relations:
                     raise TraceValidationError(
@@ -174,7 +171,7 @@ def validate_trace(trace: Trace) -> TraceValidationReport:
             expected_forwards = forward_events_by_query[query_id]
             actual_forwards = {
                 int(dependency) for dependency in dependencies
-                if kinds[int(dependency)] is PrimitiveKind.FORWARD
+                if kind_for_event(int(dependency)) is PrimitiveKind.FORWARD
             }
             if actual_forwards != expected_forwards:
                 raise TraceValidationError(
@@ -245,7 +242,7 @@ def validate_trace(trace: Trace) -> TraceValidationReport:
             expected_gradients = gradient_events_by_key[(gaussian_id, state_version)]
             actual_gradients = {
                 int(dependency) for dependency in dependencies
-                if kinds[int(dependency)] is PrimitiveKind.GRADIENT_REDUCTION
+                if kind_for_event(int(dependency)) is PrimitiveKind.GRADIENT_REDUCTION
             }
             if actual_gradients != expected_gradients:
                 raise TraceValidationError(

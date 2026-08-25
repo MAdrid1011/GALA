@@ -381,3 +381,35 @@ def test_collection_failure_prevents_finishing_partial_trace(tmp_path: Path) -> 
         wrapped(Model())
     with pytest.raises(RuntimeError, match="cannot finish after a collection failure"):
         session.finish()
+
+
+def test_trace_runner_does_not_finish_after_official_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    from gala_sim.adapters import trace_runner
+
+    calls: list[str] = []
+
+    class Session:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def install(self) -> None:
+            calls.append("install")
+
+        def restore(self) -> None:
+            calls.append("restore")
+
+        def finish(self) -> None:
+            calls.append("finish")
+
+    def fail_run_path(*_args, **_kwargs) -> None:
+        raise RuntimeError("official training failed")
+
+    monkeypatch.setattr(trace_runner, "TraceSession", Session)
+    monkeypatch.setattr(trace_runner.runpy, "run_path", fail_run_path)
+    with pytest.raises(RuntimeError, match="official training failed"):
+        trace_runner.main([
+            "--trace-output", str(tmp_path / "trace"), str(tmp_path / "train.py")
+        ])
+    assert calls == ["install", "restore"]
