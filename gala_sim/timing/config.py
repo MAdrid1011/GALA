@@ -56,6 +56,7 @@ class CycleConfig:
     fusion_adjoint_ports: int | None = None
     resource_envelope: ResourceEnvelope | None = None
     resource_usage: ResourceUsage | None = None
+    config_sha256: str | None = None
 
     def __post_init__(self) -> None:
         if min(self.clock_frequency_hz, self.relation_seed_fifo_entries, self.candidate_lanes) <= 0:
@@ -128,7 +129,8 @@ class CycleConfig:
                    fusion_consumer_ports=int(config.value("issue.consumer_ports")),
                    fusion_adjoint_ports=int(config.value("issue.adjoint_ports")),
                    resource_envelope=ResourceEnvelope.from_gala(config),
-                   resource_usage=resource_usage or _resource_usage_from_gala(config))
+                   resource_usage=resource_usage or _resource_usage_from_gala(config),
+                   config_sha256=config.sha256)
 
 
 def _resource_usage_from_gala(config: GalaConfig) -> ResourceUsage:

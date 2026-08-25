@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -15,7 +16,7 @@ from gala_sim.clamp import (
 )
 from gala_sim.adapters.trace_capture import FIELD_DENSITY
 from gala_sim.ablation import run_matrix
-from gala_sim.timing import CycleConfig, CycleEngine, ModuleTiming
+from gala_sim.timing import CycleConfig, CycleConfigurationError, CycleEngine, ModuleTiming
 from gala_sim.timing.engine import _DependencyIndex
 from gala_sim.timing.memory import Ramulator2Backend, RecordedMemoryBackend
 from gala_sim.config import load_config
@@ -72,6 +73,19 @@ def test_trace_round_trip_and_cycle_result(tmp_path: Path) -> None:
     assert result.total_cycles > 0
     assert result.completion_cycles[3] <= result.total_cycles
     assert result.module_counters["relation_constructor"]["completed"] == 2
+
+
+def test_formal_cycle_requires_matching_trace_configuration_identity() -> None:
+    trace = _trace()
+    config = replace(_config(), config_sha256="a" * 64)
+    with pytest.raises(CycleConfigurationError, match="configuration identity"):
+        CycleEngine(config).run(trace)
+
+    matching = type(trace)(
+        trace.events, trace.dependencies, trace.payload,
+        {**trace.metadata, "config_sha256": "a" * 64},
+    )
+    assert CycleEngine(config).run(matching).total_cycles > 0
 
 
 def test_chunked_trace_builder_preserves_global_offsets() -> None:
