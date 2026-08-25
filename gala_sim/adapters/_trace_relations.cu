@@ -14,6 +14,8 @@ constexpr int kVoxelBlockY = 8;
 constexpr int kVoxelBlockZ = 8;
 constexpr int kVoxelQueriesPerCandidate = kVoxelBlockX * kVoxelBlockY * kVoxelBlockZ;
 constexpr int kVoxelMaskWords = kVoxelQueriesPerCandidate / 32;
+constexpr int64_t kCandidateRecord = 0;
+constexpr int64_t kRelationRecord = 1;
 
 std::size_t align128(const torch::Tensor& buffer, std::size_t offset) {
     auto base = reinterpret_cast<std::uintptr_t>(buffer.data_ptr<std::uint8_t>());
@@ -43,6 +45,58 @@ void validate(const torch::Tensor& buffer, int64_t gaussian_count,
     if (gaussian_count < 0 || candidate_count < 0) {
         throw std::invalid_argument("trace buffer counts must be non-negative");
     }
+}
+
+torch::Tensor compact_trace_records(
+    const torch::Tensor& binning_buffer, int64_t candidate_count,
+    const torch::Tensor& masks, bool voxel) {
+    std::size_t binning_offset = 0;
+    auto point_list_pointer = obtain<std::uint32_t>(
+        binning_buffer, binning_offset, candidate_count);
+    obtain<std::uint32_t>(binning_buffer, binning_offset, candidate_count);
+    auto point_keys_pointer = obtain<std::uint64_t>(
+        binning_buffer, binning_offset, candidate_count);
+    if (voxel) {
+        obtain<std::uint64_t>(binning_buffer, binning_offset, candidate_count);
+    }
+
+    auto long_options = binning_buffer.options().dtype(torch::kInt64);
+    auto int_options = binning_buffer.options().dtype(torch::kInt32);
+    auto point_list = torch::from_blob(
+        point_list_pointer, {candidate_count}, [](void*) {}, int_options).to(torch::kInt64);
+    auto point_keys = torch::from_blob(
+        point_keys_pointer, {candidate_count}, [](void*) {}, long_options).clone();
+    auto candidate_indexes = torch::arange(candidate_count, long_options);
+    auto candidate_records = torch::stack({
+        torch::full({candidate_count}, kCandidateRecord, long_options),
+        candidate_indexes,
+        point_list,
+        point_keys,
+    }, 1);
+
+    auto nonzero_words = torch::nonzero(masks);
+    if (nonzero_words.size(0) == 0) {
+        return candidate_records.contiguous();
+    }
+    auto word_candidates = nonzero_words.select(1, 0);
+    auto word_indexes = nonzero_words.select(1, 1);
+    auto words = masks.index({word_candidates, word_indexes}).to(torch::kInt64);
+    auto bit_indexes = torch::arange(32, long_options);
+    auto bit_values = torch::bitwise_left_shift(torch::ones({32}, long_options), bit_indexes);
+    auto valid_bits = torch::bitwise_and(words.unsqueeze(1), bit_values).ne(0);
+    auto nonzero_bits = torch::nonzero(valid_bits);
+    auto word_rows = nonzero_bits.select(1, 0);
+    auto relation_candidates = word_candidates.index_select(0, word_rows);
+    auto relation_locals = word_indexes.index_select(0, word_rows) * 32
+                           + nonzero_bits.select(1, 1);
+    auto relation_count = relation_candidates.size(0);
+    auto relation_records = torch::stack({
+        torch::full({relation_count}, kRelationRecord, long_options),
+        relation_candidates,
+        relation_locals,
+        torch::zeros({relation_count}, long_options),
+    }, 1);
+    return torch::cat({candidate_records, relation_records}, 0).contiguous();
 }
 
 __global__ void raster_masks_kernel(
@@ -202,4 +256,28 @@ torch::Tensor voxel_valid_masks_cuda(const torch::Tensor& geometry_buffer,
         C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
     return masks;
+}
+
+
+torch::Tensor raster_trace_records_cuda(const torch::Tensor& geometry_buffer,
+                                        const torch::Tensor& binning_buffer,
+                                        int64_t gaussian_count, int64_t candidate_count,
+                                        int64_t image_height, int64_t image_width) {
+    auto masks = raster_valid_masks_cuda(
+        geometry_buffer, binning_buffer, gaussian_count, candidate_count,
+        image_height, image_width);
+    return compact_trace_records(
+        binning_buffer, candidate_count, masks, false);
+}
+
+
+torch::Tensor voxel_trace_records_cuda(const torch::Tensor& geometry_buffer,
+                                       const torch::Tensor& binning_buffer,
+                                       int64_t gaussian_count, int64_t candidate_count,
+                                       int64_t voxel_x, int64_t voxel_y, int64_t voxel_z) {
+    auto masks = voxel_valid_masks_cuda(
+        geometry_buffer, binning_buffer, gaussian_count, candidate_count,
+        voxel_x, voxel_y, voxel_z);
+    return compact_trace_records(
+        binning_buffer, candidate_count, masks, true);
 }

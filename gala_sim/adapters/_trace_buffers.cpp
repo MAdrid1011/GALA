@@ -124,6 +124,16 @@ torch::Tensor voxel_valid_masks_cuda(const torch::Tensor& geometry_buffer,
                                      int64_t gaussian_count, int64_t candidate_count,
                                      int64_t voxel_x, int64_t voxel_y, int64_t voxel_z);
 
+torch::Tensor raster_trace_records_cuda(const torch::Tensor& geometry_buffer,
+                                        const torch::Tensor& binning_buffer,
+                                        int64_t gaussian_count, int64_t candidate_count,
+                                        int64_t image_height, int64_t image_width);
+
+torch::Tensor voxel_trace_records_cuda(const torch::Tensor& geometry_buffer,
+                                       const torch::Tensor& binning_buffer,
+                                       int64_t gaussian_count, int64_t candidate_count,
+                                       int64_t voxel_x, int64_t voxel_y, int64_t voxel_z);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def("copy_raster_point_list", &copy_raster_point_list);
     module.def("copy_voxel_point_list", &copy_voxel_point_list);
@@ -132,4 +142,6 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def("copy_ranges", &copy_ranges);
     module.def("raster_valid_masks", &raster_valid_masks_cuda);
     module.def("voxel_valid_masks", &voxel_valid_masks_cuda);
+    module.def("raster_trace_records", &raster_trace_records_cuda);
+    module.def("voxel_trace_records", &voxel_trace_records_cuda);
 }

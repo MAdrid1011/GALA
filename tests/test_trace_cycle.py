@@ -284,7 +284,7 @@ def _fusion_port_trace():
     ))
     builder.emit(TraceEvent(
         primitive_kind=int(PrimitiveKind.CONSUMER), query_id=1,
-        gaussian_id=1, relation_id=1, reduction_key=1, address_token=1,
+        consumer_id=1, reduction_key=1, address_token=1,
         state_version=0, resource_class=int(ResourceClass.ISSUE),
     ))
     return builder.finish()

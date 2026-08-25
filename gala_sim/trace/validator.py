@@ -65,7 +65,7 @@ def validate_trace(trace: Trace) -> TraceValidationReport:
             )
 
     gaussian_version: dict[int, int] = {}
-    consumers: set[tuple[int, int]] = set()
+    consumers: dict[int, int] = {}
     reads_by_key: dict[tuple[int, int], int] = defaultdict(int)
     query_closed: set[int] = set()
     for row in events:
@@ -132,18 +132,24 @@ def validate_trace(trace: Trace) -> TraceValidationReport:
                     f"query reduction does not depend on every forward at event {event_id}"
                 )
         elif kind is PrimitiveKind.CONSUMER:
-            if query_id < 0 or relation_id < 0:
-                raise TraceValidationError(f"consumer lacks query/relation id at event {event_id}")
-            consumers.add((query_id, relation_id))
+            if query_id < 0 or int(row["consumer_id"]) < 0:
+                raise TraceValidationError(f"consumer lacks query/consumer id at event {event_id}")
+            if query_id in consumers:
+                raise TraceValidationError(f"query has multiple consumers at event {event_id}")
+            consumers[query_id] = event_id
             if counts[PrimitiveKind.QUERY_REDUCTION.name] > 0:
                 require_dependency_kind(row, PrimitiveKind.QUERY_REDUCTION)
         elif kind is PrimitiveKind.ADJOINT:
             if query_id < 0 or relation_id < 0:
                 raise TraceValidationError(f"adjoint lacks query/relation id at event {event_id}")
-            if (query_id, relation_id) not in consumers:
+            consumer = consumers.get(query_id)
+            if consumer is None:
                 raise TraceValidationError(f"adjoint precedes consumer for relation {relation_id}")
             if counts[PrimitiveKind.CONSUMER.name] > 0:
-                require_dependency_kind(row, PrimitiveKind.CONSUMER)
+                if consumer not in dependencies:
+                    raise TraceValidationError(
+                        f"adjoint does not depend on its query consumer for relation {relation_id}"
+                    )
         elif kind is PrimitiveKind.GRADIENT_REDUCTION:
             if counts[PrimitiveKind.ADJOINT.name] > 0:
                 require_dependency_kind(row, PrimitiveKind.ADJOINT)
@@ -195,11 +201,14 @@ def _validate_capture_audit(trace: Trace, counts: dict[str, int]) -> None:
         for key, value in audit.items()
     ):
         raise TraceValidationError("capture audit metadata is malformed")
+    if trace.metadata.get("capture_audit_schema_version") != "gala-r2-capture-audit-v2":
+        raise TraceValidationError("captured trace uses an obsolete capture audit schema")
 
     event_matches = {
         "cuda_relation_candidates": PrimitiveKind.RELATION_CANDIDATE,
         "cuda_valid_relations": PrimitiveKind.RELATION,
-        "captured_query_calls": PrimitiveKind.QUERY_CLOSE,
+        "captured_logical_queries": PrimitiveKind.QUERY_CLOSE,
+        "captured_consumers": PrimitiveKind.CONSUMER,
         "captured_backward_relations": PrimitiveKind.ADJOINT,
         "optimizer_updated_gaussians": PrimitiveKind.UPDATE_COMMIT,
     }
@@ -217,7 +226,6 @@ def _validate_capture_audit(trace: Trace, counts: dict[str, int]) -> None:
         PrimitiveKind.CACHE_REQUEST,
         PrimitiveKind.CACHE_RETURN,
         PrimitiveKind.FORWARD,
-        PrimitiveKind.CONSUMER,
         PrimitiveKind.ADJOINT,
         PrimitiveKind.GRADIENT_REDUCTION,
     ):
@@ -228,19 +236,25 @@ def _validate_capture_audit(trace: Trace, counts: dict[str, int]) -> None:
                 f"valid relations={relation_count}"
             )
 
-    captured_queries = int(audit.get("captured_query_calls", 0))
-    captured_by_kind = sum(
+    captured_kernels = int(audit.get("captured_query_kernel_calls", 0))
+    captured_kernels_by_kind = sum(
         int(audit.get(name, 0))
-        for name in ("captured_raster_query_calls", "captured_voxel_query_calls")
+        for name in ("captured_raster_kernel_calls", "captured_voxel_kernel_calls")
     )
-    if captured_by_kind != captured_queries:
-        raise TraceValidationError("captured query audit totals are inconsistent")
-    if int(counts.get(PrimitiveKind.QUERY_REDUCTION.name, 0)) != captured_queries:
-        raise TraceValidationError("query reduction count does not match captured queries")
+    if captured_kernels_by_kind != captured_kernels:
+        raise TraceValidationError("captured kernel audit totals are inconsistent")
+    captured_queries = int(audit.get("captured_logical_queries", 0))
+    for primitive_kind in (PrimitiveKind.QUERY_REDUCTION, PrimitiveKind.CONSUMER):
+        if int(counts.get(primitive_kind.name, 0)) != captured_queries:
+            raise TraceValidationError(
+                f"{primitive_kind.name} count does not match captured logical queries"
+            )
+    if int(audit.get("captured_backward_calls", 0)) != captured_kernels:
+        raise TraceValidationError("captured forward/backward kernel totals are inconsistent")
 
     for query_kind in ("raster", "voxel"):
-        official = int(audit.get(f"official_{query_kind}_query_calls", 0))
-        captured = int(audit.get(f"captured_{query_kind}_query_calls", 0))
-        excluded = int(audit.get(f"excluded_no_grad_{query_kind}_query_calls", 0))
+        official = int(audit.get(f"official_{query_kind}_kernel_calls", 0))
+        captured = int(audit.get(f"captured_{query_kind}_kernel_calls", 0))
+        excluded = int(audit.get(f"excluded_no_grad_{query_kind}_kernel_calls", 0))
         if official != captured + excluded:
-            raise TraceValidationError(f"official {query_kind} query audit totals are inconsistent")
+            raise TraceValidationError(f"official {query_kind} kernel audit totals are inconsistent")

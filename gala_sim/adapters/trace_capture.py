@@ -23,20 +23,27 @@ FIELD_DENSITY = 1 << 1
 FIELD_SCALE = 1 << 2
 FIELD_ROTATION = 1 << 3
 STATE_FIELD_MASK = FIELD_POSITION | FIELD_DENSITY | FIELD_SCALE | FIELD_ROTATION
+LOSS_L1 = 1 << 0
+LOSS_SSIM = 1 << 1
+LOSS_TV = 1 << 2
+RASTER_BLOCK = (16, 16)
+VOXEL_BLOCK = (8, 8, 8)
 
 
 @dataclass
 class _QueryContext:
-    query_id: int
-    gaussian_ids: tuple[int, ...]
-    relation_events: dict[int, int]
-    relation_ids: dict[int, int]
-    forward_events: dict[int, int]
-    consumer_events: dict[int, int]
-    cache_events: dict[int, tuple[int, int]]
+    query_base: int
+    query_shape: tuple[int, ...]
+    relation_query_offsets: np.ndarray
+    gaussian_ids: np.ndarray
+    relation_ids: np.ndarray
+    reduction_events: np.ndarray
     buffer_pointer: int
+    output_pointer: int
     template_id: int
     field_mask: int
+    loss_flags: int = 0
+    ssim_radius: int = 0
 
 
 @dataclass
@@ -55,6 +62,7 @@ class TraceSession:
     _next_gaussian: int = field(default=0, init=False)
     _state_version: int = field(default=0, init=False)
     _contexts: dict[int, _QueryContext] = field(default_factory=dict, init=False)
+    _output_contexts: dict[int, _QueryContext] = field(default_factory=dict, init=False)
     _pending_gradients: dict[int, list[int]] = field(default_factory=dict, init=False)
     _gaussian_ids: list[int] = field(default_factory=list, init=False)
     _query_capture_allowed: bool = field(default=False, init=False)
@@ -87,11 +95,15 @@ class TraceSession:
         self._patch(extension._C, "voxelize_gaussians_backward", self._wrap_voxel_backward)
 
         from r2_gaussian.gaussian.gaussian_model import GaussianModel
+        from r2_gaussian.utils import loss_utils
 
         self._patch(GaussianModel, "update_learning_rate", self._wrap_learning_rate)
         self._patch(GaussianModel, "training_setup", self._wrap_training_setup)
         self._patch(GaussianModel, "prune_points", self._wrap_prune_points)
         self._patch(GaussianModel, "densification_postfix", self._wrap_densification_postfix)
+        self._patch(loss_utils, "l1_loss", lambda original: self._wrap_loss(original, LOSS_L1))
+        self._patch(loss_utils, "ssim", lambda original: self._wrap_loss(original, LOSS_SSIM))
+        self._patch(loss_utils, "tv_3d_loss", lambda original: self._wrap_loss(original, LOSS_TV))
         self._installed = True
 
     def restore(self) -> None:
@@ -108,6 +120,7 @@ class TraceSession:
             "state_record_bytes": self.state_record_bytes,
             "trace_chunk_events": self.chunk_events,
             "trace_capture_status": "real_extension_buffers",
+            "capture_audit_schema_version": "gala-r2-capture-audit-v2",
             "capture_audit": dict(sorted(self._audit.items())),
         })
         TraceWriter().write(trace, self.output_root)
@@ -154,16 +167,29 @@ class TraceSession:
             import torch
 
             self._query_capture_allowed = bool(torch.is_grad_enabled())
-            self._audit_increment(f"official_{query_kind}_query_calls")
+            self._audit_increment(f"official_{query_kind}_kernel_calls")
             if self._query_capture_allowed:
-                self._audit_increment(f"captured_{query_kind}_query_calls")
-                self._audit_increment("captured_query_calls")
+                self._audit_increment(f"captured_{query_kind}_kernel_calls")
+                self._audit_increment("captured_query_kernel_calls")
             else:
-                self._audit_increment(f"excluded_no_grad_{query_kind}_query_calls")
+                self._audit_increment(f"excluded_no_grad_{query_kind}_kernel_calls")
             try:
                 return original(rasterizer, *args, **kwargs)
             finally:
                 self._query_capture_allowed = previous
+        return wrapped
+
+    def _wrap_loss(self, original: Any, loss_flag: int) -> Any:
+        def wrapped(output: Any, *args: Any, **kwargs: Any) -> Any:
+            context = self._output_contexts.get(int(output.data_ptr()))
+            if context is not None:
+                context.loss_flags |= loss_flag
+                if loss_flag == LOSS_SSIM:
+                    window_size = int(kwargs.get(
+                        "window_size", args[1] if len(args) > 1 else 11
+                    ))
+                    context.ssim_radius = max(context.ssim_radius, window_size // 2)
+            return original(output, *args, **kwargs)
         return wrapped
 
     def _capture_enabled(self) -> bool:
@@ -221,15 +247,13 @@ class TraceSession:
         return wrapped
 
     def _capture_raster(self, args: tuple[Any, ...], result: tuple[Any, ...]) -> None:
-        rendered, _, _, geometry, binning, image = result
+        rendered, output, _, geometry, binning, _ = result
         self._audit_increment("cuda_relation_candidates", int(rendered))
         means = args[0]
         height, width = int(args[10]), int(args[11])
         self._capture_query(
-            means, geometry, binning, image, int(rendered), height * width,
-            lambda: self._decoder.copy_raster_point_list(binning, int(rendered)),
-            lambda: self._decoder.copy_raster_point_keys(binning, int(rendered)),
-            lambda: self._decoder.raster_valid_masks(
+            means, binning, output, int(rendered), (height, width),
+            lambda: self._decoder.raster_trace_records(
                 geometry, binning, int(means.shape[0]), int(rendered), height, width
             ),
             template_id=RASTER_TEMPLATE_ID,
@@ -237,15 +261,13 @@ class TraceSession:
         )
 
     def _capture_voxel(self, args: tuple[Any, ...], result: tuple[Any, ...]) -> None:
-        rendered, _, _, _, _, geometry, binning, image = result
+        rendered, output, _, _, _, geometry, binning, _ = result
         self._audit_increment("cuda_relation_candidates", int(rendered))
         means = args[0]
         dimensions = tuple(int(value) for value in args[6:9])
         self._capture_query(
-            means, geometry, binning, image, int(rendered), int(np.prod(dimensions)),
-            lambda: self._decoder.copy_voxel_point_list(binning, int(rendered)),
-            lambda: self._decoder.copy_voxel_point_keys(binning, int(rendered)),
-            lambda: self._decoder.voxel_valid_masks(
+            means, binning, output, int(rendered), dimensions,
+            lambda: self._decoder.voxel_trace_records(
                 geometry, binning, int(means.shape[0]), int(rendered), *dimensions
             ),
             template_id=VOXEL_TEMPLATE_ID,
@@ -253,76 +275,130 @@ class TraceSession:
         )
 
     def _capture_query(
-        self, means: Any, geometry: Any, binning: Any, image: Any, rendered: int,
-        image_elements: int, point_list_fn: Callable[[], Any], point_keys_fn: Callable[[], Any],
-        valid_masks_fn: Callable[[], Any],
+        self, means: Any, binning: Any, output: Any, rendered: int,
+        query_shape: tuple[int, ...], records_fn: Callable[[], Any],
         *, template_id: int, field_mask: int,
     ) -> None:
-        query_id = self._next_query
-        self._next_query += 1
+        if rendered < 0 or not query_shape or any(value <= 0 for value in query_shape):
+            raise ValueError("decoded trace dimensions and candidate count must be positive")
+        query_base = self._next_query
+        image_elements = int(np.prod(query_shape))
+        self._next_query += image_elements
+        self._audit_increment("captured_logical_queries", image_elements)
         gaussian_count = int(means.shape[0])
         self._ensure_gaussians(gaussian_count)
-        if rendered <= 0:
-            self._emit_query_close(query_id, (), template_id=template_id, field_mask=field_mask)
-            self._contexts[int(binning.data_ptr())] = _QueryContext(
-                query_id, (), {}, {}, {}, {}, {}, int(binning.data_ptr()),
-                template_id, field_mask,
-            )
-            return
-        point_list = point_list_fn().detach().cpu().numpy().astype(np.int64, copy=False)
-        point_keys = point_keys_fn().detach().cpu().numpy().astype(np.uint64, copy=False)
-        masks = valid_masks_fn().detach().cpu().numpy().view(np.uint32)
-        candidate_by_gaussian: dict[int, list[int]] = {}
-        valid_by_gaussian: dict[int, bool] = {}
-        for index, (raw_gaussian, key) in enumerate(zip(point_list, point_keys)):
-            gaussian_index = int(raw_gaussian)
-            gaussian_id = self._gaussian_ids[gaussian_index]
-            mask_nonzero = any(int(word).bit_count() > 0 for word in masks[index])
+        if rendered > 0:
+            records = records_fn().detach().cpu().numpy().astype(np.int64, copy=False)
+        else:
+            records = np.empty((0, 4), dtype=np.int64)
+        self._emit_query_records(
+            records, rendered=rendered, query_base=query_base,
+            query_shape=query_shape, binning_pointer=int(binning.data_ptr()),
+            output_pointer=int(output.data_ptr()), template_id=template_id,
+            field_mask=field_mask,
+        )
+
+    def _emit_query_records(
+        self, records: np.ndarray, *, rendered: int, query_base: int,
+        query_shape: tuple[int, ...], binning_pointer: int, output_pointer: int,
+        template_id: int, field_mask: int,
+    ) -> None:
+        if records.ndim != 2 or records.shape[1] != 4:
+            raise ValueError("decoded trace records must have shape [N, 4]")
+        candidate_records = records[:rendered]
+        relation_records = records[rendered:]
+        if (
+            candidate_records.shape[0] != rendered
+            or (rendered and not np.array_equal(candidate_records[:, 0], np.zeros(rendered)))
+            or (rendered and not np.array_equal(candidate_records[:, 1], np.arange(rendered)))
+            or (relation_records.size and np.any(relation_records[:, 0] != 1))
+        ):
+            raise ValueError("decoded trace record kinds or candidate indexes are invalid")
+        gaussian_indexes = candidate_records[:, 2]
+        if gaussian_indexes.size and (
+            int(gaussian_indexes.min()) < 0
+            or int(gaussian_indexes.max()) >= len(self._gaussian_ids)
+        ):
+            raise ValueError("decoded trace record contains an invalid Gaussian index")
+        candidate_keys = candidate_records[:, 3].view(np.uint64)
+        relation_candidates = relation_records[:, 1]
+        if relation_candidates.size and (
+            int(relation_candidates.min()) < 0
+            or int(relation_candidates.max()) >= rendered
+        ):
+            raise ValueError("decoded relation refers to an invalid candidate")
+        relation_offsets = self._decode_query_offsets(
+            candidate_keys[relation_candidates], relation_records[:, 2],
+            query_shape, template_id,
+        )
+        order = np.argsort(relation_offsets, kind="stable")
+        relation_offsets = relation_offsets[order]
+        relation_candidates = relation_candidates[order]
+        valid_candidates = np.zeros(rendered, dtype=bool)
+        valid_candidates[relation_candidates] = True
+        candidate_event_ids = np.empty(rendered, dtype=np.int64)
+        for index, (_, _, raw_gaussian, _) in enumerate(candidate_records):
+            gaussian_id = self._gaussian_ids[int(raw_gaussian)]
             candidate_event = self._builder.emit(TraceEvent(
                 iteration_id=self._iteration,
                 primitive_kind=int(PrimitiveKind.RELATION_CANDIDATE),
-                query_id=query_id, gaussian_id=gaussian_id,
+                gaussian_id=gaussian_id,
                 state_version=self._state_version,
                 resource_class=int(ResourceClass.RELATION),
-                address_token=int(key), data_bytes=self.relation_candidate_bytes,
+                address_token=int(candidate_keys[index]),
+                data_bytes=self.relation_candidate_bytes,
                 template_id=template_id, field_mask=field_mask,
-                flags=1 if mask_nonzero else 0,
+                flags=int(valid_candidates[index]),
             ))
-            candidate_by_gaussian.setdefault(gaussian_index, []).append(candidate_event)
-            valid_by_gaussian[gaussian_index] = valid_by_gaussian.get(gaussian_index, False) or mask_nonzero
-        relation_events: dict[int, int] = {}
-        relation_ids: dict[int, int] = {}
-        forward_events: dict[int, int] = {}
-        consumer_events: dict[int, int] = {}
-        cache_events: dict[int, tuple[int, int]] = {}
-        for gaussian_index in sorted(candidate_by_gaussian):
-            if not valid_by_gaussian.get(gaussian_index, False):
-                continue
-            gaussian_id = self._gaussian_ids[gaussian_index]
-            relation_id = self._next_relation
-            self._next_relation += 1
+            candidate_event_ids[index] = candidate_event
+
+        relation_count = int(relation_candidates.size)
+        stable_gaussian_ids = np.asarray(self._gaussian_ids, dtype=np.int64)[
+            gaussian_indexes[relation_candidates]
+        ]
+        relation_ids = np.arange(
+            self._next_relation, self._next_relation + relation_count, dtype=np.int64
+        )
+        self._next_relation += relation_count
+        relation_event_ids = np.empty(relation_count, dtype=np.int64)
+        for index in range(relation_count):
+            gaussian_id = int(stable_gaussian_ids[index])
+            relation_id = int(relation_ids[index])
             relation = self._builder.emit(TraceEvent(
                 iteration_id=self._iteration,
-                primitive_kind=int(PrimitiveKind.RELATION), query_id=query_id,
+                primitive_kind=int(PrimitiveKind.RELATION),
+                query_id=query_base + int(relation_offsets[index]),
                 gaussian_id=gaussian_id, state_version=self._state_version,
                 relation_id=relation_id, resource_class=int(ResourceClass.RELATION),
                 address_token=gaussian_id * self.state_record_bytes,
                 template_id=template_id, field_mask=field_mask,
-            ), dependencies=candidate_by_gaussian[gaussian_index])
-            relation_events[gaussian_index] = relation
-            relation_ids[gaussian_index] = relation_id
-        self._audit_increment("cuda_valid_relations", len(relation_events))
-        self._emit_query_close(
-            query_id, tuple(relation_events.values()),
-            template_id=template_id, field_mask=field_mask,
-        )
-        for gaussian_index, relation in relation_events.items():
-            gaussian_id = self._gaussian_ids[gaussian_index]
+            ), dependencies=[candidate_event_ids[int(relation_candidates[index])]])
+            relation_event_ids[index] = relation
+        self._audit_increment("cuda_valid_relations", relation_count)
+
+        query_count = int(np.prod(query_shape))
+        counts = np.bincount(relation_offsets, minlength=query_count)
+        begins = np.empty(query_count + 1, dtype=np.int64)
+        begins[0] = 0
+        np.cumsum(counts, out=begins[1:])
+        for query_offset in range(query_count):
+            begin, end = int(begins[query_offset]), int(begins[query_offset + 1])
+            self._emit_query_close(
+                query_base + query_offset, relation_event_ids[begin:end],
+                template_id=template_id, field_mask=field_mask,
+            )
+
+        forward_event_ids = np.empty(relation_count, dtype=np.int64)
+        for index in range(relation_count):
+            query_id = query_base + int(relation_offsets[index])
+            gaussian_id = int(stable_gaussian_ids[index])
+            relation_id = int(relation_ids[index])
+            relation = int(relation_event_ids[index])
             request = self._builder.emit(TraceEvent(
                 iteration_id=self._iteration,
                 primitive_kind=int(PrimitiveKind.CACHE_REQUEST), query_id=query_id,
                 gaussian_id=gaussian_id, state_version=self._state_version,
-                relation_id=relation_ids[gaussian_index],
+                relation_id=relation_id,
                 resource_class=int(ResourceClass.CACHE),
                 address_token=gaussian_id * self.state_record_bytes,
                 data_bytes=self.state_record_bytes,
@@ -332,6 +408,7 @@ class TraceSession:
                 iteration_id=self._iteration,
                 primitive_kind=int(PrimitiveKind.CACHE_RETURN), query_id=query_id,
                 gaussian_id=gaussian_id, state_version=self._state_version,
+                relation_id=relation_id,
                 resource_class=int(ResourceClass.CACHE),
                 address_token=gaussian_id * self.state_record_bytes,
                 data_bytes=self.state_record_bytes,
@@ -341,37 +418,33 @@ class TraceSession:
                 iteration_id=self._iteration,
                 primitive_kind=int(PrimitiveKind.FORWARD), query_id=query_id,
                 gaussian_id=gaussian_id, state_version=self._state_version,
-                relation_id=relation_ids[gaussian_index], resource_class=int(ResourceClass.ISSUE),
+                relation_id=relation_id, resource_class=int(ResourceClass.ISSUE),
                 address_token=gaussian_id * self.state_record_bytes,
                 template_id=template_id, field_mask=field_mask,
             ), dependencies=[relation, returned])
-            forward_events[gaussian_index] = forward
-            cache_events[gaussian_index] = (request, returned)
-        reduction = self._builder.emit(TraceEvent(
-            iteration_id=self._iteration,
-            primitive_kind=int(PrimitiveKind.QUERY_REDUCTION), query_id=query_id,
-            state_version=self._state_version, reduction_key=query_id,
-            resource_class=int(ResourceClass.QUERY),
-            template_id=template_id,
-        ), dependencies=tuple(forward_events.values()))
-        for gaussian_index, forward in forward_events.items():
-            gaussian_id = self._gaussian_ids[gaussian_index]
-            consumer_events[gaussian_index] = self._builder.emit(TraceEvent(
+            forward_event_ids[index] = forward
+
+        reduction_events = np.empty(query_count, dtype=np.int64)
+        for query_offset in range(query_count):
+            query_id = query_base + query_offset
+            begin, end = int(begins[query_offset]), int(begins[query_offset + 1])
+            reduction_events[query_offset] = self._builder.emit(TraceEvent(
                 iteration_id=self._iteration,
-                primitive_kind=int(PrimitiveKind.CONSUMER), query_id=query_id,
-                gaussian_id=gaussian_id, state_version=self._state_version,
-                relation_id=relation_ids[gaussian_index], consumer_id=query_id,
+                primitive_kind=int(PrimitiveKind.QUERY_REDUCTION), query_id=query_id,
+                state_version=self._state_version, reduction_key=query_id,
                 resource_class=int(ResourceClass.QUERY),
                 template_id=template_id,
-            ), dependencies=[reduction])
-        self._contexts[int(binning.data_ptr())] = _QueryContext(
-            query_id, tuple(self._gaussian_ids[index] for index in forward_events),
-            relation_events, relation_ids, forward_events, consumer_events, cache_events,
-            int(binning.data_ptr()), template_id, field_mask,
+            ), dependencies=forward_event_ids[begin:end])
+        context = _QueryContext(
+            query_base, query_shape, relation_offsets, stable_gaussian_ids,
+            relation_ids, reduction_events, binning_pointer, output_pointer,
+            template_id, field_mask,
         )
+        self._contexts[binning_pointer] = context
+        self._output_contexts[output_pointer] = context
 
     def _emit_query_close(
-        self, query_id: int, dependencies: tuple[int, ...],
+        self, query_id: int, dependencies: Any,
         *, template_id: int, field_mask: int,
     ) -> None:
         self._builder.emit(TraceEvent(
@@ -385,29 +458,118 @@ class TraceSession:
         context = self._contexts.get(buffer_pointer)
         if context is None:
             return
+        expected_template = VOXEL_TEMPLATE_ID if voxel else RASTER_TEMPLATE_ID
+        if context.template_id != expected_template:
+            raise RuntimeError("captured backward kind does not match its forward context")
+        if context.loss_flags == 0:
+            raise RuntimeError("captured query reached backward without a captured loss consumer")
         self._audit_increment("captured_backward_calls")
-        self._audit_increment("captured_backward_relations", len(context.consumer_events))
-        for gaussian_index, consumer in context.consumer_events.items():
-            gaussian_id = self._gaussian_ids[gaussian_index] if gaussian_index < len(self._gaussian_ids) else context.gaussian_ids[0]
+        relation_count = int(context.relation_ids.size)
+        query_count = int(np.prod(context.query_shape))
+        self._audit_increment("captured_backward_relations", relation_count)
+        self._audit_increment("captured_consumers", query_count)
+        consumer_events = np.empty(query_count, dtype=np.int64)
+        for query_offset in range(query_count):
+            query_id = context.query_base + query_offset
+            dependencies = context.reduction_events[
+                self._consumer_query_offsets(context, query_offset)
+            ]
+            consumer_events[query_offset] = self._builder.emit(TraceEvent(
+                iteration_id=self._iteration,
+                primitive_kind=int(PrimitiveKind.CONSUMER), query_id=query_id,
+                state_version=self._state_version, consumer_id=query_id,
+                reduction_key=query_id, resource_class=int(ResourceClass.QUERY),
+                template_id=context.template_id, flags=context.loss_flags,
+            ), dependencies=dependencies)
+        for index in range(relation_count):
+            query_offset = int(context.relation_query_offsets[index])
+            query_id = context.query_base + query_offset
+            gaussian_id = int(context.gaussian_ids[index])
+            relation_id = int(context.relation_ids[index])
             adjoint = self._builder.emit(TraceEvent(
                 iteration_id=self._iteration,
-                primitive_kind=int(PrimitiveKind.ADJOINT), query_id=context.query_id,
+                primitive_kind=int(PrimitiveKind.ADJOINT), query_id=query_id,
                 gaussian_id=gaussian_id, state_version=self._state_version,
-                relation_id=context.relation_ids[gaussian_index],
+                relation_id=relation_id,
                 resource_class=int(ResourceClass.ISSUE),
                 address_token=gaussian_id * self.state_record_bytes,
                 template_id=context.template_id, field_mask=context.field_mask,
-            ), dependencies=[consumer])
+            ), dependencies=[consumer_events[query_offset]])
             gradient = self._builder.emit(TraceEvent(
                 iteration_id=self._iteration,
-                primitive_kind=int(PrimitiveKind.GRADIENT_REDUCTION), query_id=context.query_id,
+                primitive_kind=int(PrimitiveKind.GRADIENT_REDUCTION), query_id=query_id,
                 gaussian_id=gaussian_id, state_version=self._state_version,
-                relation_id=context.relation_ids[gaussian_index],
+                relation_id=relation_id,
                 reduction_key=gaussian_id, resource_class=int(ResourceClass.QUERY),
                 address_token=gaussian_id * self.state_record_bytes,
                 template_id=context.template_id, field_mask=context.field_mask,
             ), dependencies=[adjoint])
             self._pending_gradients.setdefault(gaussian_id, []).append(gradient)
+        self._output_contexts.pop(context.output_pointer, None)
+        self._contexts.pop(buffer_pointer, None)
+
+    @staticmethod
+    def _decode_query_offsets(
+        candidate_keys: np.ndarray, local_queries: np.ndarray,
+        query_shape: tuple[int, ...], template_id: int,
+    ) -> np.ndarray:
+        tiles = np.right_shift(candidate_keys, np.uint64(32)).astype(np.int64)
+        local_queries = np.asarray(local_queries, dtype=np.int64)
+        if template_id == RASTER_TEMPLATE_ID:
+            height, width = query_shape
+            blocks_x = (width + RASTER_BLOCK[1] - 1) // RASTER_BLOCK[1]
+            x = (tiles % blocks_x) * RASTER_BLOCK[1] + local_queries % RASTER_BLOCK[1]
+            y = (tiles // blocks_x) * RASTER_BLOCK[0] + local_queries // RASTER_BLOCK[1]
+            offsets = y * width + x
+        elif template_id == VOXEL_TEMPLATE_ID:
+            voxel_x, voxel_y, voxel_z = query_shape
+            blocks_x = (voxel_x + VOXEL_BLOCK[0] - 1) // VOXEL_BLOCK[0]
+            blocks_y = (voxel_y + VOXEL_BLOCK[1] - 1) // VOXEL_BLOCK[1]
+            tile_x = tiles % blocks_x
+            tile_y = (tiles // blocks_x) % blocks_y
+            tile_z = tiles // (blocks_x * blocks_y)
+            local_x = local_queries % VOXEL_BLOCK[0]
+            local_y = (local_queries // VOXEL_BLOCK[0]) % VOXEL_BLOCK[1]
+            local_z = local_queries // (VOXEL_BLOCK[0] * VOXEL_BLOCK[1])
+            x = tile_x * VOXEL_BLOCK[0] + local_x
+            y = tile_y * VOXEL_BLOCK[1] + local_y
+            z = tile_z * VOXEL_BLOCK[2] + local_z
+            offsets = x * voxel_y * voxel_z + y * voxel_z + z
+        else:
+            raise ValueError(f"unsupported query template: {template_id}")
+        query_count = int(np.prod(query_shape))
+        if offsets.size and (int(offsets.min()) < 0 or int(offsets.max()) >= query_count):
+            raise ValueError("decoded relation refers to a query outside the output")
+        return offsets.astype(np.int64, copy=False)
+
+    @staticmethod
+    def _consumer_query_offsets(context: _QueryContext, query_offset: int) -> np.ndarray:
+        if context.loss_flags & LOSS_SSIM:
+            height, width = context.query_shape
+            y, x = divmod(query_offset, width)
+            radius = context.ssim_radius
+            ys = np.arange(max(0, y - radius), min(height, y + radius + 1))
+            xs = np.arange(max(0, x - radius), min(width, x + radius + 1))
+            return (ys[:, None] * width + xs[None, :]).reshape(-1)
+        if context.loss_flags & LOSS_TV:
+            voxel_x, voxel_y, voxel_z = context.query_shape
+            x, remainder = divmod(query_offset, voxel_y * voxel_z)
+            y, z = divmod(remainder, voxel_z)
+            offsets = [query_offset]
+            if x > 0:
+                offsets.append(query_offset - voxel_y * voxel_z)
+            if x + 1 < voxel_x:
+                offsets.append(query_offset + voxel_y * voxel_z)
+            if y > 0:
+                offsets.append(query_offset - voxel_z)
+            if y + 1 < voxel_y:
+                offsets.append(query_offset + voxel_z)
+            if z > 0:
+                offsets.append(query_offset - 1)
+            if z + 1 < voxel_z:
+                offsets.append(query_offset + 1)
+            return np.asarray(offsets, dtype=np.int64)
+        return np.asarray([query_offset], dtype=np.int64)
 
     def _capture_update(self, model: Any) -> None:
         self._ensure_gaussians(int(model.get_xyz.shape[0]))
