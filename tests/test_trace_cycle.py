@@ -5,12 +5,13 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from gala_sim.clamp import PrimitiveKind, ResourceClass, TraceBuilder, TraceEvent
+from gala_sim.clamp import ChunkedTraceBuilder, PrimitiveKind, ResourceClass, TraceBuilder, TraceEvent
 from gala_sim.ablation import run_matrix
 from gala_sim.timing import CycleConfig, CycleEngine, ModuleTiming
 from gala_sim.timing.memory import RecordedMemoryBackend
 from gala_sim.config import load_config
-from gala_sim.trace import TraceReader, TraceWriter, TraceValidationError, validate_trace
+from gala_sim.trace import NumpyChunkSink, TraceReader, TraceWriter, TraceValidationError, validate_trace
+from gala_sim.adapters.r2_gaussian import _push_trace_chunks
 
 
 class _Memory:
@@ -62,6 +63,33 @@ def test_trace_round_trip_and_cycle_result(tmp_path: Path) -> None:
     assert result.total_cycles > 0
     assert result.completion_cycles[3] <= result.total_cycles
     assert result.module_counters["relation_constructor"]["completed"] == 2
+
+
+def test_chunked_trace_builder_preserves_global_offsets() -> None:
+    builder = ChunkedTraceBuilder(chunk_events=2)
+    first = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.RELATION), query_id=0, gaussian_id=0,
+        relation_id=0,
+    ))
+    second = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.RELATION), query_id=0, gaussian_id=1,
+        relation_id=1,
+    ), dependencies=[first])
+    builder.emit(TraceEvent(primitive_kind=int(PrimitiveKind.QUERY_CLOSE), query_id=0), dependencies=[second])
+    trace = builder.finish()
+    assert trace.event_count == 3
+    assert trace.dependency_ids(trace.events[2]).tolist() == [1]
+    assert validate_trace(trace).event_count == 3
+
+
+def test_sink_handoff_rebases_chunk_offsets() -> None:
+    sink = NumpyChunkSink(chunk_events=2, max_inflight_chunks=2)
+    _push_trace_chunks(_trace(), sink)
+    events, dependencies, payload = sink.collect()
+    from gala_sim.trace.model import Trace
+
+    handed_off = Trace(events, dependencies, payload, _trace().metadata)
+    assert validate_trace(handed_off).event_count == 4
 
 
 def test_trace_rejects_forward_dependency() -> None:

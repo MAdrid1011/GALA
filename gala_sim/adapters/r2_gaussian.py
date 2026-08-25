@@ -3,13 +3,16 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import os
 from pathlib import Path
 import subprocess
 import time
 from typing import Any
 
+import numpy as np
+
 from gala_sim.config import GalaConfig
-from gala_sim.trace import DeviceTraceSink
+from gala_sim.trace import DeviceTraceSink, TraceReader, validate_trace
 
 from .protocol import PreparedRun, ReferenceArtifact, TraceArtifact
 
@@ -70,19 +73,103 @@ class R2GaussianChestAdapter:
         )
 
     def capture_trace(self, run: PreparedRun, sink: DeviceTraceSink) -> TraceArtifact:
-        raise TraceCaptureUnavailable(
-            "locked R²-Gaussian CUDA extension does not expose complete CLAMP relation/task buffers; "
-            "formal trace capture is refused rather than synthesized"
+        trace_root = self.output_root / "trace"
+        repository_root = Path(__file__).resolve().parents[2]
+        command = (
+            run.official_command[0], "-m", "gala_sim.adapters.trace_runner",
+            "--trace-output", str(trace_root), str(run.source_root / "train.py"),
+            *run.official_command[2:],
         )
+        environment = os.environ.copy()
+        python_path = str(repository_root)
+        if environment.get("PYTHONPATH"):
+            python_path += os.pathsep + environment["PYTHONPATH"]
+        environment["PYTHONPATH"] = python_path
+        started = time.monotonic()
+        completed = subprocess.run(
+            list(command), cwd=run.source_root, env=environment, check=False,
+            text=True, capture_output=True,
+        )
+        elapsed = time.monotonic() - started
+        if completed.returncode != 0:
+            raise TraceCaptureUnavailable(
+                "official trace-enabled run failed: "
+                + (completed.stderr[-3000:] or completed.stdout[-3000:])
+            )
+        try:
+            trace = TraceReader().read(trace_root)
+            validate_trace(trace)
+        except (OSError, ValueError, RuntimeError) as error:
+            raise TraceCaptureUnavailable(f"captured trace failed validation: {error}") from error
+        try:
+            _push_trace_chunks(trace, sink)
+        except (BufferError, RuntimeError, ValueError) as error:
+            raise TraceCaptureUnavailable(f"trace sink handoff failed: {error}") from error
+        reference = self._reference_from_output(
+            gpu_reference={
+                "wall_seconds": elapsed,
+                "command": list(command),
+                "stdout_sha256": _text_sha256(completed.stdout),
+                "stderr_sha256": _text_sha256(completed.stderr),
+                "trace_event_count": trace.event_count,
+            }
+        )
+        return TraceArtifact(trace_root=trace_root, trace=trace, reference=reference)
 
     def replay_reductions(self, run: PreparedRun, order: Any) -> ReferenceArtifact:
         raise TraceCaptureUnavailable("functional replay requires a validated trace and reduction order")
+
+    def _reference_from_output(self, *, gpu_reference: dict[str, Any]) -> ReferenceArtifact:
+        volume_candidates = sorted(self.output_root.glob("point_cloud/iteration_*/vol_pred.npy"))
+        if not volume_candidates:
+            raise TraceCaptureUnavailable("trace-enabled run produced no reconstructed volume")
+        return ReferenceArtifact(
+            output_root=self.output_root,
+            volume_path=volume_candidates[-1],
+            metrics=_read_latest_metrics(self.output_root),
+            gpu_reference=gpu_reference,
+        )
 
 
 def _text_sha256(value: str) -> str:
     import hashlib
 
     return hashlib.sha256(value.encode("utf-8")).hexdigest()
+
+
+def _push_trace_chunks(trace: Any, sink: DeviceTraceSink) -> None:
+    """Transfer validated trace chunks with offsets local to each sink submission."""
+    chunk_events = int(getattr(sink, "chunk_events", trace.event_count or 1))
+    if chunk_events <= 0:
+        raise ValueError("trace sink chunk capacity must be positive")
+    try:
+        for start in range(0, trace.event_count, chunk_events):
+            end = min(start + chunk_events, trace.event_count)
+            events = trace.events[start:end].copy()
+            dependencies: list[int] = []
+            payload: list[float] = []
+            for row in events:
+                dep_begin = int(row["dependency_begin"])
+                dep_end = dep_begin + int(row["dependency_count"])
+                payload_begin = int(row["payload_offset"])
+                payload_end = payload_begin + int(row["payload_length"])
+                row["dependency_begin"] = len(dependencies)
+                row["payload_offset"] = len(payload)
+                dependencies.extend(int(value) for value in trace.dependencies[dep_begin:dep_end])
+                payload.extend(float(value) for value in trace.payload[payload_begin:payload_end])
+            sink.push(
+                events,
+                np.asarray(dependencies, dtype=np.dtype("<u8")),
+                np.asarray(payload, dtype=np.dtype("<f4")),
+            )
+        if trace.event_count == 0:
+            sink.push(
+                np.empty(0, dtype=trace.events.dtype),
+                np.empty(0, dtype=np.dtype("<u8")),
+                np.empty(0, dtype=np.dtype("<f4")),
+            )
+    finally:
+        sink.close()
 
 
 def _read_latest_metrics(root: Path) -> dict[str, float]:

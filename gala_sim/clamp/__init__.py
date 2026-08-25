@@ -1,7 +1,7 @@
 """CLAMP task and event contracts shared by functional and timing paths."""
 
 from .events import EVENT_SCHEMA_VERSION, PrimitiveKind, ResourceClass, TraceEvent
-from .builder import TraceBuilder
+from .builder import ChunkedTraceBuilder, TraceBuilder
 from .tasks import FusionIssueScheduler, IssueDecision, QueryState, TaskKind, TaskPacket
 
 __all__ = [
@@ -9,6 +9,6 @@ __all__ = [
     "PrimitiveKind",
     "ResourceClass",
     "TraceEvent",
-    "TraceBuilder",
+    "TraceBuilder", "ChunkedTraceBuilder",
     "FusionIssueScheduler", "IssueDecision", "QueryState", "TaskKind", "TaskPacket",
 ]
