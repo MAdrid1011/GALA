@@ -52,6 +52,10 @@ def test_native_reference_rejects_external_gpu_before_launch(tmp_path: Path) -> 
     status = (tmp_path / "run" / "status.json").read_text(encoding="utf-8")
     assert '"status": "failed_preflight"' in status
     assert '"reason": "gpu_busy_external"' in status
+    assert f'"config_sha256": "{config.sha256}"' in status
+    assert f'"freeze_manifest_sha256": "{freeze["run_manifest_sha256"]}"' in status
+    assert f'"repository_commit": "{"a" * 40}"' in status
+    assert '"reproduction"' in status
     assert not (tmp_path / "model").exists()
 
 

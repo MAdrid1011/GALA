@@ -81,16 +81,28 @@ def _tensorboard_stages(model_output: Path, python_executable: str) -> dict[str,
     }
 
 
-def _write_failed(output: Path, gpu_reference: dict[str, Any], reason: str) -> None:
+def _write_failed(
+    output: Path,
+    gpu_reference: dict[str, Any],
+    reason: str,
+    *,
+    checks: Mapping[str, Any] | None = None,
+) -> None:
     writer = RunOutputWriter(output)
     writer.write_gpu_reference(gpu_reference)
-    writer.write_status("failed_preflight", reason=reason)
+    writer.write_status("failed_preflight", reason=reason, checks=dict(checks or {}))
 
 
-def _write_quality_failure(output: Path, gpu_reference: dict[str, Any], reason: str) -> None:
+def _write_quality_failure(
+    output: Path,
+    gpu_reference: dict[str, Any],
+    reason: str,
+    *,
+    checks: Mapping[str, Any] | None = None,
+) -> None:
     writer = RunOutputWriter(output)
     writer.write_gpu_reference(gpu_reference)
-    writer.write_status("failed_quality", reason=reason)
+    writer.write_status("failed_quality", reason=reason, checks=dict(checks or {}))
 
 
 def run_native_reference(
@@ -121,10 +133,27 @@ def run_native_reference(
     output.mkdir(parents=True, exist_ok=True)
     if model_output.exists():
         raise NativeReferenceError(f"official model output already exists: {model_output}")
+    repository_info = freeze.get("repository")
+    repository_commit = (
+        str(repository_info.get("commit", ""))
+        if isinstance(repository_info, Mapping) else ""
+    )
+    identity_checks = {
+        "config_sha256": config.sha256,
+        "freeze_manifest_sha256": str(freeze["run_manifest_sha256"]),
+        "repository_commit": repository_commit,
+        "reproduction": {
+            "working_directory": working_directory,
+            "argv": command,
+        },
+    }
     try:
         initial = sample_fn()
     except RuntimeError as error:
-        _write_failed(output, {"status": "failed", "error": str(error)}, "gpu_sampling_unavailable")
+        _write_failed(
+            output, {"status": "failed", "error": str(error)},
+            "gpu_sampling_unavailable", checks=identity_checks,
+        )
         raise NativeReferenceError("gpu_sampling_unavailable") from error
     if initial.compute_processes:
         _write_failed(
@@ -134,6 +163,7 @@ def run_native_reference(
                 "external_compute_processes": [asdict(item) for item in initial.compute_processes],
             },
             "gpu_busy_external",
+            checks=identity_checks,
         )
         raise NativeReferenceError("gpu_busy_external")
     logs = output / "logs"
@@ -195,18 +225,26 @@ def run_native_reference(
     writer = RunOutputWriter(output)
     if sampling_error is not None:
         gpu_reference["error"] = sampling_error
-        _write_failed(output, gpu_reference, "gpu_sampling_unavailable")
+        _write_failed(
+            output, gpu_reference, "gpu_sampling_unavailable", checks=identity_checks,
+        )
         raise NativeReferenceError("gpu_sampling_unavailable")
     if contention:
         gpu_reference["external_compute_processes"] = contention
-        _write_failed(output, gpu_reference, "gpu_contention_detected")
+        _write_failed(
+            output, gpu_reference, "gpu_contention_detected", checks=identity_checks,
+        )
         raise NativeReferenceError("gpu_contention_detected")
     if returncode != 0:
-        _write_failed(output, gpu_reference, "official_command_failed")
+        _write_failed(
+            output, gpu_reference, "official_command_failed", checks=identity_checks,
+        )
         raise NativeReferenceError("official R²-Gaussian command failed")
     volumes = sorted(model_output.glob("point_cloud/iteration_*/vol_pred.npy"))
     if not volumes:
-        _write_failed(output, gpu_reference, "missing_reconstruction_volume")
+        _write_failed(
+            output, gpu_reference, "missing_reconstruction_volume", checks=identity_checks,
+        )
         raise NativeReferenceError("official reference produced no reconstruction volume")
     try:
         dataset = load_chest_manifest(dataset_root)
@@ -218,7 +256,10 @@ def run_native_reference(
         gpu_reference["stages"] = _tensorboard_stages(model_output, command[0])
     except (OSError, RuntimeError, ValueError) as error:
         gpu_reference["error"] = str(error)
-        _write_quality_failure(output, gpu_reference, "quality_or_stage_measurement_failed")
+        _write_quality_failure(
+            output, gpu_reference, "quality_or_stage_measurement_failed",
+            checks=identity_checks,
+        )
         raise NativeReferenceError("quality_or_stage_measurement_failed") from error
     gpu_reference["stages"]["wall_seconds"] = finished - started
     writer.write_quality({
@@ -228,7 +269,6 @@ def run_native_reference(
     writer.write_gpu_reference(gpu_reference)
     model_info = freeze.get("model")
     dataset_info = freeze.get("dataset")
-    repository_info = freeze.get("repository")
     if not all(isinstance(item, Mapping) for item in (model_info, dataset_info, repository_info)):
         raise NativeReferenceError("input freeze source identity is incomplete")
     writer.write_manifest(RunManifest(
