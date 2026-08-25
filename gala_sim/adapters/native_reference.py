@@ -87,6 +87,12 @@ def _write_failed(output: Path, gpu_reference: dict[str, Any], reason: str) -> N
     writer.write_status("failed_preflight", reason=reason)
 
 
+def _write_quality_failure(output: Path, gpu_reference: dict[str, Any], reason: str) -> None:
+    writer = RunOutputWriter(output)
+    writer.write_gpu_reference(gpu_reference)
+    writer.write_status("failed_quality", reason=reason)
+
+
 def run_native_reference(
     config: GalaConfig,
     freeze: Mapping[str, Any],
@@ -115,7 +121,11 @@ def run_native_reference(
     output.mkdir(parents=True, exist_ok=True)
     if model_output.exists():
         raise NativeReferenceError(f"official model output already exists: {model_output}")
-    initial = sample_fn()
+    try:
+        initial = sample_fn()
+    except RuntimeError as error:
+        _write_failed(output, {"status": "failed", "error": str(error)}, "gpu_sampling_unavailable")
+        raise NativeReferenceError("gpu_sampling_unavailable") from error
     if initial.compute_processes:
         raise NativeReferenceError("gpu_busy_external")
     logs = output / "logs"
@@ -125,6 +135,7 @@ def run_native_reference(
     started = time.time()
     samples: list[dict[str, Any]] = []
     contention: list[dict[str, Any]] = []
+    sampling_error: str | None = None
     with stdout_path.open("w", encoding="utf-8") as stdout_stream, \
             stderr_path.open("w", encoding="utf-8") as stderr_stream:
         process = subprocess.Popen(
@@ -132,7 +143,16 @@ def run_native_reference(
             text=True,
         )
         while process.poll() is None:
-            sample = sample_fn()
+            try:
+                sample = sample_fn()
+            except RuntimeError as error:
+                sampling_error = str(error)
+                process.terminate()
+                try:
+                    process.wait(timeout=10)
+                except subprocess.TimeoutExpired:
+                    process.kill()
+                break
             samples.append(asdict(sample))
             external = [item for item in sample.compute_processes if item.pid != process.pid]
             if external:
@@ -165,6 +185,10 @@ def run_native_reference(
         "gpu_samples": samples,
     }
     writer = RunOutputWriter(output)
+    if sampling_error is not None:
+        gpu_reference["error"] = sampling_error
+        _write_failed(output, gpu_reference, "gpu_sampling_unavailable")
+        raise NativeReferenceError("gpu_sampling_unavailable")
     if contention:
         gpu_reference["external_compute_processes"] = contention
         _write_failed(output, gpu_reference, "gpu_contention_detected")
@@ -176,13 +200,18 @@ def run_native_reference(
     if not volumes:
         _write_failed(output, gpu_reference, "missing_reconstruction_volume")
         raise NativeReferenceError("official reference produced no reconstruction volume")
-    dataset = load_chest_manifest(dataset_root)
-    quality = measure_quality(
-        np.load(dataset.volume_path, mmap_mode="r", allow_pickle=False),
-        np.load(volumes[-1], mmap_mode="r", allow_pickle=False),
-        QualityConfig.from_gala(config),
-    )
-    gpu_reference["stages"] = _tensorboard_stages(model_output, command[0])
+    try:
+        dataset = load_chest_manifest(dataset_root)
+        quality = measure_quality(
+            np.load(dataset.volume_path, mmap_mode="r", allow_pickle=False),
+            np.load(volumes[-1], mmap_mode="r", allow_pickle=False),
+            QualityConfig.from_gala(config),
+        )
+        gpu_reference["stages"] = _tensorboard_stages(model_output, command[0])
+    except (OSError, RuntimeError, ValueError) as error:
+        gpu_reference["error"] = str(error)
+        _write_quality_failure(output, gpu_reference, "quality_or_stage_measurement_failed")
+        raise NativeReferenceError("quality_or_stage_measurement_failed") from error
     gpu_reference["stages"]["wall_seconds"] = finished - started
     writer.write_quality({
         "psnr": quality.psnr, "ssim": quality.ssim, "lpips": quality.lpips,

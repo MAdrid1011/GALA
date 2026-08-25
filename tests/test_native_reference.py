@@ -46,3 +46,17 @@ def test_native_reference_rejects_external_gpu_before_launch(tmp_path: Path) -> 
             "schema_version": "gala-native-preflight-v1", "status": "passed",
             "freeze_manifest_sha256": freeze["run_manifest_sha256"],
         }, tmp_path / "run", sample_fn=lambda: sample)
+
+
+def test_native_reference_records_sampling_failure(tmp_path: Path) -> None:
+    config = load_config(ROOT / "configs/architecture/gala.yaml")
+    freeze = _freeze(tmp_path, config.sha256)
+    with pytest.raises(NativeReferenceError, match="gpu_sampling_unavailable"):
+        run_native_reference(config, freeze, {
+            "schema_version": "gala-native-preflight-v1", "status": "passed",
+            "freeze_manifest_sha256": freeze["run_manifest_sha256"],
+        }, tmp_path / "run", sample_fn=lambda: (_ for _ in ()).throw(
+            RuntimeError("fixture sampler failure")
+        ))
+    status = (tmp_path / "run" / "status.json").read_text(encoding="utf-8")
+    assert '"status": "failed_preflight"' in status
