@@ -7,7 +7,7 @@ import sys
 
 import pytest
 
-from gala_sim.config import ConfigError, load_config
+from gala_sim.config import ConfigError, load_config, load_source_manifest
 from gala_sim.identity import sha256_tree
 from gala_sim.manifest import build_freeze_record, dataset_record, verify_freeze_record
 
@@ -36,6 +36,15 @@ def test_config_rejects_invalid_metadata(tmp_path: Path) -> None:
     )
     with pytest.raises(ConfigError, match="allowed_range"):
         load_config(path)
+
+
+def test_source_manifests_are_strict() -> None:
+    model = load_source_manifest(ROOT / "configs/models/r2_gaussian.yaml",
+                                 schema_version="gala-model-source-v1")
+    dataset = load_source_manifest(ROOT / "configs/datasets/chest.yaml",
+                                   schema_version="gala-dataset-source-v1")
+    assert model.require("commit") == "f2579bfddd9aac009cb797c8503bef8119bbd022"
+    assert "meta_data.json" in dataset.require("required_files")
 
 
 def test_hash_tree_is_independent_of_creation_order(tmp_path: Path) -> None:
