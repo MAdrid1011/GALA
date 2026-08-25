@@ -35,6 +35,9 @@ class DatasetRecord:
     root: str | None
     manifest_sha256: str | None
     reason: str | None
+    files: list[dict[str, Any]] | None = None
+    metadata_sha256: str | None = None
+    geometry: dict[str, Any] | None = None
 
 
 def _command(*args: str) -> str | None:
@@ -81,7 +84,28 @@ def dataset_record(root: Path | None, name: str, source_url: str, license_url: s
     root = root.resolve()
     if not root.is_dir():
         raise ValueError(f"dataset root is not a directory: {root}")
-    return DatasetRecord(name, "planned", source_url, license_url, str(root), sha256_tree(root), None)
+    metadata_path = root / "meta_data.json"
+    metadata: dict[str, Any] | None = None
+    metadata_digest: str | None = None
+    geometry: dict[str, Any] | None = None
+    if metadata_path.is_file():
+        try:
+            parsed = json.loads(metadata_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError(f"dataset metadata is not valid JSON: {metadata_path}") from error
+        if not isinstance(parsed, dict):
+            raise ValueError("dataset metadata root must be an object")
+        metadata = parsed
+        metadata_digest = sha256_file(metadata_path)
+        if isinstance(parsed.get("scanner"), dict):
+            geometry = parsed["scanner"]
+    files = []
+    for path in sorted(item for item in root.rglob("*") if item.is_file()
+                       and ".git" not in item.relative_to(root).parts):
+        files.append({"path": path.relative_to(root).as_posix(), "bytes": path.stat().st_size,
+                      "sha256": sha256_file(path)})
+    return DatasetRecord(name, "planned", source_url, license_url, str(root), sha256_tree(root), None,
+                         files, metadata_digest, geometry)
 
 
 def build_freeze_record(config: GalaConfig, source: SourceRecord, dataset: DatasetRecord,

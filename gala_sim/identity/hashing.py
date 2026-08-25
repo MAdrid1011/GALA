@@ -37,8 +37,11 @@ def sha256_tree(root: Path) -> str:
     if not root.is_dir():
         raise ValueError(f"tree root is not a directory: {root}")
     digest = hashlib.sha256()
+    generated_names = {"__pycache__", "build", "dist"}
     files = (item for item in root.rglob("*") if item.is_file()
-             and ".git" not in item.relative_to(root).parts)
+             and not any(part in generated_names or part == ".git"
+                         for part in item.relative_to(root).parts)
+             and not any(part.endswith(".egg-info") for part in item.relative_to(root).parts))
     for path in sorted(files):
         relative = path.relative_to(root).as_posix().encode("utf-8")
         digest.update(len(relative).to_bytes(8, "big"))

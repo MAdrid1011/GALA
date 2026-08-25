@@ -43,6 +43,16 @@ def test_unavailable_dataset_is_machine_readable() -> None:
     assert dataset.reason == "source_download_not_present"
 
 
+def test_dataset_record_contains_file_inventory(tmp_path: Path) -> None:
+    (tmp_path / "meta_data.json").write_text(json.dumps({"scanner": {"DSO": 1}},), encoding="utf-8")
+    (tmp_path / "vol_gt.npy").write_bytes(b"volume")
+    dataset = dataset_record(tmp_path, "Chest", "https://data.example/chest", "https://license.example")
+    assert dataset.status == "planned"
+    assert dataset.metadata_sha256 is not None
+    assert dataset.geometry == {"DSO": 1}
+    assert [item["path"] for item in dataset.files or []] == ["meta_data.json", "vol_gt.npy"]
+
+
 def test_freeze_record_self_hash_is_verified() -> None:
     dataset = dataset_record(None, "Chest", "https://data.example/chest", "https://license.example",
                              "fixture_not_downloaded")
