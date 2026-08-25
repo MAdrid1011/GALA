@@ -16,6 +16,10 @@
 
 正式任务先完成配置中的 warmup 与短测量，并按真实事件速率预测总时间。预测达到 `long_run_threshold_seconds` 时，运行 `gpustat` 预检。预检记录 GPU 利用率、显存、CPU、读取吞吐、事件生成速度、异步拷贝重叠率和周期模拟吞吐。
 
+R²-Gaussian 官方基线在启动短测量前同时读取 `gpustat --json` 和 `nvidia-smi` compute-app 列表。目标 GPU 存在任何非本次预检启动的计算进程时，立即写出 `failed_preflight`，不得把外部任务的利用率计入本任务，也不得与其争用 GPU。短测量使用 input-freeze 中解析后的绝对 Python 解释器、工作目录、数据路径和官方入口，仅把迭代数替换为 `warmup_iterations + measure_iterations`，产物写到独立预检目录。
+
+测量区间由上游 TensorBoard `train/iter_time` 标量的 wall-time 确定，起点为 warmup 结束，终点为短测量结束。该区间用于预测论文训练迭代耗时，预检报告同时保留短任务原始 wall time、全部系统采样和日志哈希。官方基线不产生 trace，因此事件速率、异步 trace 拷贝重叠率和周期模拟吞吐必须显式标记为 `not_applicable_native_reference`，不得填零或伪造。预检预测不作为正式端到端时间，也不替代完整运行的阶段计时。
+
 GPU 利用率低于 `gpu_utilization_floor_percent` 时，不启动小时级任务。实现者先审计数据加载、Python 循环、GPU 到 CPU 同步、显存分配、trace 写出和 CPU 周期热点。只有瓶颈被定位为真实串行依赖、数据源读取或已优化的周期内核后，才允许继续。
 
 ## 4. 本地 GPU 到 AGX Orin

@@ -6,6 +6,7 @@ import argparse
 import importlib
 import json
 from pathlib import Path
+import shlex
 import sys
 
 from gala_sim.ablation import run_matrix
@@ -16,6 +17,7 @@ from gala_sim.timing import CycleConfig, CycleEngine
 from gala_sim.timing.memory import NativeRamulator2Binding, Ramulator2Backend
 from gala_sim.timing.resources import ResourceUsage
 from gala_sim.tools.cycle_preflight import run_cycle_preflight, write_cycle_preflight
+from gala_sim.tools.preflight import run_native_preflight
 from gala_sim.trace import TraceReader, validate_trace
 
 
@@ -33,6 +35,10 @@ def _parser() -> argparse.ArgumentParser:
     preflight.add_argument("--ramulator-config", type=Path, default=None)
     preflight.add_argument("--resource-usage", type=Path, default=None,
                            help="JSON ResourceUsage snapshot")
+    native = commands.add_parser("native-preflight")
+    native.add_argument("--config", type=Path, required=True)
+    native.add_argument("--freeze", type=Path, required=True)
+    native.add_argument("--output", type=Path, required=True)
     trace = commands.add_parser("trace-validate")
     trace.add_argument("--trace", type=Path, required=True)
     replay = commands.add_parser("cycle-replay")
@@ -124,6 +130,18 @@ def main(argv: list[str] | None = None) -> int:
                 reproduction=command,
             )
             write_cycle_preflight(report, args.output)
+            print(json.dumps(report.as_dict(), sort_keys=True))
+            return 0 if report.status == "passed" else 2
+        if args.command == "native-preflight":
+            config = load_config(args.config)
+            freeze = json.loads(args.freeze.read_text(encoding="utf-8"))
+            command = shlex.join([
+                "gala-sim", "native-preflight", "--config", str(args.config),
+                "--freeze", str(args.freeze), "--output", str(args.output),
+            ])
+            report = run_native_preflight(
+                config, freeze, args.output, reproduction=command,
+            )
             print(json.dumps(report.as_dict(), sort_keys=True))
             return 0 if report.status == "passed" else 2
         trace = TraceReader().read(args.trace, validate=False, mmap_mode="r")

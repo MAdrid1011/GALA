@@ -5,7 +5,6 @@ from __future__ import annotations
 import ast
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
-from importlib.metadata import PackageNotFoundError, version
 import json
 import os
 import platform
@@ -78,16 +77,15 @@ def _command(*args: str) -> str | None:
         return None
 
 
-def _package_version(name: str) -> str | None:
-    try:
-        return version(name)
-    except PackageNotFoundError:
-        return None
+def _python_value(executable: str, expression: str) -> str | None:
+    return _command(executable, "-c", f"print({expression})")
 
 
-def environment_snapshot() -> dict[str, Any]:
+def environment_snapshot(python_executable: str = sys.executable) -> dict[str, Any]:
+    executable = str(Path(python_executable).resolve())
     return {
-        "python": platform.python_version(),
+        "python_executable": executable,
+        "python": _python_value(executable, "__import__('platform').python_version()"),
         "platform": platform.platform(),
         "machine": platform.machine(),
         "cpu": _command("lscpu"),
@@ -104,14 +102,14 @@ def environment_snapshot() -> dict[str, Any]:
         "cxx_compiler_path": shutil.which(os.environ.get("CXX", "c++")),
         "cxx_compiler": _command(os.environ.get("CXX", "c++"), "--version"),
         "torch_cuda": _command(
-            sys.executable, "-c", "import torch; print(torch.version.cuda)"
+            executable, "-c", "import torch; print(torch.version.cuda)"
         ),
-        "numpy": _package_version("numpy"),
-        "scikit_image": _package_version("scikit-image"),
-        "torch": _package_version("torch"),
-        "torchvision": _package_version("torchvision"),
-        "lpips": _package_version("lpips"),
-        "numba": _package_version("numba"),
+        "numpy": _python_value(executable, "__import__('importlib.metadata').metadata.version('numpy')"),
+        "scikit_image": _python_value(executable, "__import__('importlib.metadata').metadata.version('scikit-image')"),
+        "torch": _python_value(executable, "__import__('importlib.metadata').metadata.version('torch')"),
+        "torchvision": _python_value(executable, "__import__('importlib.metadata').metadata.version('torchvision')"),
+        "lpips": _python_value(executable, "__import__('importlib.metadata').metadata.version('lpips')"),
+        "numba": _python_value(executable, "__import__('importlib.metadata').metadata.version('numba')"),
         "ramulator2": None,
     }
 
@@ -255,7 +253,7 @@ def _has_schedule_append(tree: ast.AST, field: str, value: str | int) -> bool:
 
 
 def training_record(profile_path: Path, source: SourceRecord, dataset_root: Path | None,
-                    model_output: Path | None) -> dict[str, Any]:
+                    model_output: Path | None, python_executable: Path) -> dict[str, Any]:
     """Validate and bind the frozen R2-Gaussian training profile."""
 
     profile_path = profile_path.resolve()
@@ -332,8 +330,12 @@ def training_record(profile_path: Path, source: SourceRecord, dataset_root: Path
     command = profile.get("command")
     if not isinstance(command, dict) or not isinstance(command.get("argv"), list):
         raise ValueError("training command must provide an argv list")
+    resolved_python = python_executable.resolve()
+    if not resolved_python.is_file() or not os.access(resolved_python, os.X_OK):
+        raise ValueError(f"official Python interpreter is not executable: {resolved_python}")
     bindings = {
         "source_root": str(source_root.resolve()),
+        "python_executable": str(resolved_python),
         "dataset_root": (str(dataset_root.resolve()) if dataset_root is not None
                          else "<chest-data-root>"),
         "model_output": (str(model_output.resolve()) if model_output is not None
@@ -465,6 +467,10 @@ def build_freeze_record(config: GalaConfig, source: SourceRecord, dataset: Datas
         "python_random_seed", "numpy_seed", "torch_seed",
     )):
         raise ValueError("random seed does not match the frozen upstream safe_state")
+    command = training.get("command")
+    if (not isinstance(command, Mapping) or not isinstance(command.get("argv"), list)
+            or not command["argv"] or not isinstance(command["argv"][0], str)):
+        raise ValueError("training record has no bound Python command")
     record: dict[str, Any] = {
         "schema_version": "gala-input-freeze-v3",
         "workflow_step": "freeze_inputs",
@@ -476,7 +482,7 @@ def build_freeze_record(config: GalaConfig, source: SourceRecord, dataset: Datas
         "training": _json_value(training),
         "random_seed": seed,
         "repository": {"root": str(repository.resolve()), "commit": _command("git", "-C", str(repository), "rev-parse", "HEAD")},
-        "environment": environment_snapshot(),
+        "environment": environment_snapshot(command["argv"][0]),
     }
     record["run_manifest_sha256"] = sha256_bytes(canonical_json(record))
     return record

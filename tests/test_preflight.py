@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
+import sys
 
 import pytest
 
@@ -8,7 +10,15 @@ from gala_sim.config import GalaConfig, load_config
 from gala_sim.timing.memory import Ramulator2Backend
 from gala_sim.timing.resources import ResourceUsage
 from gala_sim.tools.cycle_preflight import run_cycle_preflight, write_cycle_preflight
-from gala_sim.tools.preflight import GpuSample, decide_long_run, predict_runtime
+from gala_sim.identity import canonical_json, sha256_bytes
+from gala_sim.tools.preflight import (
+    ComputeProcess,
+    GpuSample,
+    decide_long_run,
+    predict_runtime,
+    run_native_preflight,
+    sample_gpustat,
+)
 
 
 def _sample(utilization: float) -> GpuSample:
@@ -37,6 +47,87 @@ def test_preflight_rejects_invalid_prediction() -> None:
     with pytest.raises(ValueError):
         predict_runtime(measured_seconds=0, measured_iterations=1,
                         total_iterations=2, warmup_iterations=0)
+
+
+def test_gpustat_sample_distinguishes_compute_processes(monkeypatch) -> None:
+    gpustat = json.dumps({"gpus": [{
+        "index": 0, "uuid": "GPU-fixture", "utilization.gpu": 97,
+        "memory.used": 256,
+    }]})
+    compute = "GPU-fixture, 42, /opt/external-work, 128\n"
+
+    def check_output(command, **_kwargs):
+        return gpustat if command[0] == "gpustat" else compute
+
+    monkeypatch.setattr("gala_sim.tools.preflight.subprocess.check_output", check_output)
+    sample = sample_gpustat()
+    assert sample.utilization_percent == 97.0
+    assert sample.compute_processes == (
+        ComputeProcess("GPU-fixture", 42, "/opt/external-work", 128 * 1024 * 1024),
+    )
+
+
+def _freeze(config: GalaConfig, root: Path, script: Path) -> dict[str, object]:
+    command = {
+        "working_directory": str(root),
+        "argv": [str(Path(sys.executable).resolve()), script.name, "-s", str(root / "data"),
+                 "-m", str(root / "formal")],
+    }
+    value: dict[str, object] = {
+        "schema_version": "gala-input-freeze-v3",
+        "config": {"sha256": config.sha256},
+        "repository": {"commit": "a" * 40},
+        "training": {
+            "command": command,
+            "effective_arguments": {"iterations": 30000},
+        },
+    }
+    value["run_manifest_sha256"] = sha256_bytes(canonical_json(value))
+    return value
+
+
+def test_native_preflight_rejects_external_compute_before_launch(tmp_path: Path) -> None:
+    config = load_config(Path(__file__).parents[1] / "configs/architecture/gala.yaml")
+    script = tmp_path / "train.py"
+    script.write_text("raise AssertionError('must not launch')\n", encoding="utf-8")
+    busy = GpuSample(
+        1.0, 99.0, 256, None, None, None, None, 0, "GPU-fixture",
+        (ComputeProcess("GPU-fixture", 42, "external", 128),),
+    )
+    output = tmp_path / "preflight"
+    report = run_native_preflight(
+        config, _freeze(config, tmp_path, script), output,
+        reproduction="fixture native-preflight", sample_fn=lambda: busy,
+    )
+    assert report.status == "failed_preflight"
+    assert report.reason == "gpu_busy_external"
+    assert not (output / "calibration_model").exists()
+    status = json.loads((output / "status.json").read_text(encoding="utf-8"))
+    assert status["reason"] == "gpu_busy_external"
+
+
+def test_native_preflight_predicts_from_isolated_short_run(tmp_path: Path) -> None:
+    config = load_config(Path(__file__).parents[1] / "configs/architecture/gala.yaml")
+    script = tmp_path / "train.py"
+    script.write_text("pass\n", encoding="utf-8")
+    free = GpuSample(1.0, 80.0, 1024, None, None, None, None, 0, "GPU-fixture", ())
+    output = tmp_path / "preflight"
+    report = run_native_preflight(
+        config, _freeze(config, tmp_path, script), output,
+        reproduction="fixture native-preflight", sample_fn=lambda: free,
+        measurement_reader=lambda _root, _warmup, _end: 10.0,
+        sleep_fn=lambda _seconds: None,
+    )
+    assert report.status == "passed"
+    assert report.reason == "long_run_gpu_floor_passed"
+    assert report.prediction is not None
+    assert report.prediction["predicted_seconds"] == pytest.approx(5998.0)
+    command = report.calibration["command"]
+    assert command[-6:] == [
+        "--iterations", "60", "--test_iterations", "60", "--save_iterations", "60",
+    ]
+    assert command[command.index("-m") + 1] == str(output / "calibration_model")
+    assert (output / "preflight.json").is_file()
 
 
 class _RamulatorBinding:

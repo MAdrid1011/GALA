@@ -42,6 +42,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--seed", default=0, type=int)
     parser.add_argument("--training-profile",
                         default="configs/campaigns/r2_gaussian_chest.yaml", type=Path)
+    parser.add_argument("--python-executable", required=True, type=Path,
+                        help="absolute Python interpreter for official training")
     parser.add_argument("--model-output", type=Path,
                         help="frozen output directory for the official training command")
     parser.add_argument("--repository", default=".", type=Path)
@@ -134,7 +136,7 @@ def main(argv: list[str] | None = None) -> int:
         dataset = dataset_record(args.dataset_root, "Chest", DATA_URL, DATA_LICENSE_URL,
                                  args.dataset_reason)
         training = training_record(args.training_profile, source, args.dataset_root,
-                                   args.model_output)
+                                   args.model_output, args.python_executable)
         record = build_freeze_record(config, source, dataset, training, args.seed,
                                      args.repository)
         write_freeze_record(record, args.output)

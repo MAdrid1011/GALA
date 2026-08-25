@@ -98,9 +98,12 @@ def test_freeze_record_self_hash_is_verified() -> None:
         "license_path": "/tmp/source/LICENSE.md", "license_sha256": "b" * 64,
     }
     from gala_sim.manifest import SourceRecord
-    training = {"profile": {"random_state": {
-        "python_random_seed": 0, "numpy_seed": 0, "torch_seed": 0,
-    }}}
+    training = {
+        "profile": {"random_state": {
+            "python_random_seed": 0, "numpy_seed": 0, "torch_seed": 0,
+        }},
+        "command": {"argv": [str(Path(sys.executable).resolve())]},
+    }
     record = build_freeze_record(config, SourceRecord(**source), dataset, training, 0, ROOT)
     assert record["schema_version"] == "gala-input-freeze-v3"
     assert record["quality"]["parameters"]["quality.lpips_network"]["value"] == "alex"
@@ -129,6 +132,7 @@ def test_training_profile_matches_locked_upstream(tmp_path: Path) -> None:
     output = tmp_path / "official-output"
     training = training_record(
         ROOT / "configs/campaigns/r2_gaussian_chest.yaml", source, dataset, output,
+        Path(sys.executable),
     )
     assert training["effective_arguments"]["iterations"] == 30000
     assert training["effective_arguments"]["test_iterations"] == [
@@ -137,7 +141,8 @@ def test_training_profile_matches_locked_upstream(tmp_path: Path) -> None:
     assert training["effective_arguments"]["save_iterations"] == [30000]
     assert training["effective_arguments"]["source_path"] == str(dataset.resolve())
     assert training["command"]["argv"] == [
-        "python", "train.py", "-s", str(dataset.resolve()), "-m", str(output.resolve()),
+        str(Path(sys.executable).resolve()), "train.py", "-s", str(dataset.resolve()),
+        "-m", str(output.resolve()),
     ]
     assert len(training["command"]["sha256"]) == 64
 
@@ -149,9 +154,12 @@ def test_freeze_record_rejects_seed_override() -> None:
     from gala_sim.manifest import SourceRecord
     source = SourceRecord("fixture", "https://source.example", "c" * 40, "/tmp/source",
                           "a" * 64, "e" * 64, "/tmp/LICENSE.md", "b" * 64)
-    training = {"profile": {"random_state": {
-        "python_random_seed": 0, "numpy_seed": 0, "torch_seed": 0,
-    }}}
+    training = {
+        "profile": {"random_state": {
+            "python_random_seed": 0, "numpy_seed": 0, "torch_seed": 0,
+        }},
+        "command": {"argv": [str(Path(sys.executable).resolve())]},
+    }
     with pytest.raises(ValueError, match="random seed"):
         build_freeze_record(config, source, dataset, training, 1, ROOT)
 
@@ -164,6 +172,7 @@ def test_freeze_command_records_unavailable_data(tmp_path: Path) -> None:
     result = subprocess.run([
         sys.executable, str(ROOT / "tools/freeze_inputs.py"),
         "--source-root", str(source), "--dataset-reason", "fixture_not_downloaded",
+        "--python-executable", sys.executable,
         "--output", str(output),
     ], cwd=ROOT, text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
@@ -172,4 +181,5 @@ def test_freeze_command_records_unavailable_data(tmp_path: Path) -> None:
     assert record["schema_version"] == "gala-input-freeze-v3"
     assert record["model"]["commit"] == "f2579bfddd9aac009cb797c8503bef8119bbd022"
     assert record["training"]["effective_arguments"]["iterations"] == 30000
+    assert record["environment"]["python_executable"] == str(Path(sys.executable).resolve())
     assert len(record["run_manifest_sha256"]) == 64
