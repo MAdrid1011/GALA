@@ -5,6 +5,9 @@ description = "Auditable GALA architecture simulator"
 requires-python = ">=3.10"
 dependencies = ["PyYAML>=6.0", "numpy>=1.24"]
 
+[project.scripts]
+gala-sim = "gala_sim.cli:main"
+
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
