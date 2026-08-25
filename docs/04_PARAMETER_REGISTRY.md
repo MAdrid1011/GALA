@@ -101,12 +101,16 @@ FMA、EXP、LOG、RCP、SQRT、SRAM、CAM、互连和寄存器流水延迟不写
 
 | 配置路径 | 默认值 | 单位 | 来源 |
 | --- | ---: | --- | --- |
-| `quality.data_min` | 待冻结 | scalar | Chest 数据清单参考体范围 |
-| `quality.data_max` | 待冻结 | scalar | Chest 数据清单参考体范围 |
-| `quality.ssim_window` | 待冻结 | voxel | 统一质量协议 |
-| `quality.ssim_sigma` | 待冻结 | voxel | 统一质量协议 |
-| `quality.lpips_slices` | 待冻结 | index list per axis | 三个正交方向的预注册切片 |
-| `quality.lpips_network` | 待冻结 | model name | 统一质量协议 |
+| `quality.data_min` | 0.0 | scalar | Chest `vol_gt.npy` 冻结范围 |
+| `quality.data_max` | 1.0 | scalar | Chest `vol_gt.npy` 冻结范围 |
+| `quality.ssim_window` | 11 | voxel | Chest 统一质量协议 |
+| `quality.ssim_sigma` | 1.5 | voxel | Chest 统一质量协议 |
+| `quality.ssim_boundary` | `reflect` | mode | scikit-image 0.21.0 三维 Gaussian SSIM |
+| `quality.lpips_slices` | 每轴 `[42,85,128,170,213]` | index list per axis | 上游固定五切片位置扩展到三个正交轴 |
+| `quality.lpips_network` | `alex` | model name | LPIPS 0.1.4 预训练网络 |
+| `quality.lpips_version` | `0.1` | version | LPIPS 校准权重版本 |
+| `quality.lpips_backbone_sha256` | `7be5be79...cdee02` | SHA-256 | torchvision AlexNet ImageNet checkpoint |
+| `quality.lpips_calibration_sha256` | `df73285e...835c0` | SHA-256 | LPIPS v0.1 alex calibration 权重 |
 
 缺少任一值时，质量入口必须拒绝生成正式 `quality.json`，不得回退到模型官方指标或隐式默认值。
 

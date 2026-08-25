@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 from pathlib import Path
 import subprocess
 import sys
 
+import numpy as np
 import pytest
 
 from gala_sim.config import ConfigError, load_config, load_source_manifest
@@ -68,12 +70,20 @@ def test_unavailable_dataset_is_machine_readable() -> None:
 
 def test_dataset_record_contains_file_inventory(tmp_path: Path) -> None:
     (tmp_path / "meta_data.json").write_text(json.dumps({"scanner": {"DSO": 1}},), encoding="utf-8")
-    (tmp_path / "vol_gt.npy").write_bytes(b"volume")
+    np.save(tmp_path / "vol_gt.npy", np.asarray([[[0.0, 1.0]]], dtype=np.float32))
     dataset = dataset_record(tmp_path, "Chest", "https://data.example/chest", "https://license.example")
     assert dataset.status == "planned"
     assert dataset.metadata_sha256 is not None
     assert dataset.geometry == {"DSO": 1}
     assert [item["path"] for item in dataset.files or []] == ["meta_data.json", "vol_gt.npy"]
+    assert dataset.reference_volume == {
+        "path": "vol_gt.npy",
+        "sha256": dataset.files[1]["sha256"],  # type: ignore[index]
+        "shape": [1, 1, 2],
+        "dtype": "<f4",
+        "data_min": 0.0,
+        "data_max": 1.0,
+    }
 
 
 def test_freeze_record_self_hash_is_verified() -> None:
@@ -88,7 +98,15 @@ def test_freeze_record_self_hash_is_verified() -> None:
     }
     from gala_sim.manifest import SourceRecord
     record = build_freeze_record(config, SourceRecord(**source), dataset, 0, ROOT)
+    assert record["schema_version"] == "gala-input-freeze-v2"
+    assert record["quality"]["parameters"]["quality.lpips_network"]["value"] == "alex"
     verify_freeze_record(record)
+    mismatched = replace(dataset, reference_volume={
+        "path": "vol_gt.npy", "sha256": "d" * 64, "shape": [256, 256, 256],
+        "dtype": "<f4", "data_min": 0.0, "data_max": 2.0,
+    })
+    with pytest.raises(ValueError, match="data range"):
+        build_freeze_record(config, SourceRecord(**source), mismatched, 0, ROOT)
     record["status"] = "running"
     with pytest.raises(ValueError, match="self-hash"):
         verify_freeze_record(record)

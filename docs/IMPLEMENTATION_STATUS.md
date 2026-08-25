@@ -14,7 +14,7 @@
 - 仓库自带的 C ABI bridge 已对固定 Ramulator 2 v2.1.0 提交 `38c51d40a976c6b07fbc09de869a7e08dc187d29` 完成仓库外构建；真实 LPDDR5-6400 八通道配置 smoke 中，一个 128 B 读取拆为两个 64 B transaction 并在周期 36 返回。该配置尚未冻结为 canonical 正式配置。
 - Ramulator bridge smoke 记录保存在仓库外 `GALA-runtime/records/ramulator2_bridge_smoke_20260826.json`，SHA-256 为 `c2e402375fc15ebed2e1027315e1817b9c05c9842bac455a3ddb6680748f633c`。首组合输入冻结记录已按提交 `263f368` 和配置哈希 `75911aa316ab746e5e5da8ae156529f2e78e06df68686a21130d904cc03ffadf` 重新生成，仓库外文件 SHA-256 为 `6e41fc1513f1f85a3e7166339cc1565fb31466afa34450418aa141ef07b8ecac`；其状态为 `planned`，不表示 pending 参数已经冻结。
 - 融合发射前向、消费者和伴随三类端口已使用注册配置中的独立端口数与独立 II 状态，不再由单个聚合端口互相错误阻塞。
-- CLAMP 事件 schema v2、批量 NumPy trace 存储、依赖/版本/释放校验和模块拆分的离散事件周期内核已通过 77 项测试（1 项环境依赖跳过）。
+- CLAMP 事件 schema v2、批量 NumPy trace 存储、依赖/版本/释放校验和模块拆分的离散事件周期内核已通过 79 项测试（1 项环境依赖跳过）。
 - 资源包络、长任务 GPU 利用率门和十六项消融矩阵的结构检查已通过单元测试。
 - `49bf36d` 为十六项变体使用显式 `variant:<bits>` 策略，并在周期内核中落实模块在途容量和关系种子 FIFO 反压。
 - `cde1a93` 为每个消融变体隔离记录内存完成表的消费游标，避免同一外部 Ramulator 记录被首个变体消耗。
@@ -29,11 +29,14 @@
 - event-driven 周期内核新增 4,096 事件依赖链、重复运行确定性和停顿计数合并回归测试；长链测试按真实服务延迟完成且无死锁。
 - 语义驻留状态已接入 `variant:0001` 的逐请求目录、容量反压、填充、读完成和状态版本级释放路径；query close 不再提前释放，同版本 no-op 更新仍可复用，状态写入结束后才关闭旧版本。
 - mmap trace 周期入口已使用 NumPy 压缩反向依赖索引；同一 trace 的十六项消融只执行一次结构校验。旧版 1,048,191-event 规模样本的索引构建使用约 21.8 MB 连续数组，结果仅作为软件可扩展性证据，不作为正式周期。
-- 统一质量入口已要求从冻结配置读取参考体范围、三维 SSIM 参数、三个正交方向的 LPIPS 切片列表和 LPIPS 网络；R²-Gaussian 参考产物将统一输出 `psnr`、`ssim`、`lpips`，并仅把官方 `psnr_3d`、`ssim_3d` 作为附加指标。当前这些质量参数仍为 pending，正式质量入口会拒绝运行而不会使用隐式默认值。
+- Chest 统一质量口径已在查看任何 GALA 功能重放结果前冻结：参考范围 `[0,1]`，三维 SSIM 使用 `11/1.5/reflect`，LPIPS 使用三轴各 `[42,85,128,170,213]`、`alex` v0.1 及两份受检权重。R²-Gaussian 参考产物统一输出 `psnr`、`ssim`、`lpips`，官方 `psnr_3d/ssim_3d` 仅作附加指标；input-freeze v2 展开保存参考体统计、质量参数和质量依赖版本。
+- 已保存的一迭代官方体在 `numpy 1.26.4/scikit-image 0.21.0/torch 2.1.2/torchvision 0.16.2/lpips 0.1.4` 的纯 CPU 质量 smoke 中得到 PSNR `20.2852146768`、SSIM `0.2686132998`、LPIPS `0.6325289289`，两份 LPIPS 权重哈希通过。该值只验证统一入口，不是论文配置质量结果。
 
 ## 当前入口
 
-首个组合仍停在正式 Base ASIC 之前。`configs/architecture/gala.yaml` 中的统一质量口径、`relation.seed_fifo_entries`、各模块时序、trace chunk 容量和 `memory.ramulator_config_sha256` 尚未冻结。原生 Ramulator 2 binding 已可用，但正式入口会拒绝带 pending 参数或未与 canonical 配置哈希一致的 YAML。当前周期 smoke 使用显式实验 timing，只能验证内核行为，正式运行必须拒绝并标记 `failed_preflight`。
+首个组合仍停在正式 Base ASIC 之前。`configs/architecture/gala.yaml` 的质量参数已冻结，当前配置哈希为 `8f9a249ffbc74b749a97313647f9a98785f873a75c128ec0716133e5fa1a6c50`；`relation.seed_fifo_entries`、各模块时序、trace chunk 容量和 `memory.ramulator_config_sha256` 仍未冻结。原生 Ramulator 2 binding 已可用，但正式周期入口会拒绝带 pending 参数或未与 canonical 配置哈希一致的 YAML。当前周期 smoke 使用显式实验 timing，只能验证内核行为，正式运行必须拒绝并标记 `failed_preflight`。
+
+现有仓库外 `r2_gaussian_chest_freeze.json` 仍绑定质量冻结前的配置与代码提交，不能用于下一次运行；本次代码提交后必须用 `gaussian-slam-official` 环境重新生成 input-freeze v2。
 
 R²-Gaussian 的官方 CUDA 扩展仍没有直接导出完整 CLAMP 事件缓冲区；当前旁路从官方 CUDA work buffer 重建逐 query 关系，并在官方 loss、backward 和 optimizer 边界映射其余事件。新版真实粒度 Chest smoke 因 GPU 正被外部作业持续占用而尚未执行，因此还没有重新证明插桩/未插桩体数据逐元素一致。该旁路也尚未证明长程增密 ID 稳定性、所有真实队列操作和正式 30k 训练的流式最终存储，不能视为正式 trace 闭环。
 
@@ -41,7 +44,7 @@ R²-Gaussian 的官方 CUDA 扩展仍没有直接导出完整 CLAMP 事件缓冲
 
 ## 下一步入口条件
 
-1. 从 Chest 数据清单与统一质量协议冻结数据范围、SSIM 和 LPIPS 参数；GPU 空闲后按论文配置完成官方参考训练、重建与 PSNR/SSIM/LPIPS，先闭合工作流步骤 2。
+1. 用本次提交和冻结质量配置重新生成 input-freeze v2；GPU 空闲后按论文配置完成官方参考训练、重建与 PSNR/SSIM/LPIPS，先闭合工作流步骤 2。
 2. 运行新版 Chest 1 迭代真实 trace smoke，要求 validator 通过、relation 数等于全部 mask popcount，并重新核对插桩/未插桩体数据逐元素一致。
 3. 新版 smoke 通过后继续实现 trace producer/consumer 与周期内核的实时 chunk 交接；当前 mmap/CSR 路径仍需等待捕获完成后再开始周期重放。
 4. 在真实关系粒度上实现 `template_id + primitive_kind` 的精确计算 Pod 资源序列，并测量关系种子突发、模块时序和 trace chunk，更新冻结配置及运行清单。

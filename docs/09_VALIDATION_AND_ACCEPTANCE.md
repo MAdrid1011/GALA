@@ -12,6 +12,16 @@ PSNR 在完整三维体上计算，数据范围使用数据清单中的参考体
 
 模型官方提供的二维或体指标可以附加输出，但不能替代上述统一口径。切片位置、数据范围和窗口参数在查看 GALA 结果前冻结。
 
+首个 R²-Gaussian + Chest 组合使用以下冻结口径。
+
+- 参考体为数据清单中 SHA-256 为 `c895f1f7127a2ba7b25330240e16cd28b75286e037d4bcd9419a63282bd5dedd` 的 `vol_gt.npy`。其格式为 little-endian `float32[256,256,256]`，有限值范围为 `[0,1]`；参考体与重建体按数组 X、Y、Z 轴直接对齐，不使用 mask 或重采样。
+- PSNR 在完整体上以 FP64 差值计算 MSE，动态范围固定为 `1.0`。预测值不裁剪，完全相同时报告正无穷。
+- SSIM 使用 scikit-image `0.21.0` 的原生三维 Gaussian 口径：窗口 `11`、sigma `1.5`、`reflect` 边界、population covariance、无 channel 轴。预测值不裁剪。
+- LPIPS 使用 `lpips 0.1.4` 的预训练 `alex` 网络和校准版本 `0.1`。每个灰度切片先裁剪到 `[0,1]`，线性映射到 `[-1,1]`，复制为三个通道，并在 CPU eval/inference 模式下计算。
+- X、Y、Z 三轴均使用切片 `[42,85,128,170,213]`，共十五张并取算术平均。位置来自固定上游提交训练可视化的 `np.linspace(0,256,7).astype(int)[1:-1]`，在查看任何 GALA 功能重放结果前扩展并冻结到三个正交轴。
+
+LPIPS 的 AlexNet ImageNet trunk checkpoint SHA-256 为 `7be5be791159472b1fbf3c69796f7cb30dca7ad8466c2df70058c37116cdee02`，LPIPS v0.1 `alex` calibration 权重 SHA-256 为 `df73285e35b22355a2df87cdb6b70b343713b667eddbda73e1977e0c860835c0`。正式运行记录实际 NumPy、scikit-image、PyTorch、torchvision 和 lpips 版本；权重身份不匹配时不得生成正式质量结果。
+
 ## 3. Trace 验证
 
 每个真实 smoke 样例检查事件编号唯一、依赖存在、状态版本单调、关系关闭不早于最后关系、伴随不早于消费者完成、释放不早于最后读取和更新不早于旧版本排空。事件数量还要与官方模型中的关系、查询、消费者和更新计数对照。
