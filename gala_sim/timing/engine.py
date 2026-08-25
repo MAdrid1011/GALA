@@ -11,6 +11,7 @@ from gala_sim.trace.model import Trace
 from gala_sim.trace.validator import validate_trace
 
 from .config import CycleConfig
+from .memory import MemoryRequestRecord
 from .modules import (
     BidirectionalQueryUnit,
     CacheBackpressure,
@@ -40,6 +41,7 @@ class CycleResult:
     event_counts: dict[str, int]
     policy: str
     oracle_status: str
+    memory_requests: tuple[MemoryRequestRecord, ...]
 
 
 @dataclass
@@ -60,9 +62,9 @@ class CycleEngine:
         self.policy = policy
         self.issue_scheduler = FusionIssueScheduler(
             candidate_lanes=config.candidate_lanes,
-            forward_ports=config.modules["fusion_issue"].ports,
-            consumer_ports=config.modules["fusion_issue"].ports,
-            adjoint_ports=config.modules["fusion_issue"].ports,
+            forward_ports=config.fusion_forward_ports or config.modules["fusion_issue"].ports,
+            consumer_ports=config.fusion_consumer_ports or config.modules["fusion_issue"].ports,
+            adjoint_ports=config.fusion_adjoint_ports or config.modules["fusion_issue"].ports,
         )
         counters = {name: CounterBlock() for name in config.modules}
         self.modules = {
@@ -192,6 +194,16 @@ class CycleEngine:
         bits = self.policy.removeprefix("variant:")
         return bits[0] == "1" or bits[2] == "1", bits[3] == "1"
 
+    def _fusion_port_limit(self, kind: PrimitiveKind) -> tuple[str, int]:
+        timing_ports = self.config.modules["fusion_issue"].ports
+        if kind is PrimitiveKind.FORWARD:
+            return "forward", self.config.fusion_forward_ports or timing_ports
+        if kind is PrimitiveKind.CONSUMER:
+            return "consumer", self.config.fusion_consumer_ports or timing_ports
+        if kind is PrimitiveKind.ADJOINT:
+            return "adjoint", self.config.fusion_adjoint_ports or timing_ports
+        raise CycleConfigurationError(f"invalid fusion task kind: {kind.name}")
+
     def _residency_states(self) -> dict[int, SemanticCacheState]:
         if self.config.cache_instances is None:
             raise CycleConfigurationError(
@@ -240,6 +252,7 @@ class CycleEngine:
         remaining_events = len(trace.events)
         in_flight: list[tuple[int, int, int, str]] = []
         module_busy_until = {name: 0 for name in self.modules}
+        fusion_busy_until = {name: 0 for name in ("forward", "consumer", "adjoint")}
         module_inflight = {name: 0 for name in self.modules}
         relation_seed_inflight = 0
         bank_busy: dict[tuple[str, int, int], int] = {}
@@ -249,7 +262,10 @@ class CycleEngine:
             if residency_enabled and self.config.cache_instances is not None
             else {}
         )
+        async_memory = callable(getattr(self.config.memory, "submit_async", None))
         cache_fill_done: dict[tuple[int, tuple[int, int]], int] = {}
+        cache_fill_request: dict[tuple[int, tuple[int, int]], int] = {}
+        memory_waiters: dict[int, list[tuple[int, int, str, int]]] = {}
         cache_event_state: dict[int, tuple[SemanticCacheState, tuple[int, int], CacheLookup]] = {}
         cache_keys_by_query: dict[int, list[tuple[SemanticCacheState, tuple[int, int]]]] = {}
         closed_queries: set[int] = set()
@@ -261,6 +277,24 @@ class CycleEngine:
         )
         while remaining_events or in_flight:
             progressed = False
+            if async_memory:
+                self.config.memory.advance(cycle)  # type: ignore[attr-defined]
+                for memory_record in self.config.memory.pop_completions():  # type: ignore[attr-defined]
+                    waiters = memory_waiters.pop(memory_record.request_id, None)
+                    if not waiters or memory_record.completion_cycle is None:
+                        raise CycleConfigurationError(
+                            "Ramulator completion has no pending cycle event"
+                        )
+                    for event_id, stage, module_name, service_finish in waiters:
+                        completion = max(service_finish, memory_record.completion_cycle)
+                        if memory_record.completion_cycle > service_finish:
+                            self.modules[module_name].counters.memory_wait_cycles += (
+                                memory_record.completion_cycle - service_finish
+                            )
+                        heapq.heappush(
+                            in_flight, (completion, event_id, stage, module_name)
+                        )
+                    progressed = True
             while in_flight and in_flight[0][0] <= cycle:
                 finish, event_id, stage, module_name = heapq.heappop(in_flight)
                 self.modules[module_name].complete(event_id, finish)
@@ -313,6 +347,7 @@ class CycleEngine:
                     break
                 candidates.append(heapq.heappop(ready))
             fusion_issued = 0
+            fusion_port_issued: dict[str, int] = {}
             issued_modules: dict[str, int] = {}
             ordered_ids = self._ordered_candidates(trace, [item[0] for item in candidates])
             ordered = [(event_id, dict(candidates)[event_id]) for event_id in ordered_ids]
@@ -331,12 +366,25 @@ class CycleEngine:
                         continue
                 if not module.accepts_kind(kind):
                     raise CycleConfigurationError(f"{module_name} does not accept {kind.name}")
-                if issued_modules.get(module_name, 0) >= timing.ports:
+                fusion_port_name: str | None = None
+                if module_name == "fusion_issue" and stage == 0:
+                    fusion_port_name, fusion_port_limit = self._fusion_port_limit(kind)
+                    if fusion_port_issued.get(fusion_port_name, 0) >= fusion_port_limit:
+                        module.counters.port_stalls += 1
+                        self._record_stall(cycle, module_name, "port", event_id)
+                        heapq.heappush(ready, (event_id, stage))
+                        continue
+                elif issued_modules.get(module_name, 0) >= timing.ports:
                     module.counters.port_stalls += 1
                     self._record_stall(cycle, module_name, "port", event_id)
                     heapq.heappush(ready, (event_id, stage))
                     continue
-                if module_busy_until[module_name] > cycle:
+                busy_until = (
+                    fusion_busy_until[fusion_port_name]
+                    if fusion_port_name is not None
+                    else module_busy_until[module_name]
+                )
+                if busy_until > cycle:
                     module.counters.queue_stalls += 1
                     self._record_stall(cycle, module_name, "initiation_interval", event_id)
                     heapq.heappush(ready, (event_id, stage))
@@ -359,6 +407,7 @@ class CycleEngine:
                     heapq.heappush(ready, (event_id, stage))
                     continue
                 if kind is PrimitiveKind.CACHE_REQUEST and stage == 0:
+                    completion: int | None
                     data_bytes = int(row["data_bytes"])
                     if data_bytes <= 0:
                         raise CycleConfigurationError(
@@ -383,38 +432,76 @@ class CycleEngine:
                             completion = cycle + module.service_cycles()
                         else:
                             if lookup is CacheLookup.MISS:
-                                memory_done = self.config.memory.submit(
-                                    address=int(row["address_token"]),
-                                    size_bytes=data_bytes,
-                                    is_write=False,
-                                    arrival_cycle=cycle,
-                                )
                                 memory_requests += 1
-                                cache_fill_done[(instance, key)] = memory_done
+                                if async_memory:
+                                    request_id = self.config.memory.submit_async(  # type: ignore[attr-defined]
+                                        address=int(row["address_token"]),
+                                        size_bytes=data_bytes,
+                                        is_write=False,
+                                        arrival_cycle=cycle,
+                                    )
+                                    cache_fill_request[(instance, key)] = request_id
+                                else:
+                                    memory_done = self.config.memory.submit(
+                                        address=int(row["address_token"]),
+                                        size_bytes=data_bytes,
+                                        is_write=False,
+                                        arrival_cycle=cycle,
+                                    )
+                                    cache_fill_done[(instance, key)] = memory_done
                             else:
-                                memory_done = cache_fill_done.get((instance, key))
-                                if memory_done is None:
+                                if async_memory:
+                                    request_id = cache_fill_request.get((instance, key), -1)
+                                else:
+                                    memory_done = cache_fill_done.get((instance, key), -1)
+                                if (async_memory and request_id < 0) or (
+                                    not async_memory and memory_done < 0
+                                ):
                                     raise CycleConfigurationError(
                                         f"merged cache request {event_id} has no fill completion"
                                     )
+                            if async_memory:
+                                memory_waiters.setdefault(request_id, []).append((
+                                    event_id, stage, module_name,
+                                    cycle + module.service_cycles(),
+                                ))
+                                completion = None
+                            else:
+                                if memory_done > cycle + timing.latency:
+                                    module.counters.memory_wait_cycles += memory_done - cycle - timing.latency
+                                completion = max(cycle + module.service_cycles(), memory_done)
+                    else:
+                        memory_requests += 1
+                        if async_memory:
+                            request_id = self.config.memory.submit_async(  # type: ignore[attr-defined]
+                                address=int(row["address_token"]),
+                                size_bytes=data_bytes,
+                                is_write=False,
+                                arrival_cycle=cycle,
+                            )
+                            memory_waiters[request_id] = [(
+                                event_id, stage, module_name,
+                                cycle + module.service_cycles(),
+                            )]
+                            completion = None
+                        else:
+                            memory_done = self.config.memory.submit(
+                                address=int(row["address_token"]),
+                                size_bytes=data_bytes,
+                                is_write=False,
+                                arrival_cycle=cycle,
+                            )
                             if memory_done > cycle + timing.latency:
                                 module.counters.memory_wait_cycles += memory_done - cycle - timing.latency
                             completion = max(cycle + module.service_cycles(), memory_done)
-                    else:
-                        memory_done = self.config.memory.submit(
-                            address=int(row["address_token"]),
-                            size_bytes=data_bytes,
-                            is_write=False,
-                            arrival_cycle=cycle,
-                        )
-                        memory_requests += 1
-                        if memory_done > cycle + timing.latency:
-                            module.counters.memory_wait_cycles += memory_done - cycle - timing.latency
-                        completion = max(cycle + module.service_cycles(), memory_done)
                 else:
                     completion = cycle + module.service_cycles()
-                heapq.heappush(in_flight, (completion, event_id, stage, module_name))
-                module_busy_until[module_name] = cycle + timing.initiation_interval
+                if completion is not None:
+                    heapq.heappush(in_flight, (completion, event_id, stage, module_name))
+                if fusion_port_name is not None:
+                    fusion_busy_until[fusion_port_name] = cycle + timing.initiation_interval
+                else:
+                    module_busy_until[module_name] = cycle + timing.initiation_interval
                 bank_busy[bank_key] = cycle
                 module_inflight[module_name] += 1
                 if kind is PrimitiveKind.RELATION_CANDIDATE:
@@ -424,11 +511,22 @@ class CycleEngine:
                 issued_modules[module_name] = issued_modules.get(module_name, 0) + 1
                 if module_name == "fusion_issue" and stage == 0:
                     fusion_issued += 1
+                    assert fusion_port_name is not None
+                    fusion_port_issued[fusion_port_name] = (
+                        fusion_port_issued.get(fusion_port_name, 0) + 1
+                    )
                 progressed = True
             if not progressed:
+                memory_wakeup = (
+                    self.config.memory.next_wakeup()  # type: ignore[attr-defined]
+                    if async_memory else None
+                )
                 next_points = [point for point in (in_flight[0][0] if in_flight else None,
                                                    min((module_busy_until[name] for name in self.modules
-                                                        if module_busy_until[name] > cycle), default=None))
+                                                        if module_busy_until[name] > cycle), default=None),
+                                                   min((point for point in fusion_busy_until.values()
+                                                        if point > cycle), default=None),
+                                                   memory_wakeup)
                                if point is not None and point > cycle]
                 if not next_points:
                     blocked = tuple(event_id for event_id, _ in ready[:8])
@@ -444,6 +542,8 @@ class CycleEngine:
                     cache_totals[key] += value
             module_counters["semantic_cache"].update(cache_totals)
         module_counters["semantic_cache"]["memory_requests"] = memory_requests
+        audit_records = getattr(self.config.memory, "audit_records", None)
+        memory_request_records = tuple(audit_records()) if callable(audit_records) else ()
         return CycleResult(
             total_cycles=max(completed.values(), default=0),
             module_counters=module_counters,
@@ -453,4 +553,5 @@ class CycleEngine:
                           for kind in PrimitiveKind},
             policy=self.policy,
             oracle_status=("heuristic_unproven" if self.policy.endswith("_oracle") else "not_applicable"),
+            memory_requests=memory_request_records,
         )

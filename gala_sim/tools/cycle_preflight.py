@@ -54,11 +54,33 @@ def run_cycle_preflight(
     if pending:
         missing.append("configuration_parameters")
 
-    binding_ready = (
-        isinstance(memory_backend, Ramulator2Backend)
-        and callable(getattr(memory_backend.binding, "submit", None))
+    required_binding_methods = (
+        "metadata", "try_issue", "tick", "drain_completions", "clone",
     )
+    binding_ready = isinstance(memory_backend, Ramulator2Backend) and all(
+        callable(getattr(memory_backend.binding, name, None))
+        for name in required_binding_methods
+    )
+    binding_metadata: dict[str, Any] | None = None
+    if binding_ready:
+        try:
+            binding_metadata = dict(memory_backend.metadata())
+            implementation = str(binding_metadata["implementation"])
+            version = str(binding_metadata["version"])
+            config_sha256 = str(binding_metadata["config_sha256"])
+            channels = int(binding_metadata["channels"])
+            transaction_bytes = int(binding_metadata["transaction_bytes"])
+            if implementation != "Ramulator 2" or not version or len(config_sha256) != 64:
+                raise ValueError("Ramulator metadata identity is incomplete")
+            if channels != int(config.value("memory.channels")):
+                raise ValueError("Ramulator channel count disagrees with configuration")
+            if transaction_bytes != int(config.value("cache.sector_bytes")):
+                raise ValueError("Ramulator transaction size disagrees with configuration")
+        except (KeyError, TypeError, ValueError, RuntimeError):
+            binding_ready = False
     checks["ramulator2_binding"] = binding_ready
+    if binding_metadata is not None:
+        checks["ramulator2_metadata"] = binding_metadata
     if not binding_ready:
         missing.append("ramulator2_binding")
 

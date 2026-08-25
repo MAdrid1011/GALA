@@ -12,9 +12,9 @@ from gala_sim.ablation import run_matrix
 from gala_sim.config import load_config, pending_parameters
 from gala_sim.results import AblationRow, write_ablation_csv
 from gala_sim.results.run import RunOutputWriter
-from gala_sim.timing import CycleConfig, CycleEngine, ModuleTiming
-from gala_sim.timing.memory import Ramulator2Backend, RecordedMemoryBackend
-from gala_sim.timing.resources import ResourceEnvelope, ResourceUsage
+from gala_sim.timing import CycleConfig, CycleEngine
+from gala_sim.timing.memory import Ramulator2Backend
+from gala_sim.timing.resources import ResourceUsage
 from gala_sim.tools.cycle_preflight import run_cycle_preflight, write_cycle_preflight
 from gala_sim.trace import TraceReader, validate_trace
 
@@ -28,27 +28,25 @@ def _parser() -> argparse.ArgumentParser:
     preflight.add_argument("--config", type=Path, required=True)
     preflight.add_argument("--output", type=Path, required=True)
     preflight.add_argument("--ramulator-binding", default=None,
-                           help="Python object spec module:attribute exposing submit()")
+                           help="Python object spec module:attribute exposing the async binding API")
     preflight.add_argument("--resource-usage", type=Path, default=None,
                            help="JSON ResourceUsage snapshot")
     trace = commands.add_parser("trace-validate")
     trace.add_argument("--trace", type=Path, required=True)
     replay = commands.add_parser("cycle-replay")
     replay.add_argument("--trace", type=Path, required=True)
-    replay.add_argument("--timing", type=Path, required=True)
     replay.add_argument("--config", type=Path, required=True)
     replay.add_argument("--ramulator-binding", default=None,
-                        help="Python object spec module:attribute exposing submit()")
+                        help="Python object spec module:attribute exposing the async binding API")
     replay.add_argument("--resource-usage", type=Path, required=True,
                         help="JSON ResourceUsage snapshot")
     replay.add_argument("--policy", default="base")
     replay.add_argument("--output", type=Path, required=True)
     ablation = commands.add_parser("ablation")
     ablation.add_argument("--trace", type=Path, required=True)
-    ablation.add_argument("--timing", type=Path, required=True)
     ablation.add_argument("--config", type=Path, required=True)
     ablation.add_argument("--ramulator-binding", default=None,
-                          help="Python object spec module:attribute exposing submit()")
+                          help="Python object spec module:attribute exposing the async binding API")
     ablation.add_argument("--resource-usage", type=Path, required=True,
                           help="JSON ResourceUsage snapshot")
     ablation.add_argument("--output", type=Path, required=True)
@@ -65,8 +63,10 @@ def _load_binding(spec: str | None) -> Ramulator2Backend | None:
     binding = getattr(module, attribute)
     if isinstance(binding, type):
         binding = binding()
-    if not callable(getattr(binding, "submit", None)):
-        raise ValueError("Ramulator binding object lacks submit()")
+    required = ("metadata", "try_issue", "tick", "drain_completions", "clone")
+    missing = [name for name in required if not callable(getattr(binding, name, None))]
+    if missing:
+        raise ValueError("Ramulator binding object lacks: " + ", ".join(missing))
     return Ramulator2Backend(binding)
 
 
@@ -84,29 +84,6 @@ def _load_resource_usage(path: Path | None) -> ResourceUsage | None:
         transcendental_lanes=int(document["transcendental_lanes"]),
         external_channels=int(document["external_channels"]),
         regions={str(key): int(value) for key, value in document["regions"].items()},
-    )
-
-
-def _load_timing(path: Path, memory_backend=None, *, resource_envelope=None,
-                 resource_usage=None) -> CycleConfig:
-    document = json.loads(path.read_text(encoding="utf-8"))
-    modules = {
-        name: ModuleTiming(**values)
-        for name, values in document["modules"].items()
-    }
-    completions = {
-        (int(item["address"]), int(item["size_bytes"]), bool(item["is_write"]), int(item["arrival_cycle"])):
-        int(item["completion_cycle"])
-        for item in document["memory_completions"]
-    }
-    return CycleConfig(
-        modules=modules,
-        memory=memory_backend or RecordedMemoryBackend(completions),
-        clock_frequency_hz=int(document["clock_frequency_hz"]),
-        relation_seed_fifo_entries=int(document["relation_seed_fifo_entries"]),
-        candidate_lanes=int(document["candidate_lanes"]),
-        resource_envelope=resource_envelope,
-        resource_usage=resource_usage,
     )
 
 
@@ -147,11 +124,9 @@ def main(argv: list[str] | None = None) -> int:
             write_cycle_preflight(preflight, args.output)
             print(json.dumps(preflight.as_dict(), sort_keys=True))
             return 2
-        config = _load_timing(
-            args.timing, memory_backend=binding,
-            resource_envelope=ResourceEnvelope.from_gala(gala_config),
-            resource_usage=usage,
-        )
+        if binding is None:
+            raise ValueError("formal cycle run requires a Ramulator 2 binding")
+        config = CycleConfig.from_gala(gala_config, binding, resource_usage=usage)
         if args.command == "cycle-replay":
             result = CycleEngine(config, policy=args.policy).run(trace)
             writer = RunOutputWriter(args.output)

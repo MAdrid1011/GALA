@@ -31,6 +31,7 @@ class RunOutputWriter:
         }, self.root / "cycles.json")
         write_json({"event_counts": result.event_counts}, self.root / "events.json")
         self._write_stalls(result)
+        self._write_memory_requests(result)
 
     def write_quality(self, quality: dict[str, Any]) -> None:
         write_json(quality, self.root / "quality.json")
@@ -64,3 +65,30 @@ class RunOutputWriter:
             ("event_ids", pa.list_(pa.int64())), ("count", pa.int64()),
         ]))
         pq.write_table(table, self.root / "stalls.parquet")
+
+    def _write_memory_requests(self, result: CycleResult) -> None:
+        rows = [
+            {
+                "request_id": item.request_id,
+                "address": item.address,
+                "size_bytes": item.size_bytes,
+                "is_write": item.is_write,
+                "arrival_cycle": item.arrival_cycle,
+                "completion_cycle": item.completion_cycle,
+            }
+            for item in result.memory_requests
+        ]
+        try:
+            import pyarrow as pa
+            import pyarrow.parquet as pq
+        except ImportError as error:
+            raise RuntimeError("pyarrow is required to write memory_requests.parquet") from error
+        table = pa.Table.from_pylist(rows, schema=pa.schema([
+            ("request_id", pa.int64()),
+            ("address", pa.uint64()),
+            ("size_bytes", pa.int64()),
+            ("is_write", pa.bool_()),
+            ("arrival_cycle", pa.int64()),
+            ("completion_cycle", pa.int64()),
+        ]))
+        pq.write_table(table, self.root / "memory_requests.parquet")

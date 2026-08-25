@@ -30,4 +30,5 @@ def test_run_output_writer_emits_machine_readable_cycle_files(tmp_path: Path) ->
     writer.write_status("passed")
     assert (tmp_path / "run" / "cycles.json").is_file()
     assert (tmp_path / "run" / "stalls.parquet").is_file()
+    assert (tmp_path / "run" / "memory_requests.parquet").is_file()
     assert (tmp_path / "run" / "status.json").is_file()

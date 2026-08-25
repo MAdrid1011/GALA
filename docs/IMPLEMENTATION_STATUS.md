@@ -10,7 +10,9 @@
 - 配置加载器检查参数元数据、状态、值域和不可变快照；`config-check` 现在输出逐项 pending 参数并以非零状态阻止未冻结配置。
 - `cycle-preflight` 已生成 `preflight.json` 与 `status.json`，逐项检查配置冻结、Ramulator 2 binding 和资源使用快照；失败状态使用工作流规定的 `failed_preflight`。
 - `CycleConfig` 在提供资源使用快照时由注册配置推导顶层资源包络并强制校验 SRAM、Pod、计算通路和片外通道闭合。
-- CLAMP 事件 schema、批量 NumPy trace 存储、依赖/版本/释放校验和模块拆分的离散事件周期内核已通过 40 项单元测试。
+- Ramulator 2 桥接边界已改为异步 `try_issue/tick/drain_completions`：周期内核与内存模型共同推进，支持并发到达、前端反压、64 B transaction 拆分和返回唤醒；每个逻辑请求写入 `memory_requests.parquet` 供逐请求核对。
+- 融合发射前向、消费者和伴随三类端口已使用注册配置中的独立端口数与独立 II 状态，不再由单个聚合端口互相错误阻塞。
+- CLAMP 事件 schema、批量 NumPy trace 存储、依赖/版本/释放校验和模块拆分的离散事件周期内核已通过 47 项单元测试。
 - 资源包络、长任务 GPU 利用率门和十六项消融矩阵的结构检查已通过单元测试。
 - `49bf36d` 为十六项变体使用显式 `variant:<bits>` 策略，并在周期内核中落实模块在途容量和关系种子 FIFO 反压。
 - `cde1a93` 为每个消融变体隔离记录内存完成表的消费游标，避免同一外部 Ramulator 记录被首个变体消耗。
@@ -24,7 +26,7 @@
 
 ## 当前入口
 
-首个组合仍停在正式 Base ASIC 之前。`configs/architecture/gala.yaml` 中的 `relation.seed_fifo_entries`、各模块时序、trace chunk 容量和 Ramulator 2 逐请求绑定尚未由权威设计或模块微基准冻结；当前周期 smoke 使用显式实验 timing，只能验证内核行为，正式运行必须拒绝并标记 `failed_preflight`。
+首个组合仍停在正式 Base ASIC 之前。`configs/architecture/gala.yaml` 中的 `relation.seed_fifo_entries`、各模块时序和 trace chunk 容量尚未由权威设计或模块微基准冻结；Ramulator 2 异步协议已建立，但本仓库尚无满足该协议且带版本、配置哈希、通道数与 transaction 大小元数据的原生 binding。当前周期 smoke 使用显式实验 timing，只能验证内核行为，正式运行必须拒绝并标记 `failed_preflight`。
 
 R²-Gaussian 的官方 CUDA 扩展仍没有导出完整 CLAMP 关系、消费者、伴随和更新事件缓冲区；当前旁路只读官方返回的 CUDA work buffer，并在官方 Python 调用边界映射这些事件。该旁路尚未证明长程增密 ID 稳定性、所有真实队列操作和正式 30k 训练的流式最终存储，因此不能视为正式 trace 闭环。
 

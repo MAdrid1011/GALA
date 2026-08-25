@@ -44,6 +44,7 @@ speedup_vs_orin = orin_normalized_seconds * clock_hz / cycles_variant
 | `manifest.json` | 代码、模型、数据、配置、设备与环境哈希 |
 | `cycles.json` | 端到端周期与模块周期分解 |
 | `stalls.parquet` | 阻塞原因与周期区间 |
+| `memory_requests.parquet` | 每个片外请求的地址、读写、字节数、到达周期和 Ramulator 2 返回周期 |
 | `events.json` | 事件计数、缓存和发射统计 |
 | `quality.json` | CUDA 参考和功能重放的 PSNR、SSIM、LPIPS |
 | `gpu_reference.json` | 本地 GPU 时间、校准项和 Orin 换算 |

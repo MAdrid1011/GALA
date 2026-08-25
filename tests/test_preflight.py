@@ -40,8 +40,32 @@ def test_preflight_rejects_invalid_prediction() -> None:
 
 
 class _RamulatorBinding:
-    def submit(self, address: int, size_bytes: int, is_write: bool, arrival_cycle: int) -> int:
-        return arrival_cycle
+    def __init__(self) -> None:
+        self.pending: list[int] = []
+        self.completed: list[int] = []
+
+    def metadata(self) -> dict[str, object]:
+        return {
+            "implementation": "Ramulator 2", "version": "2.1.0",
+            "config_sha256": "b" * 64,
+            "channels": 8, "transaction_bytes": 64,
+        }
+
+    def try_issue(self, address: int, is_write: bool, request_id: int) -> bool:
+        self.pending.append(request_id)
+        return True
+
+    def tick(self) -> None:
+        self.completed.extend(self.pending)
+        self.pending.clear()
+
+    def drain_completions(self) -> tuple[int, ...]:
+        result = tuple(self.completed)
+        self.completed.clear()
+        return result
+
+    def clone(self) -> "_RamulatorBinding":
+        return type(self)()
 
 
 def _ready_config() -> GalaConfig:
@@ -60,6 +84,7 @@ def _ready_config() -> GalaConfig:
             "transcendental_lanes_per_cluster": metadata(2, "lane"),
         },
         "memory": {"channels": metadata(8, "channel")},
+        "cache": {"sector_bytes": metadata(64, "byte")},
     }
     return GalaConfig(Path("fixture.yaml"), parameters, "a" * 64, True)
 

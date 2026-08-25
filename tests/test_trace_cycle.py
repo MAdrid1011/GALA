@@ -8,7 +8,7 @@ import pytest
 from gala_sim.clamp import ChunkedTraceBuilder, PrimitiveKind, ResourceClass, TraceBuilder, TraceEvent
 from gala_sim.ablation import run_matrix
 from gala_sim.timing import CycleConfig, CycleEngine, ModuleTiming
-from gala_sim.timing.memory import RecordedMemoryBackend
+from gala_sim.timing.memory import Ramulator2Backend, RecordedMemoryBackend
 from gala_sim.config import load_config
 from gala_sim.trace import NumpyChunkSink, TraceReader, TraceWriter, TraceValidationError, validate_trace
 from gala_sim.adapters.r2_gaussian import _push_trace_chunks
@@ -150,6 +150,60 @@ def test_cache_transfer_requires_memory_size_and_pairing() -> None:
     assert result.module_counters["semantic_cache"]["memory_wait_cycles"] >= 0
 
 
+class _RamulatorBinding:
+    def __init__(self) -> None:
+        self.pending: list[int] = []
+        self.completed: list[int] = []
+
+    def metadata(self) -> dict[str, object]:
+        return {
+            "implementation": "Ramulator 2", "version": "2.1.0",
+            "config_sha256": "c" * 64,
+            "channels": 8, "transaction_bytes": 64,
+        }
+
+    def try_issue(self, address: int, is_write: bool, request_id: int) -> bool:
+        self.pending.append(request_id)
+        return True
+
+    def tick(self) -> None:
+        self.completed.extend(self.pending)
+        self.pending.clear()
+
+    def drain_completions(self) -> tuple[int, ...]:
+        result = tuple(self.completed)
+        self.completed.clear()
+        return result
+
+    def clone(self) -> "_RamulatorBinding":
+        return type(self)()
+
+
+def test_cycle_engine_wakes_cache_event_from_async_ramulator_completion() -> None:
+    builder = TraceBuilder()
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_REQUEST), query_id=0,
+        gaussian_id=0, state_version=0, address_token=128, data_bytes=128,
+        resource_class=int(ResourceClass.CACHE),
+    ))
+    trace = builder.finish()
+    timing = ModuleTiming(latency=1, initiation_interval=1, queue_capacity=2, ports=1, banks=2)
+    memory = Ramulator2Backend(_RamulatorBinding())
+    config = CycleConfig(
+        modules={name: timing for name in (
+            "relation_constructor", "fusion_issue", "semantic_cache", "compute_pod",
+            "bidirectional_query", "reconstruction_update", "shared_sram",
+        )},
+        memory=memory, clock_frequency_hz=500_000_000,
+        relation_seed_fifo_entries=2, candidate_lanes=3,
+    )
+    result = CycleEngine(config).run(trace)
+    assert result.total_cycles == 2
+    assert result.module_counters["semantic_cache"]["memory_requests"] == 1
+    assert memory.audit_records()[0].completion_cycle == 1
+    assert result.memory_requests == memory.audit_records()
+
+
 def test_semantic_residency_variant_merges_repeated_state_reads() -> None:
     builder = TraceBuilder()
     first_request = builder.emit(TraceEvent(
@@ -219,6 +273,66 @@ def test_cycle_engine_applies_module_queue_and_seed_fifo_backpressure() -> None:
     reasons = {stall.reason for stall in result.stalls}
     assert "queue_capacity" in reasons or "seed_fifo" in reasons
     assert result.module_counters["relation_constructor"]["completed"] == 2
+
+
+def _fusion_port_trace():
+    builder = TraceBuilder()
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.FORWARD), query_id=0,
+        gaussian_id=0, relation_id=0, reduction_key=0, address_token=0,
+        state_version=0, resource_class=int(ResourceClass.ISSUE),
+    ))
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CONSUMER), query_id=1,
+        gaussian_id=1, relation_id=1, reduction_key=1, address_token=1,
+        state_version=0, resource_class=int(ResourceClass.ISSUE),
+    ))
+    return builder.finish()
+
+
+def test_fusion_issue_uses_independent_forward_consumer_and_adjoint_ports() -> None:
+    timing = ModuleTiming(latency=1, initiation_interval=1, queue_capacity=8, ports=1, banks=4)
+    modules = {name: timing for name in (
+        "relation_constructor", "fusion_issue", "semantic_cache", "compute_pod",
+        "bidirectional_query", "reconstruction_update", "shared_sram",
+    )}
+    independent_port_config = CycleConfig(
+        modules=modules, memory=_Memory(), clock_frequency_hz=500_000_000,
+        relation_seed_fifo_entries=8, candidate_lanes=3,
+        fusion_forward_ports=1, fusion_consumer_ports=1, fusion_adjoint_ports=1,
+    )
+    independent = CycleEngine(independent_port_config).run(_fusion_port_trace())
+    independent_fusion_stalls = [
+        stall for stall in independent.stalls
+        if stall.module == "fusion_issue" and stall.reason == "port"
+    ]
+    assert not independent_fusion_stalls
+
+
+def test_fusion_issue_applies_each_task_class_port_limit() -> None:
+    builder = TraceBuilder()
+    for event_id in range(2):
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.FORWARD), query_id=event_id,
+            gaussian_id=event_id, relation_id=event_id, reduction_key=event_id,
+            address_token=event_id, state_version=0,
+            resource_class=int(ResourceClass.ISSUE),
+        ))
+    timing = ModuleTiming(latency=1, initiation_interval=1, queue_capacity=8, ports=3, banks=4)
+    config = CycleConfig(
+        modules={name: timing for name in (
+            "relation_constructor", "fusion_issue", "semantic_cache", "compute_pod",
+            "bidirectional_query", "reconstruction_update", "shared_sram",
+        )},
+        memory=_Memory(), clock_frequency_hz=500_000_000,
+        relation_seed_fifo_entries=8, candidate_lanes=3,
+        fusion_forward_ports=1, fusion_consumer_ports=1, fusion_adjoint_ports=1,
+    )
+    result = CycleEngine(config).run(builder.finish())
+    assert any(
+        stall.module == "fusion_issue" and stall.reason == "port"
+        for stall in result.stalls
+    )
 
 
 def test_event_driven_engine_replays_large_dependency_chain() -> None:
