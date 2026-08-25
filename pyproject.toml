@@ -1,0 +1,10 @@
+[project]
+name = "gala-simulator"
+version = "0.1.0"
+description = "Auditable GALA architecture simulator"
+requires-python = ">=3.10"
+dependencies = ["PyYAML>=6.0"]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]

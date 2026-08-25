@@ -1,0 +1,232 @@
+schema_version: gala-config-v1
+parameters:
+  clock:
+    frequency:
+      value: 500000000
+      unit: Hz
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: global
+      status: frozen
+  top:
+    num_pods:
+      value: 4
+      unit: count
+      source: docs/03_HARDWARE_CONTRACT.md:resource-envelope
+      scope: hardware
+      status: frozen
+    shared_sram_bytes:
+      value: 2883584
+      unit: byte
+      source: docs/03_HARDWARE_CONTRACT.md:resource-envelope
+      scope: hardware
+      status: frozen
+  relation:
+    seed_fifo_entries:
+      value: null
+      unit: entry
+      source: module-microbenchmark-pending
+      scope: hardware
+      status: design_parameter_pending_freeze
+      allowed_range: [0.5, 2.0]
+  issue:
+    query_state_entries:
+      value: 2048
+      unit: entry
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+      allowed_range: [1024, 4096]
+    candidate_lanes:
+      value: 3
+      unit: lane
+      source: docs/03_HARDWARE_CONTRACT.md:fusion-issue
+      scope: hardware
+      status: frozen
+    forward_ports:
+      value: 1
+      unit: port
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    consumer_ports:
+      value: 1
+      unit: port
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    adjoint_ports:
+      value: 1
+      unit: port
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+  cache:
+    instances:
+      value: 4
+      unit: cache
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    directory_banks_per_instance:
+      value: 4
+      unit: bank
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    directory_entries_per_bank:
+      value: 256
+      unit: entry
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    active_records_per_instance:
+      value: 1024
+      unit: record
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+      allowed_range: [512, 2048]
+    active_record_bytes:
+      value: 128
+      unit: byte
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    active_sram_bytes_per_instance:
+      value: 131072
+      unit: byte
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    miss_merge_entries_per_instance:
+      value: 32
+      unit: entry
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+      allowed_range: [16, 64]
+    multicast_destinations:
+      value: 4
+      unit: destination
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    sector_bytes:
+      value: 64
+      unit: byte
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+  compute:
+    clusters_per_pod:
+      value: 5
+      unit: cluster
+      source: docs/03_HARDWARE_CONTRACT.md:resource-envelope
+      scope: hardware
+      status: frozen
+    fma_lanes_per_cluster:
+      value: 16
+      unit: lane
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    fma_groups_per_cluster:
+      value: 4
+      unit: group
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    fma_lanes_per_group:
+      value: 4
+      unit: lane
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    transcendental_lanes_per_cluster:
+      value: 2
+      unit: lane
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    reduction_inputs_per_cluster:
+      value: 16
+      unit: input
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    microcontexts_per_cluster:
+      value: 4
+      unit: context
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    microcontext_bytes_per_cluster:
+      value: 6656
+      unit: byte
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+  query:
+    reduction_banks:
+      value: 64
+      unit: bank
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    partial_sum_groups_per_bank:
+      value: 4
+      unit: group
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    loss_fma_lanes:
+      value: 32
+      unit: lane
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    adjoint_replay_lanes:
+      value: 8
+      unit: lane
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    relation_window_entries:
+      value: 256
+      unit: entry
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+      allowed_range: [128, 512]
+  update:
+    inflight_contexts:
+      value: 20
+      unit: context
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+  memory:
+    channels:
+      value: 8
+      unit: channel
+      source: docs/03_HARDWARE_CONTRACT.md:memory-interface
+      scope: hardware
+      status: frozen
+    channel_width_bits:
+      value: 32
+      unit: bit
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    data_rate:
+      value: 6400
+      unit: MT/s
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    peak_bandwidth_bytes_per_second:
+      value: 204800000000
+      unit: byte/s
+      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen

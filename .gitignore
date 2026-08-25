@@ -8,7 +8,7 @@ __pycache__/
 build/
 dist/
 data/
-datasets/
+/datasets/
 checkpoints/
 traces/
 results/

@@ -1,0 +1,10 @@
+schema_version: gala-model-source-v1
+name: R2-Gaussian
+repository: https://github.com/Ruyi-Zha/r2_gaussian.git
+commit: f2579bfddd9aac009cb797c8503bef8119bbd022
+evidence_level: A
+license: research-only-inherited-from-upstream
+official_commands:
+  environment: environment.yml
+  train: python train.py -s <chest-data-root>
+  evaluate: python test.py -m <model-output>
