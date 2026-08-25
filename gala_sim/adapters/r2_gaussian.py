@@ -24,7 +24,26 @@ class TraceCaptureUnavailable(RuntimeError):
     """Raised until the locked CUDA extension exposes its real event buffers."""
 
 
-def _bind_trace_identity(trace: Trace, run: PreparedRun, model_commit: str) -> Trace:
+def _repository_commit(root: Path) -> str:
+    try:
+        commit = subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            text=True,
+            stderr=subprocess.STDOUT,
+        ).strip()
+    except (OSError, subprocess.CalledProcessError) as error:
+        raise TraceCaptureUnavailable("GALA repository commit is unavailable") from error
+    if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
+        raise TraceCaptureUnavailable("GALA repository commit identity is invalid")
+    return commit
+
+
+def _bind_trace_identity(
+    trace: Trace,
+    run: PreparedRun,
+    model_commit: str,
+    repository_commit: str,
+) -> Trace:
     """Attach the frozen run identity before a trace reaches cycle replay."""
 
     return Trace(
@@ -38,6 +57,7 @@ def _bind_trace_identity(trace: Trace, run: PreparedRun, model_commit: str) -> T
             "model": run.model_name,
             "dataset": run.dataset_name,
             "dataset_manifest_sha256": sha256_tree(run.dataset_root),
+            "repository_commit": repository_commit,
         },
     )
 
@@ -101,6 +121,7 @@ class R2GaussianChestAdapter:
     def capture_trace(self, run: PreparedRun, sink: DeviceTraceSink) -> TraceArtifact:
         trace_root = self.output_root / "trace"
         repository_root = Path(__file__).resolve().parents[2]
+        repository_commit = _repository_commit(repository_root)
         command = (
             run.official_command[0], "-m", "gala_sim.adapters.trace_runner",
             "--trace-output", str(trace_root), str(run.source_root / "train.py"),
@@ -126,7 +147,7 @@ class R2GaussianChestAdapter:
             trace = TraceReader().read(trace_root, mmap_mode="r")
         except (OSError, ValueError, RuntimeError) as error:
             raise TraceCaptureUnavailable(f"captured trace failed validation: {error}") from error
-        trace = _bind_trace_identity(trace, run, self.model_commit)
+        trace = _bind_trace_identity(trace, run, self.model_commit, repository_commit)
         TraceWriter().write(trace, trace_root, validate=True)
         try:
             _push_trace_chunks(trace, sink)

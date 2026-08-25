@@ -56,10 +56,11 @@ def test_trace_identity_is_bound_before_cycle_handoff(tmp_path: Path) -> None:
         source, run_dataset, tmp_path / "output", "b" * 40, Path("/usr/bin/python3"),
     )
     run = adapter.prepare(None, load_config(Path(__file__).parents[1] / "configs/architecture/gala.yaml"))
-    bound = _bind_trace_identity(trace, run, adapter.model_commit)
+    bound = _bind_trace_identity(trace, run, adapter.model_commit, "c" * 40)
     root = tmp_path / "trace"
     TraceWriter().write(bound, root)
     metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
     assert metadata["config_sha256"] == run.config_sha256
     assert metadata["model_commit"] == "b" * 40
     assert metadata["dataset_manifest_sha256"] == sha256_tree(run_dataset)
+    assert metadata["repository_commit"] == "c" * 40
