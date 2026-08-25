@@ -6,8 +6,10 @@ from pathlib import Path
 import numpy as np
 
 from gala_sim.adapters import load_chest_manifest
-from gala_sim.adapters.r2_gaussian import R2GaussianChestAdapter
+from gala_sim.adapters.r2_gaussian import R2GaussianChestAdapter, _bind_trace_identity
 from gala_sim.config import load_config
+from gala_sim.clamp import PrimitiveKind, TraceBuilder, TraceEvent
+from gala_sim.trace import TraceWriter
 
 
 def test_chest_manifest_preserves_official_projection_references(tmp_path: Path) -> None:
@@ -39,3 +41,21 @@ def test_r2_adapter_preserves_frozen_python_interpreter(tmp_path: Path) -> None:
     config = load_config(Path(__file__).parents[1] / "configs/architecture/gala.yaml")
     run = adapter.prepare(None, config)
     assert run.official_command[0] == str(Path("/usr/bin/python3").resolve())
+
+
+def test_trace_identity_is_bound_before_cycle_handoff(tmp_path: Path) -> None:
+    builder = TraceBuilder()
+    builder.emit(TraceEvent(primitive_kind=int(PrimitiveKind.RELATION_CANDIDATE)))
+    trace = builder.finish(metadata={"model": "R²-Gaussian", "dataset": "Chest"})
+    source = tmp_path / "source"
+    source.mkdir()
+    adapter = R2GaussianChestAdapter(
+        source, tmp_path, tmp_path / "output", "b" * 40, Path("/usr/bin/python3"),
+    )
+    run = adapter.prepare(None, load_config(Path(__file__).parents[1] / "configs/architecture/gala.yaml"))
+    bound = _bind_trace_identity(trace, run, adapter.model_commit)
+    root = tmp_path / "trace"
+    TraceWriter().write(bound, root)
+    metadata = json.loads((root / "metadata.json").read_text(encoding="utf-8"))
+    assert metadata["config_sha256"] == run.config_sha256
+    assert metadata["model_commit"] == "b" * 40

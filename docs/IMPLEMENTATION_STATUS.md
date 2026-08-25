@@ -16,11 +16,11 @@
 - 官方 native-reference 预检已按同一冻结身份执行，记录位于 `GALA-runtime/records/r2_gaussian_chest_native_preflight/`。预检记录 SHA-256 为 `1fd57203d64883e07a5b80ffade42f324413812130929d7120792a774cd813b9`，状态为 `failed_preflight`，原因是 `gpu_busy_external`：`gpustat` 与 `nvidia-smi` 均确认外部 `gdesmond` PID `2594715` 占用目标 GPU。`calibration.launched=false`，因此没有启动任何 GALA 训练或争用 GPU；报告 self-hash 为 `b52e9f0a20d1b5436614824d84e6e18955f98acaea19de1c51f43ae9a99eeb5d`，状态文件 SHA-256 为 `a16db0232a1d799e937e76561a04569bcbdaa60b4fb5814f9124bbfa707e6f91`。
 - `native-reference` 入口已要求同一 input-freeze 与 `passed` native-preflight 才能启动官方完整命令；它写出流式 stdout/stderr、GPU 样本、TensorBoard `train/iter_time` 序列、统一质量指标、官方附加指标和运行 manifest。所有进入执行阶段的失败记录都绑定配置哈希、freeze manifest、仓库提交和官方命令复现信息；预启动复采样发现外部 compute 进程时也会写出 `failed_preflight/status.json` 并拒绝创建模型输出。当前使用 `failed_preflight` 记录的拒绝演练返回退出码 2，未创建模型输出。
 - 融合发射前向、消费者和伴随三类端口已使用注册配置中的独立端口数与独立 II 状态，不再由单个聚合端口互相错误阻塞。
-- CLAMP 事件 schema v2、批量 NumPy trace 存储、依赖/版本/释放校验和模块拆分的离散事件周期内核及步骤 2 入口已通过 89 项测试（1 项环境依赖跳过）。正式 `CycleConfig.from_gala` 会在周期执行前校验 trace 的 `config_sha256` 身份。
+- CLAMP 事件 schema v2、批量 NumPy trace 存储、依赖/版本/释放校验和模块拆分的离散事件周期内核及步骤 2 入口已通过 90 项测试（1 项环境依赖跳过）。正式 `CycleConfig.from_gala` 会在周期执行前校验 trace 的 `config_sha256` 身份。
 - 资源包络、长任务 GPU 利用率门和十六项消融矩阵的结构检查已通过单元测试。
 - `49bf36d` 为十六项变体使用显式 `variant:<bits>` 策略，并在周期内核中落实模块在途容量和关系种子 FIFO 反压。
 - `cde1a93` 为每个消融变体隔离记录内存完成表的消费游标，避免同一外部 Ramulator 记录被首个变体消耗。
-- 真实 CUDA trace 旁路已接入官方 `R²-Gaussian` rasterizer/voxelizer：只在官方查询边界处于 grad-enabled 的训练路径捕获，排除 `no_grad` 质量评估、保存和报告调用；Chunked sink 传输和依赖偏移重建已通过单元测试。
+- 真实 CUDA trace 旁路已接入官方 `R²-Gaussian` rasterizer/voxelizer：只在官方查询边界处于 grad-enabled 的训练路径捕获，排除 `no_grad` 质量评估、保存和报告调用；捕获完成后绑定冻结配置、模型提交和数据组合身份，才交给周期 sink；Chunked sink 传输和依赖偏移重建已通过单元测试。
 - 旧版 Chest 1 迭代 grad-gated smoke 产生 1,048,191 个结构化事件，且与未插桩官方运行的 `vol_pred.npy` 逐元素一致、PSNR/SSIM 输出一致；后续审计确认该 trace 把完整 kernel 调用当作 query，并按 Gaussian 合并 mask，故只能保留为旧粒度插桩一致性证据，不能用于正式模板周期。
 - CUDA decoder 已在设备端把 raster 16×16 与 voxel 8×8×8 mask 压紧为每个有效 bit 一个 `(candidate_index, local_query)`，候选和关系通过单个 packed tensor 批量传回主机。2-candidate CUDA 微型对照中 packed relation 数 12 与 mask popcount 12 完全一致。
 - 捕获路径现为每个 pixel/voxel 分配稳定全局 `query_id`，每个有效 Gaussian–query 配对分配独立 `relation_id`；每条 relation 只依赖其 tile–Gaussian candidate，并产生独立缓存请求、前向、伴随和梯度事件。

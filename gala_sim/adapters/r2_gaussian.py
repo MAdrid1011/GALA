@@ -13,7 +13,7 @@ import numpy as np
 
 from gala_sim.config import GalaConfig
 from gala_sim.metrics import QualityConfig, measure_quality
-from gala_sim.trace import DeviceTraceSink, TraceReader
+from gala_sim.trace import DeviceTraceSink, Trace, TraceReader, TraceWriter
 
 from .chest import load_chest_manifest
 from .protocol import PreparedRun, ReferenceArtifact, TraceArtifact
@@ -21,6 +21,23 @@ from .protocol import PreparedRun, ReferenceArtifact, TraceArtifact
 
 class TraceCaptureUnavailable(RuntimeError):
     """Raised until the locked CUDA extension exposes its real event buffers."""
+
+
+def _bind_trace_identity(trace: Trace, run: PreparedRun, model_commit: str) -> Trace:
+    """Attach the frozen run identity before a trace reaches cycle replay."""
+
+    return Trace(
+        trace.events,
+        trace.dependencies,
+        trace.payload,
+        {
+            **trace.metadata,
+            "config_sha256": run.config_sha256,
+            "model_commit": model_commit,
+            "model": run.model_name,
+            "dataset": run.dataset_name,
+        },
+    )
 
 
 @dataclass(frozen=True)
@@ -107,6 +124,8 @@ class R2GaussianChestAdapter:
             trace = TraceReader().read(trace_root, mmap_mode="r")
         except (OSError, ValueError, RuntimeError) as error:
             raise TraceCaptureUnavailable(f"captured trace failed validation: {error}") from error
+        trace = _bind_trace_identity(trace, run, self.model_commit)
+        TraceWriter().write(trace, trace_root, validate=True)
         try:
             _push_trace_chunks(trace, sink)
         except (BufferError, RuntimeError, ValueError) as error:
