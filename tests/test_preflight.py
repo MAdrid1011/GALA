@@ -1,7 +1,13 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+from gala_sim.config import GalaConfig, load_config
+from gala_sim.timing.memory import Ramulator2Backend
+from gala_sim.timing.resources import ResourceUsage
+from gala_sim.tools.cycle_preflight import run_cycle_preflight, write_cycle_preflight
 from gala_sim.tools.preflight import GpuSample, decide_long_run, predict_runtime
 
 
@@ -31,3 +37,55 @@ def test_preflight_rejects_invalid_prediction() -> None:
     with pytest.raises(ValueError):
         predict_runtime(measured_seconds=0, measured_iterations=1,
                         total_iterations=2, warmup_iterations=0)
+
+
+class _RamulatorBinding:
+    def submit(self, address: int, size_bytes: int, is_write: bool, arrival_cycle: int) -> int:
+        return arrival_cycle
+
+
+def _ready_config() -> GalaConfig:
+    metadata = lambda value, unit: {
+        "value": value, "unit": unit, "source": "fixture", "scope": "hardware",
+        "status": "frozen",
+    }
+    parameters = {
+        "top": {
+            "num_pods": metadata(4, "count"),
+            "shared_sram_bytes": metadata(2883584, "byte"),
+        },
+        "compute": {
+            "clusters_per_pod": metadata(5, "cluster"),
+            "fma_lanes_per_cluster": metadata(16, "lane"),
+            "transcendental_lanes_per_cluster": metadata(2, "lane"),
+        },
+        "memory": {"channels": metadata(8, "channel")},
+    }
+    return GalaConfig(Path("fixture.yaml"), parameters, "a" * 64, True)
+
+
+def test_cycle_preflight_records_all_formal_blockers(tmp_path: Path) -> None:
+    config = load_config(Path(__file__).parents[1] / "configs/architecture/gala.yaml")
+    report = run_cycle_preflight(
+        config, reproduction="gala-sim cycle-preflight --config configs/architecture/gala.yaml",
+    )
+    assert report.status == "failed_preflight"
+    assert "relation.seed_fifo_entries" in report.pending
+    assert "ramulator2_binding" in report.missing_bindings
+    assert "resource_envelope" in report.missing_bindings
+    write_cycle_preflight(report, tmp_path / "run")
+    assert (tmp_path / "run" / "preflight.json").is_file()
+    assert '"status": "failed_preflight"' in (tmp_path / "run" / "status.json").read_text()
+
+
+def test_cycle_preflight_passes_with_binding_and_resource_snapshot() -> None:
+    usage = ResourceUsage(
+        shared_sram_bytes=1, pods=4, clusters=20, fma_lanes=320,
+        transcendental_lanes=40, external_channels=8, regions={"fixture": 1},
+    )
+    report = run_cycle_preflight(
+        _ready_config(), memory_backend=Ramulator2Backend(_RamulatorBinding()),
+        resource_usage=usage, reproduction="fixture",
+    )
+    assert report.status == "passed"
+    assert report.missing_bindings == ()

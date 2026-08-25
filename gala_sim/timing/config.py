@@ -7,6 +7,8 @@ from typing import Protocol
 
 from gala_sim.config import GalaConfig
 
+from .resources import ResourceEnvelope, ResourceUsage
+
 
 class MemoryBackend(Protocol):
     def submit(self, *, address: int, size_bytes: int, is_write: bool, arrival_cycle: int) -> int:
@@ -38,6 +40,8 @@ class CycleConfig:
     cache_directory_banks: int | None = None
     cache_sector_bytes: int | None = None
     cache_multicast_destinations: int | None = None
+    resource_envelope: ResourceEnvelope | None = None
+    resource_usage: ResourceUsage | None = None
 
     def __post_init__(self) -> None:
         if min(self.clock_frequency_hz, self.relation_seed_fifo_entries, self.candidate_lanes) <= 0:
@@ -49,6 +53,10 @@ class CycleConfig:
         )
         if any(value is not None and value <= 0 for value in optional_cache_values):
             raise ValueError("optional cache timing values must be positive")
+        if (self.resource_envelope is None) != (self.resource_usage is None):
+            raise ValueError("resource envelope and usage must be provided together")
+        if self.resource_envelope is not None and self.resource_usage is not None:
+            self.resource_envelope.check(self.resource_usage)
         required = {
             "relation_constructor", "fusion_issue", "semantic_cache", "compute_pod",
             "bidirectional_query", "reconstruction_update", "shared_sram",
@@ -94,4 +102,34 @@ class CycleConfig:
                    cache_capacity_per_instance=int(config.value("cache.active_records_per_instance")),
                    cache_directory_banks=int(config.value("cache.directory_banks_per_instance")),
                    cache_sector_bytes=int(config.value("cache.sector_bytes")),
-                   cache_multicast_destinations=int(config.value("cache.multicast_destinations")))
+                   cache_multicast_destinations=int(config.value("cache.multicast_destinations")),
+                   resource_envelope=ResourceEnvelope.from_gala(config),
+                   resource_usage=_resource_usage_from_gala(config))
+
+
+def _resource_usage_from_gala(config: GalaConfig) -> ResourceUsage:
+    """Derive fixed execution resources and registered SRAM regions."""
+
+    try:
+        pods = int(config.value("top.num_pods"))
+        clusters_per_pod = int(config.value("compute.clusters_per_pod"))
+        clusters = pods * clusters_per_pod
+        active_sram = pods * int(config.value("cache.active_sram_bytes_per_instance"))
+        microcontexts = clusters * int(config.value("compute.microcontext_bytes_per_cluster"))
+        regions = {
+            "semantic_cache_active": active_sram,
+            "compute_microcontexts": microcontexts,
+        }
+        return ResourceUsage(
+            shared_sram_bytes=sum(regions.values()),
+            pods=pods,
+            clusters=clusters,
+            fma_lanes=clusters * int(config.value("compute.fma_lanes_per_cluster")),
+            transcendental_lanes=(
+                clusters * int(config.value("compute.transcendental_lanes_per_cluster"))
+            ),
+            external_channels=int(config.value("memory.channels")),
+            regions=regions,
+        )
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("registered resource usage is incomplete") from error
