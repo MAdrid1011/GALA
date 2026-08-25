@@ -103,7 +103,12 @@ class CycleEngine:
             return ("relation_constructor",)
         if kind in {PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN}:
             return ("semantic_cache", "shared_sram")
-        if kind in {PrimitiveKind.UPDATE_COMMIT, PrimitiveKind.SET_MODIFICATION}:
+        if kind in {
+            PrimitiveKind.UPDATE_BEGIN,
+            PrimitiveKind.UPDATE_END,
+            PrimitiveKind.UPDATE_COMMIT,
+            PrimitiveKind.SET_MODIFICATION,
+        }:
             return ("reconstruction_update",)
         if kind is PrimitiveKind.QUERY_REDUCTION:
             return ("bidirectional_query",)
@@ -267,8 +272,10 @@ class CycleEngine:
         cache_fill_request: dict[tuple[int, tuple[int, int]], int] = {}
         memory_waiters: dict[int, list[tuple[int, int, str, int]]] = {}
         cache_event_state: dict[int, tuple[SemanticCacheState, tuple[int, int], CacheLookup]] = {}
-        cache_keys_by_query: dict[int, list[tuple[SemanticCacheState, tuple[int, int]]]] = {}
-        closed_queries: set[int] = set()
+        cache_keys_by_version: dict[
+            int, list[tuple[SemanticCacheState, tuple[int, int]]]
+        ] = {}
+        closed_versions: set[int] = set()
         memory_requests = 0
         cycle = 0
         ready_scan_window = max(
@@ -309,7 +316,7 @@ class CycleEngine:
                     state, key, lookup = cache_event_state[event_id]
                     if lookup is CacheLookup.MISS:
                         state.fill_complete(key, remaining_uses=1)
-                        if int(trace.events[event_id]["query_id"]) in closed_queries:
+                        if int(trace.events[event_id]["state_version"]) in closed_versions:
                             state.close(key)
                 if cache_states and kind is PrimitiveKind.CACHE_RETURN and stage == len(stages) - 1:
                     request_ids = trace.dependency_ids(trace.events[event_id])
@@ -319,13 +326,14 @@ class CycleEngine:
                         )
                     state, key, _ = cache_event_state[int(request_ids[0])]
                     state.complete_read(key)
-                    if int(trace.events[event_id]["query_id"]) in closed_queries:
+                    if int(trace.events[event_id]["state_version"]) in closed_versions:
                         state.close(key)
-                if kind is PrimitiveKind.QUERY_CLOSE and stage == len(stages) - 1:
-                    query_id = int(trace.events[event_id]["query_id"])
-                    closed_queries.add(query_id)
-                    for state, key in cache_keys_by_query.get(query_id, []):
-                        state.close(key)
+                if kind is PrimitiveKind.UPDATE_END and stage == len(stages) - 1:
+                    state_version = int(trace.events[event_id]["state_version"])
+                    if int(trace.events[event_id]["field_mask"]) != 0:
+                        closed_versions.add(state_version)
+                        for state, key in cache_keys_by_version.get(state_version, []):
+                            state.close(key)
                 if stage + 1 < len(stages):
                     heapq.heappush(ready, (event_id, stage + 1))
                 else:
@@ -425,9 +433,12 @@ class CycleEngine:
                             heapq.heappush(ready, (event_id, stage))
                             continue
                         cache_event_state[event_id] = (state, key, lookup)
-                        cache_keys_by_query.setdefault(int(row["query_id"]), []).append((state, key))
-                        if int(row["query_id"]) in closed_queries:
-                            state.close(key)
+                        state_version = int(row["state_version"])
+                        if state_version in closed_versions:
+                            raise CycleConfigurationError(
+                                f"cache request {event_id} targets a closed state version"
+                            )
+                        cache_keys_by_version.setdefault(state_version, []).append((state, key))
                         if lookup is CacheLookup.HIT:
                             completion = cycle + module.service_cycles()
                         else:

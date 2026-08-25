@@ -92,7 +92,7 @@ configs/
 | `address_token` | 可确定地映射到 SRAM 或 DRAM 地址的布局令牌 |
 | `payload_offset` | 数值重放所需数据范围 |
 
-设备缓冲区满时，使用 CUDA stream 将完整 chunk 异步复制到固定页内存。CPU 周期线程消费上一个 chunk，GPU 同时生成下一个 chunk。追踪格式使用按列 NumPy 数组或 Arrow IPC，字段类型由 schema 版本固定。禁止逐事件 JSON 和逐事件 Python 回调。
+设备缓冲区满时，使用 CUDA stream 将完整 chunk 异步复制到固定页内存。CPU 周期线程消费上一个 chunk，GPU 同时生成下一个 chunk。追踪格式使用按列 NumPy 数组或 Arrow IPC，字段类型由 `gala-clamp-events-v2` schema 固定。`UPDATE_BEGIN` 与 `UPDATE_END` 包围优化器提交或集合修改事务；`UPDATE_END.field_mask == 0` 是不推进状态版本的控制屏障，非零掩码才关闭旧版本并推进状态。禁止逐事件 JSON 和逐事件 Python 回调。
 
 ## 5. 周期执行器
 
@@ -126,5 +126,4 @@ class CycleModule(Protocol):
 | `functional-replay` | 按选定周期顺序重放归约并输出质量 | 不重新捕获关系 |
 | `campaign` | 串联参考、追踪、十六项消融和质量汇总 | 不允许跳过验收门 |
 
-同一个经过校验的 trace 可以用于十六项消融，从而避免重复运行昂贵的模型前向和反向。trace 只有在模型提交、数据校验值、训练配置、适配器版本和 CLAMP schema 完全一致时才能复用。
-
+同一个经过校验的 trace 可以用于十六项消融，从而避免重复运行昂贵的模型前向和反向。trace 只有在模型提交、数据校验值、训练配置、适配器版本和 CLAMP schema 完全一致时才能复用。稳定 Gaussian ID、父子 lineage、跨迭代 `UPDATE_END` 依赖和状态版本级缓存驻留均由 validator 校验；查询关闭不会释放缓存，只有真实写入的更新结束才释放旧版本。

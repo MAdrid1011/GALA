@@ -174,7 +174,12 @@ class BidirectionalQueryUnit(HardwareModule):
 
 class ReconstructionUpdateUnit(HardwareModule):
     def accepts_kind(self, kind: PrimitiveKind) -> bool:
-        return kind in {PrimitiveKind.UPDATE_COMMIT, PrimitiveKind.SET_MODIFICATION}
+        return kind in {
+            PrimitiveKind.UPDATE_BEGIN,
+            PrimitiveKind.UPDATE_END,
+            PrimitiveKind.UPDATE_COMMIT,
+            PrimitiveKind.SET_MODIFICATION,
+        }
 
 
 class SharedSram(HardwareModule):

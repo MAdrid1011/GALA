@@ -5,7 +5,15 @@ from pathlib import Path
 import numpy as np
 import pytest
 
-from gala_sim.clamp import ChunkedTraceBuilder, PrimitiveKind, ResourceClass, TraceBuilder, TraceEvent
+from gala_sim.clamp import (
+    ChunkedTraceBuilder,
+    PrimitiveKind,
+    ResourceClass,
+    TraceBuilder,
+    TraceEvent,
+    UpdateBeginKind,
+)
+from gala_sim.adapters.trace_capture import FIELD_DENSITY
 from gala_sim.ablation import run_matrix
 from gala_sim.timing import CycleConfig, CycleEngine, ModuleTiming
 from gala_sim.timing.memory import Ramulator2Backend, RecordedMemoryBackend
@@ -247,6 +255,121 @@ def test_semantic_residency_variant_merges_repeated_state_reads() -> None:
     assert residency.module_counters["semantic_cache"]["memory_requests"] == 1
     assert residency.module_counters["semantic_cache"]["directory_misses"] == 1
     assert residency.module_counters["semantic_cache"]["directory_hits"] == 1
+
+
+def test_query_close_keeps_state_resident_until_update_end() -> None:
+    builder = TraceBuilder()
+    first_request = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_REQUEST), query_id=0,
+        gaussian_id=7, state_version=0, address_token=448, data_bytes=64,
+        resource_class=int(ResourceClass.CACHE),
+    ))
+    first_return = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_RETURN), query_id=0,
+        gaussian_id=7, state_version=0, address_token=448, data_bytes=64,
+        resource_class=int(ResourceClass.CACHE),
+    ), dependencies=[first_request])
+    close = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.QUERY_CLOSE), query_id=0,
+        state_version=0, resource_class=int(ResourceClass.RELATION),
+    ))
+    second_request = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_REQUEST), query_id=1,
+        gaussian_id=7, state_version=0, address_token=448, data_bytes=64,
+        resource_class=int(ResourceClass.CACHE),
+    ), dependencies=[first_return, close])
+    second_return = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_RETURN), query_id=1,
+        gaussian_id=7, state_version=0, address_token=448, data_bytes=64,
+        resource_class=int(ResourceClass.CACHE),
+    ), dependencies=[second_request])
+    begin = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.UPDATE_BEGIN), state_version=0,
+        resource_class=int(ResourceClass.UPDATE),
+        flags=int(UpdateBeginKind.OPTIMIZER),
+    ), dependencies=[second_return])
+    commit = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.UPDATE_COMMIT), gaussian_id=7,
+        state_version=0, resource_class=int(ResourceClass.UPDATE),
+        field_mask=FIELD_DENSITY,
+    ), dependencies=[begin])
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.UPDATE_END), state_version=0,
+        reduction_key=begin, resource_class=int(ResourceClass.UPDATE),
+        flags=int(UpdateBeginKind.OPTIMIZER), field_mask=FIELD_DENSITY,
+    ), dependencies=[commit])
+    trace = builder.finish()
+    config = CycleConfig(
+        modules={name: ModuleTiming(latency=1, initiation_interval=1,
+                                    queue_capacity=8, ports=1, banks=2)
+                 for name in (
+                     "relation_constructor", "fusion_issue", "semantic_cache",
+                     "compute_pod", "bidirectional_query", "reconstruction_update",
+                     "shared_sram",
+                 )},
+        memory=_Memory(), clock_frequency_hz=500_000_000,
+        relation_seed_fifo_entries=8, candidate_lanes=3,
+        cache_instances=1, cache_capacity_per_instance=2,
+        cache_directory_banks=2, cache_sector_bytes=64,
+        cache_multicast_destinations=1,
+    )
+    result = CycleEngine(config, policy="variant:0001").run(trace)
+    cache = result.module_counters["semantic_cache"]
+    assert cache["directory_misses"] == 1
+    assert cache["directory_hits"] == 1
+    assert cache["releases"] == 1
+
+
+def test_noop_update_keeps_same_state_version_resident() -> None:
+    builder = TraceBuilder()
+    request = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_REQUEST), query_id=0,
+        gaussian_id=7, state_version=0, address_token=448, data_bytes=64,
+        resource_class=int(ResourceClass.CACHE),
+    ))
+    returned = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_RETURN), query_id=0,
+        gaussian_id=7, state_version=0, address_token=448, data_bytes=64,
+        resource_class=int(ResourceClass.CACHE),
+    ), dependencies=[request])
+    begin = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.UPDATE_BEGIN), state_version=0,
+        resource_class=int(ResourceClass.UPDATE), flags=int(UpdateBeginKind.OPTIMIZER),
+    ), dependencies=[returned])
+    end = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.UPDATE_END), state_version=0,
+        reduction_key=begin, resource_class=int(ResourceClass.UPDATE),
+        flags=int(UpdateBeginKind.OPTIMIZER), field_mask=0,
+    ), dependencies=[begin])
+    second_request = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_REQUEST), query_id=1,
+        gaussian_id=7, state_version=0, address_token=448, data_bytes=64,
+        resource_class=int(ResourceClass.CACHE),
+    ), dependencies=[end])
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_RETURN), query_id=1,
+        gaussian_id=7, state_version=0, address_token=448, data_bytes=64,
+        resource_class=int(ResourceClass.CACHE),
+    ), dependencies=[second_request])
+    config = CycleConfig(
+        modules={name: ModuleTiming(latency=1, initiation_interval=1,
+                                    queue_capacity=8, ports=1, banks=2)
+                 for name in (
+                     "relation_constructor", "fusion_issue", "semantic_cache",
+                     "compute_pod", "bidirectional_query", "reconstruction_update",
+                     "shared_sram",
+                 )},
+        memory=_Memory(), clock_frequency_hz=500_000_000,
+        relation_seed_fifo_entries=8, candidate_lanes=3,
+        cache_instances=1, cache_capacity_per_instance=2,
+        cache_directory_banks=2, cache_sector_bytes=64,
+        cache_multicast_destinations=1,
+    )
+    result = CycleEngine(config, policy="variant:0001").run(builder.finish())
+    cache = result.module_counters["semantic_cache"]
+    assert cache["directory_misses"] == 1
+    assert cache["directory_hits"] == 1
+    assert cache["releases"] == 0
 
 
 def test_cycle_engine_applies_module_queue_and_seed_fifo_backpressure() -> None:

@@ -8,7 +8,7 @@ from typing import Final
 import numpy as np
 
 
-EVENT_SCHEMA_VERSION: Final[str] = "gala-clamp-events-v1"
+EVENT_SCHEMA_VERSION: Final[str] = "gala-clamp-events-v2"
 NULL_ID: Final[int] = -1
 
 
@@ -25,6 +25,8 @@ class PrimitiveKind(IntEnum):
     GRADIENT_REDUCTION = 10
     UPDATE_COMMIT = 11
     SET_MODIFICATION = 12
+    UPDATE_BEGIN = 13
+    UPDATE_END = 14
 
 
 class ResourceClass(IntEnum):
@@ -36,6 +38,19 @@ class ResourceClass(IntEnum):
     UPDATE = 6
     SRAM = 7
     MEMORY = 8
+
+
+class ModificationKind(IntEnum):
+    PRUNE = 1
+    CLONE_PARENT = 2
+    CLONE_CHILD = 4
+    SPLIT_PARENT = 8
+    SPLIT_CHILD = 16
+
+
+class UpdateBeginKind(IntEnum):
+    COLLECTION = 1
+    OPTIMIZER = 2
 
 
 def event_dtype() -> np.dtype:
