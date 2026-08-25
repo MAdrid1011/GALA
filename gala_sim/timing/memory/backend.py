@@ -40,6 +40,11 @@ class Ramulator2Backend:
 class RecordedMemoryBackend:
     completions: dict[tuple[int, int, bool, int], int]
 
+    def clone(self) -> "RecordedMemoryBackend":
+        """Return a fresh replay cursor over the same external timing table."""
+
+        return type(self)(dict(self.completions))
+
     def submit(self, *, address: int, size_bytes: int, is_write: bool, arrival_cycle: int) -> int:
         key = (address, size_bytes, bool(is_write), arrival_cycle)
         if key not in self.completions:

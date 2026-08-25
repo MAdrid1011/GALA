@@ -8,6 +8,7 @@ import pytest
 from gala_sim.clamp import PrimitiveKind, ResourceClass, TraceBuilder, TraceEvent
 from gala_sim.ablation import run_matrix
 from gala_sim.timing import CycleConfig, CycleEngine, ModuleTiming
+from gala_sim.timing.memory import RecordedMemoryBackend
 from gala_sim.config import load_config
 from gala_sim.trace import TraceReader, TraceWriter, TraceValidationError, validate_trace
 
@@ -136,3 +137,23 @@ def test_ablation_runner_uses_one_trace_for_all_variants() -> None:
     assert runs[0].variant.bits == "0000"
     assert runs[-1].variant.bits == "1111"
     assert runs[-1].result.policy == "variant:1111"
+
+
+def test_ablation_replays_recorded_memory_for_each_variant() -> None:
+    builder = TraceBuilder()
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_REQUEST), gaussian_id=4,
+        state_version=0, address_token=128, data_bytes=64,
+        resource_class=int(ResourceClass.CACHE),
+    ))
+    trace = builder.finish()
+    timing = ModuleTiming(latency=1, initiation_interval=1, queue_capacity=8, ports=1, banks=2)
+    config = CycleConfig(
+        modules={name: timing for name in (
+            "relation_constructor", "fusion_issue", "semantic_cache", "compute_pod",
+            "bidirectional_query", "reconstruction_update", "shared_sram",
+        )},
+        memory=RecordedMemoryBackend({(128, 64, False, 0): 1}),
+        clock_frequency_hz=500_000_000, relation_seed_fifo_entries=8, candidate_lanes=3,
+    )
+    assert len(run_matrix(trace, config)) == 16
