@@ -8,4 +8,4 @@
 
 ## Internal Helpers
 
-命令解析器绑定数据与模型输出路径；TensorBoard 读取器只报告实际 `train/iter_time` 标量，并把未单独测量的剩余 wall time 标为 residual，不填充虚构阶段值。
+命令解析器绑定数据与模型输出路径；R²-Gaussian 适配器可接收冻结的绝对 Python 解释器，使 trace 命令不回退到环境 PATH；TensorBoard 读取器只报告实际 `train/iter_time` 标量，并把未单独测量的剩余 wall time 标为 residual，不填充虚构阶段值。

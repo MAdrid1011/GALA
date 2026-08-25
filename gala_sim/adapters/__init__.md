@@ -8,4 +8,4 @@
 
 ## Internal Helpers
 
-具体模型入口和追踪实现分别位于 `r2_gaussian.py`、`trace_capture.py` 和 `native_reference.py`；该包不定义额外硬件模块。
+具体模型入口和追踪实现分别位于 `r2_gaussian.py`、`trace_capture.py` 和 `native_reference.py`；R²-Gaussian 适配器的 `python_executable` 字段用于绑定冻结解释器；该包不定义额外硬件模块。

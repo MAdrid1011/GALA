@@ -29,6 +29,7 @@ class R2GaussianChestAdapter:
     dataset_root: Path
     output_root: Path
     model_commit: str
+    python_executable: Path | None = None
 
     def prepare(self, dataset: Any, config: GalaConfig) -> PreparedRun:
         if not self.source_root.is_dir() or not self.dataset_root.is_dir():
@@ -41,7 +42,10 @@ class R2GaussianChestAdapter:
             config_sha256=config.sha256,
             quality_config=QualityConfig.from_gala(config),
             seed=0,
-            official_command=("python", "train.py", "-s", str(self.dataset_root), "-m", str(self.output_root)),
+            official_command=(
+                str(self.python_executable.resolve()) if self.python_executable is not None else "python",
+                "train.py", "-s", str(self.dataset_root), "-m", str(self.output_root),
+            ),
         )
 
     def run_reference(self, run: PreparedRun) -> ReferenceArtifact:
