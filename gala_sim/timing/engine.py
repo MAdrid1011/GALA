@@ -49,7 +49,8 @@ class CycleEngine:
     """Run the same trace for Base, Oracle, or mechanism-specific policies."""
 
     def __init__(self, config: CycleConfig, *, policy: str = "base") -> None:
-        if policy not in {"base", "query_oracle", "residency_oracle", "query", "residency", "full"}:
+        valid_variants = {f"variant:{bits:04b}" for bits in range(16)}
+        if policy not in {"base", "query_oracle", "residency_oracle", "query", "residency", "full"} | valid_variants:
             raise ValueError(f"unknown cycle policy: {policy}")
         self.config = config
         self.policy = policy
@@ -83,15 +84,25 @@ class CycleEngine:
         return ("fusion_issue", "compute_pod")
 
     def _ordered_candidates(self, trace: Trace, candidates: list[int]) -> list[int]:
-        if self.policy == "base":
+        variant_bits = self.policy.removeprefix("variant:") if self.policy.startswith("variant:") else None
+        query_enabled = variant_bits is not None and (variant_bits[0] == "1" or variant_bits[2] == "1")
+        residency_enabled = variant_bits is not None and (variant_bits[1] == "1" or variant_bits[3] == "1")
+        if self.policy == "base" or self.policy == "variant:0000":
             return candidates
-        if self.policy in {"residency", "residency_oracle"}:
+        if self.policy in {"residency", "residency_oracle"} or residency_enabled:
+            if query_enabled:
+                return sorted(candidates, key=lambda event_id: (
+                    0 if PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
+                    in {PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN} else 1,
+                    int(trace.events[event_id]["query_id"]),
+                    int(trace.events[event_id]["gaussian_id"]), event_id,
+                ))
             return sorted(candidates, key=lambda event_id: (
                 0 if PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
                 in {PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN} else 1,
                 int(trace.events[event_id]["gaussian_id"]), event_id,
             ))
-        if self.policy in {"query", "query_oracle"}:
+        if self.policy in {"query", "query_oracle"} or query_enabled:
             return sorted(candidates, key=lambda event_id: (
                 int(trace.events[event_id]["query_id"]),
                 int(trace.events[event_id]["relation_id"]), event_id,
@@ -116,6 +127,8 @@ class CycleEngine:
         }
         in_flight: list[tuple[int, int, int, str]] = []
         module_busy_until = {name: 0 for name in self.modules}
+        module_inflight = {name: 0 for name in self.modules}
+        relation_seed_inflight = 0
         bank_busy: dict[tuple[str, int, int], int] = {}
         cycle = 0
         while pending or in_flight:
@@ -123,6 +136,11 @@ class CycleEngine:
             while in_flight and in_flight[0][0] <= cycle:
                 finish, event_id, stage, module_name = heapq.heappop(in_flight)
                 self.modules[module_name].complete(event_id, finish)
+                module_inflight[module_name] -= 1
+                if module_inflight[module_name] < 0:
+                    raise CycleConfigurationError(
+                        f"negative in-flight count for {module_name}"
+                    )
                 stages = self._stages_for(PrimitiveKind(int(trace.events[event_id]["primitive_kind"])))
                 if stage + 1 < len(stages):
                     next_stage[event_id] = stage + 1
@@ -130,6 +148,11 @@ class CycleEngine:
                     completed[event_id] = finish
                     next_stage[event_id] = None
                     pending.remove(event_id)
+                if (PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
+                        is PrimitiveKind.RELATION_CANDIDATE):
+                    relation_seed_inflight -= 1
+                    if relation_seed_inflight < 0:
+                        raise CycleConfigurationError("negative relation seed FIFO occupancy")
                 progressed = True
             candidates: list[tuple[int, int]] = []
             for event_id in sorted(pending):
@@ -164,6 +187,15 @@ class CycleEngine:
                     module.counters.queue_stalls += 1
                     self.stalls.append(StallRecord(cycle, module_name, "initiation_interval", (event_id,)))
                     continue
+                if module_inflight[module_name] >= timing.queue_capacity:
+                    module.counters.queue_stalls += 1
+                    self.stalls.append(StallRecord(cycle, module_name, "queue_capacity", (event_id,)))
+                    continue
+                if (kind is PrimitiveKind.RELATION_CANDIDATE
+                        and relation_seed_inflight >= self.config.relation_seed_fifo_entries):
+                    module.counters.queue_stalls += 1
+                    self.stalls.append(StallRecord(cycle, module_name, "seed_fifo", (event_id,)))
+                    continue
                 bank_key = (module_name, cycle, module.bank(int(row["address_token"])))
                 if bank_key in bank_busy:
                     module.counters.bank_conflicts += 1
@@ -191,6 +223,9 @@ class CycleEngine:
                 heapq.heappush(in_flight, (completion, event_id, stage, module_name))
                 module_busy_until[module_name] = cycle + timing.initiation_interval
                 bank_busy[bank_key] = cycle
+                module_inflight[module_name] += 1
+                if kind is PrimitiveKind.RELATION_CANDIDATE:
+                    relation_seed_inflight += 1
                 module.counters.accepted += 1
                 module.counters.busy_cycles += timing.latency
                 issued_modules[module_name] = issued_modules.get(module_name, 0) + 1

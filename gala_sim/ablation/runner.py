@@ -17,19 +17,7 @@ class AblationRun:
 
 
 def _policy(variant: AblationVariant) -> str:
-    if variant.bits == "0000":
-        return "base"
-    if variant.bits == "1111":
-        return "full"
-    if variant.compiler_query_load_rules and variant.overlap_guided_issue:
-        return "query"
-    if variant.compiler_semantic_worksets and variant.semantic_residency:
-        return "residency"
-    if variant.compiler_query_load_rules or variant.overlap_guided_issue:
-        return "query"
-    if variant.compiler_semantic_worksets or variant.semantic_residency:
-        return "residency"
-    return "base"
+    return f"variant:{variant.bits}"
 
 
 def run_matrix(trace: Trace, config: CycleConfig) -> tuple[AblationRun, ...]:
@@ -38,7 +26,7 @@ def run_matrix(trace: Trace, config: CycleConfig) -> tuple[AblationRun, ...]:
                  for variant in all_variants())
     validate_matrix([run.variant.bits for run in runs])
     full = next(run for run in runs if run.variant.bits == "1111")
-    if full.result.total_cycles != CycleEngine(config, policy="full").run(trace).total_cycles:
+    if full.result.total_cycles != CycleEngine(config, policy="variant:1111").run(trace).total_cycles:
         raise AssertionError("full GALA entry and 1111 ablation cycles differ")
     event_counts = {tuple(sorted(run.result.event_counts.items())) for run in runs}
     if len(event_counts) != 1:

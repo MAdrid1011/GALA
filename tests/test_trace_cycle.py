@@ -98,6 +98,32 @@ def test_cache_transfer_requires_memory_size_and_pairing() -> None:
     assert result.module_counters["semantic_cache"]["memory_wait_cycles"] >= 0
 
 
+def test_cycle_engine_applies_module_queue_and_seed_fifo_backpressure() -> None:
+    builder = TraceBuilder()
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.RELATION_CANDIDATE), query_id=1,
+        gaussian_id=2, state_version=0, resource_class=int(ResourceClass.RELATION),
+    ))
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.RELATION_CANDIDATE), query_id=1,
+        gaussian_id=3, state_version=0, resource_class=int(ResourceClass.RELATION),
+    ))
+    trace = builder.finish()
+    timing = ModuleTiming(latency=3, initiation_interval=1, queue_capacity=1, ports=1, banks=2)
+    config = CycleConfig(
+        modules={name: timing for name in (
+            "relation_constructor", "fusion_issue", "semantic_cache", "compute_pod",
+            "bidirectional_query", "reconstruction_update", "shared_sram",
+        )},
+        memory=_Memory(), clock_frequency_hz=500_000_000, relation_seed_fifo_entries=1,
+        candidate_lanes=3,
+    )
+    result = CycleEngine(config).run(trace)
+    reasons = {stall.reason for stall in result.stalls}
+    assert "queue_capacity" in reasons or "seed_fifo" in reasons
+    assert result.module_counters["relation_constructor"]["completed"] == 2
+
+
 def test_production_cycle_config_cannot_bypass_unfrozen_parameters() -> None:
     config = load_config(Path(__file__).parents[1] / "configs/architecture/gala.yaml")
     with pytest.raises(ValueError, match="clock or seed FIFO"):
@@ -109,4 +135,4 @@ def test_ablation_runner_uses_one_trace_for_all_variants() -> None:
     assert len(runs) == 16
     assert runs[0].variant.bits == "0000"
     assert runs[-1].variant.bits == "1111"
-    assert runs[-1].result.policy == "full"
+    assert runs[-1].result.policy == "variant:1111"
