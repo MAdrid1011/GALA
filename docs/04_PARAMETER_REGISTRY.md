@@ -46,6 +46,9 @@
 | `memory.channel_width_bits` | 32 | bit | LPDDR5 接口 |
 | `memory.data_rate` | 6400 | MT/s | LPDDR5-6400 |
 | `memory.peak_bandwidth_bytes_per_second` | 204800000000 | byte/s | 八通道总带宽 |
+| `memory.ramulator_version` | v2.1.0 | version | Ramulator 2 固定版本 |
+| `memory.ramulator_commit` | `38c51d40a976c6b07fbc09de869a7e08dc187d29` | git_commit | Ramulator 2 v2.1.0 发布提交 |
+| `memory.ramulator_config_sha256` | 待冻结 | sha256 | canonical LPDDR5 配置身份 |
 
 `relation.seed_fifo_entries` 等尚未在论文正文给出具体数值的字段不能在代码中猜测。首个实现应从总体架构源图、冻结配置或模块微基准配置中读取。若权威来源仍无值，使用带名称的实验参数，并在结果中标记 `design_parameter_pending_freeze`。不得根据端到端目标调节该值。
 

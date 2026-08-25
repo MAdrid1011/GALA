@@ -62,23 +62,42 @@ def run_cycle_preflight(
         for name in required_binding_methods
     )
     binding_metadata: dict[str, Any] | None = None
+    binding_reason: str | None = None
+    if not binding_ready:
+        binding_reason = "async_binding_api_missing"
     if binding_ready:
         try:
             binding_metadata = dict(memory_backend.metadata())
             implementation = str(binding_metadata["implementation"])
             version = str(binding_metadata["version"])
+            commit = str(binding_metadata["commit"])
             config_sha256 = str(binding_metadata["config_sha256"])
             channels = int(binding_metadata["channels"])
             transaction_bytes = int(binding_metadata["transaction_bytes"])
+            channel_width_bits = int(binding_metadata["channel_width_bits"])
+            data_rate_mtps = int(binding_metadata["data_rate_mtps"])
             if implementation != "Ramulator 2" or not version or len(config_sha256) != 64:
                 raise ValueError("Ramulator metadata identity is incomplete")
+            if version != str(config.value("memory.ramulator_version")):
+                raise ValueError("Ramulator version disagrees with configuration")
+            if commit != str(config.value("memory.ramulator_commit")):
+                raise ValueError("Ramulator commit disagrees with configuration")
+            if config_sha256 != str(config.value("memory.ramulator_config_sha256")):
+                raise ValueError("Ramulator config SHA-256 disagrees with configuration")
             if channels != int(config.value("memory.channels")):
                 raise ValueError("Ramulator channel count disagrees with configuration")
             if transaction_bytes != int(config.value("cache.sector_bytes")):
                 raise ValueError("Ramulator transaction size disagrees with configuration")
-        except (KeyError, TypeError, ValueError, RuntimeError):
+            if channel_width_bits != int(config.value("memory.channel_width_bits")):
+                raise ValueError("Ramulator channel width disagrees with configuration")
+            if data_rate_mtps != int(config.value("memory.data_rate")):
+                raise ValueError("Ramulator data rate disagrees with configuration")
+        except (KeyError, TypeError, ValueError, RuntimeError) as error:
             binding_ready = False
+            binding_reason = str(error)
     checks["ramulator2_binding"] = binding_ready
+    if binding_reason is not None:
+        checks["ramulator2_reason"] = binding_reason
     if binding_metadata is not None:
         checks["ramulator2_metadata"] = binding_metadata
     if not binding_ready:

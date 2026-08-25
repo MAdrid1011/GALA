@@ -230,6 +230,24 @@ parameters:
       source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
       scope: hardware
       status: frozen
+    ramulator_version:
+      value: v2.1.0
+      unit: version
+      source: Ramulator 2 release v2.1.0
+      scope: memory_model
+      status: frozen
+    ramulator_commit:
+      value: 38c51d40a976c6b07fbc09de869a7e08dc187d29
+      unit: git_commit
+      source: Ramulator 2 release v2.1.0
+      scope: memory_model
+      status: frozen
+    ramulator_config_sha256:
+      value: null
+      unit: sha256
+      source: canonical-lpddr5-config-pending-freeze
+      scope: memory_model
+      status: pending
   numeric:
     dtype:
       value: fp32

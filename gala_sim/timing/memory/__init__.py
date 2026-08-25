@@ -7,8 +7,9 @@ from .backend import (
     Ramulator2Backend,
     RecordedMemoryBackend,
 )
+from .native import NativeRamulator2Binding
 
 __all__ = [
     "CallableMemoryBackend", "MemoryRequestRecord", "MissingMemoryBackend",
-    "Ramulator2Backend", "RecordedMemoryBackend",
+    "NativeRamulator2Binding", "Ramulator2Backend", "RecordedMemoryBackend",
 ]

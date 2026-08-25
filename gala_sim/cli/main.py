@@ -13,7 +13,7 @@ from gala_sim.config import load_config, pending_parameters
 from gala_sim.results import AblationRow, write_ablation_csv
 from gala_sim.results.run import RunOutputWriter
 from gala_sim.timing import CycleConfig, CycleEngine
-from gala_sim.timing.memory import Ramulator2Backend
+from gala_sim.timing.memory import NativeRamulator2Binding, Ramulator2Backend
 from gala_sim.timing.resources import ResourceUsage
 from gala_sim.tools.cycle_preflight import run_cycle_preflight, write_cycle_preflight
 from gala_sim.trace import TraceReader, validate_trace
@@ -29,6 +29,8 @@ def _parser() -> argparse.ArgumentParser:
     preflight.add_argument("--output", type=Path, required=True)
     preflight.add_argument("--ramulator-binding", default=None,
                            help="Python object spec module:attribute exposing the async binding API")
+    preflight.add_argument("--ramulator-build-manifest", type=Path, default=None)
+    preflight.add_argument("--ramulator-config", type=Path, default=None)
     preflight.add_argument("--resource-usage", type=Path, default=None,
                            help="JSON ResourceUsage snapshot")
     trace = commands.add_parser("trace-validate")
@@ -38,6 +40,8 @@ def _parser() -> argparse.ArgumentParser:
     replay.add_argument("--config", type=Path, required=True)
     replay.add_argument("--ramulator-binding", default=None,
                         help="Python object spec module:attribute exposing the async binding API")
+    replay.add_argument("--ramulator-build-manifest", type=Path, default=None)
+    replay.add_argument("--ramulator-config", type=Path, default=None)
     replay.add_argument("--resource-usage", type=Path, required=True,
                         help="JSON ResourceUsage snapshot")
     replay.add_argument("--policy", default="base")
@@ -47,13 +51,24 @@ def _parser() -> argparse.ArgumentParser:
     ablation.add_argument("--config", type=Path, required=True)
     ablation.add_argument("--ramulator-binding", default=None,
                           help="Python object spec module:attribute exposing the async binding API")
+    ablation.add_argument("--ramulator-build-manifest", type=Path, default=None)
+    ablation.add_argument("--ramulator-config", type=Path, default=None)
     ablation.add_argument("--resource-usage", type=Path, required=True,
                           help="JSON ResourceUsage snapshot")
     ablation.add_argument("--output", type=Path, required=True)
     return parser
 
 
-def _load_binding(spec: str | None) -> Ramulator2Backend | None:
+def _load_binding(spec: str | None, build_manifest: Path | None,
+                  configuration: Path | None) -> Ramulator2Backend | None:
+    if spec and (build_manifest is not None or configuration is not None):
+        raise ValueError("choose either a Python binding or a native build manifest")
+    if (build_manifest is None) != (configuration is None):
+        raise ValueError("native Ramulator binding requires build manifest and configuration")
+    if build_manifest is not None and configuration is not None:
+        return Ramulator2Backend(
+            NativeRamulator2Binding.from_build_manifest(build_manifest, configuration)
+        )
     if not spec:
         return None
     module_name, separator, attribute = spec.partition(":")
@@ -98,7 +113,10 @@ def main(argv: list[str] | None = None) -> int:
             return 0 if config.ready else 2
         if args.command == "cycle-preflight":
             config = load_config(args.config)
-            binding = _load_binding(args.ramulator_binding)
+            binding = _load_binding(
+                args.ramulator_binding, args.ramulator_build_manifest,
+                args.ramulator_config,
+            )
             usage = _load_resource_usage(args.resource_usage)
             command = "gala-sim cycle-preflight --config " + str(args.config)
             report = run_cycle_preflight(
@@ -114,7 +132,10 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps({"events": trace.event_count, "status": "passed"}, sort_keys=True))
             return 0
         gala_config = load_config(args.config)
-        binding = _load_binding(args.ramulator_binding)
+        binding = _load_binding(
+            args.ramulator_binding, args.ramulator_build_manifest,
+            args.ramulator_config,
+        )
         usage = _load_resource_usage(args.resource_usage)
         preflight = run_cycle_preflight(
             gala_config, memory_backend=binding, resource_usage=usage,

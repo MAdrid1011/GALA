@@ -47,8 +47,10 @@ class _RamulatorBinding:
     def metadata(self) -> dict[str, object]:
         return {
             "implementation": "Ramulator 2", "version": "2.1.0",
+            "commit": "d" * 40,
             "config_sha256": "b" * 64,
             "channels": 8, "transaction_bytes": 64,
+            "channel_width_bits": 32, "data_rate_mtps": 6400,
         }
 
     def try_issue(self, address: int, is_write: bool, request_id: int) -> bool:
@@ -83,7 +85,14 @@ def _ready_config() -> GalaConfig:
             "fma_lanes_per_cluster": metadata(16, "lane"),
             "transcendental_lanes_per_cluster": metadata(2, "lane"),
         },
-        "memory": {"channels": metadata(8, "channel")},
+        "memory": {
+            "channels": metadata(8, "channel"),
+            "channel_width_bits": metadata(32, "bit"),
+            "data_rate": metadata(6400, "MT/s"),
+            "ramulator_version": metadata("2.1.0", "version"),
+            "ramulator_commit": metadata("d" * 40, "git_commit"),
+            "ramulator_config_sha256": metadata("b" * 64, "sha256"),
+        },
         "cache": {"sector_bytes": metadata(64, "byte")},
     }
     return GalaConfig(Path("fixture.yaml"), parameters, "a" * 64, True)
