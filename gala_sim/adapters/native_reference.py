@@ -127,6 +127,14 @@ def run_native_reference(
         _write_failed(output, {"status": "failed", "error": str(error)}, "gpu_sampling_unavailable")
         raise NativeReferenceError("gpu_sampling_unavailable") from error
     if initial.compute_processes:
+        _write_failed(
+            output,
+            {
+                "status": "failed",
+                "external_compute_processes": [asdict(item) for item in initial.compute_processes],
+            },
+            "gpu_busy_external",
+        )
         raise NativeReferenceError("gpu_busy_external")
     logs = output / "logs"
     logs.mkdir(parents=True, exist_ok=True)
