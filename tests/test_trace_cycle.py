@@ -221,6 +221,63 @@ def test_cycle_engine_applies_module_queue_and_seed_fifo_backpressure() -> None:
     assert result.module_counters["relation_constructor"]["completed"] == 2
 
 
+def test_event_driven_engine_replays_large_dependency_chain() -> None:
+    builder = TraceBuilder()
+    previous: int | None = None
+    event_count = 4096
+    for relation_id in range(event_count):
+        dependencies = () if previous is None else (previous,)
+        previous = builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.RELATION), query_id=0,
+            gaussian_id=relation_id, relation_id=relation_id,
+            state_version=0, resource_class=int(ResourceClass.RELATION),
+        ), dependencies=dependencies)
+    trace = builder.finish()
+    timing = ModuleTiming(latency=2, initiation_interval=1, queue_capacity=4, ports=1, banks=4)
+    config = CycleConfig(
+        modules={name: timing for name in (
+            "relation_constructor", "fusion_issue", "semantic_cache", "compute_pod",
+            "bidirectional_query", "reconstruction_update", "shared_sram",
+        )},
+        memory=_Memory(), clock_frequency_hz=500_000_000,
+        relation_seed_fifo_entries=4, candidate_lanes=3,
+    )
+    result = CycleEngine(config).run(trace)
+    # Each dependency becomes runnable after the two-cycle service completes.
+    assert result.total_cycles == event_count * timing.latency
+    assert len(result.completion_cycles) == event_count
+    assert result.completion_cycles[event_count - 1] == result.total_cycles
+
+
+def test_cycle_replay_is_deterministic_and_compresses_stall_counts() -> None:
+    builder = TraceBuilder()
+    for gaussian_id in range(4):
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.RELATION_CANDIDATE), query_id=0,
+            gaussian_id=gaussian_id, relation_id=gaussian_id,
+            state_version=0, resource_class=int(ResourceClass.RELATION),
+        ))
+    trace = builder.finish()
+    timing = ModuleTiming(latency=3, initiation_interval=1, queue_capacity=4, ports=1, banks=1)
+    config = CycleConfig(
+        modules={name: timing for name in (
+            "relation_constructor", "fusion_issue", "semantic_cache", "compute_pod",
+            "bidirectional_query", "reconstruction_update", "shared_sram",
+        )},
+        memory=_Memory(), clock_frequency_hz=500_000_000,
+        relation_seed_fifo_entries=4, candidate_lanes=3,
+    )
+    first = CycleEngine(config).run(trace)
+    second = CycleEngine(config).run(trace)
+    assert first.total_cycles == second.total_cycles
+    assert first.completion_cycles == second.completion_cycles
+    assert first.stalls == second.stalls
+    compressed = [stall for stall in first.stalls if stall.reason == "port"]
+    assert compressed
+    assert any(stall.count > 1 for stall in compressed)
+    assert all(len(stall.event_ids) <= config.candidate_lanes for stall in compressed)
+
+
 def test_production_cycle_config_cannot_bypass_unfrozen_parameters() -> None:
     config = load_config(Path(__file__).parents[1] / "configs/architecture/gala.yaml")
     with pytest.raises(ValueError, match="clock or seed FIFO"):
