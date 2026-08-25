@@ -22,6 +22,20 @@ def test_architecture_config_is_hashable_but_pending() -> None:
     assert not config.ready
     with pytest.raises(ConfigError, match="seed_fifo_entries"):
         config.require_ready()
+    with pytest.raises(TypeError):
+        config.parameters["clock"] = {}  # type: ignore[index]
+
+
+def test_config_rejects_invalid_metadata(tmp_path: Path) -> None:
+    path = tmp_path / "invalid.yaml"
+    path.write_text(
+        "schema_version: gala-config-v1\nparameters:\n  x:\n"
+        "    value: 3\n    unit: count\n    source: test\n    scope: test\n"
+        "    status: frozen\n    allowed_range: [4, 2]\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(ConfigError, match="allowed_range"):
+        load_config(path)
 
 
 def test_hash_tree_is_independent_of_creation_order(tmp_path: Path) -> None:

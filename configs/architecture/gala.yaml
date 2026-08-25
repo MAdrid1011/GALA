@@ -230,3 +230,314 @@ parameters:
       source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
       scope: hardware
       status: frozen
+  numeric:
+    dtype:
+      value: fp32
+      unit: enum
+      source: docs/04_PARAMETER_REGISTRY.md:numeric
+      scope: functional
+      status: frozen
+    rounding:
+      value: round_to_nearest_even
+      unit: enum
+      source: docs/04_PARAMETER_REGISTRY.md:numeric
+      scope: functional
+      status: frozen
+    flush_subnormal_input:
+      value: true
+      unit: bool
+      source: docs/04_PARAMETER_REGISTRY.md:numeric
+      scope: functional
+      status: frozen
+    flush_subnormal_output:
+      value: true
+      unit: bool
+      source: docs/04_PARAMETER_REGISTRY.md:numeric
+      scope: functional
+      status: frozen
+    exp_max_relative_error:
+      value: 0.0000749
+      unit: ratio
+      source: docs/04_PARAMETER_REGISTRY.md:numeric
+      scope: functional
+      status: frozen
+    log_max_absolute_error:
+      value: 0.000000169
+      unit: absolute
+      source: docs/04_PARAMETER_REGISTRY.md:numeric
+      scope: functional
+      status: frozen
+    rcp_max_relative_error:
+      value: 0.000000145
+      unit: ratio
+      source: docs/04_PARAMETER_REGISTRY.md:numeric
+      scope: functional
+      status: frozen
+    sqrt_max_relative_error:
+      value: 0.000000183
+      unit: ratio
+      source: docs/04_PARAMETER_REGISTRY.md:numeric
+      scope: functional
+      status: frozen
+  preflight:
+    long_run_threshold_seconds:
+      value: 3600
+      unit: second
+      source: docs/04_PARAMETER_REGISTRY.md:run-strategy
+      scope: workflow
+      status: frozen
+    gpu_utilization_floor_percent:
+      value: 60
+      unit: percent
+      source: docs/04_PARAMETER_REGISTRY.md:run-strategy
+      scope: workflow
+      status: frozen
+    gpustat_interval_seconds:
+      value: 1
+      unit: second
+      source: docs/04_PARAMETER_REGISTRY.md:run-strategy
+      scope: workflow
+      status: frozen
+    warmup_iterations:
+      value: 10
+      unit: iteration
+      source: docs/04_PARAMETER_REGISTRY.md:run-strategy
+      scope: workflow
+      status: frozen
+    measure_iterations:
+      value: 50
+      unit: iteration
+      source: docs/04_PARAMETER_REGISTRY.md:run-strategy
+      scope: workflow
+      status: frozen
+  trace:
+    chunk_events:
+      value: null
+      unit: event
+      source: trace-chunk-autotune-pending-freeze
+      scope: software
+      status: pending
+    max_inflight_chunks:
+      value: null
+      unit: chunk
+      source: trace-chunk-autotune-pending-freeze
+      scope: software
+      status: pending
+  latency:
+    relation_constructor:
+      latency:
+        value: null
+        unit: cycle
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      initiation_interval:
+        value: null
+        unit: cycle
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      queue_capacity:
+        value: null
+        unit: entry
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      ports:
+        value: null
+        unit: port
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      banks:
+        value: null
+        unit: bank
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+    fusion_issue:
+      latency:
+        value: null
+        unit: cycle
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      initiation_interval:
+        value: null
+        unit: cycle
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      queue_capacity:
+        value: null
+        unit: entry
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      ports:
+        value: null
+        unit: port
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      banks:
+        value: null
+        unit: bank
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+    semantic_cache:
+      latency:
+        value: null
+        unit: cycle
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      initiation_interval:
+        value: null
+        unit: cycle
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      queue_capacity:
+        value: null
+        unit: entry
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      ports:
+        value: null
+        unit: port
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      banks:
+        value: null
+        unit: bank
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+    compute_pod:
+      latency:
+        value: null
+        unit: cycle
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      initiation_interval:
+        value: null
+        unit: cycle
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      queue_capacity:
+        value: null
+        unit: entry
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      ports:
+        value: null
+        unit: port
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      banks:
+        value: null
+        unit: bank
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+    bidirectional_query:
+      latency:
+        value: null
+        unit: cycle
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      initiation_interval:
+        value: null
+        unit: cycle
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      queue_capacity:
+        value: null
+        unit: entry
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      ports:
+        value: null
+        unit: port
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      banks:
+        value: null
+        unit: bank
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+    reconstruction_update:
+      latency:
+        value: null
+        unit: cycle
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      initiation_interval:
+        value: null
+        unit: cycle
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      queue_capacity:
+        value: null
+        unit: entry
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      ports:
+        value: null
+        unit: port
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      banks:
+        value: null
+        unit: bank
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+    shared_sram:
+      latency:
+        value: null
+        unit: cycle
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      initiation_interval:
+        value: null
+        unit: cycle
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      queue_capacity:
+        value: null
+        unit: entry
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      ports:
+        value: null
+        unit: port
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending
+      banks:
+        value: null
+        unit: bank
+        source: module-microbenchmark-pending-freeze
+        scope: hardware
+        status: pending

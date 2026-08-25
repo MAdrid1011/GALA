@@ -20,3 +20,8 @@ runs/
 *.pt
 *.pth
 *.ckpt
+
+# Keep the simulator's versioned results package; root-level result artifacts remain ignored.
+!gala_sim/results/
+!gala_sim/results/**
+gala_sim/results/__pycache__/
