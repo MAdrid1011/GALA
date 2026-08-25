@@ -19,9 +19,9 @@ class TraceWriter:
             validate_trace(trace)
         root = Path(root)
         root.mkdir(parents=True, exist_ok=True)
-        np.save(root / "events.npy", trace.events, allow_pickle=False)
-        np.save(root / "dependencies.npy", trace.dependencies, allow_pickle=False)
-        np.save(root / "payload.npy", trace.payload, allow_pickle=False)
+        _write_array_if_needed(trace.events, root / "events.npy")
+        _write_array_if_needed(trace.dependencies, root / "dependencies.npy")
+        _write_array_if_needed(trace.payload, root / "payload.npy")
         metadata = {
             "schema_version": TRACE_SCHEMA_VERSION,
             "event_schema_version": trace.metadata["schema_version"],
@@ -31,6 +31,18 @@ class TraceWriter:
             json.dumps(metadata, ensure_ascii=True, sort_keys=True, indent=2) + "\n",
             encoding="utf-8",
         )
+
+
+def _write_array_if_needed(array: np.ndarray, path: Path) -> None:
+    """Avoid truncating a final mmap that already lives at the target path."""
+    filename = getattr(array, "filename", None)
+    if filename is not None:
+        try:
+            if Path(filename).resolve() == path.resolve():
+                return
+        except OSError:
+            pass
+    np.save(path, array, allow_pickle=False)
 
 
 class TraceReader:

@@ -82,6 +82,27 @@ def test_chunked_trace_builder_preserves_global_offsets() -> None:
     assert validate_trace(trace).event_count == 3
 
 
+def test_disk_chunked_builder_streams_all_columns(tmp_path: Path) -> None:
+    builder = ChunkedTraceBuilder(chunk_events=2, chunk_root=tmp_path / "chunks")
+    first = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.RELATION), query_id=0, gaussian_id=0,
+        relation_id=0,
+    ), payload=[1.5])
+    second = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.RELATION), query_id=0, gaussian_id=1,
+        relation_id=1,
+    ), dependencies=[first], payload=[2.5, 3.5])
+    builder.emit(TraceEvent(primitive_kind=int(PrimitiveKind.QUERY_CLOSE), query_id=0), dependencies=[second])
+    trace = builder.finish()
+    assert trace.event_count == 3
+    assert trace.dependency_ids(trace.events[2]).tolist() == [1]
+    assert trace.payload_values(trace.events[1]).tolist() == [2.5, 3.5]
+    assert validate_trace(trace).event_count == 3
+    assert (tmp_path / "chunks").exists() is False
+    TraceWriter().write(trace, tmp_path)
+    assert TraceReader().read(tmp_path).event_count == 3
+
+
 def test_sink_handoff_rebases_chunk_offsets() -> None:
     sink = NumpyChunkSink(chunk_events=2, max_inflight_chunks=2)
     _push_trace_chunks(_trace(), sink)
