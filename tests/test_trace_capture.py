@@ -37,6 +37,38 @@ def _rows(trace, kind: PrimitiveKind) -> np.ndarray:
     return trace.events[trace.events["primitive_kind"] == int(kind)]
 
 
+class _ArrayRef:
+    def __init__(self, shape: tuple[int, ...], pointer: int) -> None:
+        self.shape = shape
+        self._pointer = pointer
+
+    def data_ptr(self) -> int:
+        return self._pointer
+
+
+def _queue_query(
+    session: TraceSession, records: np.ndarray, *, binning_pointer: int,
+    output_pointer: int, template_id: int,
+) -> _ArrayRef:
+    query_shape = (1, 1, 1) if template_id == VOXEL_TEMPLATE_ID else (1, 1)
+    output = _ArrayRef(query_shape, output_pointer)
+    gaussian_count = int(records[0, 2]) + 1
+    session._capture_query(
+        _ArrayRef((gaussian_count, 3), 0),
+        _ArrayRef((records.shape[0],), binning_pointer),
+        output, 1, query_shape, lambda: records,
+        template_id=template_id, field_mask=STATE_FIELD_MASK,
+    )
+    return output
+
+
+def _single_relation_records(gaussian_index: int = 0) -> np.ndarray:
+    return np.asarray([
+        [0, 0, gaussian_index, 0],
+        [1, 0, 0, 0],
+    ], dtype=np.int64)
+
+
 def test_capture_expands_each_valid_mask_bit_into_a_query_relation(tmp_path: Path) -> None:
     session = TraceSession(tmp_path / "trace", chunk_events=16)
     session._ensure_gaussians(2)
@@ -82,6 +114,193 @@ def test_capture_expands_each_valid_mask_bit_into_a_query_relation(tmp_path: Pat
     consumer = _rows(trace, PrimitiveKind.CONSUMER)[16]
     dependency_queries = trace.events[trace.dependency_ids(consumer)]["query_id"].tolist()
     assert dependency_queries == [15, 16, 32, 33]
+
+
+def test_pending_queries_share_one_host_copy_and_preserve_event_order(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = TraceSession(tmp_path / "trace", chunk_events=8)
+    raster_output = _queue_query(
+        session, _single_relation_records(), binning_pointer=10,
+        output_pointer=20, template_id=RASTER_TEMPLATE_ID,
+    )
+    voxel_output = _queue_query(
+        session, _single_relation_records(), binning_pointer=11,
+        output_pointer=21, template_id=VOXEL_TEMPLATE_ID,
+    )
+    session._audit.update({
+        "official_raster_kernel_calls": 1,
+        "official_voxel_kernel_calls": 1,
+        "captured_raster_kernel_calls": 1,
+        "captured_voxel_kernel_calls": 1,
+        "captured_query_kernel_calls": 2,
+        "cuda_relation_candidates": 2,
+    })
+    l1_loss = session._wrap_loss(lambda _output: None, LOSS_L1)
+    l1_loss(raster_output)
+    l1_loss(voxel_output)
+    session._capture_backward(11, voxel=True)
+    session._capture_backward(10, voxel=False)
+
+    copy_calls: list[int] = []
+    copy_batches = session._copy_record_batches
+
+    def counted_copy(record_batches: list[object]) -> np.ndarray:
+        copy_calls.append(len(record_batches))
+        return copy_batches(record_batches)
+
+    monkeypatch.setattr(session, "_copy_record_batches", counted_copy)
+    trace = session.finish()
+
+    report = validate_trace(trace)
+    assert copy_calls == [2]
+    assert session._audit["relation_record_device_batches"] == 2
+    assert session._audit["relation_record_d2h_batches"] == 1
+    assert report.counts[PrimitiveKind.RELATION.name] == 2
+    assert report.counts[PrimitiveKind.CONSUMER.name] == 2
+    assert _rows(trace, PrimitiveKind.RELATION_CANDIDATE)["template_id"].tolist() == [
+        RASTER_TEMPLATE_ID, VOXEL_TEMPLATE_ID,
+    ]
+    assert _rows(trace, PrimitiveKind.CONSUMER)["template_id"].tolist() == [
+        VOXEL_TEMPLATE_ID, RASTER_TEMPLATE_ID,
+    ]
+    incomplete_metadata = dict(trace.metadata)
+    incomplete_audit = dict(incomplete_metadata["capture_audit"])
+    incomplete_audit.pop("relation_record_d2h_batches")
+    incomplete_metadata["capture_audit"] = incomplete_audit
+    with pytest.raises(TraceValidationError, match="transfer audit totals are missing"):
+        validate_trace(Trace(
+            trace.events, trace.dependencies, trace.payload, incomplete_metadata,
+        ))
+
+    immediate = TraceSession(tmp_path / "immediate", chunk_events=8)
+    immediate._ensure_gaussians(1)
+    for query_base, buffer_pointer, output_pointer, template_id in (
+        (0, 10, 20, RASTER_TEMPLATE_ID),
+        (1, 11, 21, VOXEL_TEMPLATE_ID),
+    ):
+        query_shape = (1, 1, 1) if template_id == VOXEL_TEMPLATE_ID else (1, 1)
+        immediate._emit_query_records(
+            _single_relation_records(), rendered=1, query_base=query_base,
+            query_shape=query_shape, binning_pointer=buffer_pointer,
+            output_pointer=output_pointer, template_id=template_id,
+            field_mask=STATE_FIELD_MASK,
+        )
+        immediate._contexts[buffer_pointer].loss_flags = LOSS_L1
+    immediate._capture_backward(11, voxel=True)
+    immediate._capture_backward(10, voxel=False)
+    immediate_trace = immediate._builder.finish(metadata={"initial_gaussian_count": 1})
+    for kind in (
+        PrimitiveKind.RELATION, PrimitiveKind.QUERY_REDUCTION,
+        PrimitiveKind.CONSUMER, PrimitiveKind.ADJOINT,
+    ):
+        assert _rows(trace, kind).size == _rows(immediate_trace, kind).size
+
+
+def test_finish_rejects_pending_query_without_backward(tmp_path: Path) -> None:
+    session = TraceSession(tmp_path / "trace")
+    _queue_query(
+        session, _single_relation_records(), binning_pointer=10,
+        output_pointer=20, template_id=RASTER_TEMPLATE_ID,
+    )
+    with pytest.raises(RuntimeError, match="exactly one backward"):
+        session.finish()
+
+
+def test_pending_query_rejects_duplicate_backward(tmp_path: Path) -> None:
+    session = TraceSession(tmp_path / "trace")
+    output = _queue_query(
+        session, _single_relation_records(), binning_pointer=10,
+        output_pointer=20, template_id=RASTER_TEMPLATE_ID,
+    )
+    session._wrap_loss(lambda _output: None, LOSS_L1)(output)
+    session._capture_backward(10, voxel=False)
+    with pytest.raises(RuntimeError, match="duplicate backward"):
+        session._capture_backward(10, voxel=False)
+
+
+def test_pending_query_rejects_backward_without_loss_or_with_wrong_kind(
+    tmp_path: Path,
+) -> None:
+    missing_loss = TraceSession(tmp_path / "missing-loss")
+    _queue_query(
+        missing_loss, _single_relation_records(), binning_pointer=10,
+        output_pointer=20, template_id=RASTER_TEMPLATE_ID,
+    )
+    with pytest.raises(RuntimeError, match="without a captured loss consumer"):
+        missing_loss._capture_backward(10, voxel=False)
+
+    wrong_kind = TraceSession(tmp_path / "wrong-kind")
+    output = _queue_query(
+        wrong_kind, _single_relation_records(), binning_pointer=10,
+        output_pointer=20, template_id=RASTER_TEMPLATE_ID,
+    )
+    wrong_kind._wrap_loss(lambda _output: None, LOSS_L1)(output)
+    with pytest.raises(RuntimeError, match="does not match its forward context"):
+        wrong_kind._capture_backward(10, voxel=True)
+
+
+def test_densification_flushes_queries_before_stable_ids_change(tmp_path: Path) -> None:
+    class Model:
+        def __init__(self) -> None:
+            self.get_xyz = np.empty((2, 3), dtype=np.float32)
+
+    class Mask:
+        def detach(self) -> "Mask":
+            return self
+
+        def cpu(self) -> "Mask":
+            return self
+
+        def numpy(self) -> np.ndarray:
+            return np.asarray([True, False])
+
+    session = TraceSession(tmp_path / "trace")
+    output = _queue_query(
+        session, _single_relation_records(1), binning_pointer=10,
+        output_pointer=20, template_id=RASTER_TEMPLATE_ID,
+    )
+    session._wrap_loss(lambda _output: None, LOSS_L1)(output)
+    session._capture_backward(10, voxel=False)
+
+    def prune_original(model: Model, _mask: Mask) -> None:
+        model.get_xyz = model.get_xyz[1:]
+
+    prune = session._wrap_prune_points(prune_original)
+
+    def densify_original(model: Model) -> None:
+        assert not session._pending_queries
+        assert session._audit["captured_backward_calls"] == 1
+        prune(model, Mask())
+
+    session._wrap_densify_and_prune(densify_original)(Model())
+    trace = session._builder.finish(metadata={"initial_gaussian_count": 2})
+    assert _rows(trace, PrimitiveKind.RELATION)["gaussian_id"].tolist() == [1]
+    assert session._gaussian_ids == [1]
+
+
+def test_next_iteration_flushes_queries_with_the_previous_iteration_id(
+    tmp_path: Path,
+) -> None:
+    class Model:
+        get_xyz = np.empty((1, 3), dtype=np.float32)
+
+    session = TraceSession(tmp_path / "trace")
+    session._iteration = 3
+    output = _queue_query(
+        session, _single_relation_records(), binning_pointer=10,
+        output_pointer=20, template_id=RASTER_TEMPLATE_ID,
+    )
+    session._wrap_loss(lambda _output: None, LOSS_L1)(output)
+    session._capture_backward(10, voxel=False)
+
+    def update_learning_rate(_model: Model, iteration: int) -> None:
+        assert iteration == 4
+        assert not session._pending_queries
+
+    session._wrap_learning_rate(update_learning_rate)(Model(), 4)
+    trace = session._builder.finish(metadata={"initial_gaussian_count": 1})
+    assert set(trace.events["iteration_id"].tolist()) == {3}
 
 
 def test_voxel_query_offsets_match_official_x_y_z_layout() -> None:

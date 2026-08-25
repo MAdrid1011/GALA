@@ -387,7 +387,7 @@ def _validate_capture_audit(trace: Trace, counts: dict[str, int]) -> None:
         for key, value in audit.items()
     ):
         raise TraceValidationError("capture audit metadata is malformed")
-    if trace.metadata.get("capture_audit_schema_version") != "gala-r2-capture-audit-v3":
+    if trace.metadata.get("capture_audit_schema_version") != "gala-r2-capture-audit-v4":
         raise TraceValidationError("captured trace uses an obsolete capture audit schema")
 
     event_matches = {
@@ -440,6 +440,21 @@ def _validate_capture_audit(trace: Trace, counts: dict[str, int]) -> None:
             )
     if int(audit.get("captured_backward_calls", 0)) != captured_kernels:
         raise TraceValidationError("captured forward/backward kernel totals are inconsistent")
+    transfer_names = {
+        "relation_record_device_batches", "relation_record_d2h_batches",
+    }
+    if not transfer_names.issubset(audit):
+        raise TraceValidationError("relation record transfer audit totals are missing")
+    device_batches = int(audit["relation_record_device_batches"])
+    d2h_batches = int(audit["relation_record_d2h_batches"])
+    candidate_count = int(audit.get("cuda_relation_candidates", 0))
+    if (
+        device_batches > captured_kernels
+        or device_batches > candidate_count
+        or (device_batches == 0) != (d2h_batches == 0)
+        or d2h_batches > device_batches
+    ):
+        raise TraceValidationError("relation record transfer audit totals are inconsistent")
 
     begin_counts: dict[UpdateBeginKind, int] = defaultdict(int)
     end_counts: dict[UpdateBeginKind, int] = defaultdict(int)

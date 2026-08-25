@@ -61,6 +61,20 @@ class _QueryContext:
 
 
 @dataclass
+class _PendingQuery:
+    records: Any | None
+    rendered: int
+    query_base: int
+    query_shape: tuple[int, ...]
+    binning_pointer: int
+    output_pointer: int
+    template_id: int
+    field_mask: int
+    loss_flags: int = 0
+    ssim_radius: int = 0
+
+
+@dataclass
 class TraceSession:
     """Capture real extension buffers and Python call boundaries in one process."""
 
@@ -77,6 +91,11 @@ class TraceSession:
     _state_version: int = field(default=0, init=False)
     _contexts: dict[int, _QueryContext] = field(default_factory=dict, init=False)
     _output_contexts: dict[int, _QueryContext] = field(default_factory=dict, init=False)
+    _pending_queries: list[_PendingQuery] = field(default_factory=list, init=False)
+    _pending_query_by_buffer: dict[int, _PendingQuery] = field(default_factory=dict, init=False)
+    _pending_query_by_output: dict[int, _PendingQuery] = field(default_factory=dict, init=False)
+    _pending_backwards: list[tuple[int, bool]] = field(default_factory=list, init=False)
+    _pending_backward_buffers: set[int] = field(default_factory=set, init=False)
     _pending_gradients: dict[int, list[int]] = field(default_factory=dict, init=False)
     _pending_backward_events: list[int] = field(default_factory=list, init=False)
     _gaussian_ids: list[int] = field(default_factory=list, init=False)
@@ -145,6 +164,10 @@ class TraceSession:
                 "trace capture cannot finish after a collection failure: "
                 + self._capture_error
             )
+        self._flush_pending_queries()
+        audit = dict(self._audit)
+        audit.setdefault("relation_record_device_batches", 0)
+        audit.setdefault("relation_record_d2h_batches", 0)
         trace = self._builder.finish(metadata={
             "model": "R2-Gaussian",
             "dataset": "Chest",
@@ -152,9 +175,9 @@ class TraceSession:
             "state_record_bytes": self.state_record_bytes,
             "trace_chunk_events": self.chunk_events,
             "trace_capture_status": "real_extension_buffers",
-            "capture_audit_schema_version": "gala-r2-capture-audit-v3",
+            "capture_audit_schema_version": "gala-r2-capture-audit-v4",
             "initial_gaussian_count": self._initial_gaussian_count,
-            "capture_audit": dict(sorted(self._audit.items())),
+            "capture_audit": dict(sorted(audit.items())),
         })
         TraceWriter().write(trace, self.output_root)
         return trace
@@ -215,6 +238,7 @@ class TraceSession:
     def _wrap_loss(self, original: Any, loss_flag: int) -> Any:
         def wrapped(output: Any, *args: Any, **kwargs: Any) -> Any:
             context = self._output_contexts.get(int(output.data_ptr()))
+            pending = self._pending_query_by_output.get(int(output.data_ptr()))
             if context is not None:
                 context.loss_flags |= loss_flag
                 if loss_flag == LOSS_SSIM:
@@ -222,6 +246,13 @@ class TraceSession:
                         "window_size", args[1] if len(args) > 1 else 11
                     ))
                     context.ssim_radius = max(context.ssim_radius, window_size // 2)
+            elif pending is not None:
+                pending.loss_flags |= loss_flag
+                if loss_flag == LOSS_SSIM:
+                    window_size = int(kwargs.get(
+                        "window_size", args[1] if len(args) > 1 else 11
+                    ))
+                    pending.ssim_radius = max(pending.ssim_radius, window_size // 2)
             return original(output, *args, **kwargs)
         return wrapped
 
@@ -231,6 +262,7 @@ class TraceSession:
 
     def _wrap_learning_rate(self, original: Any) -> Any:
         def wrapped(model: Any, iteration: int, *args: Any, **kwargs: Any) -> Any:
+            self._flush_pending_queries()
             self._iteration = int(iteration)
             self._ensure_gaussians(int(model.get_xyz.shape[0]))
             return original(model, iteration, *args, **kwargs)
@@ -244,6 +276,7 @@ class TraceSession:
             original_step = optimizer.step
 
             def step(*step_args: Any, **step_kwargs: Any) -> Any:
+                self._flush_pending_queries()
                 field_mask = self._optimizer_field_mask(optimizer)
                 result_step = original_step(*step_args, **step_kwargs)
                 self._capture_update(model, field_mask=field_mask)
@@ -355,6 +388,7 @@ class TraceSession:
     def _wrap_densify_and_prune(self, original: Any) -> Any:
         def wrapped(model: Any, *args: Any, **kwargs: Any) -> Any:
             self._ensure_gaussians(int(model.get_xyz.shape[0]))
+            self._flush_pending_queries()
             self._start_collection_transaction()
             try:
                 result = original(model, *args, **kwargs)
@@ -431,16 +465,98 @@ class TraceSession:
         self._audit_increment("captured_logical_queries", image_elements)
         gaussian_count = int(means.shape[0])
         self._ensure_gaussians(gaussian_count)
-        if rendered > 0:
-            records = records_fn().detach().cpu().numpy().astype(np.int64, copy=False)
-        else:
-            records = np.empty((0, 4), dtype=np.int64)
-        self._emit_query_records(
-            records, rendered=rendered, query_base=query_base,
-            query_shape=query_shape, binning_pointer=int(binning.data_ptr()),
-            output_pointer=int(output.data_ptr()), template_id=template_id,
-            field_mask=field_mask,
+        binning_pointer = int(binning.data_ptr())
+        output_pointer = int(output.data_ptr())
+        if binning_pointer in self._pending_query_by_buffer or binning_pointer in self._contexts:
+            raise RuntimeError("captured query reused a live binning buffer pointer")
+        if output_pointer in self._pending_query_by_output or output_pointer in self._output_contexts:
+            raise RuntimeError("captured query reused a live output buffer pointer")
+        pending = _PendingQuery(
+            records_fn() if rendered > 0 else None,
+            rendered, query_base, query_shape, binning_pointer, output_pointer,
+            template_id, field_mask,
         )
+        if pending.records is not None:
+            self._audit_increment("relation_record_device_batches")
+        self._pending_queries.append(pending)
+        self._pending_query_by_buffer[binning_pointer] = pending
+        self._pending_query_by_output[output_pointer] = pending
+
+    def _flush_pending_queries(self) -> None:
+        if not self._pending_queries and not self._pending_backwards:
+            return
+        pending_buffers = {item.binning_pointer for item in self._pending_queries}
+        if (
+            len(pending_buffers) != len(self._pending_queries)
+            or pending_buffers != set(self._pending_query_by_buffer)
+            or pending_buffers != self._pending_backward_buffers
+            or len(self._pending_backwards) != len(self._pending_queries)
+        ):
+            raise RuntimeError("pending query batch does not have exactly one backward per query")
+        for item in self._pending_queries:
+            if item.loss_flags == 0:
+                raise RuntimeError(
+                    "captured query reached flush without a captured loss consumer"
+                )
+        for buffer_pointer, voxel in self._pending_backwards:
+            item = self._pending_query_by_buffer.get(buffer_pointer)
+            if item is None:
+                raise RuntimeError("pending backward does not match a captured query")
+            expected_template = VOXEL_TEMPLATE_ID if voxel else RASTER_TEMPLATE_ID
+            if item.template_id != expected_template:
+                raise RuntimeError("captured backward kind does not match its forward context")
+
+        records_by_query: list[np.ndarray] = []
+        device_records = [item.records for item in self._pending_queries if item.records is not None]
+        if device_records:
+            host_records = self._copy_record_batches(device_records)
+            self._audit_increment("relation_record_d2h_batches")
+            cursor = 0
+            for item in self._pending_queries:
+                if item.records is None:
+                    records_by_query.append(np.empty((0, 4), dtype=np.int64))
+                else:
+                    record_count = int(item.records.shape[0])
+                    records_by_query.append(np.asarray(host_records[cursor:cursor + record_count], dtype=np.int64))
+                    cursor += record_count
+        else:
+            records_by_query = [np.empty((0, 4), dtype=np.int64) for _ in self._pending_queries]
+        pending = tuple(self._pending_queries)
+        self._pending_queries.clear()
+        self._pending_query_by_buffer.clear()
+        self._pending_query_by_output.clear()
+        self._pending_backward_buffers.clear()
+        for item, records in zip(pending, records_by_query):
+            self._emit_query_records(
+                records, rendered=item.rendered, query_base=item.query_base,
+                query_shape=item.query_shape, binning_pointer=item.binning_pointer,
+                output_pointer=item.output_pointer, template_id=item.template_id,
+                field_mask=item.field_mask,
+            )
+            context = self._contexts[item.binning_pointer]
+            context.loss_flags = item.loss_flags
+            context.ssim_radius = item.ssim_radius
+        pending_backwards = tuple(self._pending_backwards)
+        self._pending_backwards.clear()
+        for buffer_pointer, voxel in pending_backwards:
+            self._emit_backward(buffer_pointer, voxel=voxel)
+
+    @staticmethod
+    def _copy_record_batches(record_batches: list[Any]) -> np.ndarray:
+        if not record_batches:
+            return np.empty((0, 4), dtype=np.int64)
+        if all(isinstance(batch, np.ndarray) for batch in record_batches):
+            if len(record_batches) == 1:
+                return np.asarray(record_batches[0])
+            return np.concatenate(record_batches, axis=0)
+        if any(isinstance(batch, np.ndarray) for batch in record_batches):
+            raise TypeError("relation record batches must all use the same tensor backend")
+        combined = record_batches[0]
+        if len(record_batches) > 1:
+            import torch
+
+            combined = torch.cat(record_batches, dim=0)
+        return combined.detach().cpu().numpy()
 
     def _emit_query_records(
         self, records: np.ndarray, *, rendered: int, query_base: int,
@@ -610,6 +726,23 @@ class TraceSession:
         ), dependencies=dependencies)
 
     def _capture_backward(self, buffer_pointer: int, *, voxel: bool) -> None:
+        pending = self._pending_query_by_buffer.get(buffer_pointer)
+        if pending is not None:
+            expected_template = VOXEL_TEMPLATE_ID if voxel else RASTER_TEMPLATE_ID
+            if pending.template_id != expected_template:
+                raise RuntimeError("captured backward kind does not match its forward context")
+            if pending.loss_flags == 0:
+                raise RuntimeError(
+                    "captured query reached backward without a captured loss consumer"
+                )
+            if buffer_pointer in self._pending_backward_buffers:
+                raise RuntimeError("captured query received duplicate backward calls")
+            self._pending_backward_buffers.add(buffer_pointer)
+            self._pending_backwards.append((buffer_pointer, voxel))
+            return
+        self._emit_backward(buffer_pointer, voxel=voxel)
+
+    def _emit_backward(self, buffer_pointer: int, *, voxel: bool) -> None:
         context = self._contexts.get(buffer_pointer)
         if context is None:
             return
