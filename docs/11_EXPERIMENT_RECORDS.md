@@ -4,7 +4,7 @@
 
 每次运行分配稳定的 `run_id`，并保存代码提交、模型仓库与提交、上游补丁哈希、数据清单哈希、GALA 配置哈希、消融位、随机种子、主机、CPU、GPU、显存、驱动、CUDA、PyTorch、Numba 和 Ramulator 2 版本。
 
-首组合 input-freeze 记录还保存参考体路径、SHA-256、shape、dtype、有限值范围和全部冻结质量参数的值、单位、来源与状态。环境快照分别记录 `CUDA_HOME`、nvcc 路径与版本、C/C++ 编译器路径与版本、PyTorch CUDA 版本，以及 NumPy、scikit-image、torchvision 和 lpips 版本，使扩展与统一指标不依赖未记录的本地默认值。
+首组合 input-freeze 记录还保存参考体路径、SHA-256、shape、dtype、有限值范围和全部冻结质量参数的值、单位、来源与状态。训练身份保存完整官方命令及哈希、工作目录、解析后的参数全集、评估/保存/检查点调度、随机状态语义、训练快照哈希，以及定义这些行为的上游源码哈希；生成器必须将快照与固定提交源码交叉检查，参数或调度漂移时拒绝生成记录。环境快照分别记录 `CUDA_HOME`、nvcc 路径与版本、C/C++ 编译器路径与版本、PyTorch CUDA 版本，以及 NumPy、scikit-image、torchvision 和 lpips 版本，使扩展与统一指标不依赖未记录的本地默认值。
 
 正式结果还保存开始时间、结束时间、退出状态、峰值主机内存、峰值显存、GPU 利用率分布、trace 字节数和结果文件哈希。
 

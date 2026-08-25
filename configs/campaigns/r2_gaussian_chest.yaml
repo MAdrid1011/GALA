@@ -10,3 +10,72 @@ random_seed:
   source: workflow-freeze-inputs
   scope: campaign
   status: frozen
+training:
+  schema_version: gala-r2-training-freeze-v1
+  model_commit: f2579bfddd9aac009cb797c8503bef8119bbd022
+  entrypoint: train.py
+  command:
+    working_directory: "{source_root}"
+    argv:
+      - python
+      - train.py
+      - -s
+      - "{dataset_root}"
+      - -m
+      - "{model_output}"
+  configuration_file: null
+  parameter_groups:
+    model:
+      source_path: ""
+      model_path: ""
+      data_device: cuda
+      ply_path: ""
+      scale_min: 0.0005
+      scale_max: 0.5
+      eval: true
+    pipeline:
+      compute_cov3D_python: false
+      debug: false
+    optimization:
+      iterations: 30000
+      position_lr_init: 0.0002
+      position_lr_final: 0.00002
+      position_lr_max_steps: 30000
+      density_lr_init: 0.01
+      density_lr_final: 0.001
+      density_lr_max_steps: 30000
+      scaling_lr_init: 0.005
+      scaling_lr_final: 0.0005
+      scaling_lr_max_steps: 30000
+      rotation_lr_init: 0.001
+      rotation_lr_final: 0.0001
+      rotation_lr_max_steps: 30000
+      lambda_dssim: 0.25
+      lambda_tv: 0.05
+      tv_vol_size: 32
+      density_min_threshold: 0.00001
+      densification_interval: 100
+      densify_from_iter: 500
+      densify_until_iter: 15000
+      densify_grad_threshold: 0.00005
+      densify_scale_threshold: 0.1
+      max_screen_size: null
+      max_scale: null
+      max_num_gaussians: 500000
+  runtime_arguments:
+    detect_anomaly: false
+    test_iterations: [5000, 10000, 20000]
+    save_iterations: []
+    quiet: false
+    checkpoint_iterations: []
+    start_checkpoint: null
+    config: null
+  effective_schedule:
+    test_iterations: [5000, 10000, 20000, 30000, 1]
+    save_iterations: [30000]
+    checkpoint_iterations: []
+  random_state:
+    python_random_seed: 0
+    numpy_seed: 0
+    torch_seed: 0
+    cuda_device: "cuda:0"

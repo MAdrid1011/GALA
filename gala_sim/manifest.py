@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from collections.abc import Mapping
 from dataclasses import asdict, dataclass
 from importlib.metadata import PackageNotFoundError, version
@@ -18,6 +19,7 @@ from typing import Any
 import numpy as np
 
 from gala_sim.config import GalaConfig
+from gala_sim.config.loader import _yaml_load
 from gala_sim.identity import canonical_json, sha256_bytes, sha256_file, sha256_tree
 
 
@@ -60,6 +62,13 @@ class DatasetRecord:
     metadata_sha256: str | None = None
     geometry: dict[str, Any] | None = None
     reference_volume: dict[str, Any] | None = None
+
+
+TRAINING_GROUP_CLASSES = {
+    "model": "ModelParams",
+    "pipeline": "PipelineParams",
+    "optimization": "OptimizationParams",
+}
 
 
 def _command(*args: str) -> str | None:
@@ -120,6 +129,241 @@ def source_record(root: Path, name: str, url: str, commit: str) -> SourceRecord:
         raise ValueError(f"{name} license file is missing: {license_path}")
     return SourceRecord(name, url, commit, str(root), sha256_tree(root),
                         sha256_bytes(b""), str(license_path), sha256_file(license_path))
+
+
+def _class_defaults(path: Path, class_name: str) -> dict[str, Any]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    class_node = next(
+        (node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name),
+        None,
+    )
+    if class_node is None:
+        raise ValueError(f"upstream training class is missing: {class_name}")
+    init_node = next(
+        (node for node in class_node.body
+         if isinstance(node, ast.FunctionDef) and node.name == "__init__"),
+        None,
+    )
+    if init_node is None:
+        raise ValueError(f"upstream training class has no initializer: {class_name}")
+    defaults: dict[str, Any] = {}
+    for node in init_node.body:
+        if not isinstance(node, ast.Assign) or len(node.targets) != 1:
+            continue
+        target = node.targets[0]
+        if (isinstance(target, ast.Attribute) and isinstance(target.value, ast.Name)
+                and target.value.id == "self"):
+            try:
+                defaults[target.attr.lstrip("_")] = ast.literal_eval(node.value)
+            except (ValueError, TypeError) as error:
+                raise ValueError(
+                    f"upstream default for {class_name}.{target.attr} is not literal"
+                ) from error
+    return defaults
+
+
+def _runtime_defaults(path: Path) -> dict[str, Any]:
+    tree = ast.parse(path.read_text(encoding="utf-8"), filename=str(path))
+    defaults: dict[str, Any] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        if node.func.attr != "add_argument" or not node.args:
+            continue
+        try:
+            flag = ast.literal_eval(node.args[0])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(flag, str) or not flag.startswith("--"):
+            continue
+        destination = flag[2:]
+        keywords = {keyword.arg: keyword.value for keyword in node.keywords if keyword.arg}
+        if "default" in keywords:
+            defaults[destination] = ast.literal_eval(keywords["default"])
+        elif "action" in keywords and ast.literal_eval(keywords["action"]) == "store_true":
+            defaults[destination] = False
+        else:
+            defaults[destination] = None
+    return defaults
+
+
+def _call_arguments(tree: ast.AST, dotted_name: str) -> list[tuple[Any, ...]]:
+    found: list[tuple[Any, ...]] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call):
+            continue
+        parts: list[str] = []
+        function: ast.expr = node.func
+        while isinstance(function, ast.Attribute):
+            parts.append(function.attr)
+            function = function.value
+        if isinstance(function, ast.Name):
+            parts.append(function.id)
+        if ".".join(reversed(parts)) != dotted_name:
+            continue
+        try:
+            found.append(tuple(ast.literal_eval(argument) for argument in node.args))
+        except (ValueError, TypeError):
+            continue
+    return found
+
+
+def _cuda_device(tree: ast.AST) -> str | None:
+    for node in ast.walk(tree):
+        if (not isinstance(node, ast.Call) or len(node.args) != 1
+                or not isinstance(node.args[0], ast.Call)):
+            continue
+        parts: list[str] = []
+        function: ast.expr = node.func
+        while isinstance(function, ast.Attribute):
+            parts.append(function.attr)
+            function = function.value
+        if isinstance(function, ast.Name):
+            parts.append(function.id)
+        if ".".join(reversed(parts)) != "torch.cuda.set_device":
+            continue
+        device_call = node.args[0]
+        if (isinstance(device_call.func, ast.Attribute)
+                and isinstance(device_call.func.value, ast.Name)
+                and device_call.func.value.id == "torch" and device_call.func.attr == "device"
+                and len(device_call.args) == 1):
+            try:
+                device = ast.literal_eval(device_call.args[0])
+            except (ValueError, TypeError):
+                return None
+            return device if isinstance(device, str) else None
+    return None
+
+
+def _has_schedule_append(tree: ast.AST, field: str, value: str | int) -> bool:
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Call) or not isinstance(node.func, ast.Attribute):
+            continue
+        owner = node.func.value
+        if (node.func.attr != "append" or not isinstance(owner, ast.Attribute)
+                or not isinstance(owner.value, ast.Name) or owner.value.id != "args"
+                or owner.attr != field or len(node.args) != 1):
+            continue
+        argument = node.args[0]
+        if isinstance(value, str):
+            if (isinstance(argument, ast.Attribute) and isinstance(argument.value, ast.Name)
+                    and argument.value.id == "args" and argument.attr == value):
+                return True
+        elif isinstance(argument, ast.Constant) and argument.value == value:
+            return True
+    return False
+
+
+def training_record(profile_path: Path, source: SourceRecord, dataset_root: Path | None,
+                    model_output: Path | None) -> dict[str, Any]:
+    """Validate and bind the frozen R2-Gaussian training profile."""
+
+    profile_path = profile_path.resolve()
+    document = _yaml_load(profile_path)
+    if not isinstance(document, Mapping):
+        raise ValueError("campaign manifest root must be a mapping")
+    training = document.get("training")
+    if not isinstance(training, Mapping):
+        raise ValueError("campaign manifest has no training profile")
+    profile = _json_value(training)
+    if profile.get("schema_version") != "gala-r2-training-freeze-v1":
+        raise ValueError("unsupported training profile schema")
+    if profile.get("model_commit") != source.commit:
+        raise ValueError("training profile model commit does not match source")
+    if profile.get("configuration_file") is not None:
+        raise ValueError("frozen official training must not use a configuration override")
+
+    source_root = Path(source.root)
+    arguments_path = source_root / "r2_gaussian/arguments/__init__.py"
+    train_path = source_root / str(profile.get("entrypoint"))
+    state_path = source_root / "r2_gaussian/utils/general_utils.py"
+    for path in (arguments_path, train_path, state_path):
+        if not path.is_file():
+            raise ValueError(f"upstream training source is missing: {path}")
+
+    groups = profile.get("parameter_groups")
+    if not isinstance(groups, dict):
+        raise ValueError("training parameter_groups must be a mapping")
+    for group, class_name in TRAINING_GROUP_CLASSES.items():
+        expected = groups.get(group)
+        actual = _class_defaults(arguments_path, class_name)
+        if expected != actual:
+            raise ValueError(f"frozen {group} parameters do not match upstream defaults")
+
+    runtime = profile.get("runtime_arguments")
+    if runtime != _runtime_defaults(train_path):
+        raise ValueError("frozen runtime arguments do not match upstream defaults")
+    iterations = groups["optimization"]["iterations"]
+    expected_schedule = {
+        "test_iterations": [*runtime["test_iterations"], iterations, 1],
+        "save_iterations": [*runtime["save_iterations"], iterations],
+        "checkpoint_iterations": list(runtime["checkpoint_iterations"]),
+    }
+    train_tree = ast.parse(train_path.read_text(encoding="utf-8"), filename=str(train_path))
+    if not all((
+        _has_schedule_append(train_tree, "save_iterations", "iterations"),
+        _has_schedule_append(train_tree, "test_iterations", "iterations"),
+        _has_schedule_append(train_tree, "test_iterations", 1),
+    )) or profile.get("effective_schedule") != expected_schedule:
+        raise ValueError("frozen evaluation/save schedule does not match upstream")
+
+    state_tree = ast.parse(state_path.read_text(encoding="utf-8"), filename=str(state_path))
+    safe_state = next(
+        (node for node in state_tree.body
+         if isinstance(node, ast.FunctionDef) and node.name == "safe_state"),
+        None,
+    )
+    if safe_state is None:
+        raise ValueError("upstream safe_state function is missing")
+    frozen_state = profile.get("random_state")
+    actual_state = {
+        "python_random_seed": _call_arguments(safe_state, "random.seed"),
+        "numpy_seed": _call_arguments(safe_state, "np.random.seed"),
+        "torch_seed": _call_arguments(safe_state, "torch.manual_seed"),
+    }
+    normalized_state = {
+        key: values[0][0] if len(values) == 1 and len(values[0]) == 1 else None
+        for key, values in actual_state.items()
+    }
+    normalized_state["cuda_device"] = _cuda_device(safe_state)
+    if frozen_state != normalized_state:
+        raise ValueError("frozen random state does not match upstream safe_state")
+
+    command = profile.get("command")
+    if not isinstance(command, dict) or not isinstance(command.get("argv"), list):
+        raise ValueError("training command must provide an argv list")
+    bindings = {
+        "source_root": str(source_root.resolve()),
+        "dataset_root": (str(dataset_root.resolve()) if dataset_root is not None
+                         else "<chest-data-root>"),
+        "model_output": (str(model_output.resolve()) if model_output is not None
+                         else "<model-output-root>"),
+    }
+    try:
+        argv = [str(value).format(**bindings) for value in command["argv"]]
+        working_directory = str(command["working_directory"]).format(**bindings)
+    except (KeyError, ValueError) as error:
+        raise ValueError("training command contains an invalid binding") from error
+    if dataset_root is not None and model_output is None:
+        raise ValueError("--model-output is required with --dataset-root")
+    command_record = {"working_directory": working_directory, "argv": argv}
+    effective_arguments = {
+        **groups["model"], **groups["pipeline"], **groups["optimization"], **runtime,
+        "source_path": bindings["dataset_root"], "model_path": bindings["model_output"],
+        **expected_schedule,
+    }
+    files = {
+        path.relative_to(source_root).as_posix(): sha256_file(path)
+        for path in (arguments_path, train_path, state_path)
+    }
+    return {
+        "profile": profile,
+        "profile_path": str(profile_path),
+        "profile_sha256": sha256_file(profile_path),
+        "source_files": files,
+        "command": {**command_record, "sha256": sha256_bytes(canonical_json(command_record))},
+        "effective_arguments": effective_arguments,
+    }
 
 
 def dataset_record(root: Path | None, name: str, source_url: str, license_url: str,
@@ -213,16 +457,23 @@ def _validate_quality_reference(config: GalaConfig, dataset: DatasetRecord) -> N
 
 
 def build_freeze_record(config: GalaConfig, source: SourceRecord, dataset: DatasetRecord,
-                        seed: int, repository: Path) -> dict[str, Any]:
+                        training: Mapping[str, Any], seed: int,
+                        repository: Path) -> dict[str, Any]:
     _validate_quality_reference(config, dataset)
+    random_state = training.get("profile", {}).get("random_state", {})
+    if seed != 0 or any(random_state.get(name) != seed for name in (
+        "python_random_seed", "numpy_seed", "torch_seed",
+    )):
+        raise ValueError("random seed does not match the frozen upstream safe_state")
     record: dict[str, Any] = {
-        "schema_version": "gala-input-freeze-v2",
+        "schema_version": "gala-input-freeze-v3",
         "workflow_step": "freeze_inputs",
         "status": "planned" if dataset.status == "planned" and config.ready else dataset.status,
         "model": asdict(source),
         "dataset": asdict(dataset),
         "config": {"path": str(config.path), "sha256": config.sha256, "ready": config.ready},
         "quality": {"parameters": _quality_snapshot(config)},
+        "training": _json_value(training),
         "random_seed": seed,
         "repository": {"root": str(repository.resolve()), "commit": _command("git", "-C", str(repository), "rev-parse", "HEAD")},
         "environment": environment_snapshot(),

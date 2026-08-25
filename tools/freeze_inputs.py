@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from gala_sim.config import ConfigError, load_config
 from gala_sim.manifest import (build_freeze_record, dataset_record, source_record,
-                               write_freeze_record)
+                               training_record, write_freeze_record)
 
 
 MODEL_URL = "https://github.com/Ruyi-Zha/r2_gaussian.git"
@@ -40,6 +40,10 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--dataset-reason",
                         help="machine-readable reason when the dataset cannot be used")
     parser.add_argument("--seed", default=0, type=int)
+    parser.add_argument("--training-profile",
+                        default="configs/campaigns/r2_gaussian_chest.yaml", type=Path)
+    parser.add_argument("--model-output", type=Path,
+                        help="frozen output directory for the official training command")
     parser.add_argument("--repository", default=".", type=Path)
     parser.add_argument("--output", default="records/input_freeze/r2_gaussian_chest.json", type=Path)
     return parser
@@ -129,7 +133,10 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("--dataset-root or --dataset-reason is required")
         dataset = dataset_record(args.dataset_root, "Chest", DATA_URL, DATA_LICENSE_URL,
                                  args.dataset_reason)
-        record = build_freeze_record(config, source, dataset, args.seed, args.repository)
+        training = training_record(args.training_profile, source, args.dataset_root,
+                                   args.model_output)
+        record = build_freeze_record(config, source, dataset, training, args.seed,
+                                     args.repository)
         write_freeze_record(record, args.output)
     except (ConfigError, OSError, ValueError) as error:
         print(f"freeze_inputs: {error}", file=sys.stderr)
