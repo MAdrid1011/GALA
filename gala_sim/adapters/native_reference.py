@@ -4,17 +4,16 @@ from __future__ import annotations
 
 from dataclasses import asdict
 import json
+import os
 from pathlib import Path
 import subprocess
 import time
 from typing import Any, Callable, Mapping
 
-import numpy as np
-
 from gala_sim.config import GalaConfig
 from gala_sim.identity import canonical_json, sha256_bytes, sha256_file
 from gala_sim.manifest import verify_freeze_record
-from gala_sim.metrics import QualityConfig, measure_quality
+from gala_sim.metrics import QualityConfig
 from gala_sim.results import RunManifest
 from gala_sim.results.run import RunOutputWriter
 from gala_sim.tools.preflight import GpuSample, sample_gpustat
@@ -79,6 +78,68 @@ def _tensorboard_stages(model_output: Path, python_executable: str) -> dict[str,
         "tensorboard_sha256": sha256_file(events[0]),
         "unmeasured_residual_seconds": "wall_seconds_minus_training_iteration_time",
     }
+
+
+def _quality_with_frozen_interpreter(
+    reference_path: Path,
+    candidate_path: Path,
+    config: QualityConfig,
+    python_executable: str,
+) -> dict[str, float]:
+    """Measure unified quality using the interpreter frozen for the run.
+
+    The simulator's shell environment is intentionally independent from the
+    official training environment.  Running the metric in the frozen
+    interpreter keeps torch, torchvision, lpips and scikit-image identities
+    aligned with the recorded training environment.
+    """
+
+    script = (
+        "import json,sys; "
+        "import numpy as np; "
+        "from gala_sim.metrics.quality import QualityConfig,measure_quality; "
+        "reference=np.load(sys.argv[1],mmap_mode='r',allow_pickle=False); "
+        "candidate=np.load(sys.argv[2],mmap_mode='r',allow_pickle=False); "
+        "raw=json.loads(sys.argv[3]); "
+        "raw['lpips_slices']=tuple(tuple(int(i) for i in axis) for axis in raw['lpips_slices']); "
+        "metrics=measure_quality(reference,candidate,QualityConfig(**raw)); "
+        "print(json.dumps({'psnr':metrics.psnr,'ssim':metrics.ssim,'lpips':metrics.lpips},sort_keys=True))"
+    )
+    repository_root = Path(__file__).resolve().parents[2]
+    environment = os.environ.copy()
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        item for item in (str(repository_root), existing_pythonpath) if item
+    )
+    try:
+        raw = subprocess.check_output(
+            [
+                python_executable,
+                "-c",
+                script,
+                str(reference_path.resolve()),
+                str(candidate_path.resolve()),
+                json.dumps(asdict(config), sort_keys=True),
+            ],
+            text=True,
+            stderr=subprocess.STDOUT,
+            env=environment,
+        )
+        lines = [line for line in raw.splitlines() if line.strip()]
+        if not lines:
+            raise ValueError("quality subprocess returned no output")
+        metrics = json.loads(lines[-1])
+        if not isinstance(metrics, dict):
+            raise ValueError("quality subprocess returned a non-object")
+        return {name: float(metrics[name]) for name in ("psnr", "ssim", "lpips")}
+    except (OSError, subprocess.CalledProcessError, TypeError, ValueError,
+            KeyError, json.JSONDecodeError) as error:
+        detail = (
+            str(error.output).strip()
+            if isinstance(error, subprocess.CalledProcessError)
+            else str(error)
+        )
+        raise RuntimeError(f"frozen quality measurement failed: {detail}") from error
 
 
 def _write_failed(
@@ -248,10 +309,11 @@ def run_native_reference(
         raise NativeReferenceError("official reference produced no reconstruction volume")
     try:
         dataset = load_chest_manifest(dataset_root)
-        quality = measure_quality(
-            np.load(dataset.volume_path, mmap_mode="r", allow_pickle=False),
-            np.load(volumes[-1], mmap_mode="r", allow_pickle=False),
+        quality = _quality_with_frozen_interpreter(
+            dataset.volume_path,
+            volumes[-1],
             QualityConfig.from_gala(config),
+            command[0],
         )
         gpu_reference["stages"] = _tensorboard_stages(model_output, command[0])
     except (OSError, RuntimeError, ValueError) as error:
@@ -263,7 +325,7 @@ def run_native_reference(
         raise NativeReferenceError("quality_or_stage_measurement_failed") from error
     gpu_reference["stages"]["wall_seconds"] = finished - started
     writer.write_quality({
-        "psnr": quality.psnr, "ssim": quality.ssim, "lpips": quality.lpips,
+        "psnr": quality["psnr"], "ssim": quality["ssim"], "lpips": quality["lpips"],
         **_read_latest_metrics(model_output),
     })
     writer.write_gpu_reference(gpu_reference)
@@ -281,6 +343,6 @@ def run_native_reference(
     writer.write_status("passed", checks={"quality": "passed", "official_command": "passed"})
     return {
         "status": "passed",
-        "quality": {"psnr": quality.psnr, "ssim": quality.ssim, "lpips": quality.lpips},
+        "quality": quality,
         "output": str(output), "gpu_reference": gpu_reference,
     }

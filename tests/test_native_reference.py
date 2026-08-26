@@ -4,9 +4,14 @@ from pathlib import Path
 
 import pytest
 
-from gala_sim.adapters.native_reference import NativeReferenceError, run_native_reference
+from gala_sim.adapters.native_reference import (
+    NativeReferenceError,
+    _quality_with_frozen_interpreter,
+    run_native_reference,
+)
 from gala_sim.config import load_config
 from gala_sim.identity import canonical_json, sha256_bytes
+from gala_sim.metrics import QualityConfig
 from gala_sim.tools.preflight import ComputeProcess
 
 
@@ -71,3 +76,36 @@ def test_native_reference_records_sampling_failure(tmp_path: Path) -> None:
         ))
     status = (tmp_path / "run" / "status.json").read_text(encoding="utf-8")
     assert '"status": "failed_preflight"' in status
+
+
+def test_quality_uses_frozen_interpreter(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    config = QualityConfig(
+        data_min=0.0,
+        data_max=1.0,
+        ssim_window=3,
+        ssim_sigma=1.5,
+        ssim_boundary="reflect",
+        lpips_slices=((0,), (0,), (0,)),
+        lpips_network="alex",
+        lpips_version="0.1",
+        lpips_backbone_sha256="a" * 64,
+        lpips_calibration_sha256="b" * 64,
+    )
+    captured: dict[str, object] = {}
+
+    def fake_check_output(command: list[str], **kwargs: object) -> str:
+        captured["command"] = command
+        captured["environment"] = kwargs["env"]
+        return 'weight loader notice\n{"lpips": 0.03, "psnr": 31.5, "ssim": 0.92}\n'
+
+    monkeypatch.setattr("subprocess.check_output", fake_check_output)
+    result = _quality_with_frozen_interpreter(
+        tmp_path / "reference.npy",
+        tmp_path / "candidate.npy",
+        config,
+        "/frozen/python",
+    )
+
+    assert result == {"psnr": 31.5, "ssim": 0.92, "lpips": 0.03}
+    assert captured["command"][0] == "/frozen/python"  # type: ignore[index]
+    assert str(ROOT) in captured["environment"]["PYTHONPATH"]  # type: ignore[index]
