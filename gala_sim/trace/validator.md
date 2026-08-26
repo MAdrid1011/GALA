@@ -10,4 +10,4 @@
 
 ## Internal Helpers
 
-流式路径把跨事件回查限制为按实际 domain 压缩的 kind/query/Gaussian/relation 字段，并使用紧凑 relation index。含 optimizer 或 collection 的大 trace 在完整状态迁移 pass 实现前会明确拒绝，不会降级检查。
+流式结构 pass 把跨事件回查限制为按实际 domain 压缩的 kind/query/Gaussian/relation 字段，并使用紧凑 relation index。生命周期 pass 再以有界向量状态检查当前版本、活动 Gaussian、缓存读完成、梯度到 optimizer commit 的精确集合、update begin/end、Clone/Split/Prune lineage 和后继查询屏障。合法的 backward 完成顺序可以不同，但 gradient 集合不得遗漏、重复或错配 relation。

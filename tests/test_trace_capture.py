@@ -153,6 +153,131 @@ def test_streaming_capture_validator_uses_compact_dependency_keys(tmp_path: Path
     assert report.counts[PrimitiveKind.RELATION.name] == 1
 
 
+def test_streaming_capture_validator_checks_update_and_collection_state(
+    tmp_path: Path,
+) -> None:
+    class Model:
+        get_xyz = np.empty((1, 3), dtype=np.float32)
+
+    session = TraceSession(tmp_path / "trace", chunk_events=4)
+    session._ensure_gaussians(1)
+    session._audit.update({
+        "official_raster_kernel_calls": 1,
+        "captured_raster_kernel_calls": 1,
+        "captured_query_kernel_calls": 1,
+        "cuda_relation_candidates": 1,
+        "captured_logical_queries": 1,
+    })
+    session._emit_query_records(
+        _single_relation_records(), rendered=1, query_base=0, query_shape=(1, 1),
+        binning_pointer=10, output_pointer=20, template_id=RASTER_TEMPLATE_ID,
+        field_mask=STATE_FIELD_MASK,
+    )
+    session._contexts[10].loss_flags = LOSS_L1
+    session._capture_backward(10, voxel=False)
+    session._capture_update(Model(), field_mask=FIELD_DENSITY)
+    session._start_collection_transaction()
+    clone_parent = session._emit_set_modification(
+        0, flags=MOD_CLONE_PARENT, reduction_key=0,
+    )
+    session._emit_set_modification(
+        1, flags=MOD_CLONE_CHILD, reduction_key=0,
+        dependencies=[clone_parent],
+    )
+    split_children = [
+        session._emit_set_modification(
+            child, flags=MOD_SPLIT_CHILD, reduction_key=0,
+        )
+        for child in (2, 3)
+    ]
+    session._emit_set_modification(
+        0, flags=MOD_SPLIT_PARENT, reduction_key=0,
+        dependencies=split_children,
+    )
+    session._emit_set_modification(1, flags=MOD_PRUNE, reduction_key=1)
+    session._finish_collection_transaction()
+    trace = session.finish()
+    metadata = {**trace.metadata, "trace_storage_format": "raw_columns"}
+    streaming = Trace(trace.events, trace.dependencies, trace.payload, metadata)
+    config = TraceValidationConfig(scan_events=3, index_directory=tmp_path)
+
+    report = validate_trace(streaming, config=config)
+    assert report.gaussian_count == 4
+    assert report.update_count == 1
+
+    commit = int(_rows(trace, PrimitiveKind.UPDATE_COMMIT)[0]["event_id"])
+    broken_dependencies = trace.dependencies.copy()
+    commit_begin = int(trace.events[commit]["dependency_begin"])
+    broken_dependencies[commit_begin + 1] = broken_dependencies[commit_begin]
+    with pytest.raises(TraceValidationError, match="optimizer begin"):
+        validate_trace(
+            Trace(trace.events, broken_dependencies, trace.payload, metadata),
+            config=config,
+        )
+
+    broken_events = trace.events.copy()
+    child = np.flatnonzero(
+        (broken_events["primitive_kind"] == int(PrimitiveKind.SET_MODIFICATION))
+        & (broken_events["flags"] == MOD_CLONE_CHILD)
+    )[0]
+    broken_events[child]["reduction_key"] = 1
+    with pytest.raises(TraceValidationError, match="child lineage"):
+        validate_trace(
+            Trace(broken_events, trace.dependencies, trace.payload, metadata),
+            config=config,
+        )
+
+
+def test_streaming_capture_validator_requires_noop_update_barrier(
+    tmp_path: Path,
+) -> None:
+    class Model:
+        get_xyz = np.empty((1, 3), dtype=np.float32)
+
+    session = TraceSession(tmp_path / "trace", chunk_events=4)
+    session._ensure_gaussians(1)
+    session._audit.update({
+        "official_raster_kernel_calls": 2,
+        "captured_raster_kernel_calls": 2,
+        "captured_query_kernel_calls": 2,
+        "cuda_relation_candidates": 2,
+        "captured_logical_queries": 2,
+    })
+    for query_base, pointer in ((0, 10), (1, 11)):
+        session._emit_query_records(
+            _single_relation_records(), rendered=1, query_base=query_base,
+            query_shape=(1, 1), binning_pointer=pointer,
+            output_pointer=pointer + 10, template_id=RASTER_TEMPLATE_ID,
+            field_mask=STATE_FIELD_MASK,
+        )
+        session._contexts[pointer].loss_flags = LOSS_L1
+        session._capture_backward(pointer, voxel=False)
+        if query_base == 0:
+            session._capture_update(Model(), field_mask=0)
+    trace = session.finish()
+    metadata = {**trace.metadata, "trace_storage_format": "raw_columns"}
+    config = TraceValidationConfig(scan_events=3, index_directory=tmp_path)
+    assert validate_trace(
+        Trace(trace.events, trace.dependencies, trace.payload, metadata),
+        config=config,
+    ).query_count == 2
+
+    candidates = np.flatnonzero(
+        trace.events["primitive_kind"] == int(PrimitiveKind.RELATION_CANDIDATE)
+    )
+    gradients = np.flatnonzero(
+        trace.events["primitive_kind"] == int(PrimitiveKind.GRADIENT_REDUCTION)
+    )
+    broken_dependencies = trace.dependencies.copy()
+    candidate_begin = int(trace.events[candidates[1]]["dependency_begin"])
+    broken_dependencies[candidate_begin] = gradients[0]
+    with pytest.raises(TraceValidationError, match="prior update end"):
+        validate_trace(
+            Trace(trace.events, broken_dependencies, trace.payload, metadata),
+            config=config,
+        )
+
+
 def test_query_and_backward_batches_preserve_capture_order_across_chunk_sizes(
     tmp_path: Path,
 ) -> None:
@@ -228,6 +353,11 @@ def test_pending_queries_share_one_host_copy_and_preserve_event_order(
     assert session._audit["relation_record_d2h_batches"] == 1
     assert report.counts[PrimitiveKind.RELATION.name] == 2
     assert report.counts[PrimitiveKind.CONSUMER.name] == 2
+    metadata = {**trace.metadata, "trace_storage_format": "raw_columns"}
+    assert validate_trace(
+        Trace(trace.events, trace.dependencies, trace.payload, metadata),
+        config=TraceValidationConfig(scan_events=3, index_directory=tmp_path),
+    ).event_count == trace.event_count
     assert _rows(trace, PrimitiveKind.RELATION_CANDIDATE)["template_id"].tolist() == [
         RASTER_TEMPLATE_ID, VOXEL_TEMPLATE_ID,
     ]

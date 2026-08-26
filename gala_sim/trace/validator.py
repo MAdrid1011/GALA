@@ -427,14 +427,6 @@ def _validate_large_capture_trace_streaming(
         raise TraceValidationError("capture audit relation/query totals are missing")
     if not isinstance(initial_gaussian_count, int) or initial_gaussian_count < 0:
         raise TraceValidationError("initial Gaussian count metadata is invalid")
-    if any(int(audit.get(name, 0)) for name in (
-        "optimizer_steps", "collection_modification_transactions",
-        "update_begin_events", "update_end_events", "collection_modification_events",
-    )):
-        raise TraceValidationError(
-            "large mmap validator requires a state-transition pass for update events"
-        )
-
     event_count = int(events.size)
     dependency_count = int(dependencies.size)
     payload_count = int(payload.size)
@@ -621,15 +613,21 @@ def _validate_large_capture_trace_streaming(
                     raise TraceValidationError("query close ID is outside the captured domain")
                 if bool(query_close_seen[queries].any()):
                     raise TraceValidationError("query has multiple close events")
-                if bool((dep_counts[close_pos] != relation_query_counts[queries]).any()):
+                if bool((dep_counts[close_pos] < relation_query_counts[queries]).any()):
                     raise TraceValidationError("query close does not depend on every relation")
                 for first, last in _contiguous_position_runs(close_pos):
                     run_queries = np.asarray(rows["query_id"][first:last], dtype=np.int64)
                     run_counts = dep_counts[first:last]
                     run_deps = dependencies[int(begins[first]):int(dep_ends[last - 1])]
-                    if bool((event_keys["kind"][run_deps] != int(PrimitiveKind.RELATION)).any()):
-                        raise TraceValidationError("query close has a non-relation dependency")
-                    if bool((event_keys["query"][run_deps] != np.repeat(run_queries, run_counts)).any()):
+                    run_kinds = event_keys["kind"][run_deps]
+                    relation_mask = run_kinds == int(PrimitiveKind.RELATION)
+                    if not bool(np.isin(run_kinds, [
+                        int(PrimitiveKind.RELATION), int(PrimitiveKind.UPDATE_END),
+                    ]).all()):
+                        raise TraceValidationError("query close dependency kind is invalid")
+                    dependency_queries = np.repeat(run_queries, run_counts)
+                    if bool((event_keys["query"][run_deps[relation_mask]]
+                             != dependency_queries[relation_mask]).any()):
                         raise TraceValidationError("query close relation belongs to another query")
                 query_close_seen[queries] = True
 
@@ -756,6 +754,13 @@ def _validate_large_capture_trace_streaming(
             raise TraceValidationError("relation pipeline counts are inconsistent")
         if bool((relation_event_ids == missing_event_id).any()):
             raise TraceValidationError("relation index is incomplete")
+        lifecycle = _validate_streaming_state_transitions(
+            events, dependencies, event_keys, relation_event_ids,
+            relation_query_counts,
+            initial_gaussian_count=initial_gaussian_count,
+            max_new_gaussians=int(counts_array[PrimitiveKind.SET_MODIFICATION]),
+            scan_events=chunk_size,
+        )
     if not bool(query_close_seen.all()):
         raise TraceValidationError("captured query is missing its close event")
     if not bool(consumer_seen.all()):
@@ -767,14 +772,19 @@ def _validate_large_capture_trace_streaming(
         for kind in range(1, len(PrimitiveKind) + 1)
         if counts_array[kind]
     }
-    _validate_capture_audit(trace, counts)
+    _validate_capture_audit(
+        trace, counts,
+        begin_counts=lifecycle.begin_counts,
+        end_counts=lifecycle.end_counts,
+        modification_counts=lifecycle.modification_counts,
+    )
     return TraceValidationReport(
         event_count=event_count,
         dependency_count=dependency_count,
         counts=counts,
         query_count=query_count,
-        gaussian_count=initial_gaussian_count,
-        update_count=0,
+        gaussian_count=lifecycle.gaussian_count,
+        update_count=counts.get(PrimitiveKind.UPDATE_COMMIT.name, 0),
     )
 
 
@@ -792,6 +802,462 @@ def _compact_unsigned_dtype(domain_size: int) -> np.dtype:
     if domain_size <= np.iinfo(np.uint32).max:
         return np.dtype("<u4")
     return np.dtype("<u8")
+
+
+@dataclass(frozen=True)
+class _StreamingLifecycleReport:
+    gaussian_count: int
+    begin_counts: dict[UpdateBeginKind, int]
+    end_counts: dict[UpdateBeginKind, int]
+    modification_counts: dict[ModificationKind, int]
+
+
+def _validate_streaming_state_transitions(
+    events: np.ndarray,
+    dependencies: np.ndarray,
+    event_keys: np.ndarray,
+    gradient_event_ids: np.ndarray,
+    relation_query_counts: np.ndarray,
+    *,
+    initial_gaussian_count: int,
+    max_new_gaussians: int,
+    scan_events: int,
+) -> _StreamingLifecycleReport:
+    """Validate sparse lifecycle boundaries without relation-sized Python state."""
+
+    gaussian_capacity = initial_gaussian_count + max_new_gaussians
+    active = np.zeros(gaussian_capacity, dtype=bool)
+    active[:initial_gaussian_count] = True
+    pending_gradients = np.zeros(gaussian_capacity, dtype=np.uint64)
+    next_gaussian = initial_gaussian_count
+    current_version = 0
+    latest_state_ready: tuple[int, int] | None = None
+    required_transition_event: int | None = None
+    relation_seen = 0
+    gradient_seen = 0
+    query_seen = 0
+    epoch_relation_start = 0
+    epoch_query_start = 0
+    outstanding_reads = 0
+
+    current_begin: tuple[int, UpdateBeginKind] | None = None
+    current_members: list[int] = []
+    current_committed_gaussians: set[int] = set()
+    current_gradient_dependencies = 0
+    current_field_mask: int | None = None
+    clone_parent_events: dict[int, int] = {}
+    split_child_events: dict[int, list[int]] = defaultdict(list)
+    begin_counts: dict[UpdateBeginKind, int] = defaultdict(int)
+    end_counts: dict[UpdateBeginKind, int] = defaultdict(int)
+    modification_counts: dict[ModificationKind, int] = defaultdict(int)
+    relation_count = int(relation_query_counts.sum(dtype=np.uint64))
+    if int(gradient_event_ids.size) != relation_count:
+        raise TraceValidationError("lifecycle relation index size is inconsistent")
+    missing_event = np.iinfo(gradient_event_ids.dtype).max
+    gradient_event_ids[:] = missing_event
+    commit_gradient_seen = np.zeros(relation_count, dtype=bool)
+    transition_values = np.asarray([
+        int(PrimitiveKind.UPDATE_BEGIN), int(PrimitiveKind.UPDATE_COMMIT),
+        int(PrimitiveKind.SET_MODIFICATION), int(PrimitiveKind.UPDATE_END),
+    ], dtype=np.uint8)
+
+    def dependency_ids(row: object) -> np.ndarray:
+        begin = int(row["dependency_begin"])
+        end = begin + int(row["dependency_count"])
+        return np.asarray(dependencies[begin:end], dtype=np.uint64)
+
+    def require_current_state(rows: np.ndarray, base_event: int) -> None:
+        if rows.size == 0:
+            return
+        versions = np.asarray(rows["state_version"], dtype=np.uint64)
+        invalid_version = versions != current_version
+        if bool(invalid_version.any()):
+            offset = int(np.flatnonzero(invalid_version)[0])
+            raise TraceValidationError(
+                f"state version is not current at event {base_event + offset}"
+            )
+        gaussian_ids = np.asarray(rows["gaussian_id"], dtype=np.int64)
+        used = gaussian_ids >= 0
+        if bool(used.any()):
+            ids = gaussian_ids[used]
+            if (
+                bool((ids >= next_gaussian).any())
+                or bool((ids < 0).any())
+                or not bool(active[ids].all())
+            ):
+                raise TraceValidationError(
+                    f"inactive Gaussian is used at event {base_event}"
+                )
+
+    def require_dense_ids(values: np.ndarray, start: int, message: str) -> int:
+        ids = np.asarray(values, dtype=np.int64)
+        if ids.size:
+            expected = np.arange(start, start + ids.size, dtype=np.int64)
+            if not np.array_equal(ids, expected):
+                raise TraceValidationError(message)
+        return start + int(ids.size)
+
+    def require_state_barriers(rows: np.ndarray) -> None:
+        candidate_pos = np.flatnonzero(
+            rows["primitive_kind"] == int(PrimitiveKind.RELATION_CANDIDATE)
+        )
+        close_pos = np.flatnonzero(
+            rows["primitive_kind"] == int(PrimitiveKind.QUERY_CLOSE)
+        )
+        barrier_count = int(latest_state_ready is not None)
+        if candidate_pos.size:
+            counts = np.asarray(rows["dependency_count"][candidate_pos], dtype=np.int64)
+            if bool((counts != barrier_count).any()):
+                raise TraceValidationError("relation candidate lacks prior update end")
+            if latest_state_ready is not None:
+                begins = np.asarray(
+                    rows["dependency_begin"][candidate_pos], dtype=np.int64,
+                )
+                if bool((dependencies[begins] != latest_state_ready[0]).any()):
+                    raise TraceValidationError("relation candidate lacks prior update end")
+        if close_pos.size:
+            queries = np.asarray(rows["query_id"][close_pos], dtype=np.int64)
+            counts = np.asarray(rows["dependency_count"][close_pos], dtype=np.int64)
+            expected = relation_query_counts[queries].astype(np.int64) + barrier_count
+            if bool((counts != expected).any()):
+                raise TraceValidationError("query close does not depend on every relation")
+            if latest_state_ready is not None:
+                begins = np.asarray(rows["dependency_begin"][close_pos], dtype=np.int64)
+                if bool((dependencies[begins] != latest_state_ready[0]).any()):
+                    raise TraceValidationError("query close lacks prior update end")
+
+    def process_regular_span(rows: np.ndarray, base_event: int) -> None:
+        nonlocal relation_seen, gradient_seen, query_seen, outstanding_reads
+        if rows.size == 0:
+            return
+        require_current_state(rows, base_event)
+        require_state_barriers(rows)
+        kinds = np.asarray(rows["primitive_kind"], dtype=np.uint8)
+        relation_pos = np.flatnonzero(kinds == int(PrimitiveKind.RELATION))
+        relation_seen = require_dense_ids(
+            rows["relation_id"][relation_pos], relation_seen,
+            "relation IDs are not dense across state transitions",
+        )
+        close_pos = np.flatnonzero(kinds == int(PrimitiveKind.QUERY_CLOSE))
+        query_seen = require_dense_ids(
+            rows["query_id"][close_pos], query_seen,
+            "query close IDs are not dense across state transitions",
+        )
+        gradient_pos = np.flatnonzero(kinds == int(PrimitiveKind.GRADIENT_REDUCTION))
+        if gradient_pos.size:
+            relation_ids = np.asarray(rows["relation_id"][gradient_pos], dtype=np.int64)
+            gaussian_ids = np.asarray(rows["gaussian_id"][gradient_pos], dtype=np.int64)
+            if (
+                bool((relation_ids < 0).any())
+                or bool((relation_ids >= relation_seen).any())
+                or bool((gradient_event_ids[relation_ids] != missing_event).any())
+            ):
+                raise TraceValidationError("relation has multiple or invalid gradients")
+            gradient_event_ids[relation_ids] = (
+                np.arange(base_event, base_event + rows.size, dtype=np.uint64)[gradient_pos]
+            )
+            gradient_seen += int(gradient_pos.size)
+            np.add.at(pending_gradients, gaussian_ids, 1)
+        outstanding_reads += int(np.count_nonzero(
+            kinds == int(PrimitiveKind.CACHE_REQUEST)
+        ))
+        outstanding_reads -= int(np.count_nonzero(
+            kinds == int(PrimitiveKind.CACHE_RETURN)
+        ))
+        if outstanding_reads < 0:
+            raise TraceValidationError("cache return has no active request")
+
+    def require_backward_barrier(deps: np.ndarray) -> None:
+        kinds = np.asarray(event_keys["kind"][deps], dtype=np.uint8)
+        if not bool(np.isin(kinds, [
+            int(PrimitiveKind.GRADIENT_REDUCTION), int(PrimitiveKind.CONSUMER),
+            int(PrimitiveKind.UPDATE_END),
+        ]).all()):
+            raise TraceValidationError("update begin dependency kind is invalid")
+        gradient_deps = deps[kinds == int(PrimitiveKind.GRADIENT_REDUCTION)]
+        relation_ids = np.asarray(event_keys["relation"][gradient_deps], dtype=np.uint64)
+        expected_gradients = relation_seen - epoch_relation_start
+        valid_range = (
+            relation_ids >= epoch_relation_start
+        ) & (relation_ids < relation_seen)
+        if (
+            relation_ids.size != expected_gradients
+            or not bool(valid_range.all())
+            or not np.array_equal(gradient_event_ids[relation_ids], gradient_deps)
+        ):
+            raise TraceValidationError("update begin does not wait for every gradient")
+        relation_ids.sort()
+        if relation_ids.size and (
+            int(relation_ids[0]) != epoch_relation_start
+            or int(relation_ids[-1]) != relation_seen - 1
+            or bool((np.diff(relation_ids) != 1).any())
+        ):
+            raise TraceValidationError("update begin does not wait for every gradient")
+        consumer_deps = deps[kinds == int(PrimitiveKind.CONSUMER)]
+        consumer_queries = np.asarray(event_keys["query"][consumer_deps], dtype=np.uint64)
+        zero_relation_queries = (
+            np.flatnonzero(
+                relation_query_counts[epoch_query_start:query_seen] == 0
+            ).astype(np.uint64, copy=False)
+            + epoch_query_start
+        )
+        if not np.array_equal(consumer_queries, zero_relation_queries):
+            raise TraceValidationError(
+                "update begin does not wait for every zero-relation consumer"
+            )
+        transition_deps = deps[kinds == int(PrimitiveKind.UPDATE_END)]
+        expected_transition = (
+            np.asarray([required_transition_event], dtype=np.uint64)
+            if required_transition_event is not None else np.empty(0, dtype=np.uint64)
+        )
+        if not np.array_equal(transition_deps, expected_transition):
+            raise TraceValidationError("update begin lacks its prior collection end")
+
+    def process_transition(row: object, event_id: int) -> None:
+        nonlocal current_begin, current_members, current_committed_gaussians
+        nonlocal current_gradient_dependencies, current_field_mask
+        nonlocal current_version, latest_state_ready, required_transition_event
+        nonlocal next_gaussian, epoch_relation_start, epoch_query_start
+        if int(row["state_version"]) != current_version:
+            raise TraceValidationError(
+                f"state version is not current at event {event_id}"
+            )
+        kind = PrimitiveKind(int(row["primitive_kind"]))
+        deps = dependency_ids(row)
+        dep_kinds = np.asarray(event_keys["kind"][deps], dtype=np.uint8)
+
+        if kind is PrimitiveKind.UPDATE_BEGIN:
+            if current_begin is not None:
+                raise TraceValidationError(f"nested update transaction at event {event_id}")
+            try:
+                begin_kind = UpdateBeginKind(int(row["flags"]))
+            except ValueError as error:
+                raise TraceValidationError(
+                    f"update begin has invalid kind at event {event_id}"
+                ) from error
+            require_backward_barrier(deps)
+            current_begin = (event_id, begin_kind)
+            current_members = []
+            current_committed_gaussians = set()
+            current_gradient_dependencies = 0
+            current_field_mask = None
+            clone_parent_events.clear()
+            split_child_events.clear()
+            begin_counts[begin_kind] += 1
+            return
+
+        if current_begin is None:
+            raise TraceValidationError(
+                f"{kind.name.lower()} occurs outside an update transaction at event {event_id}"
+            )
+        begin_event, begin_kind = current_begin
+        if kind is PrimitiveKind.UPDATE_COMMIT:
+            gaussian_id = int(row["gaussian_id"])
+            if begin_kind is not UpdateBeginKind.OPTIMIZER:
+                raise TraceValidationError(
+                    f"update commit lacks its optimizer begin at event {event_id}"
+                )
+            if (
+                gaussian_id < 0 or gaussian_id >= next_gaussian
+                or not active[gaussian_id]
+                or gaussian_id in current_committed_gaussians
+            ):
+                raise TraceValidationError(f"invalid update commit Gaussian at event {event_id}")
+            begin_deps = deps[dep_kinds == int(PrimitiveKind.UPDATE_BEGIN)]
+            gradient_deps = deps[dep_kinds == int(PrimitiveKind.GRADIENT_REDUCTION)]
+            if (
+                begin_deps.size != 1 or int(begin_deps[0]) != begin_event
+                or begin_deps.size + gradient_deps.size != deps.size
+            ):
+                raise TraceValidationError(
+                    f"update commit lacks its optimizer begin at event {event_id}"
+                )
+            relation_ids = np.asarray(
+                event_keys["relation"][gradient_deps], dtype=np.uint64,
+            )
+            dependency_gaussians = np.asarray(
+                event_keys["gaussian"][gradient_deps], dtype=np.uint64,
+            )
+            if (
+                relation_ids.size != int(pending_gradients[gaussian_id])
+                or bool((dependency_gaussians != gaussian_id).any())
+                or bool((relation_ids < epoch_relation_start).any())
+                or bool((relation_ids >= relation_seen).any())
+                or bool(commit_gradient_seen[relation_ids].any())
+                or not np.array_equal(gradient_event_ids[relation_ids], gradient_deps)
+            ):
+                raise TraceValidationError(
+                    f"update commit does not wait for every Gaussian gradient at event {event_id}"
+                )
+            field_mask = int(row["field_mask"])
+            if field_mask == 0 or (
+                current_field_mask is not None and current_field_mask != field_mask
+            ):
+                raise TraceValidationError(
+                    f"update commit field mask is inconsistent at event {event_id}"
+                )
+            current_field_mask = field_mask
+            current_gradient_dependencies += int(gradient_deps.size)
+            commit_gradient_seen[relation_ids] = True
+            pending_gradients[gaussian_id] = 0
+            current_committed_gaussians.add(gaussian_id)
+            current_members.append(event_id)
+            return
+
+        if kind is PrimitiveKind.SET_MODIFICATION:
+            if begin_kind is not UpdateBeginKind.COLLECTION or begin_event not in deps:
+                raise TraceValidationError(
+                    f"set modification lacks its collection begin at event {event_id}"
+                )
+            if outstanding_reads != 0:
+                raise TraceValidationError(f"state release precedes final read at event {event_id}")
+            gaussian_id = int(row["gaussian_id"])
+            parent_id = int(row["reduction_key"])
+            try:
+                modification = ModificationKind(int(row["flags"]))
+            except ValueError as error:
+                raise TraceValidationError(
+                    f"set modification has invalid kind at event {event_id}"
+                ) from error
+            if modification in {
+                ModificationKind.PRUNE, ModificationKind.CLONE_PARENT,
+                ModificationKind.SPLIT_PARENT,
+            } and (
+                gaussian_id < 0 or gaussian_id >= next_gaussian
+                or not active[gaussian_id]
+            ):
+                raise TraceValidationError(
+                    f"modification uses inactive Gaussian at event {event_id}"
+                )
+            if modification in {
+                ModificationKind.CLONE_CHILD, ModificationKind.SPLIT_CHILD,
+            }:
+                if (
+                    gaussian_id != next_gaussian or parent_id < 0
+                    or parent_id >= next_gaussian or not active[parent_id]
+                ):
+                    raise TraceValidationError(
+                        f"modification has invalid child lineage at event {event_id}"
+                    )
+                active[gaussian_id] = True
+                next_gaussian += 1
+            elif modification in {
+                ModificationKind.PRUNE, ModificationKind.SPLIT_PARENT,
+            }:
+                active[gaussian_id] = False
+            if modification is ModificationKind.CLONE_PARENT:
+                if parent_id != gaussian_id:
+                    raise TraceValidationError(
+                        f"clone parent lineage is invalid at event {event_id}"
+                    )
+                clone_parent_events[gaussian_id] = event_id
+            elif modification is ModificationKind.CLONE_CHILD:
+                parent_event = clone_parent_events.get(parent_id)
+                if parent_event is None or parent_event not in deps:
+                    raise TraceValidationError(
+                        f"clone child lacks its parent mutation at event {event_id}"
+                    )
+            elif modification is ModificationKind.SPLIT_CHILD:
+                split_child_events[parent_id].append(event_id)
+            elif modification is ModificationKind.SPLIT_PARENT:
+                children = split_child_events[parent_id]
+                if (
+                    parent_id != gaussian_id or not children
+                    or not set(children).issubset(set(int(value) for value in deps))
+                ):
+                    raise TraceValidationError(
+                        f"split parent does not wait for every child at event {event_id}"
+                    )
+            elif modification is ModificationKind.PRUNE and parent_id != gaussian_id:
+                raise TraceValidationError(f"prune lineage is invalid at event {event_id}")
+            modification_counts[modification] += 1
+            current_members.append(event_id)
+            return
+
+        if kind is not PrimitiveKind.UPDATE_END:
+            raise AssertionError(f"unsupported transition primitive: {kind}")
+        try:
+            end_kind = UpdateBeginKind(int(row["flags"]))
+        except ValueError as error:
+            raise TraceValidationError(
+                f"update end has invalid kind at event {event_id}"
+            ) from error
+        if end_kind is not begin_kind or int(row["reduction_key"]) != begin_event:
+            raise TraceValidationError(f"update end does not match its begin at event {event_id}")
+        expected_dependencies = np.asarray(
+            current_members or [begin_event], dtype=np.uint64,
+        )
+        if not np.array_equal(deps, expected_dependencies):
+            raise TraceValidationError(
+                f"update end does not wait for its transaction at event {event_id}"
+            )
+        field_mask = int(row["field_mask"])
+        advances_version = field_mask != 0
+        if bool(current_members) != advances_version:
+            raise TraceValidationError(
+                f"update end field mask does not match transaction writes at event {event_id}"
+            )
+        if end_kind is UpdateBeginKind.OPTIMIZER:
+            if current_members:
+                expected_gaussians = set(np.flatnonzero(active[:next_gaussian]).tolist())
+                if current_committed_gaussians != expected_gaussians:
+                    raise TraceValidationError("optimizer does not update every active Gaussian")
+                if current_field_mask != field_mask:
+                    raise TraceValidationError("optimizer field masks do not match update end")
+                if current_gradient_dependencies != relation_seen - epoch_relation_start:
+                    raise TraceValidationError("optimizer does not consume every gradient")
+                if not bool(commit_gradient_seen[
+                    epoch_relation_start:relation_seen
+                ].all()):
+                    raise TraceValidationError("optimizer does not consume every gradient")
+            pending_gradients[:next_gaussian] = 0
+            commit_gradient_seen[epoch_relation_start:relation_seen] = False
+            epoch_relation_start = relation_seen
+            epoch_query_start = query_seen
+            required_transition_event = None
+        else:
+            if not current_members or not advances_version:
+                raise TraceValidationError("collection transaction has no state modifications")
+            required_transition_event = event_id
+        latest_state_ready = (event_id, current_version + int(advances_version))
+        current_version += int(advances_version)
+        end_counts[end_kind] += 1
+        current_begin = None
+        current_members = []
+        current_committed_gaussians = set()
+        current_gradient_dependencies = 0
+        current_field_mask = None
+        clone_parent_events.clear()
+        split_child_events.clear()
+
+    for start in range(0, int(events.size), scan_events):
+        end = min(start + scan_events, int(events.size))
+        rows = events[start:end]
+        transition_positions = np.flatnonzero(np.isin(
+            rows["primitive_kind"], transition_values,
+        ))
+        cursor = 0
+        for position in transition_positions:
+            position = int(position)
+            process_regular_span(rows[cursor:position], start + cursor)
+            process_transition(rows[position], start + position)
+            cursor = position + 1
+        process_regular_span(rows[cursor:], start + cursor)
+        _release_mmap_pages(events)
+        _release_mmap_pages(dependencies)
+
+    if current_begin is not None:
+        raise TraceValidationError("trace ends with an open update transaction")
+    if outstanding_reads != 0:
+        raise TraceValidationError("trace ends with an outstanding cache request")
+    if relation_seen != gradient_seen:
+        raise TraceValidationError("captured relation is missing its gradient")
+    return _StreamingLifecycleReport(
+        gaussian_count=next_gaussian,
+        begin_counts=dict(begin_counts),
+        end_counts=dict(end_counts),
+        modification_counts=dict(modification_counts),
+    )
 
 
 def _release_mmap_pages(array: object) -> None:
@@ -1051,7 +1517,14 @@ def _validate_large_capture_trace(trace: Trace) -> TraceValidationReport:
     )
 
 
-def _validate_capture_audit(trace: Trace, counts: dict[str, int]) -> None:
+def _validate_capture_audit(
+    trace: Trace,
+    counts: dict[str, int],
+    *,
+    begin_counts: dict[UpdateBeginKind, int] | None = None,
+    end_counts: dict[UpdateBeginKind, int] | None = None,
+    modification_counts: dict[ModificationKind, int] | None = None,
+) -> None:
     audit = trace.metadata.get("capture_audit")
     if audit is None:
         return
@@ -1129,40 +1602,40 @@ def _validate_capture_audit(trace: Trace, counts: dict[str, int]) -> None:
     ):
         raise TraceValidationError("relation record transfer audit totals are inconsistent")
 
-    begin_counts: dict[UpdateBeginKind, int] = defaultdict(int)
-    end_counts: dict[UpdateBeginKind, int] = defaultdict(int)
-    has_update_boundaries = any(counts.get(kind.name, 0) for kind in (
-        PrimitiveKind.UPDATE_BEGIN, PrimitiveKind.UPDATE_END,
-    ))
-    if has_update_boundaries:
+    if begin_counts is None or end_counts is None:
+        scanned_begin_counts: dict[UpdateBeginKind, int] = defaultdict(int)
+        scanned_end_counts: dict[UpdateBeginKind, int] = defaultdict(int)
         for row in trace.events:
             primitive = PrimitiveKind(int(row["primitive_kind"]))
             if primitive is PrimitiveKind.UPDATE_BEGIN:
-                begin_counts[UpdateBeginKind(int(row["flags"]))] += 1
+                scanned_begin_counts[UpdateBeginKind(int(row["flags"]))] += 1
             elif primitive is PrimitiveKind.UPDATE_END:
-                end_counts[UpdateBeginKind(int(row["flags"]))] += 1
+                scanned_end_counts[UpdateBeginKind(int(row["flags"]))] += 1
+        begin_counts = scanned_begin_counts
+        end_counts = scanned_end_counts
     if begin_counts != end_counts:
         raise TraceValidationError("update begin/end audit totals are inconsistent")
     optimizer_steps = int(audit.get("optimizer_steps", 0))
     optimizer_noops = int(audit.get("optimizer_noop_steps", 0))
-    if optimizer_steps != begin_counts[UpdateBeginKind.OPTIMIZER]:
+    if optimizer_steps != begin_counts.get(UpdateBeginKind.OPTIMIZER, 0):
         raise TraceValidationError("optimizer step audit totals are inconsistent")
     if optimizer_noops > optimizer_steps:
         raise TraceValidationError("optimizer no-op audit total is inconsistent")
-    if int(audit.get("collection_modification_transactions", 0)) != begin_counts[
-        UpdateBeginKind.COLLECTION
-    ]:
+    if int(audit.get("collection_modification_transactions", 0)) != begin_counts.get(
+        UpdateBeginKind.COLLECTION, 0
+    ):
         raise TraceValidationError("collection transaction audit totals are inconsistent")
-    modification_counts: dict[ModificationKind, int] = defaultdict(int)
-    if counts.get(PrimitiveKind.SET_MODIFICATION.name, 0):
+    if modification_counts is None:
+        scanned_modification_counts: dict[ModificationKind, int] = defaultdict(int)
         for row in trace.events:
             if PrimitiveKind(int(row["primitive_kind"])) is PrimitiveKind.SET_MODIFICATION:
-                modification_counts[ModificationKind(int(row["flags"]))] += 1
+                scanned_modification_counts[ModificationKind(int(row["flags"]))] += 1
+        modification_counts = scanned_modification_counts
     for modification in ModificationKind:
         expected = int(audit.get(
             f"collection_{modification.name.lower()}_events", 0
         ))
-        if expected != modification_counts[modification]:
+        if expected != modification_counts.get(modification, 0):
             raise TraceValidationError(
                 f"collection {modification.name.lower()} audit total is inconsistent"
             )

@@ -36,12 +36,13 @@
 - R²-Gaussian + Chest 论文训练协议已冻结并由生成器直接对照固定上游源码：完整 41 项解析参数、30,000 次迭代、评估/保存/检查点调度、Python/NumPy/PyTorch seed 0、`cuda:0` 设备选择、实际工作目录和完整命令均进入 v3 记录。参数、调度、提交或 seed 漂移时生成器拒绝输出。
 - 已保存的一迭代官方体在 `numpy 1.26.4/scikit-image 0.21.0/torch 2.1.2/torchvision 0.16.2/lpips 0.1.4` 的纯 CPU 质量 smoke 中得到 PSNR `20.2852146768`、SSIM `0.2686132998`、LPIPS `0.6325289289`，两份 LPIPS 权重哈希通过。该值只验证统一入口，不是论文配置质量结果。
 - 大型 raw-column validator 的历史事件键已按实际 query、Gaussian、relation 和 event domain 压缩，并支持把临时索引显式放到独立目录；扫描时不再逐块丢弃仍会被后续依赖引用的历史索引。真实 v9 一迭代 trace 连续两次完成标准全量验证，第二次为 577,268,206 个事件、895,439,361 条依赖，耗时 `213.56 s`、峰值 RSS `8,459,036 KB`、进程 swap 0。仓库外日志 SHA-256 为 `5972ce75c9c06a40aad6827eb9808807e9d94d28335a3eac548ab15178a90107`，结构化记录 SHA-256 为 `b4f54dfa468cf98f93b7fdbecc8d1726a0e9a05904c093dd9706ad5873a8aac5`。
+- 大型 raw-column 生命周期 pass 已实现当前版本、active/known Gaussian、cache read 闭合、gradient→optimizer commit 集合、update begin/end、Clone/Split/Prune lineage 和后继查询状态屏障检查。小型 raw trace 覆盖 optimizer、no-op optimizer、collection 及故障注入；真实一迭代 v9 的结构+生命周期全量回归耗时 `325.30 s`、峰值 RSS `8,803,612 KB`、进程 swap 0。该真实 trace 没有 optimizer/collection 事务，因此只证明无事务大规模回归；仓库外日志 SHA-256 为 `9d7638ba704efddbf02528a6777353a3f946de03b05ebfe464448814d3514721`，结构化记录 SHA-256 为 `6e67709cd45283dfcf8bf2836d4dae4f78301184d50325fb7732c5b77a652676`。
 
 ## 当前入口
 
 本轮 v9 stream-only 真实 Chest 1-iteration capture 已生成完整 raw-column manifest：577,268,206 个事件、895,439,361 条依赖；capture audit 记录 294,912 个逻辑 query、690,928 个 CUDA candidate、95,948,757 条有效 relation，实际 D2H transfer 12 次。插桩与未插桩官方运行的 `vol_pred.npy` SHA-256 和逐元素值完全一致，PSNR `20.285214676826495`、SSIM `0.268613299848576`、LPIPS `0.6325289289156596` 完全一致。该证据仍是 1 iteration smoke，不是正式 30k trace。
 
-`TraceReader` 现会从旧式 raw-column `chunk_manifest.json` 的 `storage_format` 补入 `trace_storage_format`，标准 `read(validate=True)` 可自动选择流式校验入口。上述大 trace 的标准 validator 已连续两次 PASS；第二次使用 4,000,000-event 扫描块和 `/dev/shm` 临时紧凑索引，耗时 `3:33.56`、峰值 RSS 约 8.07 GiB、无进程 swap。扫描块和临时目录只改变验证软件的吞吐与资源位置，不改变全量检查集合。该 trace 不含正式 30k 路径所需的 optimizer/update/collection 状态迁移，因此仍不能视为正式 trace 闭环。
+`TraceReader` 现会从旧式 raw-column `chunk_manifest.json` 的 `storage_format` 补入 `trace_storage_format`，标准 `read(validate=True)` 可自动选择流式校验入口。上述大 trace 的结构 validator 已连续两次 PASS；加入生命周期 pass 并复用 relation/gradient 索引后再次全量 PASS，使用 4,000,000-event 扫描块和 `/dev/shm` 临时紧凑索引，耗时 `5:25.30`、峰值 RSS 约 8.40 GiB、无进程 swap。扫描块和临时目录只改变验证软件的吞吐与资源位置，不改变全量检查集合。该 trace 不含正式 30k 路径所需的 optimizer/update/collection 事务，因此仍不能视为正式 trace 闭环。
 
 快速 trace 路径现支持显式 query ranges、事件上限、扫描块和 `cpu/cuda/auto` 后端。对同一 v9 q0 闭包，CUDA 与 CPU 输出的 events/dependencies/payload 逐元素一致；CUDA 用时 `88.65 s`、峰值 RSS `884,720 KB`，CPU 用时 `110.77 s`、峰值 RSS `476,364 KB`。中心 raster query `131328` 与中心 voxel query `279056` 的联合闭包包含 406,008 个事件、700,903 条依赖、99,831 条真实 relation 和两种 template，并通过独立 validator。四策略周期 smoke 已完成，但使用实验 timing，且两个 Oracle 均返回 `heuristic_unproven`；这些结果只证明快速路径可运行，不是正式 Base ASIC/Oracle 周期。
 
@@ -51,12 +52,12 @@
 
 R²-Gaussian 的官方 CUDA 扩展仍没有直接导出完整 CLAMP 事件缓冲区；当前旁路从官方 CUDA work buffer 重建逐 query 关系，并在官方 loss、backward 和 optimizer 边界映射其余事件。v9 已重新证明一迭代插桩/未插桩体数据逐元素一致，但尚未证明长程增密 ID 稳定性、所有真实队列操作和正式 30k 训练的流式最终存储，不能视为正式 trace 闭环。
 
-关系记录 decoder 输出现按迭代边界合并，每个非空 flush 最多执行一次 D2H；flush 在最后一个 query 的 backward 到达、下一迭代、optimizer step、Gaussian 集合修改和最终写出之前发生，并要求每个捕获 query 恰有一次类型匹配且已关联 loss 的 backward。v9 decoder 的 raw terminal CUDA scanner 已通过 CPU 逐索引对照；完整一迭代质量与全量 validator 均已通过，仍待含 optimizer/update/collection 的大 trace 状态迁移验证。
+关系记录 decoder 输出现按迭代边界合并，每个非空 flush 最多执行一次 D2H；flush 在最后一个 query 的 backward 到达、下一迭代、optimizer step、Gaussian 集合修改和最终写出之前发生，并要求每个捕获 query 恰有一次类型匹配且已关联 loss 的 backward。v9 decoder 的 raw terminal CUDA scanner 已通过 CPU 逐索引对照；完整一迭代质量与结构+生命周期全量 validator 均已通过，仍待实际跨迭代 trace 覆盖 optimizer/update/collection 事务。
 
 ## 下一步入口条件
 
 1. 外部 `gdesmond` 释放 GPU 后，重新运行相同 input-freeze 的 native-preflight；门控通过后按论文配置完成官方参考训练、重建与 PSNR/SSIM/LPIPS，先闭合工作流步骤 2。
-2. 为大型 raw-column validator 补齐 optimizer/update/collection 状态迁移 pass，并用跨迭代增密 smoke 验证稳定 ID、版本屏障、lineage 和关闭版本访问；一迭代 v9 的全量结构检查、relation 计数与插桩一致性已通过。
+2. 生成并验证实际跨迭代 stream-only trace，覆盖 optimizer/update/collection 事务，证明稳定 ID、版本屏障、lineage 和关闭版本访问；生命周期 pass 的实现与小型故障注入已通过，一迭代 v9 的结构+生命周期大规模回归已通过。
 3. 在 smoke 通过后把 raw-column manifest 接入 trace producer/consumer 与周期内核的实时 chunk 交接；当前 `TraceReader` 已可 mmap raw 列，但周期 replay 仍需等待捕获完成后开始。
 4. 在真实关系粒度上实现 `template_id + primitive_kind` 的精确计算 Pod 资源序列，并测量关系种子突发、模块时序和 trace chunk，更新冻结配置及运行清单。
 5. 用完整真实 trace 通过依赖/状态/释放检查后，运行 `0000` Base ASIC 和两个受资源约束的 Oracle。
