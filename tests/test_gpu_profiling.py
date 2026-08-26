@@ -20,9 +20,10 @@ from gala_sim.tools.gpu_profile_artifacts import (
 from gala_sim.tools.gpu_profile_artifacts import classify_sass_csv
 from gala_sim.tools.gpu_profile_campaign import GpuProfileCampaign
 from gala_sim.tools.gpu_ncu_plan import (
-    NcuPlanConfig, build_ncu_plan, main as ncu_plan_main,
+    NcuPlanConfig, _regex_alternation, build_ncu_plan, main as ncu_plan_main,
     validate_ncu_measurement,
 )
+from gala_sim.tools.gpu_ncu_runner import _capture_job, _sample_summary
 from gala_sim.adapters.stage_runner import _frozen_profile_identity, _profile_selection
 from gala_sim.tools.gpu_normalization import normalize_stage_profiles
 
@@ -279,6 +280,7 @@ def test_ncu_plan_preserves_multiplicity_and_selects_validation_occurrences(
     ] == [1, 3, 5]
     assert result["coverage"]["observed_kernel_launch_count"] == 121
     assert result["coverage"]["representative_iteration_signature_count"] == 117
+    assert result["ncu"]["preflight_profile_launch_count"] == 16
     assert 0 < result["coverage"]["capture_job_count"] <= 6
     assert sum(
         group["required_sample_count"] for group in result["capture_groups"]
@@ -292,8 +294,11 @@ def test_ncu_plan_preserves_multiplicity_and_selects_validation_occurrences(
         and "--launch-count" not in group["ncu_arguments"]
         and "--kill" not in group["ncu_arguments"]
         and "--nvtx-include" not in group["ncu_arguments"]
-        and "--kernel-name" in group["ncu_arguments"]
+        and "--kernel-name" not in group["ncu_arguments"]
         and "--kernel-id" in group["ncu_arguments"]
+        and group["ncu_arguments"][
+            group["ncu_arguments"].index("--kernel-id") + 1
+        ].startswith("::regex:")
         for group in result["capture_groups"]
     )
     assert all(
@@ -302,6 +307,7 @@ def test_ncu_plan_preserves_multiplicity_and_selects_validation_occurrences(
         == "SourceCounters"
         for group in result["capture_groups"]
     )
+    assert r"\x3a\x3a" in _regex_alternation(["namespace::kernel"])
 
 
 def test_ncu_plan_rejects_inexact_nsys_coverage(tmp_path: Path) -> None:
@@ -316,6 +322,21 @@ def test_ncu_plan_rejects_inexact_nsys_coverage(tmp_path: Path) -> None:
     paths[0].write_text(json.dumps(profile), encoding="utf-8")
     with pytest.raises(ValueError, match="exactly once"):
         build_ncu_plan(config, paths)
+
+
+def test_ncu_runner_rejects_early_termination_options() -> None:
+    plan = {"capture_groups": [{
+        "job_index": 1,
+        "ncu_arguments": ["--profile-from-start", "off", "--kill", "1"],
+    }]}
+    with pytest.raises(ValueError, match="formal contract"):
+        _capture_job(plan, 1)
+    summary = _sample_summary([
+        {"utilization_percent": 80, "memory_used_bytes": 100},
+        {"utilization_percent": 40, "memory_used_bytes": 200},
+    ])
+    assert summary["mean_utilization_percent"] == 60
+    assert summary["maximum_memory_used_bytes"] == 200
 
 
 def test_ncu_job_binding_restores_exact_planned_launch_identity(

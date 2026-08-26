@@ -1,6 +1,6 @@
 # NCU launch-signature plan
 
-`python -m gala_sim.tools.gpu_ncu_plan --config <yaml> --nsys-profile <json> ... --output <json>` validates every frozen representative NSYS inventory and creates a measured-counter plan. After NCU runs, `python -m gala_sim.tools.gpu_ncu_plan --plan <plan.json> --ncu-profile <json> ... --output <evidence.json>` validates measured CSV-derived profiles against every selected launch and signature.
+`python -m gala_sim.tools.gpu_ncu_plan --config <yaml> --nsys-profile <json> ... --output <json>` validates every frozen representative NSYS inventory and creates a measured-counter plan. After NCU runs, `python -m gala_sim.tools.gpu_ncu_plan --plan <plan.json> --ncu-profile <json> ... --output <evidence.json>` validates measured CSV-derived profiles against every selected launch and signature. Use `gpu_ncu_runner preflight` for the short, first-window NCU overhead/utilization gate; it deliberately uses common metrics rather than full-run invocation ordinals.
 
 The signature retains stage, demangled kernel name, grid, and block. Multiplicity remains separate for every representative iteration. First, middle, and last observed occurrences are selected to test counter reuse; a signature may be multiplied by its exact NSYS multiplicity only when not every occurrence is measured and the sampled counters agree. When every occurrence is measured, differing counters are retained and summed per launch instead of being reused.
 

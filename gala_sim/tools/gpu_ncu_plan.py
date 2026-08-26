@@ -38,6 +38,7 @@ class NcuPlanConfig:
     counter_scope: str
     validation_occurrences: tuple[str, ...]
     maximum_capture_job_count: int
+    preflight_profile_launch_count: int
     metrics: tuple[str, ...]
     sections: tuple[str, ...]
     ncu_options: Mapping[str, str]
@@ -62,6 +63,9 @@ class NcuPlanConfig:
                 str(value) for value in document.get("validation_occurrences", ())
             ),
             maximum_capture_job_count=int(document.get("maximum_capture_job_count", 0)),
+            preflight_profile_launch_count=int(
+                document.get("preflight_profile_launch_count", 0)
+            ),
             metrics=tuple(str(value) for value in document.get("metrics", ())),
             sections=tuple(str(value) for value in document.get("sections", ())),
             ncu_options={str(name): str(value) for name, value in options.items()},
@@ -84,6 +88,8 @@ class NcuPlanConfig:
             raise ValueError("NCU validation occurrence policy is invalid")
         if self.maximum_capture_job_count <= 0:
             raise ValueError("NCU maximum capture job count must be positive")
+        if self.preflight_profile_launch_count <= 0:
+            raise ValueError("NCU preflight profile launch count must be positive")
         if not self.metrics or len(set(self.metrics)) != len(self.metrics):
             raise ValueError("NCU metrics must be nonempty and unique")
         if (
@@ -146,17 +152,23 @@ def _anchor_indices(count: int, policy: Iterable[str]) -> tuple[int, ...]:
 
 
 def _regex_alternation(values: Iterable[str]) -> str:
-    escaped = sorted({re.escape(value) for value in values})
+    escaped = sorted({
+        re.escape(value).replace(":", r"\x3a") for value in values
+    })
     if not escaped:
         raise ValueError("NCU regex group cannot be empty")
-    return "^(?:" + "|".join(escaped) + ")$"
+    return "^(" + "|".join(escaped) + ")$"
 
 
 def _ordinal_regex(values: Iterable[int]) -> str:
     ordinals = sorted({int(value) for value in values})
     if not ordinals or any(value <= 0 for value in ordinals):
         raise ValueError("NCU invocation group cannot be empty")
-    return "^(?:" + "|".join(str(value) for value in ordinals) + ")$"
+    return "^(" + "|".join(str(value) for value in ordinals) + ")$"
+
+
+def _kernel_id_filter(names: Iterable[str], ordinals: Iterable[int]) -> str:
+    return "::regex:" + _regex_alternation(names) + ":" + _ordinal_regex(ordinals)
 
 
 def _load_inventory(path: Path) -> tuple[dict[str, Any], str]:
@@ -460,8 +472,7 @@ def build_ncu_plan(
                 "--cache-control", config.ncu_options["cache_control"],
                 "--clock-control", config.ncu_options["clock_control"],
                 "--kernel-name-base", config.ncu_options["kernel_name_base"],
-                "--kernel-name", "regex:" + _regex_alternation(names),
-                "--kernel-id", ":::" + _ordinal_regex(ordinals),
+                "--kernel-id", _kernel_id_filter(names, ordinals),
                 *[
                     argument
                     for section in config.sections
@@ -528,6 +539,7 @@ def build_ncu_plan(
             ],
             "capture_mode": "cuda_profiler_api",
             "invocation_scope": "all_representative_windows_in_one_process",
+            "preflight_profile_launch_count": config.preflight_profile_launch_count,
         },
         "coverage": {
             "status": "complete",

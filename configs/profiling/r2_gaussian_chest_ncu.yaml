@@ -5,6 +5,7 @@ signature_fields: [stage, kernel_name, grid, block]
 counter_scope: representative_iteration
 validation_occurrences: [first, middle, last]
 maximum_capture_job_count: 6
+preflight_profile_launch_count: 16
 metrics:
   - dram__bytes_read.sum
   - dram__bytes_write.sum
