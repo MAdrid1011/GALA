@@ -229,19 +229,28 @@ def main(argv: list[str] | None = None) -> int:
             }, sort_keys=True))
             return 0
         sample_metadata = trace.metadata.get("trace_sample")
+        window_metadata = trace.metadata.get("trace_window")
         if sample_metadata is not None:
-            if not args.quick_validation:
-                raise ValueError(
-                    "sampled traces require the explicit --quick-validation scope"
-                )
             if (
                 not isinstance(sample_metadata, dict)
                 or sample_metadata.get("formal_performance_eligible") is not False
                 or sample_metadata.get("result_scope") != "quick_cycle_validation"
             ):
                 raise ValueError("sampled trace metadata is malformed")
-        elif args.quick_validation:
-            raise ValueError("--quick-validation requires a sampled trace")
+        if window_metadata is not None and (
+            not isinstance(window_metadata, dict)
+            or window_metadata.get("schema_version") != "gala-iteration-window-v1"
+            or window_metadata.get("result_scope") != "quick_trace_validation"
+            or window_metadata.get("formal_performance_eligible") is not False
+        ):
+            raise ValueError("trace iteration window metadata is malformed")
+        quick_scope = sample_metadata is not None or window_metadata is not None
+        if quick_scope and not args.quick_validation:
+            raise ValueError(
+                "partial traces require the explicit --quick-validation scope"
+            )
+        if args.quick_validation and not quick_scope:
+            raise ValueError("--quick-validation requires a sampled or windowed trace")
         gala_config = load_config(args.config)
         binding = _load_binding(
             args.ramulator_binding, args.ramulator_build_manifest,
@@ -265,13 +274,14 @@ def main(argv: list[str] | None = None) -> int:
             writer.write_cycles(result)
             writer.write_manifest({
                 "result_scope": (
-                    "quick_cycle_validation" if sample_metadata else "formal_performance"
+                    "quick_cycle_validation" if quick_scope else "formal_performance"
                 ),
-                "formal_performance_eligible": not bool(sample_metadata),
+                "formal_performance_eligible": not quick_scope,
                 "trace_sample": sample_metadata,
+                "trace_window": window_metadata,
             })
             writer.write_status("passed", checks={
-                "formal_performance_eligible": not bool(sample_metadata),
+                "formal_performance_eligible": not quick_scope,
             })
             print(json.dumps({"cycles": result.total_cycles, "policy": result.policy}, sort_keys=True))
             return 0
@@ -287,11 +297,12 @@ def main(argv: list[str] | None = None) -> int:
             status="passed",
         ) for run in runs]
         write_ablation_csv(rows, args.output)
-        if sample_metadata:
+        if quick_scope:
             write_json({
                 "result_scope": "quick_cycle_validation",
                 "formal_performance_eligible": False,
                 "trace_sample": sample_metadata,
+                "trace_window": window_metadata,
             }, args.output.with_suffix(args.output.suffix + ".manifest.json"))
         print(json.dumps({"variants": len(runs), "status": "passed"}, sort_keys=True))
         return 0

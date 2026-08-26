@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import argparse
 from pathlib import Path
+import sys
+from types import SimpleNamespace
 
 import numpy as np
 import pytest
@@ -23,6 +26,7 @@ from gala_sim.adapters.trace_capture import (
     TraceSession,
     _QueryContext,
 )
+from gala_sim.adapters.trace_runner import _iteration_range
 from gala_sim.clamp import (
     PrimitiveKind,
     ResourceClass,
@@ -276,6 +280,117 @@ def test_streaming_capture_validator_requires_noop_update_barrier(
             Trace(trace.events, broken_dependencies, trace.payload, metadata),
             config=config,
         )
+
+
+def test_streaming_capture_validator_closes_gradients_at_collection(
+    tmp_path: Path,
+) -> None:
+    class Model:
+        get_xyz = np.empty((2, 3), dtype=np.float32)
+
+    session = TraceSession(tmp_path / "trace", chunk_events=4)
+    session._ensure_gaussians(1)
+    session._audit.update({
+        "official_raster_kernel_calls": 2,
+        "captured_raster_kernel_calls": 2,
+        "captured_query_kernel_calls": 2,
+        "cuda_relation_candidates": 2,
+        "captured_logical_queries": 2,
+    })
+    session._emit_query_records(
+        _single_relation_records(), rendered=1, query_base=0, query_shape=(1, 1),
+        binning_pointer=10, output_pointer=20, template_id=RASTER_TEMPLATE_ID,
+        field_mask=STATE_FIELD_MASK,
+    )
+    session._contexts[10].loss_flags = LOSS_L1
+    session._capture_backward(10, voxel=False)
+    session._start_collection_transaction()
+    parent = session._emit_set_modification(
+        0, flags=MOD_CLONE_PARENT, reduction_key=0,
+    )
+    session._gaussian_ids.append(1)
+    session._next_gaussian = 2
+    session._emit_set_modification(
+        1, flags=MOD_CLONE_CHILD, reduction_key=0, dependencies=[parent],
+    )
+    session._finish_collection_transaction()
+    session._capture_update(Model(), field_mask=0)
+    session._emit_query_records(
+        _single_relation_records(gaussian_index=1), rendered=1, query_base=1,
+        query_shape=(1, 1),
+        binning_pointer=11, output_pointer=21, template_id=RASTER_TEMPLATE_ID,
+        field_mask=STATE_FIELD_MASK,
+    )
+    session._contexts[11].loss_flags = LOSS_L1
+    session._capture_backward(11, voxel=False)
+    trace = session.finish()
+    metadata = {**trace.metadata, "trace_storage_format": "raw_columns"}
+
+    report = validate_trace(
+        Trace(trace.events, trace.dependencies, trace.payload, metadata),
+        config=TraceValidationConfig(scan_events=3, index_directory=tmp_path),
+    )
+
+    assert report.query_count == 2
+    assert session._audit["collection_modification_transactions"] == 1
+    assert session._audit["optimizer_noop_steps"] == 1
+
+
+def test_capture_iteration_window_is_explicit_and_audited(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        sys.modules, "torch", SimpleNamespace(is_grad_enabled=lambda: True),
+    )
+    session = TraceSession(
+        tmp_path / "trace", chunk_events=4, capture_iteration_range=(2, 3),
+    )
+    session._ensure_gaussians(1)
+    query = session._wrap_query_forward(lambda _owner: None, "raster")
+    session._iteration = 1
+    query(object())
+    session._iteration = 2
+    session._begin_capture_window(1)
+    query(object())
+    session._audit.update({
+        "cuda_relation_candidates": 1,
+        "captured_logical_queries": 1,
+    })
+    session._emit_query_records(
+        _single_relation_records(), rendered=1, query_base=0, query_shape=(1, 1),
+        binning_pointer=10, output_pointer=20, template_id=RASTER_TEMPLATE_ID,
+        field_mask=STATE_FIELD_MASK,
+    )
+    session._contexts[10].loss_flags = LOSS_L1
+    session._capture_backward(10, voxel=False)
+    trace = session.finish()
+
+    assert trace.metadata["trace_window"] == {
+        "schema_version": "gala-iteration-window-v1",
+        "result_scope": "quick_trace_validation",
+        "formal_performance_eligible": False,
+        "quality_eligible": False,
+        "selection": "inclusive_training_iteration_range",
+        "iteration_start": 2,
+        "iteration_end": 3,
+    }
+    assert validate_trace(trace).event_count == trace.event_count
+    broken_metadata = dict(trace.metadata)
+    broken_metadata.pop("trace_window")
+    with pytest.raises(TraceValidationError, match="window metadata"):
+        validate_trace(Trace(
+            trace.events, trace.dependencies, trace.payload, broken_metadata,
+        ))
+
+
+def test_capture_iteration_range_parser_rejects_invalid_bounds() -> None:
+    assert _iteration_range("600:601") == (600, 601)
+    with pytest.raises(argparse.ArgumentTypeError, match="START:END"):
+        _iteration_range("600")
+    with pytest.raises(argparse.ArgumentTypeError, match="1 <= START <= END"):
+        _iteration_range("0:1")
+    with pytest.raises(argparse.ArgumentTypeError, match="1 <= START <= END"):
+        _iteration_range("2:1")
 
 
 def test_query_and_backward_batches_preserve_capture_order_across_chunk_sizes(

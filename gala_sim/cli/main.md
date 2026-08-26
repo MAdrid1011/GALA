@@ -12,7 +12,7 @@
 
 `trace-validate --trace <dir> [--scan-events N] [--index-directory DIR]` 对完整 trace 执行结构和生命周期校验。显式扫描块和临时索引目录只改变软件验证吞吐、临时空间和峰值，不改变检查集合；省略扫描块时沿用 trace capture chunk。`--index-directory` 必须与 `--scan-events` 一起使用。
 
-其余入口为 `config-check`、`cycle-preflight`、`trace-validate`、`cycle-replay` 和 `ablation`。sample trace 默认被周期入口拒绝；调用者必须显式传入 `--quick-validation`，输出 manifest 会固定 `formal_performance_eligible=false`。
+其余入口为 `config-check`、`cycle-preflight`、`trace-validate`、`cycle-replay` 和 `ablation`。query sample 和显式迭代窗口 trace 默认均被周期入口拒绝；调用者必须显式传入 `--quick-validation`，输出 manifest 会固定 `formal_performance_eligible=false`。
 
 ## Internal Helpers
 

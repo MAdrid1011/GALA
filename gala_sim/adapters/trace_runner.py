@@ -11,12 +11,32 @@ import sys
 from .trace_capture import TraceSession
 
 
+def _iteration_range(value: str) -> tuple[int, int]:
+    start_text, separator, end_text = value.partition(":")
+    if not separator:
+        raise argparse.ArgumentTypeError("iteration range must use START:END")
+    try:
+        start, end = int(start_text), int(end_text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("iteration range bounds must be integers") from error
+    if start <= 0 or end < start:
+        raise argparse.ArgumentTypeError(
+            "iteration range must have 1 <= START <= END"
+        )
+    return start, end
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gala-r2-trace-runner")
     parser.add_argument("--trace-output", type=Path, required=True)
     parser.add_argument(
         "--stream-only", action="store_true",
         help="keep validated capture columns in bounded chunks without final mmap merge",
+    )
+    parser.add_argument(
+        "--capture-iteration-range", type=_iteration_range, default=None,
+        metavar="START:END",
+        help="capture an inclusive validation window while executing all training iterations",
     )
     parser.add_argument("train_script", type=Path)
     parser.add_argument("train_args", nargs=argparse.REMAINDER)
@@ -34,6 +54,7 @@ def main(argv: list[str] | None = None) -> int:
     session = TraceSession(
         args.trace_output, state_record_bytes=state_record_bytes,
         chunk_events=chunk_events, stream_only=args.stream_only,
+        capture_iteration_range=args.capture_iteration_range,
     )
     session.install()
     original_argv = sys.argv

@@ -10,4 +10,4 @@
 
 ## Internal Helpers
 
-流式结构 pass 把跨事件回查限制为按实际 domain 压缩的 kind/query/Gaussian/relation 字段，并使用紧凑 relation index。生命周期 pass 再以有界向量状态检查当前版本、活动 Gaussian、缓存读完成、梯度到 optimizer commit 的精确集合、update begin/end、Clone/Split/Prune lineage 和后继查询屏障。合法的 backward 完成顺序可以不同，但 gradient 集合不得遗漏、重复或错配 relation。
+流式结构 pass 把跨事件回查限制为按实际 domain 压缩的 kind/query/Gaussian/relation 字段，并使用紧凑 relation index；Gaussian domain 包含 initial 集合和实际 child 事件，但 active 状态仍由生命周期 pass 精确重建。生命周期 pass 再以有界向量状态检查当前版本、活动 Gaussian、缓存读完成、梯度到 optimizer 或 collection 的精确 epoch、update begin/end、Clone/Split/Prune lineage 和后继查询屏障。合法的 backward 完成顺序可以不同，但 gradient 集合不得遗漏、重复或错配 relation。

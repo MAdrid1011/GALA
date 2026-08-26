@@ -427,6 +427,11 @@ def _validate_large_capture_trace_streaming(
         raise TraceValidationError("capture audit relation/query totals are missing")
     if not isinstance(initial_gaussian_count, int) or initial_gaussian_count < 0:
         raise TraceValidationError("initial Gaussian count metadata is invalid")
+    max_new_gaussians = sum(
+        int(audit.get(f"collection_{kind.name.lower()}_events", 0))
+        for kind in (ModificationKind.CLONE_CHILD, ModificationKind.SPLIT_CHILD)
+    )
+    gaussian_domain_count = initial_gaussian_count + max_new_gaussians
     event_count = int(events.size)
     dependency_count = int(dependencies.size)
     payload_count = int(payload.size)
@@ -439,7 +444,7 @@ def _validate_large_capture_trace_streaming(
     event_key_dtype = np.dtype([
         ("kind", np.dtype("u1")),
         ("query", _compact_unsigned_dtype(query_count)),
-        ("gaussian", _compact_unsigned_dtype(initial_gaussian_count)),
+        ("gaussian", _compact_unsigned_dtype(gaussian_domain_count)),
         ("relation", _compact_unsigned_dtype(relation_count)),
     ], align=False)
     counts_array = np.zeros(len(PrimitiveKind) + 1, dtype=np.int64)
@@ -576,8 +581,8 @@ def _validate_large_capture_trace_streaming(
             candidate_pos = positions(PrimitiveKind.RELATION_CANDIDATE)
             if candidate_pos.size:
                 gaussian_ids = np.asarray(rows["gaussian_id"][candidate_pos], dtype=np.int64)
-                if bool((gaussian_ids < 0).any()) or bool((gaussian_ids >= initial_gaussian_count).any()):
-                    raise TraceValidationError("relation candidate uses an inactive Gaussian")
+                if bool((gaussian_ids < 0).any()) or bool((gaussian_ids >= gaussian_domain_count).any()):
+                    raise TraceValidationError("relation candidate is outside the Gaussian domain")
 
             relation_pos = positions(PrimitiveKind.RELATION)
             relation_deps = one_dependency(
@@ -597,7 +602,7 @@ def _validate_large_capture_trace_streaming(
                 if (
                     bool((queries < 0).any()) or bool((queries >= query_count).any())
                     or bool((gaussians < 0).any())
-                    or bool((gaussians >= initial_gaussian_count).any())
+                    or bool((gaussians >= gaussian_domain_count).any())
                 ):
                     raise TraceValidationError("relation IDs are outside the active domains")
                 if bool((event_keys["gaussian"][relation_deps] != gaussians).any()):
@@ -758,7 +763,7 @@ def _validate_large_capture_trace_streaming(
             events, dependencies, event_keys, relation_event_ids,
             relation_query_counts,
             initial_gaussian_count=initial_gaussian_count,
-            max_new_gaussians=int(counts_array[PrimitiveKind.SET_MODIFICATION]),
+            max_new_gaussians=max_new_gaussians,
             scan_events=chunk_size,
         )
     if not bool(query_close_seen.all()):
@@ -1219,6 +1224,10 @@ def _validate_streaming_state_transitions(
             if not current_members or not advances_version:
                 raise TraceValidationError("collection transaction has no state modifications")
             required_transition_event = event_id
+            pending_gradients[:next_gaussian] = 0
+            commit_gradient_seen[epoch_relation_start:relation_seen] = False
+            epoch_relation_start = relation_seen
+            epoch_query_start = query_seen
         latest_state_ready = (event_id, current_version + int(advances_version))
         current_version += int(advances_version)
         end_counts[end_kind] += 1
@@ -1535,6 +1544,19 @@ def _validate_capture_audit(
         raise TraceValidationError("capture audit metadata is malformed")
     if trace.metadata.get("capture_audit_schema_version") != "gala-r2-capture-audit-v4":
         raise TraceValidationError("captured trace uses an obsolete capture audit schema")
+    window = trace.metadata.get("trace_window")
+    if window is not None and (
+        not isinstance(window, dict)
+        or window.get("schema_version") != "gala-iteration-window-v1"
+        or window.get("result_scope") != "quick_trace_validation"
+        or window.get("formal_performance_eligible") is not False
+        or window.get("quality_eligible") is not False
+        or not isinstance(window.get("iteration_start"), int)
+        or not isinstance(window.get("iteration_end"), int)
+        or int(window["iteration_start"]) <= 0
+        or int(window["iteration_end"]) < int(window["iteration_start"])
+    ):
+        raise TraceValidationError("trace iteration window metadata is malformed")
 
     event_matches = {
         "cuda_relation_candidates": PrimitiveKind.RELATION_CANDIDATE,
@@ -1643,6 +1665,16 @@ def _validate_capture_audit(
     for query_kind in ("raster", "voxel"):
         official = int(audit.get(f"official_{query_kind}_kernel_calls", 0))
         captured = int(audit.get(f"captured_{query_kind}_kernel_calls", 0))
-        excluded = int(audit.get(f"excluded_no_grad_{query_kind}_kernel_calls", 0))
+        excluded_window = int(audit.get(
+            f"excluded_iteration_window_{query_kind}_kernel_calls", 0
+        ))
+        if excluded_window and window is None:
+            raise TraceValidationError(
+                "iteration-window exclusions require trace window metadata"
+            )
+        excluded = (
+            int(audit.get(f"excluded_no_grad_{query_kind}_kernel_calls", 0))
+            + excluded_window
+        )
         if official != captured + excluded:
             raise TraceValidationError(f"official {query_kind} kernel audit totals are inconsistent")

@@ -87,6 +87,7 @@ class TraceSession:
     relation_candidate_bytes: int = 0
     chunk_events: int = 65536
     stream_only: bool = False
+    capture_iteration_range: tuple[int, int] | None = None
     _builder: ChunkedTraceBuilder = field(init=False)
     _decoder: Any = field(default=None, init=False)
     _iteration: int = field(default=0, init=False)
@@ -118,8 +119,13 @@ class TraceSession:
     _prior_transition_events: list[int] = field(default_factory=list, init=False)
     _state_ready_event: int | None = field(default=None, init=False)
     _capture_error: str | None = field(default=None, init=False)
+    _capture_window_started: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
+        if self.capture_iteration_range is not None:
+            start, end = self.capture_iteration_range
+            if start <= 0 or end < start:
+                raise ValueError("capture iteration range must have 1 <= start <= end")
         self._builder = ChunkedTraceBuilder(
             self.chunk_events, chunk_root=self.output_root / ".capture_chunks",
             stream_only=self.stream_only,
@@ -172,12 +178,14 @@ class TraceSession:
                 + self._capture_error
             )
         self._flush_pending_queries()
+        if self.capture_iteration_range is not None and not self._capture_window_started:
+            raise RuntimeError("trace capture iteration range was never reached")
         audit = dict(self._audit)
         audit.setdefault("relation_record_device_batches", 0)
         audit.setdefault("relation_record_d2h_batches", 0)
         audit.setdefault("relation_record_device_chunks", 0)
         audit.setdefault("relation_record_d2h_chunks", 0)
-        trace = self._builder.finish(metadata={
+        metadata: dict[str, object] = {
             "model": "R2-Gaussian",
             "dataset": "Chest",
             "capture_backend": "official_cuda_buffers_and_call_hooks",
@@ -187,7 +195,19 @@ class TraceSession:
             "capture_audit_schema_version": "gala-r2-capture-audit-v4",
             "initial_gaussian_count": self._initial_gaussian_count,
             "capture_audit": dict(sorted(audit.items())),
-        }, materialize=not self.stream_only)
+        }
+        if self.capture_iteration_range is not None:
+            start, end = self.capture_iteration_range
+            metadata["trace_window"] = {
+                "schema_version": "gala-iteration-window-v1",
+                "result_scope": "quick_trace_validation",
+                "formal_performance_eligible": False,
+                "quality_eligible": False,
+                "selection": "inclusive_training_iteration_range",
+                "iteration_start": start,
+                "iteration_end": end,
+            }
+        trace = self._builder.finish(metadata=metadata, materialize=not self.stream_only)
         if isinstance(trace, Trace):
             TraceWriter().write(trace, self.output_root)
         return trace
@@ -232,11 +252,17 @@ class TraceSession:
             previous = self._query_capture_allowed
             import torch
 
-            self._query_capture_allowed = bool(torch.is_grad_enabled())
+            grad_enabled = bool(torch.is_grad_enabled())
+            iteration_selected = self._iteration_capture_enabled()
+            self._query_capture_allowed = grad_enabled and iteration_selected
             self._audit_increment(f"official_{query_kind}_kernel_calls")
             if self._query_capture_allowed:
                 self._audit_increment(f"captured_{query_kind}_kernel_calls")
                 self._audit_increment("captured_query_kernel_calls")
+            elif not iteration_selected:
+                self._audit_increment(
+                    f"excluded_iteration_window_{query_kind}_kernel_calls"
+                )
             else:
                 self._audit_increment(f"excluded_no_grad_{query_kind}_kernel_calls")
             try:
@@ -270,11 +296,37 @@ class TraceSession:
         """Return the grad-mode decision captured at the official query boundary."""
         return self._query_capture_allowed
 
+    def _iteration_capture_enabled(self) -> bool:
+        if self.capture_iteration_range is None:
+            return True
+        start, end = self.capture_iteration_range
+        return start <= self._iteration <= end
+
+    def _begin_capture_window(self, gaussian_count: int) -> None:
+        if self.capture_iteration_range is None or self._capture_window_started:
+            return
+        if self._builder.next_event_id != 0:
+            raise RuntimeError("capture window cannot start after events were emitted")
+        self._gaussian_ids = list(range(gaussian_count))
+        self._next_gaussian = gaussian_count
+        self._initial_gaussian_count = gaussian_count
+        self._next_query = 0
+        self._next_relation = 0
+        self._state_version = 0
+        self._state_ready_event = None
+        self._prior_transition_events.clear()
+        self._pending_gradients.clear()
+        self._pending_backward_events.clear()
+        self._completed_backward_buffers.clear()
+        self._capture_window_started = True
+
     def _wrap_learning_rate(self, original: Any) -> Any:
         def wrapped(model: Any, iteration: int, *args: Any, **kwargs: Any) -> Any:
             self._flush_pending_queries()
             self._iteration = int(iteration)
             self._ensure_gaussians(int(model.get_xyz.shape[0]))
+            if self._iteration_capture_enabled():
+                self._begin_capture_window(int(model.get_xyz.shape[0]))
             return original(model, iteration, *args, **kwargs)
         return wrapped
 
@@ -289,7 +341,8 @@ class TraceSession:
                 self._flush_pending_queries()
                 field_mask = self._optimizer_field_mask(optimizer)
                 result_step = original_step(*step_args, **step_kwargs)
-                self._capture_update(model, field_mask=field_mask)
+                if self._iteration_capture_enabled():
+                    self._capture_update(model, field_mask=field_mask)
                 return result_step
 
             optimizer.step = step
@@ -309,7 +362,7 @@ class TraceSession:
                                   if index < len(removed) and not removed[index]]
             if len(self._gaussian_ids) != int(model.get_xyz.shape[0]):
                 raise RuntimeError("prune result does not match stable Gaussian ID count")
-            if self._modification_action != "split":
+            if self._iteration_capture_enabled() and self._modification_action != "split":
                 for gaussian_id in removed_ids:
                     self._emit_set_modification(
                         gaussian_id, flags=MOD_PRUNE, reduction_key=gaussian_id
@@ -346,6 +399,8 @@ class TraceSession:
             new_ids = list(range(next_gaussian, self._next_gaussian))
             if len(new_ids) != len(parents):
                 raise RuntimeError("clone event count does not match selected Gaussian count")
+            if not self._iteration_capture_enabled():
+                return result
             for parent, child in zip(parents, new_ids):
                 parent_event = self._emit_set_modification(
                     parent, flags=MOD_CLONE_PARENT, reduction_key=parent
@@ -375,6 +430,8 @@ class TraceSession:
             expected = len(parents) * int(N)
             if len(new_ids) != expected:
                 raise RuntimeError("split event count does not match selected Gaussian count")
+            if not self._iteration_capture_enabled():
+                return result
             children_by_parent: dict[int, list[int]] = {parent: [] for parent in parents}
             for child, parent in zip(new_ids, self._split_child_lineage(parents, int(N))):
                 event = self._emit_set_modification(
@@ -398,6 +455,8 @@ class TraceSession:
     def _wrap_densify_and_prune(self, original: Any) -> Any:
         def wrapped(model: Any, *args: Any, **kwargs: Any) -> Any:
             self._ensure_gaussians(int(model.get_xyz.shape[0]))
+            if not self._iteration_capture_enabled():
+                return original(model, *args, **kwargs)
             self._flush_pending_queries()
             self._start_collection_transaction()
             try:
@@ -895,6 +954,8 @@ class TraceSession:
         ), dependencies=dependencies)
 
     def _capture_backward(self, buffer_pointer: int, *, voxel: bool) -> None:
+        if not self._iteration_capture_enabled():
+            return
         pending = self._pending_query_by_buffer.get(buffer_pointer)
         if pending is not None:
             expected_template = VOXEL_TEMPLATE_ID if voxel else RASTER_TEMPLATE_ID
