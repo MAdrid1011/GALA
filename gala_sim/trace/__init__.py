@@ -2,8 +2,11 @@
 
 from .model import TRACE_SCHEMA_VERSION, Trace
 from .io import TraceReader, TraceWriter
-from .validator import TraceValidationError, TraceValidationReport, validate_trace
+from .validator import (
+    TraceValidationConfig, TraceValidationError, TraceValidationReport, validate_trace,
+)
 from .sink import DeviceTraceSink, NumpyChunkSink
+from .sample import QueryRange, TraceSampleConfig, dependency_closed_query_sample
 
 __all__ = [
     "TRACE_SCHEMA_VERSION",
@@ -11,8 +14,12 @@ __all__ = [
     "TraceReader",
     "TraceWriter",
     "TraceValidationError",
+    "TraceValidationConfig",
     "TraceValidationReport",
     "validate_trace",
     "DeviceTraceSink",
     "NumpyChunkSink",
+    "QueryRange",
+    "TraceSampleConfig",
+    "dependency_closed_query_sample",
 ]

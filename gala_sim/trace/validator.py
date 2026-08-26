@@ -4,8 +4,10 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
-import tempfile
 import mmap
+import os
+from pathlib import Path
+import tempfile
 
 import numpy as np
 
@@ -28,7 +30,23 @@ class TraceValidationReport:
     update_count: int
 
 
-def validate_trace(trace: Trace) -> TraceValidationReport:
+@dataclass(frozen=True)
+class TraceValidationConfig:
+    scan_events: int
+    index_directory: Path | None = None
+
+    def __post_init__(self) -> None:
+        if self.scan_events <= 0:
+            raise ValueError("trace validation scan_events must be positive")
+        if self.index_directory is not None:
+            directory = Path(self.index_directory)
+            if not directory.is_dir():
+                raise ValueError("trace validation index_directory must be a directory")
+
+
+def validate_trace(
+    trace: Trace, *, config: TraceValidationConfig | None = None,
+) -> TraceValidationReport:
     # Large raw-column captures are mmap-backed.  Keeping a Python set for
     # every relation or forward event defeats the bounded trace writer, so
     # validate them with chunked NumPy passes that retain the same dependency
@@ -37,7 +55,7 @@ def validate_trace(trace: Trace) -> TraceValidationReport:
         trace.metadata.get("trace_storage_format") == "raw_columns"
         and trace.metadata.get("capture_audit_schema_version") == "gala-r2-capture-audit-v4"
     ):
-        return _validate_large_capture_trace_streaming(trace)
+        return _validate_large_capture_trace_streaming(trace, config=config)
     events = trace.events
     counts: dict[str, int] = defaultdict(int)
     relation_event_by_id: dict[int, int] = {}
@@ -391,23 +409,13 @@ def validate_trace(trace: Trace) -> TraceValidationReport:
     )
 
 
-def _validate_large_capture_trace_streaming(trace: Trace) -> TraceValidationReport:
+def _validate_large_capture_trace_streaming(
+    trace: Trace, *, config: TraceValidationConfig | None = None,
+) -> TraceValidationReport:
     """Validate a real raw capture with bounded chunks and a disk-backed relation index."""
 
-    source_events = trace.events
-    source_dependencies = trace.dependencies
-    if isinstance(source_events, np.memmap) and isinstance(source_dependencies, np.memmap):
-        events = np.memmap(
-            source_events.filename, dtype=source_events.dtype, mode="c",
-            shape=source_events.shape,
-        )
-        dependencies = np.memmap(
-            source_dependencies.filename, dtype=source_dependencies.dtype, mode="c",
-            shape=source_dependencies.shape,
-        )
-    else:
-        events = source_events
-        dependencies = source_dependencies
+    events = trace.events
+    dependencies = trace.dependencies
     payload = trace.payload
     audit = trace.metadata.get("capture_audit")
     if not isinstance(audit, dict):
@@ -430,8 +438,18 @@ def _validate_large_capture_trace_streaming(trace: Trace) -> TraceValidationRepo
     event_count = int(events.size)
     dependency_count = int(dependencies.size)
     payload_count = int(payload.size)
-    chunk_size = max(1, int(trace.metadata.get("trace_chunk_events", 1)))
-    dependency_chunk_size = max(chunk_size, 1_048_576)
+    chunk_size = (
+        config.scan_events if config is not None
+        else max(1, int(trace.metadata.get("trace_chunk_events", 1)))
+    )
+    dependency_chunk_size = chunk_size
+    event_index_dtype = _compact_unsigned_dtype(event_count)
+    event_key_dtype = np.dtype([
+        ("kind", np.dtype("u1")),
+        ("query", _compact_unsigned_dtype(query_count)),
+        ("gaussian", _compact_unsigned_dtype(initial_gaussian_count)),
+        ("relation", _compact_unsigned_dtype(relation_count)),
+    ], align=False)
     counts_array = np.zeros(len(PrimitiveKind) + 1, dtype=np.int64)
     relation_query_counts = np.zeros(query_count, dtype=np.uint64)
     query_close_seen = np.zeros(query_count, dtype=bool)
@@ -443,15 +461,36 @@ def _validate_large_capture_trace_streaming(trace: Trace) -> TraceValidationRepo
             PrimitiveKind.CACHE_RETURN, PrimitiveKind.FORWARD,
         )
     }
-    relation_index_directory = None
+    relation_index_directory: str | None = None
     filename = getattr(events, "filename", None)
     if filename is not None:
         relation_index_directory = str(__import__("pathlib").Path(filename).parent)
-    with tempfile.TemporaryFile(dir=relation_index_directory) as relation_index_file:
+    if config is not None and config.index_directory is not None:
+        relation_index_directory = str(config.index_directory)
+    required_index_bytes = (
+        relation_count * event_index_dtype.itemsize
+        + event_count * event_key_dtype.itemsize
+    )
+    if relation_index_directory is not None:
+        stats = os.statvfs(relation_index_directory)
+        available_index_bytes = stats.f_bavail * stats.f_frsize
+        if required_index_bytes > available_index_bytes:
+            raise TraceValidationError(
+                "trace validation index directory has insufficient free space: "
+                f"requires {required_index_bytes} bytes, has {available_index_bytes} bytes"
+            )
+    with (
+        tempfile.TemporaryFile(dir=relation_index_directory) as relation_index_file,
+        tempfile.TemporaryFile(dir=relation_index_directory) as event_key_file,
+    ):
         relation_event_ids = np.memmap(
-            relation_index_file, dtype=np.uint64, mode="w+", shape=(relation_count,)
+            relation_index_file, dtype=event_index_dtype, mode="w+", shape=(relation_count,)
         )
-        relation_event_ids[:] = np.iinfo(np.uint64).max
+        missing_event_id = np.iinfo(event_index_dtype).max
+        relation_event_ids[:] = missing_event_id
+        event_keys = np.memmap(
+            event_key_file, dtype=event_key_dtype, mode="w+", shape=(event_count,)
+        )
         start = 0
         while start < event_count:
             end = min(start + chunk_size, event_count)
@@ -471,6 +510,12 @@ def _validate_large_capture_trace_streaming(trace: Trace) -> TraceValidationRepo
                 dep_counts = dep_counts[:bounded_count]
                 dep_ends = dep_ends[:bounded_count]
             event_ids = np.arange(start, end, dtype=np.uint64)
+            compact_keys = np.empty(rows.size, dtype=event_key_dtype)
+            compact_keys["kind"] = rows["primitive_kind"]
+            compact_keys["query"] = rows["query_id"]
+            compact_keys["gaussian"] = rows["gaussian_id"]
+            compact_keys["relation"] = rows["relation_id"]
+            event_keys[start:end] = compact_keys
             if not np.array_equal(rows["event_id"], event_ids):
                 mismatch = int(start + np.flatnonzero(rows["event_id"] != event_ids)[0])
                 raise TraceValidationError(
@@ -530,7 +575,7 @@ def _validate_large_capture_trace_streaming(trace: Trace) -> TraceValidationRepo
                         f"{owner.name} must have exactly one dependency"
                     )
                 deps = np.asarray(dependencies[begins[pos]], dtype=np.uint64)
-                if bool((events["primitive_kind"][deps] != int(expected)).any()):
+                if bool((event_keys["kind"][deps] != int(expected)).any()):
                     raise TraceValidationError(
                         f"{owner.name} has an invalid dependency kind"
                     )
@@ -563,7 +608,7 @@ def _validate_large_capture_trace_streaming(trace: Trace) -> TraceValidationRepo
                     or bool((gaussians >= initial_gaussian_count).any())
                 ):
                     raise TraceValidationError("relation IDs are outside the active domains")
-                if bool((events["gaussian_id"][relation_deps] != gaussians).any()):
+                if bool((event_keys["gaussian"][relation_deps] != gaussians).any()):
                     raise TraceValidationError("relation Gaussian does not match its candidate")
                 relation_event_ids[ids] = event_ids[relation_pos]
                 np.add.at(relation_query_counts, queries, 1)
@@ -582,9 +627,9 @@ def _validate_large_capture_trace_streaming(trace: Trace) -> TraceValidationRepo
                     run_queries = np.asarray(rows["query_id"][first:last], dtype=np.int64)
                     run_counts = dep_counts[first:last]
                     run_deps = dependencies[int(begins[first]):int(dep_ends[last - 1])]
-                    if bool((events["primitive_kind"][run_deps] != int(PrimitiveKind.RELATION)).any()):
+                    if bool((event_keys["kind"][run_deps] != int(PrimitiveKind.RELATION)).any()):
                         raise TraceValidationError("query close has a non-relation dependency")
-                    if bool((events["query_id"][run_deps] != np.repeat(run_queries, run_counts)).any()):
+                    if bool((event_keys["query"][run_deps] != np.repeat(run_queries, run_counts)).any()):
                         raise TraceValidationError("query close relation belongs to another query")
                 query_close_seen[queries] = True
 
@@ -602,9 +647,9 @@ def _validate_large_capture_trace_streaming(trace: Trace) -> TraceValidationRepo
                     )
                     if not np.array_equal(ids, expected):
                         raise TraceValidationError(f"{owner.name} relation IDs are not dense")
-                    if bool((events["relation_id"][deps] != ids).any()):
+                    if bool((event_keys["relation"][deps] != ids).any()):
                         raise TraceValidationError(f"{owner.name} relation dependency is mismatched")
-                    if bool((events["gaussian_id"][deps] != rows["gaussian_id"][pos]).any()):
+                    if bool((event_keys["gaussian"][deps] != rows["gaussian_id"][pos]).any()):
                         raise TraceValidationError(f"{owner.name} Gaussian dependency is mismatched")
                     next_relation[owner] += int(ids.size)
 
@@ -625,9 +670,9 @@ def _validate_large_capture_trace_streaming(trace: Trace) -> TraceValidationRepo
                     np.asarray(dependencies[begins[forward_pos] + 1], dtype=np.uint64),
                 ))
                 if (
-                    bool((events["primitive_kind"][deps[:, 0]] != int(PrimitiveKind.RELATION)).any())
-                    or bool((events["primitive_kind"][deps[:, 1]] != int(PrimitiveKind.CACHE_RETURN)).any())
-                    or bool((events["relation_id"][deps] != ids[:, None]).any())
+                    bool((event_keys["kind"][deps[:, 0]] != int(PrimitiveKind.RELATION)).any())
+                    or bool((event_keys["kind"][deps[:, 1]] != int(PrimitiveKind.CACHE_RETURN)).any())
+                    or bool((event_keys["relation"][deps] != ids[:, None]).any())
                 ):
                     raise TraceValidationError("forward dependencies are mismatched")
                 next_relation[PrimitiveKind.FORWARD] += int(ids.size)
@@ -641,13 +686,13 @@ def _validate_large_capture_trace_streaming(trace: Trace) -> TraceValidationRepo
                     run_queries = np.asarray(rows["query_id"][first:last], dtype=np.int64)
                     run_counts = dep_counts[first:last]
                     run_deps = dependencies[int(begins[first]):int(dep_ends[last - 1])]
-                    run_kinds = events["primitive_kind"][run_deps]
+                    run_kinds = event_keys["kind"][run_deps]
                     if not bool(np.isin(
                         run_kinds,
                         [int(PrimitiveKind.QUERY_CLOSE), int(PrimitiveKind.FORWARD)],
                     ).all()):
                         raise TraceValidationError("query reduction dependency kind is invalid")
-                    if bool((events["query_id"][run_deps] != np.repeat(run_queries, run_counts)).any()):
+                    if bool((event_keys["query"][run_deps] != np.repeat(run_queries, run_counts)).any()):
                         raise TraceValidationError("query reduction dependency belongs to another query")
 
             consumer_pos = positions(PrimitiveKind.CONSUMER)
@@ -659,7 +704,7 @@ def _validate_large_capture_trace_streaming(trace: Trace) -> TraceValidationRepo
                     raise TraceValidationError("query has multiple consumers")
                 for first, last in _contiguous_position_runs(consumer_pos):
                     run_deps = dependencies[int(begins[first]):int(dep_ends[last - 1])]
-                    if bool((events["primitive_kind"][run_deps] != int(PrimitiveKind.QUERY_REDUCTION)).any()):
+                    if bool((event_keys["kind"][run_deps] != int(PrimitiveKind.QUERY_REDUCTION)).any()):
                         raise TraceValidationError("consumer has a non-reduction dependency")
                 consumer_seen[queries] = True
 
@@ -674,12 +719,12 @@ def _validate_large_capture_trace_streaming(trace: Trace) -> TraceValidationRepo
                 if bool(backward_pending[ids].any()):
                     raise TraceValidationError("relation has multiple pending adjoints")
                 relation_events = np.asarray(relation_event_ids[ids], dtype=np.uint64)
-                if bool((relation_events == np.iinfo(np.uint64).max).any()):
+                if bool((relation_events == missing_event_id).any()):
                     raise TraceValidationError("adjoint precedes its relation")
                 if (
-                    bool((events["query_id"][adjoint_deps] != rows["query_id"][adjoint_pos]).any())
-                    or bool((events["query_id"][relation_events] != rows["query_id"][adjoint_pos]).any())
-                    or bool((events["gaussian_id"][relation_events] != rows["gaussian_id"][adjoint_pos]).any())
+                    bool((event_keys["query"][adjoint_deps] != rows["query_id"][adjoint_pos]).any())
+                    or bool((event_keys["query"][relation_events] != rows["query_id"][adjoint_pos]).any())
+                    or bool((event_keys["gaussian"][relation_events] != rows["gaussian_id"][adjoint_pos]).any())
                 ):
                     raise TraceValidationError("adjoint relation or consumer identity is mismatched")
                 backward_pending[ids] = True
@@ -695,25 +740,21 @@ def _validate_large_capture_trace_streaming(trace: Trace) -> TraceValidationRepo
                 if not bool(backward_pending[ids].all()):
                     raise TraceValidationError("gradient has no unique pending adjoint")
                 if (
-                    bool((events["relation_id"][gradient_deps] != ids).any())
-                    or bool((events["gaussian_id"][gradient_deps] != rows["gaussian_id"][gradient_pos]).any())
-                    or bool((events["query_id"][gradient_deps] != rows["query_id"][gradient_pos]).any())
+                    bool((event_keys["relation"][gradient_deps] != ids).any())
+                    or bool((event_keys["gaussian"][gradient_deps] != rows["gaussian_id"][gradient_pos]).any())
+                    or bool((event_keys["query"][gradient_deps] != rows["query_id"][gradient_pos]).any())
                 ):
                     raise TraceValidationError("gradient and adjoint identities are mismatched")
                 backward_pending[ids] = False
 
             _release_mmap_pages(events)
             _release_mmap_pages(dependencies)
-            # The original read-only mappings remain live on the Trace object;
-            # release their sequentially scanned pages as well as the COW views.
-            _release_mmap_pages(source_events)
-            _release_mmap_pages(source_dependencies)
             start = end
 
         relation_event_ids.flush()
         if any(value != relation_count for value in next_relation.values()):
             raise TraceValidationError("relation pipeline counts are inconsistent")
-        if bool((relation_event_ids == np.iinfo(np.uint64).max).any()):
+        if bool((relation_event_ids == missing_event_id).any()):
             raise TraceValidationError("relation index is incomplete")
     if not bool(query_close_seen.all()):
         raise TraceValidationError("captured query is missing its close event")
@@ -743,6 +784,14 @@ def _contiguous_position_runs(positions: np.ndarray):
     splits = np.flatnonzero(np.diff(positions) != 1) + 1
     for run in np.split(positions, splits):
         yield int(run[0]), int(run[-1]) + 1
+
+
+def _compact_unsigned_dtype(domain_size: int) -> np.dtype:
+    if domain_size < 0:
+        raise ValueError("compact index domain must be non-negative")
+    if domain_size <= np.iinfo(np.uint32).max:
+        return np.dtype("<u4")
+    return np.dtype("<u8")
 
 
 def _release_mmap_pages(array: object) -> None:
@@ -1082,12 +1131,16 @@ def _validate_capture_audit(trace: Trace, counts: dict[str, int]) -> None:
 
     begin_counts: dict[UpdateBeginKind, int] = defaultdict(int)
     end_counts: dict[UpdateBeginKind, int] = defaultdict(int)
-    for row in trace.events:
-        primitive = PrimitiveKind(int(row["primitive_kind"]))
-        if primitive is PrimitiveKind.UPDATE_BEGIN:
-            begin_counts[UpdateBeginKind(int(row["flags"]))] += 1
-        elif primitive is PrimitiveKind.UPDATE_END:
-            end_counts[UpdateBeginKind(int(row["flags"]))] += 1
+    has_update_boundaries = any(counts.get(kind.name, 0) for kind in (
+        PrimitiveKind.UPDATE_BEGIN, PrimitiveKind.UPDATE_END,
+    ))
+    if has_update_boundaries:
+        for row in trace.events:
+            primitive = PrimitiveKind(int(row["primitive_kind"]))
+            if primitive is PrimitiveKind.UPDATE_BEGIN:
+                begin_counts[UpdateBeginKind(int(row["flags"]))] += 1
+            elif primitive is PrimitiveKind.UPDATE_END:
+                end_counts[UpdateBeginKind(int(row["flags"]))] += 1
     if begin_counts != end_counts:
         raise TraceValidationError("update begin/end audit totals are inconsistent")
     optimizer_steps = int(audit.get("optimizer_steps", 0))
@@ -1101,9 +1154,10 @@ def _validate_capture_audit(trace: Trace, counts: dict[str, int]) -> None:
     ]:
         raise TraceValidationError("collection transaction audit totals are inconsistent")
     modification_counts: dict[ModificationKind, int] = defaultdict(int)
-    for row in trace.events:
-        if PrimitiveKind(int(row["primitive_kind"])) is PrimitiveKind.SET_MODIFICATION:
-            modification_counts[ModificationKind(int(row["flags"]))] += 1
+    if counts.get(PrimitiveKind.SET_MODIFICATION.name, 0):
+        for row in trace.events:
+            if PrimitiveKind(int(row["primitive_kind"])) is PrimitiveKind.SET_MODIFICATION:
+                modification_counts[ModificationKind(int(row["flags"]))] += 1
     for modification in ModificationKind:
         expected = int(audit.get(
             f"collection_{modification.name.lower()}_events", 0

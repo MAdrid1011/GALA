@@ -30,7 +30,9 @@ from gala_sim.clamp import (
     TraceEvent,
     UpdateBeginKind,
 )
-from gala_sim.trace import Trace, TraceValidationError, validate_trace
+from gala_sim.trace import (
+    Trace, TraceValidationConfig, TraceValidationError, validate_trace,
+)
 
 
 def _rows(trace, kind: PrimitiveKind) -> np.ndarray:
@@ -114,6 +116,41 @@ def test_capture_expands_each_valid_mask_bit_into_a_query_relation(tmp_path: Pat
     consumer = _rows(trace, PrimitiveKind.CONSUMER)[16]
     dependency_queries = trace.events[trace.dependency_ids(consumer)]["query_id"].tolist()
     assert dependency_queries == [15, 16, 32, 33]
+
+
+def test_streaming_capture_validator_uses_compact_dependency_keys(tmp_path: Path) -> None:
+    session = TraceSession(tmp_path / "trace", chunk_events=16)
+    session._ensure_gaussians(1)
+    session._audit.update({
+        "official_raster_kernel_calls": 1,
+        "captured_raster_kernel_calls": 1,
+        "captured_query_kernel_calls": 1,
+        "cuda_relation_candidates": 1,
+        "captured_logical_queries": 1,
+    })
+    session._emit_query_records(
+        _single_relation_records(), rendered=1, query_base=0, query_shape=(1, 1),
+        binning_pointer=10, output_pointer=20, template_id=RASTER_TEMPLATE_ID,
+        field_mask=STATE_FIELD_MASK,
+    )
+    session._contexts[10].loss_flags = LOSS_L1
+    session._capture_backward(10, voxel=False)
+    trace = session.finish()
+    metadata = dict(trace.metadata)
+    metadata["trace_storage_format"] = "raw_columns"
+    index_directory = tmp_path / "validation-index"
+    index_directory.mkdir()
+
+    report = validate_trace(
+        Trace(trace.events, trace.dependencies, trace.payload, metadata),
+        config=TraceValidationConfig(
+            scan_events=4, index_directory=index_directory,
+        ),
+    )
+
+    assert report.event_count == trace.event_count
+    assert report.query_count == 1
+    assert report.counts[PrimitiveKind.RELATION.name] == 1
 
 
 def test_query_and_backward_batches_preserve_capture_order_across_chunk_sizes(

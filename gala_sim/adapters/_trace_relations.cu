@@ -1,4 +1,5 @@
 #include <ATen/cuda/CUDAContext.h>
+#include <cstring>
 #include <cstdint>
 #include <stdexcept>
 #include <torch/extension.h>
@@ -16,6 +17,35 @@ constexpr int kVoxelQueriesPerCandidate = kVoxelBlockX * kVoxelBlockY * kVoxelBl
 constexpr int kVoxelMaskWords = kVoxelQueriesPerCandidate / 32;
 constexpr int64_t kCandidateRecord = 0;
 constexpr int64_t kRelationRecord = 1;
+
+__global__ void trace_terminal_mask_kernel(
+    const std::uint8_t* events, const int64_t* query_ranges,
+    int64_t event_count, int64_t event_stride, int64_t primitive_offset,
+    int64_t query_offset, int64_t range_count, std::uint16_t consumer_kind,
+    std::uint16_t gradient_kind, bool* output) {
+    auto event = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (event >= event_count) {
+        return;
+    }
+    auto row = events + event * event_stride;
+    std::uint16_t primitive;
+    int64_t query;
+    memcpy(&primitive, row + primitive_offset, sizeof(primitive));
+    memcpy(&query, row + query_offset, sizeof(query));
+    auto terminal = primitive == consumer_kind || primitive == gradient_kind;
+    auto selected = false;
+    if (terminal) {
+        for (int64_t range = 0; range < range_count; ++range) {
+            auto start = query_ranges[range * 2];
+            auto end = query_ranges[range * 2 + 1];
+            if (query >= start && query < end) {
+                selected = true;
+                break;
+            }
+        }
+    }
+    output[event] = selected;
+}
 
 __global__ void count_mask_bits_kernel(
     const std::uint32_t* masks, int words, int64_t candidate_count,
@@ -228,6 +258,42 @@ __global__ void voxel_masks_kernel(
 }
 
 }  // namespace
+
+torch::Tensor trace_terminal_mask_cuda(
+    const torch::Tensor& raw_events, const torch::Tensor& query_ranges,
+    int64_t event_count, int64_t event_stride,
+    int64_t primitive_offset, int64_t query_offset,
+    int64_t consumer_kind, int64_t gradient_kind) {
+    if (!raw_events.defined() || !raw_events.is_contiguous()
+        || raw_events.scalar_type() != torch::kUInt8
+        || raw_events.device().type() != torch::kCUDA) {
+        throw std::invalid_argument("raw trace events must be contiguous CUDA uint8");
+    }
+    if (!query_ranges.defined() || !query_ranges.is_contiguous()
+        || query_ranges.scalar_type() != torch::kInt64
+        || query_ranges.device() != raw_events.device()
+        || query_ranges.dim() != 2 || query_ranges.size(1) != 2) {
+        throw std::invalid_argument("trace query ranges must be CUDA int64 pairs");
+    }
+    if (event_count < 0 || event_stride <= 0 || primitive_offset < 0
+        || query_offset < 0 || primitive_offset + sizeof(std::uint16_t) > event_stride
+        || query_offset + sizeof(int64_t) > event_stride
+        || event_count > raw_events.numel() / event_stride) {
+        throw std::invalid_argument("raw trace event layout is invalid");
+    }
+    auto output = torch::empty({event_count}, raw_events.options().dtype(torch::kBool));
+    constexpr int threads = 256;
+    if (event_count > 0) {
+        trace_terminal_mask_kernel<<<(event_count + threads - 1) / threads, threads,
+                                     0, at::cuda::getCurrentCUDAStream()>>>(
+            raw_events.data_ptr<std::uint8_t>(), query_ranges.data_ptr<int64_t>(),
+            event_count, event_stride, primitive_offset, query_offset,
+            query_ranges.size(0), static_cast<std::uint16_t>(consumer_kind),
+            static_cast<std::uint16_t>(gradient_kind), output.data_ptr<bool>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return output;
+}
 
 torch::Tensor raster_valid_masks_range_cuda(const torch::Tensor& geometry_buffer,
                                             const torch::Tensor& binning_buffer,

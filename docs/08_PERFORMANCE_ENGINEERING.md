@@ -39,3 +39,9 @@ GPU 利用率低于 `gpu_utilization_floor_percent` 时，不启动小时级任�
 ## 6. 自动调优边界
 
 允许自动调优 trace chunk、GPU batch、固定页缓冲数量、数据加载 worker、Numba batch 和结果压缩批量。这些值记录在环境配置中。禁止自动调优硬件资源、事件延迟、缓存命中率、冲突数量或模型训练参数来拟合论文结果。
+
+## 7. 超大 Trace 快速验证
+
+全量质量和正式 trace 完整性门仍对完整模型执行一次。模块开发和周期吞吐调试可以从真实 trace 的一个或多个 query range 构造依赖闭合样本；选择从 consumer 和 gradient terminal 开始，必须保留其全部候选、关系、缓存、前向、查询归约、伴随和梯度前置事件，不得生成平均关系或合成命中率。
+
+扫描块、事件上限和 CPU/CUDA 后端必须显式记录。CUDA 扫描只优化软件处理时间，不改变 trace 内容。sample manifest 固定 `result_scope=quick_cycle_validation`、`formal_performance_eligible=false` 和 `quality_eligible=false`。周期与消融入口默认拒绝 sample；只有显式 quick-validation 模式可运行，且结果不得进入正式 Base ASIC、Oracle、论文消融或端到端加速比汇总。

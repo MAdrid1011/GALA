@@ -8,8 +8,12 @@
 
 `native-reference --config <yaml> --freeze <json> --preflight <json> --output <dir>` 只在预检通过后运行官方完整训练并写出质量、GPU 参考和状态文件。
 
-其余入口为 `config-check`、`cycle-preflight`、`trace-validate`、`cycle-replay` 和 `ablation`。
+`trace-sample --trace <dir> --output <dir> --query-range START:COUNT --max-events N --max-dependencies N --scan-events N --scan-backend cpu|cuda|auto` 从一个或多个 query range 的 consumer/gradient terminal 出发，抽取完整传递依赖闭包。输出保留真实 relation、地址、字节数和依赖，只能用于快速周期验证。
+
+`trace-validate --trace <dir> [--scan-events N] [--index-directory DIR]` 对完整 trace 执行结构和生命周期校验。显式扫描块和临时索引目录只改变软件验证吞吐、临时空间和峰值，不改变检查集合；省略扫描块时沿用 trace capture chunk。`--index-directory` 必须与 `--scan-events` 一起使用。
+
+其余入口为 `config-check`、`cycle-preflight`、`trace-validate`、`cycle-replay` 和 `ablation`。sample trace 默认被周期入口拒绝；调用者必须显式传入 `--quick-validation`，输出 manifest 会固定 `formal_performance_eligible=false`。
 
 ## Internal Helpers
 
-解析 Ramulator binding、资源使用快照和子命令参数；异常统一转换为非零退出状态。
+解析 query range、Ramulator binding、资源使用快照和子命令参数；异常统一转换为非零退出状态。

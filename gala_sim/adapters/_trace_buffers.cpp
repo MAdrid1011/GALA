@@ -146,6 +146,12 @@ torch::Tensor voxel_trace_records_chunk_cuda(
     int64_t candidate_start, int64_t candidate_count,
     int64_t voxel_x, int64_t voxel_y, int64_t voxel_z);
 
+torch::Tensor trace_terminal_mask_cuda(
+    const torch::Tensor& raw_events, const torch::Tensor& query_ranges,
+    int64_t event_count, int64_t event_stride,
+    int64_t primitive_offset, int64_t query_offset,
+    int64_t consumer_kind, int64_t gradient_kind);
+
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def("copy_raster_point_list", &copy_raster_point_list);
     module.def("copy_voxel_point_list", &copy_voxel_point_list);
@@ -158,4 +164,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, module) {
     module.def("voxel_trace_records", &voxel_trace_records_cuda);
     module.def("raster_trace_records_chunk", &raster_trace_records_chunk_cuda);
     module.def("voxel_trace_records_chunk", &voxel_trace_records_chunk_cuda);
+    module.def("trace_terminal_mask", &trace_terminal_mask_cuda);
 }

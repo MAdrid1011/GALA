@@ -125,6 +125,13 @@ FMA、EXP、LOG、RCP、SQRT、SRAM、CAM、互连和寄存器流水延迟不写
 | `preflight.measure_iterations` | 50 | iteration | 预测总运行时间 |
 | `trace.chunk_events` | 自动调优后冻结 | event | 设备 trace chunk 容量 |
 | `trace.max_inflight_chunks` | 自动调优后冻结 | chunk | GPU 与 CPU 重叠深度 |
+| `trace-sample.query_ranges` | 命令显式指定 | query range | quick-validation terminal 选择 |
+| `trace-sample.max_events` | 命令显式指定 | event | quick-validation 闭包事件上限 |
+| `trace-sample.max_dependencies` | 命令显式指定 | dependency | quick-validation 中间与输出依赖上限 |
+| `trace-sample.scan_events` | 命令显式指定 | event | CPU/CUDA 顺序扫描块 |
+| `trace-sample.scan_backend` | `auto` | enum | `cpu`、`cuda` 或记录实际回退的 `auto` |
+| `trace-validate.scan_events` | trace capture chunk | event | 全量流式 validator 顺序扫描块 |
+| `trace-validate.index_directory` | source trace directory | path | 全量 validator 的临时紧凑索引目录；不改变检查集合 |
 
 自动调优只允许在首个真实样例上搜索 trace chunk 和软件缓冲参数。调优目标是减少主机同步与内存峰值，不改变任何硬件参数、事件内容或周期结果。冻结值记录在运行环境配置中。
 

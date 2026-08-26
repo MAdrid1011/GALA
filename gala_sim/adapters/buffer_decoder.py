@@ -25,7 +25,7 @@ def load_buffer_decoder() -> Any:
     source = Path(__file__).with_name("_trace_buffers.cpp")
     if not source.is_file():
         raise FileNotFoundError(f"trace buffer decoder source is missing: {source}")
-    name = "gala_trace_buffers_v8"
+    name = "gala_trace_buffers_v9"
     try:
         from torch.utils.cpp_extension import get_default_build_root
         cache_root = Path(get_default_build_root())
@@ -86,3 +86,30 @@ def decode_voxel_buffers(
         np.asarray(point_keys, dtype=np.uint64),
         np.asarray(ranges, dtype=np.int64),
     )
+
+
+def scan_trace_terminals_cuda(
+    decoder: Any,
+    raw_events: np.ndarray,
+    event_count: int,
+    event_stride: int,
+    primitive_offset: int,
+    query_offset: int,
+    query_ranges: np.ndarray,
+    consumer_kind: int,
+    gradient_kind: int,
+) -> np.ndarray:
+    """Return local event indices selected by the CUDA raw-trace scanner."""
+
+    import torch
+
+    host_bytes = np.asarray(raw_events).view(np.uint8).reshape(-1)
+    device_bytes = torch.tensor(host_bytes, dtype=torch.uint8, device="cuda")
+    device_ranges = torch.as_tensor(
+        query_ranges, dtype=torch.int64, device=device_bytes.device,
+    ).contiguous()
+    mask = decoder.trace_terminal_mask(
+        device_bytes, device_ranges, int(event_count), int(event_stride),
+        int(primitive_offset), int(query_offset), int(consumer_kind), int(gradient_kind),
+    )
+    return mask.nonzero().flatten().cpu().numpy().astype(np.uint64, copy=False)
