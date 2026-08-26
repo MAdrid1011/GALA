@@ -116,6 +116,38 @@ def test_capture_expands_each_valid_mask_bit_into_a_query_relation(tmp_path: Pat
     assert dependency_queries == [15, 16, 32, 33]
 
 
+def test_query_and_backward_batches_preserve_capture_order_across_chunk_sizes(
+    tmp_path: Path,
+) -> None:
+    records = np.asarray([
+        [0, 0, 0, 0], [0, 1, 1, 1 << 32],
+        [1, 0, 0, 0], [1, 1, 1, 0], [1, 1, 0, 0],
+    ], dtype=np.int64)
+    traces = []
+    for chunk_events in (1, 3, 64):
+        session = TraceSession(tmp_path / f"trace_{chunk_events}", chunk_events=chunk_events)
+        session._ensure_gaussians(2)
+        session._audit.update({
+            "official_raster_kernel_calls": 1,
+            "captured_raster_kernel_calls": 1,
+            "captured_query_kernel_calls": 1,
+            "cuda_relation_candidates": 2,
+            "captured_logical_queries": 34,
+        })
+        session._emit_query_records(
+            records, rendered=2, query_base=0, query_shape=(2, 17),
+            binning_pointer=10, output_pointer=20, template_id=RASTER_TEMPLATE_ID,
+            field_mask=STATE_FIELD_MASK,
+        )
+        session._contexts[10].loss_flags = LOSS_L1
+        session._capture_backward(10, voxel=False)
+        traces.append(session.finish())
+    for trace in traces[1:]:
+        assert np.array_equal(traces[0].events, trace.events)
+        assert np.array_equal(traces[0].dependencies, trace.dependencies)
+        assert np.array_equal(traces[0].payload, trace.payload)
+
+
 def test_pending_queries_share_one_host_copy_and_preserve_event_order(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

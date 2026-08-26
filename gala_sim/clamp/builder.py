@@ -104,6 +104,10 @@ class ChunkedTraceBuilder:
                 for suffix in ("events.raw", "dependencies.raw", "payload.raw"):
                     (self.chunk_root.parent / suffix).unlink(missing_ok=True)
 
+    @property
+    def next_event_id(self) -> int:
+        return self._next_event_id
+
     def _flush_current(self) -> None:
         if self._current is None:
             return
