@@ -17,6 +17,49 @@ constexpr int kVoxelMaskWords = kVoxelQueriesPerCandidate / 32;
 constexpr int64_t kCandidateRecord = 0;
 constexpr int64_t kRelationRecord = 1;
 
+__global__ void count_mask_bits_kernel(
+    const std::uint32_t* masks, int words, int64_t candidate_count,
+    int64_t* counts) {
+    auto candidate = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (candidate >= candidate_count) {
+        return;
+    }
+    std::uint32_t count = 0;
+    for (int word = 0; word < words; ++word) {
+        count += __popc(masks[candidate * words + word]);
+    }
+    counts[candidate] = static_cast<int64_t>(count);
+}
+
+__global__ void write_trace_records_kernel(
+    const std::uint32_t* point_list, const std::uint64_t* point_keys,
+    const std::uint32_t* masks, const int64_t* relation_offsets,
+    int words, int64_t candidate_count, int64_t* output) {
+    auto candidate = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (candidate >= candidate_count) {
+        return;
+    }
+    auto candidate_row = output + candidate * 4;
+    candidate_row[0] = kCandidateRecord;
+    candidate_row[1] = candidate;
+    candidate_row[2] = static_cast<int64_t>(point_list[candidate]);
+    candidate_row[3] = static_cast<int64_t>(point_keys[candidate]);
+    auto relation_row = candidate == 0 ? 0 : relation_offsets[candidate - 1];
+    for (int word = 0; word < words; ++word) {
+        auto bits = masks[candidate * words + word];
+        while (bits != 0) {
+            auto bit = __ffs(bits) - 1;
+            auto row = output + (candidate_count + relation_row) * 4;
+            row[0] = kRelationRecord;
+            row[1] = candidate;
+            row[2] = static_cast<int64_t>(word * 32 + bit);
+            row[3] = 0;
+            ++relation_row;
+            bits &= bits - 1;
+        }
+    }
+}
+
 std::size_t align128(const torch::Tensor& buffer, std::size_t offset) {
     auto base = reinterpret_cast<std::uintptr_t>(buffer.data_ptr<std::uint8_t>());
     auto address = base + offset;
@@ -61,42 +104,33 @@ torch::Tensor compact_trace_records(
     }
 
     auto long_options = binning_buffer.options().dtype(torch::kInt64);
-    auto int_options = binning_buffer.options().dtype(torch::kInt32);
-    auto point_list = torch::from_blob(
-        point_list_pointer, {candidate_count}, [](void*) {}, int_options).to(torch::kInt64);
-    auto point_keys = torch::from_blob(
-        point_keys_pointer, {candidate_count}, [](void*) {}, long_options).clone();
-    auto candidate_indexes = torch::arange(candidate_count, long_options);
-    auto candidate_records = torch::stack({
-        torch::full({candidate_count}, kCandidateRecord, long_options),
-        candidate_indexes,
-        point_list,
-        point_keys,
-    }, 1);
-
-    auto nonzero_words = torch::nonzero(masks);
-    if (nonzero_words.size(0) == 0) {
-        return candidate_records.contiguous();
+    auto count_options = masks.options().dtype(torch::kInt64);
+    auto mask_words = static_cast<int>(masks.size(1));
+    auto counts = torch::empty({candidate_count}, count_options);
+    constexpr int threads = 256;
+    if (candidate_count > 0) {
+        count_mask_bits_kernel<<<(candidate_count + threads - 1) / threads, threads,
+                                 0, at::cuda::getCurrentCUDAStream()>>>(
+            reinterpret_cast<const std::uint32_t*>(masks.data_ptr<int>()),
+            mask_words, candidate_count, counts.data_ptr<int64_t>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
     }
-    auto word_candidates = nonzero_words.select(1, 0);
-    auto word_indexes = nonzero_words.select(1, 1);
-    auto words = masks.index({word_candidates, word_indexes}).to(torch::kInt64);
-    auto bit_indexes = torch::arange(32, long_options);
-    auto bit_values = torch::bitwise_left_shift(torch::ones({32}, long_options), bit_indexes);
-    auto valid_bits = torch::bitwise_and(words.unsqueeze(1), bit_values).ne(0);
-    auto nonzero_bits = torch::nonzero(valid_bits);
-    auto word_rows = nonzero_bits.select(1, 0);
-    auto relation_candidates = word_candidates.index_select(0, word_rows);
-    auto relation_locals = word_indexes.index_select(0, word_rows) * 32
-                           + nonzero_bits.select(1, 1);
-    auto relation_count = relation_candidates.size(0);
-    auto relation_records = torch::stack({
-        torch::full({relation_count}, kRelationRecord, long_options),
-        relation_candidates,
-        relation_locals,
-        torch::zeros({relation_count}, long_options),
-    }, 1);
-    return torch::cat({candidate_records, relation_records}, 0).contiguous();
+    auto offsets = torch::cumsum(counts, 0);
+    int64_t relation_count = 0;
+    if (candidate_count > 0) {
+        relation_count = offsets.index({candidate_count - 1}).item<int64_t>();
+    }
+    auto output = torch::empty({candidate_count + relation_count, 4}, long_options);
+    if (candidate_count > 0) {
+        write_trace_records_kernel<<<(candidate_count + threads - 1) / threads, threads,
+                                     0, at::cuda::getCurrentCUDAStream()>>>(
+            point_list_pointer, point_keys_pointer,
+            reinterpret_cast<const std::uint32_t*>(masks.data_ptr<int>()),
+            offsets.data_ptr<int64_t>(), mask_words, candidate_count,
+            output.data_ptr<int64_t>());
+        C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+    return output.contiguous();
 }
 
 __global__ void raster_masks_kernel(
