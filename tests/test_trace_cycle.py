@@ -152,6 +152,30 @@ def test_chunked_trace_builder_batch_matches_single_event_writer(
     assert validate_trace(result).event_count == 5
 
 
+def test_stream_only_builder_writes_raw_columns_readable_as_mmap(tmp_path: Path) -> None:
+    root = tmp_path / "stream"
+    builder = ChunkedTraceBuilder(
+        chunk_events=2, chunk_root=root / ".capture_chunks", stream_only=True
+    )
+    relation = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.RELATION), query_id=0, gaussian_id=0,
+        relation_id=0,
+    ))
+    builder.emit(
+        TraceEvent(primitive_kind=int(PrimitiveKind.QUERY_CLOSE), query_id=0),
+        dependencies=[relation],
+    )
+    manifest = builder.finish(
+        metadata={"model": "fixture"}, materialize=False
+    )
+    assert manifest.storage_format == "raw_columns"
+    assert (root / "events.raw").is_file()
+    loaded = TraceReader().read(root, mmap_mode="r")
+    assert isinstance(loaded.events, np.memmap)
+    assert loaded.event_count == 2
+    assert validate_trace(loaded).event_count == 2
+
+
 def test_dependency_index_uses_compressed_stable_reverse_edges() -> None:
     builder = TraceBuilder()
     root = builder.emit(TraceEvent(primitive_kind=int(PrimitiveKind.RELATION)))

@@ -8,7 +8,7 @@ from .events import (
     TraceEvent,
     UpdateBeginKind,
 )
-from .builder import ChunkedTraceBuilder, TraceBuilder
+from .builder import ChunkedTraceBuilder, TraceBuilder, TraceChunkManifest
 from .tasks import FusionIssueScheduler, IssueDecision, QueryState, TaskKind, TaskPacket
 
 __all__ = [
@@ -18,6 +18,6 @@ __all__ = [
     "UpdateBeginKind",
     "ResourceClass",
     "TraceEvent",
-    "TraceBuilder", "ChunkedTraceBuilder",
+    "TraceBuilder", "ChunkedTraceBuilder", "TraceChunkManifest",
     "FusionIssueScheduler", "IssueDecision", "QueryState", "TaskKind", "TaskPacket",
 ]

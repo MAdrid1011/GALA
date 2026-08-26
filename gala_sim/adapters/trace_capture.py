@@ -16,6 +16,7 @@ from gala_sim.clamp import (
     TraceEvent,
     UpdateBeginKind,
 )
+from gala_sim.clamp.builder import TraceChunkManifest
 from gala_sim.clamp.events import dependency_dtype, event_dtype
 from gala_sim.trace import Trace, TraceWriter
 
@@ -83,6 +84,7 @@ class TraceSession:
     state_record_bytes: int = 128
     relation_candidate_bytes: int = 0
     chunk_events: int = 65536
+    stream_only: bool = False
     _builder: ChunkedTraceBuilder = field(init=False)
     _decoder: Any = field(default=None, init=False)
     _iteration: int = field(default=0, init=False)
@@ -97,6 +99,7 @@ class TraceSession:
     _pending_query_by_output: dict[int, _PendingQuery] = field(default_factory=dict, init=False)
     _pending_backwards: list[tuple[int, bool]] = field(default_factory=list, init=False)
     _pending_backward_buffers: set[int] = field(default_factory=set, init=False)
+    _completed_backward_buffers: set[int] = field(default_factory=set, init=False)
     _pending_gradients: dict[int, list[np.ndarray]] = field(default_factory=dict, init=False)
     _pending_backward_events: list[int] = field(default_factory=list, init=False)
     _gaussian_ids: list[int] = field(default_factory=list, init=False)
@@ -116,7 +119,8 @@ class TraceSession:
 
     def __post_init__(self) -> None:
         self._builder = ChunkedTraceBuilder(
-            self.chunk_events, chunk_root=self.output_root / ".capture_chunks"
+            self.chunk_events, chunk_root=self.output_root / ".capture_chunks",
+            stream_only=self.stream_only,
         )
 
     def install(self) -> None:
@@ -159,7 +163,7 @@ class TraceSession:
         self._originals.clear()
         self._installed = False
 
-    def finish(self) -> Trace:
+    def finish(self) -> Trace | TraceChunkManifest:
         if self._capture_error is not None:
             raise RuntimeError(
                 "trace capture cannot finish after a collection failure: "
@@ -179,8 +183,9 @@ class TraceSession:
             "capture_audit_schema_version": "gala-r2-capture-audit-v4",
             "initial_gaussian_count": self._initial_gaussian_count,
             "capture_audit": dict(sorted(audit.items())),
-        })
-        TraceWriter().write(trace, self.output_root)
+        }, materialize=not self.stream_only)
+        if isinstance(trace, Trace):
+            TraceWriter().write(trace, self.output_root)
         return trace
 
     def _patch(self, owner: Any, name: str, wrapper_factory: Callable[..., Any]) -> None:
@@ -470,6 +475,7 @@ class TraceSession:
         output_pointer = int(output.data_ptr())
         if binning_pointer in self._pending_query_by_buffer or binning_pointer in self._contexts:
             raise RuntimeError("captured query reused a live binning buffer pointer")
+        self._completed_backward_buffers.discard(binning_pointer)
         if output_pointer in self._pending_query_by_output or output_pointer in self._output_contexts:
             raise RuntimeError("captured query reused a live output buffer pointer")
         pending = _PendingQuery(
@@ -520,6 +526,9 @@ class TraceSession:
                     record_count = int(item.records.shape[0])
                     records_by_query.append(np.asarray(host_records[cursor:cursor + record_count], dtype=np.int64))
                     cursor += record_count
+                    # The CUDA tensor can be hundreds of MB for a dense view;
+                    # release it before emitting the structured event batches.
+                    item.records = None
         else:
             records_by_query = [np.empty((0, 4), dtype=np.int64) for _ in self._pending_queries]
         pending = tuple(self._pending_queries)
@@ -541,6 +550,8 @@ class TraceSession:
         self._pending_backwards.clear()
         for buffer_pointer, voxel in pending_backwards:
             self._emit_backward(buffer_pointer, voxel=voxel)
+        if device_records:
+            del host_records
 
     @staticmethod
     def _copy_record_batches(record_batches: list[Any]) -> np.ndarray:
@@ -769,12 +780,16 @@ class TraceSession:
                 raise RuntimeError("captured query received duplicate backward calls")
             self._pending_backward_buffers.add(buffer_pointer)
             self._pending_backwards.append((buffer_pointer, voxel))
+            if len(self._pending_backwards) == len(self._pending_queries):
+                self._flush_pending_queries()
             return
         self._emit_backward(buffer_pointer, voxel=voxel)
 
     def _emit_backward(self, buffer_pointer: int, *, voxel: bool) -> None:
         context = self._contexts.get(buffer_pointer)
         if context is None:
+            if buffer_pointer in self._completed_backward_buffers:
+                raise RuntimeError("captured query received duplicate backward calls")
             return
         expected_template = VOXEL_TEMPLATE_ID if voxel else RASTER_TEMPLATE_ID
         if context.template_id != expected_template:
@@ -852,6 +867,7 @@ class TraceSession:
         self._pending_backward_events.extend(int(event) for event in gradient_events)
         self._output_contexts.pop(context.output_pointer, None)
         self._contexts.pop(buffer_pointer, None)
+        self._completed_backward_buffers.add(buffer_pointer)
 
     @staticmethod
     def _decode_query_offsets(

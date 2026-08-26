@@ -139,9 +139,6 @@ def test_pending_queries_share_one_host_copy_and_preserve_event_order(
     l1_loss = session._wrap_loss(lambda _output: None, LOSS_L1)
     l1_loss(raster_output)
     l1_loss(voxel_output)
-    session._capture_backward(11, voxel=True)
-    session._capture_backward(10, voxel=False)
-
     copy_calls: list[int] = []
     copy_batches = session._copy_record_batches
 
@@ -150,6 +147,10 @@ def test_pending_queries_share_one_host_copy_and_preserve_event_order(
         return copy_batches(record_batches)
 
     monkeypatch.setattr(session, "_copy_record_batches", counted_copy)
+    session._capture_backward(11, voxel=True)
+    session._capture_backward(10, voxel=False)
+    assert not session._pending_queries
+    assert not session._pending_backwards
     trace = session.finish()
 
     report = validate_trace(trace)

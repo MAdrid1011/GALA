@@ -14,6 +14,10 @@ from .trace_capture import TraceSession
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gala-r2-trace-runner")
     parser.add_argument("--trace-output", type=Path, required=True)
+    parser.add_argument(
+        "--stream-only", action="store_true",
+        help="keep validated capture columns in bounded chunks without final mmap merge",
+    )
     parser.add_argument("train_script", type=Path)
     parser.add_argument("train_args", nargs=argparse.REMAINDER)
     return parser
@@ -29,7 +33,7 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("GALA_TRACE_CHUNK_EVENTS must be positive")
     session = TraceSession(
         args.trace_output, state_record_bytes=state_record_bytes,
-        chunk_events=chunk_events,
+        chunk_events=chunk_events, stream_only=args.stream_only,
     )
     session.install()
     original_argv = sys.argv

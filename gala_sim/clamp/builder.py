@@ -4,12 +4,28 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from array import array
+import json
 from typing import Iterable
 from pathlib import Path
 
 import numpy as np
 
 from .events import EVENT_SCHEMA_VERSION, TraceEvent, dependency_dtype, event_dtype
+
+
+@dataclass(frozen=True)
+class TraceChunkManifest:
+    """Manifest for a capture that remains in bounded columnar chunks."""
+
+    root: Path
+    event_count: int
+    dependency_count: int
+    payload_count: int
+    metadata: dict[str, object]
+    event_chunks: tuple[str, ...]
+    dependency_chunks: tuple[str, ...]
+    payload_chunks: tuple[str, ...]
+    storage_format: str = "npy_chunks"
 
 
 @dataclass
@@ -38,9 +54,12 @@ class TraceBuilder:
         self._next_event_id += 1
         return self._next_event_id - 1
 
-    def finish(self, *, metadata: dict[str, object] | None = None):
+    def finish(self, *, metadata: dict[str, object] | None = None,
+               materialize: bool = True):
         from gala_sim.trace.model import Trace
 
+        if not materialize:
+            raise ValueError("TraceBuilder cannot finish without materializing its in-memory rows")
         rows = np.asarray(self._rows, dtype=event_dtype())
         if not self._rows:
             rows = np.empty(0, dtype=event_dtype())
@@ -58,6 +77,7 @@ class ChunkedTraceBuilder:
 
     chunk_events: int
     chunk_root: Path | None = None
+    stream_only: bool = False
     _chunks: list[np.ndarray] = field(default_factory=list)
     _chunk_paths: list[Path] = field(default_factory=list, init=False)
     _current: np.ndarray | None = field(default=None, init=False, repr=False)
@@ -75,15 +95,28 @@ class ChunkedTraceBuilder:
     def __post_init__(self) -> None:
         if self.chunk_events <= 0:
             raise ValueError("trace chunk capacity must be positive")
+        if self.stream_only and self.chunk_root is None:
+            raise ValueError("stream-only mode requires a chunk root")
         if self.chunk_root is not None:
             self.chunk_root = Path(self.chunk_root)
             self.chunk_root.mkdir(parents=True, exist_ok=True)
+            if self.stream_only:
+                for suffix in ("events.raw", "dependencies.raw", "payload.raw"):
+                    (self.chunk_root.parent / suffix).unlink(missing_ok=True)
 
     def _flush_current(self) -> None:
         if self._current is None:
             return
         if self.chunk_root is None:
             self._chunks.append(self._current[:self._current_size].copy())
+        elif self.stream_only:
+            root = self.chunk_root.parent
+            with (root / "events.raw").open("ab") as output:
+                output.write(self._current[:self._current_size].tobytes())
+            with (root / "dependencies.raw").open("ab") as output:
+                output.write(np.asarray(self._current_dependencies, dtype=dependency_dtype()).tobytes())
+            with (root / "payload.raw").open("ab") as output:
+                output.write(np.asarray(self._current_payload, dtype=np.dtype("<f4")).tobytes())
         else:
             chunk_index = len(self._chunk_paths)
             path = self.chunk_root / f"events_{chunk_index:08d}.npy"
@@ -239,11 +272,60 @@ class ChunkedTraceBuilder:
         self._next_event_id += event_count
         return event_ids
 
-    def finish(self, *, metadata: dict[str, object] | None = None):
+    def finish(self, *, metadata: dict[str, object] | None = None,
+               materialize: bool = True):
         from gala_sim.trace.model import Trace
 
+        if self.stream_only and materialize:
+            raise ValueError("stream-only builder cannot materialize merged arrays")
         if self.chunk_root is not None:
             self._flush_current()
+            event_metadata = {"schema_version": EVENT_SCHEMA_VERSION, **(metadata or {})}
+            if not materialize:
+                if self.stream_only:
+                    root = self.chunk_root.parent
+                    manifest = TraceChunkManifest(
+                        root=root,
+                        event_count=self._next_event_id,
+                        dependency_count=self._dependency_count,
+                        payload_count=self._payload_count,
+                        metadata=event_metadata,
+                        event_chunks=("events.raw",),
+                        dependency_chunks=("dependencies.raw",),
+                        payload_chunks=("payload.raw",),
+                        storage_format="raw_columns",
+                    )
+                else:
+                    manifest = TraceChunkManifest(
+                        root=self.chunk_root,
+                        event_count=sum(
+                            int(np.load(path, mmap_mode="r", allow_pickle=False).shape[0])
+                            for path in self._chunk_paths
+                        ),
+                        dependency_count=self._dependency_count,
+                        payload_count=self._payload_count,
+                        metadata=event_metadata,
+                        event_chunks=tuple(path.name for path in self._chunk_paths),
+                        dependency_chunks=tuple(path.name for path in self._dependency_chunk_paths),
+                        payload_chunks=tuple(path.name for path in self._payload_chunk_paths),
+                    )
+                manifest_path = self.chunk_root.parent / "chunk_manifest.json"
+                manifest_path.write_text(
+                    json.dumps({
+                        "schema_version": "gala-trace-chunks-v1",
+                        "event_schema_version": EVENT_SCHEMA_VERSION,
+                        "event_count": manifest.event_count,
+                        "dependency_count": manifest.dependency_count,
+                        "payload_count": manifest.payload_count,
+                        "metadata": manifest.metadata,
+                        "event_chunks": list(manifest.event_chunks),
+                        "dependency_chunks": list(manifest.dependency_chunks),
+                        "payload_chunks": list(manifest.payload_chunks),
+                        "storage_format": manifest.storage_format,
+                    }, ensure_ascii=True, sort_keys=True, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                return manifest
             events_path = self.chunk_root.parent / "events.npy"
             dependencies_path = self.chunk_root.parent / "dependencies.npy"
             payload_path = self.chunk_root.parent / "payload.npy"

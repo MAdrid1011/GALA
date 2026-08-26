@@ -27,6 +27,7 @@
 - consumer 已从 relation 粒度改为 query 粒度，并从实际 loss 调用捕获 L1、11×11 SSIM 与 3D TV：投影 consumer 依赖对应 SSIM 邻域的 query reduction，体 consumer 依赖轴向相邻 query reduction，所有同 query adjoint 依赖同一 consumer。
 - Trace validator 已对真实事件链执行候选→关系→关闭、关系→缓存→前向→归约→查询消费者→伴随→梯度以及梯度→更新事务的前置依赖检查；同时重建 active Gaussian 集合、稳定 ID、Clone/Split/Prune lineage、跨迭代更新屏障和关闭版本访问。capture audit v4 分开记录官方/捕获 kernel 调用、逻辑 query、CUDA 候选、有效关系、backward relation 数、关系记录设备批次与 D2H 批次，以及 begin/end、no-op 和集合修改事务。
 - 事件、依赖和 payload 三列均支持磁盘 chunk 合并为最终 mmap 文件；同路径 writer 不再重复截断，避免正式长任务在 `finish()` 阶段聚合整份数组。
+- 批量 trace writer 已支持 `stream_only` raw-column 模式：事件、依赖和 payload 在有界 chunk 刷满时直接追加到仓库外 raw 列，`finish()` 只写 chunk manifest，`TraceReader` 可按冻结 dtype 直接 mmap，不再复制数十 GB 的最终数组。capture 在最后一个 query backward 到达时立即转移并释放 pending decoder records；该路径已通过 `94 passed, 1 skipped`。
 - 周期内核已改为依赖计数反向唤醒和有界就绪窗口，不再逐周期扫描全部 pending 事件；在真实 1,048,191-event trace 上两次 `variant:0000` smoke 均为 997,127 周期，停顿记录按同周期/模块/原因合并。
 - event-driven 周期内核新增 4,096 事件依赖链、重复运行确定性和停顿计数合并回归测试；长链测试按真实服务延迟完成且无死锁。
 - 语义驻留状态已接入 `variant:0001` 的逐请求目录、容量反压、填充、读完成和状态版本级释放路径；query close 不再提前释放，同版本 no-op 更新仍可复用，状态写入结束后才关闭旧版本。
@@ -43,13 +44,13 @@
 
 R²-Gaussian 的官方 CUDA 扩展仍没有直接导出完整 CLAMP 事件缓冲区；当前旁路从官方 CUDA work buffer 重建逐 query 关系，并在官方 loss、backward 和 optimizer 边界映射其余事件。新版真实粒度 Chest smoke 因 GPU 正被外部作业持续占用而尚未执行，因此还没有重新证明插桩/未插桩体数据逐元素一致。该旁路也尚未证明长程增密 ID 稳定性、所有真实队列操作和正式 30k 训练的流式最终存储，不能视为正式 trace 闭环。
 
-关系记录 decoder 输出现按迭代边界合并，每个非空 flush 最多执行一次 D2H；flush 在下一迭代、optimizer step、Gaussian 集合修改和最终写出之前发生，并要求每个捕获 query 恰有一次类型匹配且已关联 loss 的 backward。该路径已通过纯 CPU 状态机测试，尚待 GPU 空闲后的真实 CUDA smoke 验证。
+关系记录 decoder 输出现按迭代边界合并，每个非空 flush 最多执行一次 D2H；flush 在最后一个 query 的 backward 到达、下一迭代、optimizer step、Gaussian 集合修改和最终写出之前发生，并要求每个捕获 query 恰有一次类型匹配且已关联 loss 的 backward。该路径已通过纯 CPU 状态机测试；真实 CUDA smoke 已验证 raw 增量写出和 pending 内存不再无限保留，但完整一迭代仍需完成后再做 validator/质量闭环。
 
 ## 下一步入口条件
 
 1. 外部 `gdesmond` 释放 GPU 后，重新运行相同 input-freeze 的 native-preflight；门控通过后按论文配置完成官方参考训练、重建与 PSNR/SSIM/LPIPS，先闭合工作流步骤 2。
-2. 运行新版 Chest 1 迭代真实 trace smoke，要求 validator 通过、relation 数等于全部 mask popcount，并重新核对插桩/未插桩体数据逐元素一致。
-3. 新版 smoke 通过后继续实现 trace producer/consumer 与周期内核的实时 chunk 交接；当前 mmap/CSR 路径仍需等待捕获完成后再开始周期重放。
+2. 完成新版 Chest 1 迭代 stream-only trace smoke，要求 validator 通过、relation 数等于全部 mask popcount，并重新核对插桩/未插桩体数据逐元素一致。
+3. 在 smoke 通过后把 raw-column manifest 接入 trace producer/consumer 与周期内核的实时 chunk 交接；当前 `TraceReader` 已可 mmap raw 列，但周期 replay 仍需等待捕获完成后开始。
 4. 在真实关系粒度上实现 `template_id + primitive_kind` 的精确计算 Pod 资源序列，并测量关系种子突发、模块时序和 trace chunk，更新冻结配置及运行清单。
 5. 用完整真实 trace 通过依赖/状态/释放检查后，运行 `0000` Base ASIC 和两个受资源约束的 Oracle。
 
