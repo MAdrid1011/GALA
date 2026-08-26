@@ -66,11 +66,11 @@ def _profile_selection(
             raise ValueError("full timing requires cuda_event without profiler capture")
         ranges = campaign.cuda_event_ranges
     else:
-        expected_control = args.profile_tool == "nsys"
+        expected_control = args.profile_tool in {"nsys", "ncu"}
         if args.profile_tool not in {"nsys", "ncu"}:
             raise ValueError("representative profiling requires nsys or ncu")
         if args.capture_profiler_api != expected_control:
-            raise ValueError("NSYS requires profiler API control and NCU forbids it")
+            raise ValueError("NSYS and NCU require profiler API control")
         ranges = tuple(
             IterationRange(item.iteration, item.iteration)
             for item in campaign.representatives

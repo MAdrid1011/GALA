@@ -20,6 +20,9 @@ SASS_SCHEMA_VERSION = "gala-ncu-sass-classification-v1"
 _STAGE_PATTERN = re.compile(
     r"gala_stage:(?P<stage>[a-z_]+):iteration=(?P<iteration>[0-9]+):call=(?P<call>[0-9]+)"
 )
+_NCU_STAGE_PATTERN = re.compile(
+    r"gala_ncu_stage:(?P<stage>[a-z_]+):iteration=(?P<iteration>[0-9]+):call=(?P<call>[0-9]+)"
+)
 _ITERATION_PATTERN = re.compile(
     r"gala_iteration:training:iteration=(?P<iteration>[0-9]+):call=(?P<call>[0-9]+)"
 )
@@ -36,7 +39,7 @@ _NCU_METRICS = {
 
 
 def _stage_identity(value: str) -> tuple[str, int, int] | None:
-    match = _STAGE_PATTERN.search(value)
+    match = _STAGE_PATTERN.search(value) or _NCU_STAGE_PATTERN.search(value)
     if match is None:
         return None
     return (
@@ -286,8 +289,11 @@ def parse_ncu_csv(path: Path) -> dict[str, Any]:
     launches: dict[tuple[str, int, int, str, str], dict[str, Any]] = defaultdict(dict)
     campaign_hashes: set[str] = set()
     for row in _ncu_rows(path):
-        range_column = next((key for key in row if "Push/Pop_Range" in key), None)
-        range_value = row.get(range_column, "") if range_column else ""
+        range_value = " ".join(
+            row.get(key, "")
+            for key in row
+            if "Push/Pop_Range" in key or "Start/Stop_Range" in key
+        )
         identity = _stage_identity(range_value)
         metric = row.get("Metric Name", "")
         if identity is None or metric not in _NCU_METRICS:

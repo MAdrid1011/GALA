@@ -156,6 +156,10 @@ class GpuStageProfileSession:
         digest = campaign.get("campaign_sha256")
         return f":campaign={digest}" if isinstance(digest, str) else ""
 
+    def _uses_ncu_global_ranges(self) -> bool:
+        campaign = self.run_identity.get("profiling_campaign")
+        return isinstance(campaign, dict) and campaign.get("profile_tool") == "ncu"
+
     def _measure(self, stage: str, call: Callable[[], Any]) -> Any:
         if not self._selected():
             return call()
@@ -174,11 +178,20 @@ class GpuStageProfileSession:
         start.record()
         torch.cuda.nvtx.range_push(stable_label)
         torch.cuda.nvtx.range_push(detailed_label)
+        global_range = (
+            torch.cuda.nvtx.range_start(
+                f"gala_ncu_stage:{stage}:iteration={self._current_iteration}:"
+                f"call={call_index}{self._campaign_label_suffix()}"
+            )
+            if self._uses_ncu_global_ranges() else None
+        )
         self._stage_depth += 1
         try:
             return call()
         finally:
             self._stage_depth -= 1
+            if global_range is not None:
+                torch.cuda.nvtx.range_end(global_range)
             torch.cuda.nvtx.range_pop()
             torch.cuda.nvtx.range_pop()
             end.record()

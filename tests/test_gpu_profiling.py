@@ -157,11 +157,16 @@ def test_stage_runner_campaign_selection_is_frozen() -> None:
             profile_tool="nsys", profile_iteration_range=[IterationRange(2, 2)],
             capture_profiler_api=True,
         ))
-    with pytest.raises(ValueError, match="NCU forbids"):
+    with pytest.raises(ValueError, match="require profiler API"):
         _profile_selection(argparse.Namespace(
             profile_campaign=campaign, profile_mode="representative",
-            profile_tool="ncu", profile_iteration_range=[], capture_profiler_api=True,
+            profile_tool="ncu", profile_iteration_range=[], capture_profiler_api=False,
         ))
+    ncu_ranges, _ = _profile_selection(argparse.Namespace(
+        profile_campaign=campaign, profile_mode="representative",
+        profile_tool="ncu", profile_iteration_range=[], capture_profiler_api=True,
+    ))
+    assert ncu_ranges == representative_ranges
 
 
 def test_gpu_profile_campaign_evidence_requires_every_role() -> None:
@@ -540,6 +545,41 @@ def test_ncu_stage_parser_builds_counter_inputs(tmp_path: Path) -> None:
     assert stage["weight_eligible"] is False
     assert result["run_identity"]["profiling_campaign_sha256"] == "a" * 64
     assert result["launches"][0]["kernel_ordinal_in_call"] == 1
+
+
+def test_ncu_stage_parser_accepts_cross_thread_start_stop_ranges(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "ncu.csv"
+    range_column = "Id:Domain:Start/Stop_Range"
+    fieldnames = [
+        "ID", range_column, "Kernel Name", "Block Size", "Grid Size",
+        "Metric Name", "Metric Value",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.DictWriter(stream, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+        writer.writeheader()
+        for name in (
+            "dram__bytes_read.sum", "dram__bytes_write.sum",
+            "smsp__sass_thread_inst_executed_op_ffma_pred_on.sum",
+            "smsp__sass_thread_inst_executed_op_fadd_pred_on.sum",
+            "smsp__sass_thread_inst_executed_op_fmul_pred_on.sum",
+            "smsp__inst_executed_pipe_xu.sum", "lts__t_requests_op_atom.sum",
+        ):
+            writer.writerow({
+                "ID": "0",
+                range_column: (
+                    "0:<default domain>:gala_ncu_stage:backward:iteration=499:"
+                    "call=1084:campaign=" + "a" * 64
+                ),
+                "Kernel Name": "worker_kernel", "Block Size": "(32, 1, 1)",
+                "Grid Size": "(4, 1, 1)", "Metric Name": name,
+                "Metric Value": "1",
+            })
+    result = parse_ncu_csv(path)
+    assert result["status"] == "passed"
+    assert result["launches"][0]["stage"] == "backward"
+    assert result["launches"][0]["call_index"] == 1084
 
 
 def test_ncu_sass_parser_keeps_dynamic_opcode_evidence_provisional(tmp_path: Path) -> None:
