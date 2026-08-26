@@ -3,20 +3,21 @@
 from __future__ import annotations
 
 import argparse
-from collections import Counter, defaultdict
+from collections import Counter, defaultdict, deque
 import csv
 import json
 from pathlib import Path
 import re
 import sqlite3
-from typing import Any, Iterable
+from typing import Any, Iterable, Mapping
 
-from gala_sim.identity import sha256_file
+from gala_sim.identity import canonical_json, sha256_bytes, sha256_file
 
 
 NSYS_SCHEMA_VERSION = "gala-nsys-stage-kernels-v1"
 NCU_SCHEMA_VERSION = "gala-ncu-stage-counters-v1"
 SASS_SCHEMA_VERSION = "gala-ncu-sass-classification-v1"
+NCU_SELECTED_SCHEMA_VERSION = "gala-ncu-selected-launch-counters-v1"
 _STAGE_PATTERN = re.compile(
     r"gala_stage:(?P<stage>[a-z_]+):iteration=(?P<iteration>[0-9]+):call=(?P<call>[0-9]+)"
 )
@@ -288,7 +289,14 @@ def parse_ncu_csv(path: Path) -> dict[str, Any]:
     path = path.resolve()
     launches: dict[tuple[str, int, int, str, str], dict[str, Any]] = defaultdict(dict)
     campaign_hashes: set[str] = set()
+    process_ids: set[int] = set()
     for row in _ncu_rows(path):
+        process_id = row.get("Process ID", "").strip()
+        if process_id:
+            try:
+                process_ids.add(int(process_id))
+            except ValueError as error:
+                raise ValueError("Nsight Compute process ID is invalid") from error
         range_value = " ".join(
             row.get(key, "")
             for key in row
@@ -394,6 +402,7 @@ def parse_ncu_csv(path: Path) -> dict[str, Any]:
         "source_sha256": sha256_file(path),
         "run_identity": {
             "status": identity_status,
+            "process_ids": sorted(process_ids),
             "profiling_campaign_sha256": (
                 next(iter(campaign_hashes)) if len(campaign_hashes) == 1 else None
             ),
@@ -402,6 +411,146 @@ def parse_ncu_csv(path: Path) -> dict[str, Any]:
         "stage_summaries": summaries,
         "launches": launch_records,
         "incomplete_launches": incomplete_launches,
+    }
+
+
+def bind_ncu_profile_to_plan(
+    ncu_profile: Mapping[str, Any], plan: Mapping[str, Any], job_index: int,
+    stage_profile: Mapping[str, Any],
+) -> dict[str, Any]:
+    """Bind filtered NCU launch order to exact NSYS identities from one plan job."""
+
+    reasons: list[str] = []
+    plan_hash = plan.get("content_sha256")
+    plan_payload = {
+        str(key): value for key, value in plan.items() if key != "content_sha256"
+    }
+    if (
+        plan.get("schema_version") != "gala-ncu-launch-signature-plan-v3"
+        or not isinstance(plan_hash, str)
+        or sha256_bytes(canonical_json(plan_payload)) != plan_hash
+    ):
+        reasons.append("ncu_plan_identity_invalid")
+    jobs = [
+        item for item in plan.get("capture_groups", ())
+        if isinstance(item, Mapping) and int(item.get("job_index", -1)) == job_index
+    ]
+    if len(jobs) != 1:
+        reasons.append("ncu_capture_job_invalid")
+        expected_launches: list[Mapping[str, Any]] = []
+    else:
+        expected_launches = [
+            item for item in jobs[0].get("expected_launches", ())
+            if isinstance(item, Mapping)
+        ]
+    expected_campaign = (
+        plan.get("campaign", {}).get("sha256")
+        if isinstance(plan.get("campaign"), Mapping) else None
+    )
+    ncu_identity = ncu_profile.get("run_identity")
+    stage_identity = stage_profile.get("run_identity")
+    stage_campaign = (
+        stage_identity.get("profiling_campaign")
+        if isinstance(stage_identity, Mapping) else None
+    )
+    expected_ranges = [
+        {"start": int(iteration), "end": int(iteration)}
+        for iteration in plan.get("coverage", {}).get("representative_iterations", ())
+    ] if isinstance(plan.get("coverage"), Mapping) else []
+    stage_process_id = (
+        stage_identity.get("process_id") if isinstance(stage_identity, Mapping) else None
+    )
+    if (
+        ncu_profile.get("status") != "passed"
+        or not isinstance(ncu_identity, Mapping)
+        or ncu_identity.get("status") != "passed"
+        or ncu_identity.get("profiling_campaign_sha256") != expected_campaign
+        or ncu_identity.get("process_ids") != [stage_process_id]
+        or stage_profile.get("status") != "passed"
+        or stage_profile.get("iteration_ranges") != expected_ranges
+        or not isinstance(stage_identity, Mapping)
+        or stage_identity.get("cuda_profiler_api_control") is not True
+        or not isinstance(stage_campaign, Mapping)
+        or stage_campaign.get("campaign_sha256") != expected_campaign
+        or stage_campaign.get("profile_mode") != "representative"
+        or stage_campaign.get("profile_tool") != "ncu"
+    ):
+        reasons.append("ncu_job_run_identity_invalid")
+
+    def launch_key(launch: Mapping[str, Any], *, expected: bool) -> tuple[Any, ...]:
+        grid_name = "grid" if expected else "grid_size"
+        block_name = "block" if expected else "block_size"
+        return (
+            int(launch["iteration"]), str(launch["stage"]), int(launch["call_index"]),
+            str(launch["kernel_name"]),
+            tuple(int(value) for value in launch[grid_name]),
+            tuple(int(value) for value in launch[block_name]),
+        )
+
+    expected_groups: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
+    actual_groups: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
+    try:
+        for launch in expected_launches:
+            expected_groups[launch_key(launch, expected=True)].append(launch)
+        for launch in ncu_profile.get("launches", ()):
+            if isinstance(launch, Mapping):
+                actual_groups[launch_key(launch, expected=False)].append(launch)
+    except (KeyError, TypeError, ValueError):
+        reasons.append("ncu_job_launch_identity_invalid")
+    expected_queues = {}
+    for key in set(expected_groups) | set(actual_groups):
+        expected_group = sorted(expected_groups[key], key=lambda item: int(
+            item["kernel_ordinal_in_call"]
+        ))
+        if len(expected_group) != len(actual_groups[key]):
+            reasons.append("ncu_job_launch_multiplicity_mismatch")
+        expected_queues[key] = deque(expected_group)
+    bound_launches = []
+    for actual in ncu_profile.get("launches", ()):
+        if not isinstance(actual, Mapping):
+            continue
+        try:
+            key = launch_key(actual, expected=False)
+        except (KeyError, TypeError, ValueError):
+            continue
+        queue = expected_queues.get(key)
+        if not queue:
+            continue
+        expected = queue.popleft()
+        bound_launches.append({
+            **dict(actual),
+            "selected_launch_id": str(expected["selected_launch_id"]),
+            "signature_id": str(expected["signature_id"]),
+            "iteration": int(expected["iteration"]),
+            "stage": str(expected["stage"]),
+            "call_index": int(expected["call_index"]),
+            "kernel_ordinal_in_call": int(expected["kernel_ordinal_in_call"]),
+            "kernel_name_ordinal_in_call": int(
+                expected["kernel_name_ordinal_in_call"]
+            ),
+            "kernel_name_ordinal_in_capture": int(
+                expected["kernel_name_ordinal_in_capture"]
+            ),
+            "required_sample": bool(expected["required_sample"]),
+        })
+    if len(bound_launches) != len(expected_launches):
+        reasons.append("ncu_job_selected_launch_count_mismatch")
+    return {
+        **dict(ncu_profile),
+        "schema_version": NCU_SELECTED_SCHEMA_VERSION,
+        "status": "passed" if not reasons else "failed_preflight",
+        "formal_performance_eligible": False,
+        "run_identity": {
+            "status": "passed" if not reasons else "failed_preflight",
+            "profiling_campaign_sha256": expected_campaign,
+            "ncu_plan_content_sha256": plan_hash,
+            "capture_job_index": job_index,
+            "process_id": stage_process_id,
+            "stage_profile_source": stage_profile.get("source"),
+            "stage_profile_source_sha256": stage_profile.get("source_sha256"),
+        },
+        "launches": bound_launches,
+        "binding_reasons": sorted(set(reasons)),
     }
 
 
@@ -642,6 +791,12 @@ def main(argv: list[str] | None = None) -> int:
         command = commands.add_parser(name)
         command.add_argument("--input", type=Path, required=True)
         command.add_argument("--output", type=Path, required=True)
+    ncu_job = commands.add_parser("ncu-job")
+    ncu_job.add_argument("--input", type=Path, required=True)
+    ncu_job.add_argument("--plan", type=Path, required=True)
+    ncu_job.add_argument("--capture-job-index", type=int, required=True)
+    ncu_job.add_argument("--stage-profile", type=Path, required=True)
+    ncu_job.add_argument("--output", type=Path, required=True)
     sass = commands.add_parser("sass")
     sass.add_argument("--input", type=Path, required=True)
     sass.add_argument("--ncu-input", type=Path, required=True)
@@ -651,6 +806,16 @@ def main(argv: list[str] | None = None) -> int:
         result = parse_nsys_sqlite(args.input)
     elif args.command == "ncu":
         result = parse_ncu_csv(args.input)
+    elif args.command == "ncu-job":
+        stage_profile = json.loads(args.stage_profile.read_text(encoding="utf-8"))
+        stage_profile["source"] = str(args.stage_profile.resolve())
+        stage_profile["source_sha256"] = sha256_file(args.stage_profile)
+        result = bind_ncu_profile_to_plan(
+            parse_ncu_csv(args.input),
+            json.loads(args.plan.read_text(encoding="utf-8")),
+            args.capture_job_index,
+            stage_profile,
+        )
     else:
         result = classify_sass_csv(
             args.input, json.loads(args.ncu_input.read_text(encoding="utf-8")),

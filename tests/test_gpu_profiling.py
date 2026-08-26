@@ -14,7 +14,9 @@ from gala_sim.adapters.stage_profile import (
     parse_iteration_range,
 )
 from gala_sim.tools.gpu_calibration import CalibrationConfig
-from gala_sim.tools.gpu_profile_artifacts import parse_ncu_csv, parse_nsys_sqlite
+from gala_sim.tools.gpu_profile_artifacts import (
+    bind_ncu_profile_to_plan, parse_ncu_csv, parse_nsys_sqlite,
+)
 from gala_sim.tools.gpu_profile_artifacts import classify_sass_csv
 from gala_sim.tools.gpu_profile_campaign import GpuProfileCampaign
 from gala_sim.tools.gpu_ncu_plan import (
@@ -277,14 +279,21 @@ def test_ncu_plan_preserves_multiplicity_and_selects_validation_occurrences(
     ] == [1, 3, 5]
     assert result["coverage"]["observed_kernel_launch_count"] == 121
     assert result["coverage"]["representative_iteration_signature_count"] == 117
-    assert all(
-        include["filter"].endswith("/")
-        for group in result["capture_groups"] for include in group["nvtx_includes"]
-    )
+    assert 0 < result["coverage"]["capture_job_count"] <= 6
+    assert sum(
+        group["required_sample_count"] for group in result["capture_groups"]
+    ) == result["coverage"]["required_sample_count"]
+    assert sum(
+        len(group["expected_launches"]) for group in result["capture_groups"]
+    ) == result["coverage"]["selected_kernel_launch_count"]
     assert all(
         group["ncu_arguments"][-2:] == ["--check-exit-code", "1"]
+        and group["ncu_arguments"][:2] == ["--profile-from-start", "off"]
         and "--launch-count" not in group["ncu_arguments"]
         and "--kill" not in group["ncu_arguments"]
+        and "--nvtx-include" not in group["ncu_arguments"]
+        and "--kernel-name" in group["ncu_arguments"]
+        and "--kernel-id" in group["ncu_arguments"]
         for group in result["capture_groups"]
     )
     assert all(
@@ -309,6 +318,62 @@ def test_ncu_plan_rejects_inexact_nsys_coverage(tmp_path: Path) -> None:
         build_ncu_plan(config, paths)
 
 
+def test_ncu_job_binding_restores_exact_planned_launch_identity(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = NcuPlanConfig.load(root / "configs/profiling/r2_gaussian_chest_ncu.yaml")
+    campaign = GpuProfileCampaign.load(config.campaign)
+    plan = build_ncu_plan(config, _nsys_plan_profiles(tmp_path, campaign))
+    job = plan["capture_groups"][0]
+    metrics = {
+        "dram_read_bytes": 64.0, "dram_write_bytes": 32.0,
+        "fp32_ffma": 10.0, "fp32_fadd": 4.0, "fp32_fmul": 2.0,
+        "xu_instructions": 8.0, "atomic_requests": 3.0,
+    }
+    raw_launches = [{
+        "stage": launch["stage"], "iteration": launch["iteration"],
+        "call_index": launch["call_index"], "launch_id": str(index),
+        "kernel_name": launch["kernel_name"], "grid_size": launch["grid"],
+        "block_size": launch["block"], "kernel_ordinal_in_call": index + 1,
+        "metrics": metrics,
+    } for index, launch in enumerate(job["expected_launches"])]
+    raw_profile = {
+        "status": "passed", "incomplete_launches": [], "launches": raw_launches,
+        "run_identity": {
+            "status": "passed", "process_ids": [123],
+            "profiling_campaign_sha256": plan["campaign"]["sha256"],
+        },
+    }
+    stage_profile = {
+        "status": "passed",
+        "iteration_ranges": [
+            {"start": value, "end": value}
+            for value in plan["coverage"]["representative_iterations"]
+        ],
+        "run_identity": {
+            "process_id": 123, "cuda_profiler_api_control": True,
+            "profiling_campaign": {
+                "campaign_sha256": plan["campaign"]["sha256"],
+                "profile_mode": "representative", "profile_tool": "ncu",
+            },
+        },
+    }
+    result = bind_ncu_profile_to_plan(
+        raw_profile, plan, job["job_index"], stage_profile,
+    )
+    assert result["status"] == "passed"
+    assert [item["selected_launch_id"] for item in result["launches"]] == [
+        item["selected_launch_id"] for item in job["expected_launches"]
+    ]
+    stage_profile["run_identity"]["process_id"] = 124
+    invalid = bind_ncu_profile_to_plan(
+        raw_profile, plan, job["job_index"], stage_profile,
+    )
+    assert invalid["status"] == "failed_preflight"
+    assert "ncu_job_run_identity_invalid" in invalid["binding_reasons"]
+
+
 def test_ncu_measurement_validator_requires_exact_call_sequences(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[1]
     config = NcuPlanConfig.load(root / "configs/profiling/r2_gaussian_chest_ncu.yaml")
@@ -320,30 +385,30 @@ def test_ncu_measurement_validator_requires_exact_call_sequences(tmp_path: Path)
         "xu_instructions": 8.0, "atomic_requests": 3.0,
     }
     launches = []
-    launch_id = 0
+    profiles = []
     for group in plan["capture_groups"]:
-        iteration = int(group["iteration"])
-        for call in group["nvtx_includes"]:
-            for ordinal, signature in enumerate(call["kernel_sequence"], start=1):
-                launch_id += 1
-                launches.append({
-                    "stage": signature["stage"], "iteration": iteration,
-                    "call_index": int(call["call_index"]), "launch_id": str(launch_id),
-                    "kernel_name": signature["kernel_name"],
-                    "grid_size": signature["grid"], "block_size": signature["block"],
-                    "kernel_ordinal_in_call": ordinal,
-                    "metrics": metrics,
-                })
-    profile = {
-        "status": "passed",
-        "run_identity": {
-            "status": "passed", "profiling_campaign_sha256": plan["campaign"]["sha256"],
-        },
-        "incomplete_launches": [], "launches": launches,
-    }
-    result = validate_ncu_measurement(plan, [profile])
+        group_launches = []
+        for expected in group["expected_launches"]:
+            launch = {
+                **expected,
+                "grid_size": expected["grid"], "block_size": expected["block"],
+                "launch_id": expected["selected_launch_id"], "metrics": metrics,
+            }
+            group_launches.append(launch)
+            launches.append(launch)
+        profiles.append({
+            "status": "passed",
+            "run_identity": {
+                "status": "passed",
+                "profiling_campaign_sha256": plan["campaign"]["sha256"],
+                "ncu_plan_content_sha256": plan["content_sha256"],
+                "capture_job_index": group["job_index"],
+            },
+            "incomplete_launches": [], "launches": group_launches,
+        })
+    result = validate_ncu_measurement(plan, profiles)
     assert result["status"] == "passed"
-    assert result["exact_call_coverage"] is True
+    assert result["exact_launch_coverage"] is True
     assert result["counter_reuse_gate"]["status"] == "passed"
     assert sum(
         item["multiplicity"] for item in result["aggregated_signatures"]
@@ -356,27 +421,16 @@ def test_ncu_measurement_validator_requires_exact_call_sequences(tmp_path: Path)
         for item in result["stage_summaries"].values()
     )
     tampered_plan = {**plan, "content_sha256": "0" * 64}
-    invalid_plan = validate_ncu_measurement(tampered_plan, [profile])
+    invalid_plan = validate_ncu_measurement(tampered_plan, profiles)
     assert "ncu_plan_identity_invalid" in invalid_plan["reasons"]
-    repeated = next(
-        (index for index in range(1, len(launches))
-         if launches[index]["iteration"] == launches[index - 1]["iteration"]
-         and launches[index]["stage"] == launches[index - 1]["stage"]
-         and launches[index]["kernel_name"] == launches[index - 1]["kernel_name"]),
-        None,
-    )
-    assert repeated is not None
-    launches[repeated]["metrics"] = {**metrics, "dram_read_bytes": 65.0}
-    measured = validate_ncu_measurement(plan, [profile])
-    assert measured["status"] == "passed"
-    assert not any(
-        reason.startswith("counter_reuse_disagreement:")
-        for reason in measured["reasons"]
-    )
     assert any(
         item["aggregation_mode"] == "exact_observed_launches"
-        for item in measured["aggregated_signatures"]
+        for item in result["aggregated_signatures"]
     )
+    profiles[0]["launches"] = profiles[0]["launches"][:-1]
+    incomplete = validate_ncu_measurement(plan, profiles)
+    assert incomplete["status"] == "provisional_ncu_evidence"
+    assert "ncu_selected_launches_missing" in incomplete["reasons"]
 
 
 def test_ncu_plan_validation_cli_returns_nonzero_for_provisional(

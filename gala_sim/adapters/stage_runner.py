@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 from pathlib import Path
 import runpy
 import subprocess
@@ -154,6 +155,7 @@ def main(argv: list[str] | None = None) -> int:
         if args.input_freeze is not None else None
     )
     identity = {
+        "process_id": os.getpid(),
         "repository_commit": _repository_commit(),
         "train_script": str(train_script),
         "train_script_sha256": sha256_file(train_script),
