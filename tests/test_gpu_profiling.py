@@ -573,6 +573,51 @@ def test_ncu_sass_parser_keeps_dynamic_opcode_evidence_provisional(tmp_path: Pat
     assert result["stage_summaries"]["projection_forward"]["sass_classification"]["xu_coverage_complete"] is False
 
 
+def test_ncu_sass_parser_classifies_known_mufu_and_atomic_variants(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source.csv"
+    fieldnames = [
+        "Address", "Source", "Instructions Executed",
+        "Predicated-On Thread Instructions Executed",
+    ]
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(["Kernel Name", "known_kernel"])
+        writer.writerow(fieldnames)
+        rows = [
+            ("0x1", "      MUFU.RSQ R0, R1", "4", "4"),
+            ("0x2", "      MUFU.RCP64H R0, R1", "5", "5"),
+            ("0x3", "      MUFU.RSQ64H R0, R1", "6", "6"),
+            ("0x3b", "      I2FP.F32.U32 R0, R1", "3", "3"),
+            ("0x4", "      ATOMS.ADD R0, [R1], R2", "7", "7"),
+            ("0x5", "      RED.E.ADD.STRONG.GPU [R1], R2", "8", "8"),
+            ("0x6", "      REDUX.OR R0, R1", "9", "9"),
+        ]
+        writer.writerows(rows)
+    profile = {
+        "stage_summaries": {"projection_forward": {
+            "unclassified_xu_instructions": 18.0,
+            "unclassified_transcendental_operations": 18.0,
+            "weight_eligible": False,
+        }},
+        "launches": [{
+            "stage": "projection_forward", "iteration": 1, "call_index": 1,
+            "launch_id": "0", "kernel_name": "known_kernel",
+            "metrics": {"xu_instructions": 18.0},
+        }],
+    }
+    result = classify_sass_csv(path, profile)
+    launch = result["launches"][0]
+    assert launch["sqrt_operations"] == 10
+    assert launch["rcp_operations"] == 5
+    assert launch["conversion_operations"] == 3
+    assert launch["atomic_operations"] == 15
+    assert launch["sass_classification"]["status"] == "passed"
+    assert launch["sass_classification"]["unsupported_opcodes"] == {}
+    assert result["stage_summaries"]["projection_forward"]["weight_eligible"] is True
+
+
 def _calibration(scale: float, *, missing: str | None = None) -> dict:
     categories = (
         "fp32_fma", "exp", "log", "rcp", "sqrt", "memory_bandwidth",

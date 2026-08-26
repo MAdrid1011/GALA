@@ -453,18 +453,19 @@ def _sass_category(
         return "exp", None, True
     if instruction == "MUFU.LG2":
         return "log", None, True
-    if instruction == "MUFU.RCP":
+    if instruction in {"MUFU.RCP", "MUFU.RCP64H"}:
         return "rcp", None, True
-    if instruction == "MUFU.SQRT":
+    if instruction in {"MUFU.SQRT", "MUFU.RSQ", "MUFU.RSQ64H"}:
         return "sqrt", None, True
     if instruction.startswith("MUFU."):
         return None, instruction, True
-    if (instruction.startswith("ATOMG") or instruction.startswith("RED")) and ".ADD" in instruction:
-        if "float" in kernel_name.lower():
-            return "atomic", None, False
-        return None, f"untyped_{instruction}", False
-    if instruction.startswith("ATOM"):
-        return None, instruction, False
+    # Ampere's XU also executes explicit numeric type conversions.  Keep them
+    # separate from arithmetic counts while including their warp instructions
+    # in the XU reconciliation below.
+    if instruction.startswith(("I2F", "F2I", "F2F", "D2F", "F2D", "H2F", "F2H")):
+        return "conversion", None, True
+    if instruction.startswith(("ATOM", "RED.")):
+        return "atomic", None, False
     return None, None, False
 
 
@@ -532,7 +533,7 @@ def classify_sass_csv(
         unsupported: dict[str, float] = defaultdict(float)
         unaccounted_xu = 0.0
         for launch in stage_launches:
-            for category in ("exp", "log", "rcp", "sqrt", "atomic"):
+            for category in ("exp", "log", "rcp", "sqrt", "conversion", "atomic"):
                 summary[f"{category}_operations"] = float(summary.get(f"{category}_operations", 0.0)) + float(
                     launch.get(f"{category}_operations", 0.0)
                 )
