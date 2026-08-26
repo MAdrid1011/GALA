@@ -22,6 +22,7 @@ from gala_sim.timing.memory import Ramulator2Backend, RecordedMemoryBackend
 from gala_sim.config import load_config
 from gala_sim.trace import NumpyChunkSink, TraceReader, TraceWriter, TraceValidationError, validate_trace
 from gala_sim.adapters.r2_gaussian import _push_trace_chunks
+from gala_sim.clamp.events import dependency_dtype, event_dtype
 
 
 class _Memory:
@@ -103,6 +104,52 @@ def test_chunked_trace_builder_preserves_global_offsets() -> None:
     assert trace.event_count == 3
     assert trace.dependency_ids(trace.events[2]).tolist() == [1]
     assert validate_trace(trace).event_count == 3
+
+
+@pytest.mark.parametrize("disk", [False, True])
+def test_chunked_trace_builder_batch_matches_single_event_writer(
+    tmp_path: Path, disk: bool,
+) -> None:
+    single = TraceBuilder()
+    rows = []
+    dependencies: list[int] = []
+    dependency_counts: list[int] = []
+    payload = np.asarray([1.25, 2.5, 3.75], dtype=np.dtype("<f4"))
+    payload_counts = [1, 2, 0, 0, 0]
+    payload_offset = 0
+    for index in range(5):
+        event = TraceEvent(
+            primitive_kind=int(
+                PrimitiveKind.RELATION if index < 4 else PrimitiveKind.QUERY_CLOSE
+            ),
+            query_id=index,
+            gaussian_id=index,
+            relation_id=index,
+            resource_class=int(ResourceClass.RELATION),
+        )
+        deps = () if index == 0 else (index - 1,)
+        rows.append(event.as_tuple())
+        dependencies.extend(deps)
+        dependency_counts.append(len(deps))
+        next_offset = payload_offset + payload_counts[index]
+        single.emit(event, dependencies=deps, payload=payload[payload_offset:next_offset])
+        payload_offset = next_offset
+    kwargs = {"chunk_root": tmp_path / "chunks"} if disk else {}
+    batched = ChunkedTraceBuilder(chunk_events=2, **kwargs)
+    ids = batched.emit_batch(
+        np.asarray(rows, dtype=event_dtype()),
+        dependencies=np.asarray(dependencies, dtype=dependency_dtype()),
+        dependency_counts=np.asarray(dependency_counts, dtype=np.int64),
+        payload=payload,
+        payload_counts=np.asarray(payload_counts, dtype=np.int64),
+    )
+    result = batched.finish(metadata={"fixture": "batch"})
+    expected = single.finish(metadata={"fixture": "single"})
+    assert ids.tolist() == list(range(5))
+    assert np.array_equal(result.events, expected.events)
+    assert np.array_equal(result.dependencies, expected.dependencies)
+    assert np.array_equal(result.payload, expected.payload)
+    assert validate_trace(result).event_count == 5
 
 
 def test_dependency_index_uses_compressed_stable_reverse_edges() -> None:

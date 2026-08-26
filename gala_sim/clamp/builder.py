@@ -145,6 +145,100 @@ class ChunkedTraceBuilder:
         self._next_event_id += 1
         return self._next_event_id - 1
 
+    def emit_batch(
+        self,
+        events: np.ndarray,
+        *,
+        dependencies: np.ndarray | None = None,
+        dependency_counts: np.ndarray | None = None,
+        payload: np.ndarray | None = None,
+        payload_counts: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Append structured events and their row-major ragged columns."""
+
+        if events.dtype != event_dtype() or events.ndim != 1:
+            raise ValueError("event batch does not use the frozen structured schema")
+        event_count = int(events.size)
+        dependencies = (
+            np.empty(0, dtype=dependency_dtype())
+            if dependencies is None else np.asarray(dependencies)
+        )
+        payload = (
+            np.empty(0, dtype=np.dtype("<f4"))
+            if payload is None else np.asarray(payload)
+        )
+        if dependencies.dtype != dependency_dtype() or dependencies.ndim != 1:
+            raise ValueError("event batch dependencies must use uint64 schema")
+        if payload.dtype != np.dtype("<f4") or payload.ndim != 1:
+            raise ValueError("event batch payload must use little-endian float32 schema")
+        dependency_counts = (
+            np.zeros(event_count, dtype=np.int64)
+            if dependency_counts is None else np.asarray(dependency_counts, dtype=np.int64)
+        )
+        payload_counts = (
+            np.zeros(event_count, dtype=np.int64)
+            if payload_counts is None else np.asarray(payload_counts, dtype=np.int64)
+        )
+        if dependency_counts.shape != (event_count,) or payload_counts.shape != (event_count,):
+            raise ValueError("event batch count arrays have an invalid shape")
+        if bool((dependency_counts < 0).any()) or bool((payload_counts < 0).any()):
+            raise ValueError("event batch count arrays cannot be negative")
+        if int(dependency_counts.sum()) != int(dependencies.size):
+            raise ValueError("event batch dependency counts do not match dependencies")
+        if int(payload_counts.sum()) != int(payload.size):
+            raise ValueError("event batch payload counts do not match payload")
+        dependency_prefix = np.empty(event_count + 1, dtype=np.int64)
+        dependency_prefix[0] = 0
+        np.cumsum(dependency_counts, out=dependency_prefix[1:])
+        payload_prefix = np.empty(event_count + 1, dtype=np.int64)
+        payload_prefix[0] = 0
+        np.cumsum(payload_counts, out=payload_prefix[1:])
+        event_ids = np.arange(
+            self._next_event_id, self._next_event_id + event_count, dtype=np.int64
+        )
+        dependency_base = (
+            len(self._dependencies) if self.chunk_root is None else self._dependency_count
+        )
+        payload_base = len(self._payload) if self.chunk_root is None else self._payload_count
+
+        if self.chunk_root is None:
+            self._dependencies.frombytes(dependencies.tobytes())
+            self._payload.frombytes(payload.tobytes())
+        start = 0
+        while start < event_count:
+            if self._current is None:
+                self._current = np.empty(self.chunk_events, dtype=event_dtype())
+                self._current_size = 0
+            capacity = self.chunk_events - self._current_size
+            end = min(start + capacity, event_count)
+            rows = np.array(events[start:end], copy=True)
+            rows["event_id"] = event_ids[start:end]
+            rows["dependency_begin"] = dependency_base + dependency_prefix[start:end]
+            rows["dependency_count"] = dependency_counts[start:end]
+            rows["payload_offset"] = payload_base + payload_prefix[start:end]
+            rows["payload_length"] = payload_counts[start:end]
+            dep_begin = int(dependency_prefix[start])
+            dep_end = int(dependency_prefix[end])
+            payload_begin = int(payload_prefix[start])
+            payload_end = int(payload_prefix[end])
+            if self.chunk_root is not None:
+                self._current_dependencies.frombytes(
+                    dependencies[dep_begin:dep_end].tobytes()
+                )
+                self._current_payload.frombytes(
+                    payload[payload_begin:payload_end].tobytes()
+                )
+                self._dependency_count += dep_end - dep_begin
+                self._payload_count += payload_end - payload_begin
+            batch_size = end - start
+            self._current[self._current_size:self._current_size + batch_size] = rows
+            self._current_size += batch_size
+            if self._current_size == self.chunk_events:
+                self._flush_current()
+            start = end
+        self._next_event_id += event_count
+        return event_ids
+
     def finish(self, *, metadata: dict[str, object] | None = None):
         from gala_sim.trace.model import Trace
 

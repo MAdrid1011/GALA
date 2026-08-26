@@ -16,6 +16,7 @@ from gala_sim.clamp import (
     TraceEvent,
     UpdateBeginKind,
 )
+from gala_sim.clamp.events import dependency_dtype, event_dtype
 from gala_sim.trace import Trace, TraceWriter
 
 from .buffer_decoder import load_buffer_decoder
@@ -96,7 +97,7 @@ class TraceSession:
     _pending_query_by_output: dict[int, _PendingQuery] = field(default_factory=dict, init=False)
     _pending_backwards: list[tuple[int, bool]] = field(default_factory=list, init=False)
     _pending_backward_buffers: set[int] = field(default_factory=set, init=False)
-    _pending_gradients: dict[int, list[int]] = field(default_factory=dict, init=False)
+    _pending_gradients: dict[int, list[np.ndarray]] = field(default_factory=dict, init=False)
     _pending_backward_events: list[int] = field(default_factory=list, init=False)
     _gaussian_ids: list[int] = field(default_factory=list, init=False)
     _gaussian_ids_initialized: bool = field(default=False, init=False)
@@ -596,23 +597,25 @@ class TraceSession:
         relation_candidates = relation_candidates[order]
         valid_candidates = np.zeros(rendered, dtype=bool)
         valid_candidates[relation_candidates] = True
-        candidate_event_ids = np.empty(rendered, dtype=np.int64)
-        for index, (_, _, raw_gaussian, _) in enumerate(candidate_records):
-            gaussian_id = self._gaussian_ids[int(raw_gaussian)]
-            candidate_event = self._builder.emit(TraceEvent(
-                iteration_id=self._iteration,
-                primitive_kind=int(PrimitiveKind.RELATION_CANDIDATE),
-                gaussian_id=gaussian_id,
-                state_version=self._state_version,
-                resource_class=int(ResourceClass.RELATION),
-                address_token=int(candidate_keys[index]),
-                data_bytes=self.relation_candidate_bytes,
-                template_id=template_id, field_mask=field_mask,
-                flags=int(valid_candidates[index]),
-            ), dependencies=(
-                () if self._state_ready_event is None else (self._state_ready_event,)
-            ))
-            candidate_event_ids[index] = candidate_event
+        candidate_events = self._new_event_batch(rendered)
+        candidate_events["iteration_id"] = self._iteration
+        candidate_events["primitive_kind"] = int(PrimitiveKind.RELATION_CANDIDATE)
+        candidate_events["gaussian_id"] = np.asarray(self._gaussian_ids, dtype=np.int64)[gaussian_indexes]
+        candidate_events["state_version"] = self._state_version
+        candidate_events["resource_class"] = int(ResourceClass.RELATION)
+        candidate_events["address_token"] = candidate_keys
+        candidate_events["data_bytes"] = self.relation_candidate_bytes
+        candidate_events["template_id"] = template_id
+        candidate_events["field_mask"] = field_mask
+        candidate_events["flags"] = valid_candidates
+        if self._state_ready_event is None:
+            candidate_event_ids = self._builder.emit_batch(candidate_events)
+        else:
+            candidate_event_ids = self._builder.emit_batch(
+                candidate_events,
+                dependencies=np.full(rendered, self._state_ready_event, dtype=dependency_dtype()),
+                dependency_counts=np.ones(rendered, dtype=np.int64),
+            )
 
         relation_count = int(relation_candidates.size)
         stable_gaussian_ids = np.asarray(self._gaussian_ids, dtype=np.int64)[
@@ -622,20 +625,22 @@ class TraceSession:
             self._next_relation, self._next_relation + relation_count, dtype=np.int64
         )
         self._next_relation += relation_count
-        relation_event_ids = np.empty(relation_count, dtype=np.int64)
-        for index in range(relation_count):
-            gaussian_id = int(stable_gaussian_ids[index])
-            relation_id = int(relation_ids[index])
-            relation = self._builder.emit(TraceEvent(
-                iteration_id=self._iteration,
-                primitive_kind=int(PrimitiveKind.RELATION),
-                query_id=query_base + int(relation_offsets[index]),
-                gaussian_id=gaussian_id, state_version=self._state_version,
-                relation_id=relation_id, resource_class=int(ResourceClass.RELATION),
-                address_token=gaussian_id * self.state_record_bytes,
-                template_id=template_id, field_mask=field_mask,
-            ), dependencies=[candidate_event_ids[int(relation_candidates[index])]])
-            relation_event_ids[index] = relation
+        relation_events = self._new_event_batch(relation_count)
+        relation_events["iteration_id"] = self._iteration
+        relation_events["primitive_kind"] = int(PrimitiveKind.RELATION)
+        relation_events["query_id"] = query_base + relation_offsets
+        relation_events["gaussian_id"] = stable_gaussian_ids
+        relation_events["state_version"] = self._state_version
+        relation_events["relation_id"] = relation_ids
+        relation_events["resource_class"] = int(ResourceClass.RELATION)
+        relation_events["address_token"] = stable_gaussian_ids * self.state_record_bytes
+        relation_events["template_id"] = template_id
+        relation_events["field_mask"] = field_mask
+        relation_event_ids = self._builder.emit_batch(
+            relation_events,
+            dependencies=np.asarray(candidate_event_ids[relation_candidates], dtype=dependency_dtype()),
+            dependency_counts=np.ones(relation_count, dtype=np.int64),
+        )
         self._audit_increment("cuda_valid_relations", relation_count)
 
         query_count = int(np.prod(query_shape))
@@ -643,69 +648,88 @@ class TraceSession:
         begins = np.empty(query_count + 1, dtype=np.int64)
         begins[0] = 0
         np.cumsum(counts, out=begins[1:])
-        query_close_events = np.empty(query_count, dtype=np.int64)
-        for query_offset in range(query_count):
-            begin, end = int(begins[query_offset]), int(begins[query_offset + 1])
-            close_dependencies: list[int] = [
-                int(event) for event in relation_event_ids[begin:end]
-            ]
-            if self._state_ready_event is not None:
-                close_dependencies.append(self._state_ready_event)
-            query_close_events[query_offset] = self._emit_query_close(
-                query_base + query_offset, close_dependencies,
-                template_id=template_id, field_mask=field_mask,
-            )
+        close_counts = counts.astype(np.int64, copy=True)
+        close_dependencies = np.asarray(relation_event_ids, dtype=dependency_dtype())
+        if self._state_ready_event is not None:
+            close_counts += 1
+            positions = begins[:-1] + np.arange(query_count, dtype=np.int64)
+            expanded = np.empty(relation_count + query_count, dtype=dependency_dtype())
+            relation_positions = np.ones(expanded.size, dtype=bool)
+            relation_positions[positions] = False
+            expanded[positions] = self._state_ready_event
+            expanded[relation_positions] = relation_event_ids
+            close_dependencies = expanded
+        close_events = self._new_event_batch(query_count)
+        close_events["iteration_id"] = self._iteration
+        close_events["primitive_kind"] = int(PrimitiveKind.QUERY_CLOSE)
+        close_events["query_id"] = query_base + np.arange(query_count, dtype=np.int64)
+        close_events["state_version"] = self._state_version
+        close_events["resource_class"] = int(ResourceClass.RELATION)
+        close_events["template_id"] = template_id
+        close_events["field_mask"] = field_mask
+        query_close_events = self._builder.emit_batch(
+            close_events,
+            dependencies=close_dependencies,
+            dependency_counts=close_counts,
+        )
 
-        forward_event_ids = np.empty(relation_count, dtype=np.int64)
-        for index in range(relation_count):
-            query_id = query_base + int(relation_offsets[index])
-            gaussian_id = int(stable_gaussian_ids[index])
-            relation_id = int(relation_ids[index])
-            relation = int(relation_event_ids[index])
-            request = self._builder.emit(TraceEvent(
-                iteration_id=self._iteration,
-                primitive_kind=int(PrimitiveKind.CACHE_REQUEST), query_id=query_id,
-                gaussian_id=gaussian_id, state_version=self._state_version,
-                relation_id=relation_id,
-                resource_class=int(ResourceClass.CACHE),
-                address_token=gaussian_id * self.state_record_bytes,
-                data_bytes=self.state_record_bytes,
-                template_id=template_id, field_mask=field_mask,
-            ), dependencies=[relation])
-            returned = self._builder.emit(TraceEvent(
-                iteration_id=self._iteration,
-                primitive_kind=int(PrimitiveKind.CACHE_RETURN), query_id=query_id,
-                gaussian_id=gaussian_id, state_version=self._state_version,
-                relation_id=relation_id,
-                resource_class=int(ResourceClass.CACHE),
-                address_token=gaussian_id * self.state_record_bytes,
-                data_bytes=self.state_record_bytes,
-                template_id=template_id, field_mask=field_mask,
-            ), dependencies=[request])
-            forward = self._builder.emit(TraceEvent(
-                iteration_id=self._iteration,
-                primitive_kind=int(PrimitiveKind.FORWARD), query_id=query_id,
-                gaussian_id=gaussian_id, state_version=self._state_version,
-                relation_id=relation_id, resource_class=int(ResourceClass.ISSUE),
-                address_token=gaussian_id * self.state_record_bytes,
-                template_id=template_id, field_mask=field_mask,
-            ), dependencies=[relation, returned])
-            forward_event_ids[index] = forward
+        request_events = self._new_event_batch(relation_count)
+        request_events["iteration_id"] = self._iteration
+        request_events["primitive_kind"] = int(PrimitiveKind.CACHE_REQUEST)
+        request_events["query_id"] = query_base + relation_offsets
+        request_events["gaussian_id"] = stable_gaussian_ids
+        request_events["state_version"] = self._state_version
+        request_events["relation_id"] = relation_ids
+        request_events["resource_class"] = int(ResourceClass.CACHE)
+        request_events["address_token"] = stable_gaussian_ids * self.state_record_bytes
+        request_events["data_bytes"] = self.state_record_bytes
+        request_events["template_id"] = template_id
+        request_events["field_mask"] = field_mask
+        request_event_ids = self._builder.emit_batch(
+            request_events,
+            dependencies=np.asarray(relation_event_ids, dtype=dependency_dtype()),
+            dependency_counts=np.ones(relation_count, dtype=np.int64),
+        )
+        return_events = request_events.copy()
+        return_events["primitive_kind"] = int(PrimitiveKind.CACHE_RETURN)
+        return_event_ids = self._builder.emit_batch(
+            return_events,
+            dependencies=np.asarray(request_event_ids, dtype=dependency_dtype()),
+            dependency_counts=np.ones(relation_count, dtype=np.int64),
+        )
+        forward_events = request_events.copy()
+        forward_events["primitive_kind"] = int(PrimitiveKind.FORWARD)
+        forward_events["resource_class"] = int(ResourceClass.ISSUE)
+        forward_events["data_bytes"] = 0
+        forward_dependencies = np.empty(relation_count * 2, dtype=dependency_dtype())
+        forward_dependencies[0::2] = relation_event_ids
+        forward_dependencies[1::2] = return_event_ids
+        forward_event_ids = self._builder.emit_batch(
+            forward_events,
+            dependencies=forward_dependencies,
+            dependency_counts=np.full(relation_count, 2, dtype=np.int64),
+        )
 
-        reduction_events = np.empty(query_count, dtype=np.int64)
-        for query_offset in range(query_count):
-            query_id = query_base + query_offset
-            begin, end = int(begins[query_offset]), int(begins[query_offset + 1])
-            reduction_events[query_offset] = self._builder.emit(TraceEvent(
-                iteration_id=self._iteration,
-                primitive_kind=int(PrimitiveKind.QUERY_REDUCTION), query_id=query_id,
-                state_version=self._state_version, reduction_key=query_id,
-                resource_class=int(ResourceClass.QUERY),
-                template_id=template_id,
-            ), dependencies=(
-                query_close_events[query_offset],
-                *(int(event) for event in forward_event_ids[begin:end]),
-            ))
+        reduction_counts = counts.astype(np.int64, copy=True) + 1
+        reduction_dependencies = np.empty(relation_count + query_count, dtype=dependency_dtype())
+        reduction_positions = begins[:-1] + np.arange(query_count, dtype=np.int64)
+        relation_positions = np.ones(reduction_dependencies.size, dtype=bool)
+        relation_positions[reduction_positions] = False
+        reduction_dependencies[reduction_positions] = query_close_events
+        reduction_dependencies[relation_positions] = forward_event_ids
+        reduction_events_batch = self._new_event_batch(query_count)
+        reduction_events_batch["iteration_id"] = self._iteration
+        reduction_events_batch["primitive_kind"] = int(PrimitiveKind.QUERY_REDUCTION)
+        reduction_events_batch["query_id"] = query_base + np.arange(query_count, dtype=np.int64)
+        reduction_events_batch["state_version"] = self._state_version
+        reduction_events_batch["reduction_key"] = query_base + np.arange(query_count, dtype=np.int64)
+        reduction_events_batch["resource_class"] = int(ResourceClass.QUERY)
+        reduction_events_batch["template_id"] = template_id
+        reduction_events = self._builder.emit_batch(
+            reduction_events_batch,
+            dependencies=reduction_dependencies,
+            dependency_counts=reduction_counts,
+        )
         context = _QueryContext(
             query_base, query_shape, relation_offsets, stable_gaussian_ids,
             relation_ids, reduction_events, binning_pointer, output_pointer,
@@ -713,6 +737,12 @@ class TraceSession:
         )
         self._contexts[binning_pointer] = context
         self._output_contexts[output_pointer] = context
+
+    @staticmethod
+    def _new_event_batch(event_count: int) -> np.ndarray:
+        events = np.empty(event_count, dtype=event_dtype())
+        events[:] = TraceEvent().as_tuple()
+        return events
 
     def _emit_query_close(
         self, query_id: int, dependencies: Any,
@@ -756,45 +786,63 @@ class TraceSession:
         query_count = int(np.prod(context.query_shape))
         self._audit_increment("captured_backward_relations", relation_count)
         self._audit_increment("captured_consumers", query_count)
-        consumer_events = np.empty(query_count, dtype=np.int64)
-        for query_offset in range(query_count):
-            query_id = context.query_base + query_offset
-            dependencies = context.reduction_events[
-                self._consumer_query_offsets(context, query_offset)
-            ]
-            consumer_events[query_offset] = self._builder.emit(TraceEvent(
-                iteration_id=self._iteration,
-                primitive_kind=int(PrimitiveKind.CONSUMER), query_id=query_id,
-                state_version=self._state_version, consumer_id=query_id,
-                reduction_key=query_id, resource_class=int(ResourceClass.QUERY),
-                template_id=context.template_id, flags=context.loss_flags,
-            ), dependencies=dependencies)
-        gradient_events = np.empty(relation_count, dtype=np.int64)
-        for index in range(relation_count):
-            query_offset = int(context.relation_query_offsets[index])
-            query_id = context.query_base + query_offset
-            gaussian_id = int(context.gaussian_ids[index])
-            relation_id = int(context.relation_ids[index])
-            adjoint = self._builder.emit(TraceEvent(
-                iteration_id=self._iteration,
-                primitive_kind=int(PrimitiveKind.ADJOINT), query_id=query_id,
-                gaussian_id=gaussian_id, state_version=self._state_version,
-                relation_id=relation_id,
-                resource_class=int(ResourceClass.ISSUE),
-                address_token=gaussian_id * self.state_record_bytes,
-                template_id=context.template_id, field_mask=context.field_mask,
-            ), dependencies=[consumer_events[query_offset]])
-            gradient = self._builder.emit(TraceEvent(
-                iteration_id=self._iteration,
-                primitive_kind=int(PrimitiveKind.GRADIENT_REDUCTION), query_id=query_id,
-                gaussian_id=gaussian_id, state_version=self._state_version,
-                relation_id=relation_id,
-                reduction_key=gaussian_id, resource_class=int(ResourceClass.QUERY),
-                address_token=gaussian_id * self.state_record_bytes,
-                template_id=context.template_id, field_mask=context.field_mask,
-            ), dependencies=[adjoint])
-            self._pending_gradients.setdefault(gaussian_id, []).append(gradient)
-            gradient_events[index] = gradient
+        consumer_dependencies, consumer_counts = self._consumer_dependencies(context)
+        query_ids = context.query_base + np.arange(query_count, dtype=np.int64)
+        consumer_batch = self._new_event_batch(query_count)
+        consumer_batch["iteration_id"] = self._iteration
+        consumer_batch["primitive_kind"] = int(PrimitiveKind.CONSUMER)
+        consumer_batch["query_id"] = query_ids
+        consumer_batch["state_version"] = self._state_version
+        consumer_batch["consumer_id"] = query_ids
+        consumer_batch["reduction_key"] = query_ids
+        consumer_batch["resource_class"] = int(ResourceClass.QUERY)
+        consumer_batch["template_id"] = context.template_id
+        consumer_batch["flags"] = context.loss_flags
+        consumer_events = self._builder.emit_batch(
+            consumer_batch,
+            dependencies=consumer_dependencies,
+            dependency_counts=consumer_counts,
+        )
+
+        relation_query_ids = context.query_base + context.relation_query_offsets
+        adjoint_batch = self._new_event_batch(relation_count)
+        adjoint_batch["iteration_id"] = self._iteration
+        adjoint_batch["primitive_kind"] = int(PrimitiveKind.ADJOINT)
+        adjoint_batch["query_id"] = relation_query_ids
+        adjoint_batch["gaussian_id"] = context.gaussian_ids
+        adjoint_batch["state_version"] = self._state_version
+        adjoint_batch["relation_id"] = context.relation_ids
+        adjoint_batch["resource_class"] = int(ResourceClass.ISSUE)
+        adjoint_batch["address_token"] = context.gaussian_ids * self.state_record_bytes
+        adjoint_batch["template_id"] = context.template_id
+        adjoint_batch["field_mask"] = context.field_mask
+        adjoint_events = self._builder.emit_batch(
+            adjoint_batch,
+            dependencies=np.asarray(
+                consumer_events[context.relation_query_offsets], dtype=dependency_dtype()
+            ),
+            dependency_counts=np.ones(relation_count, dtype=np.int64),
+        )
+
+        gradient_batch = adjoint_batch.copy()
+        gradient_batch["primitive_kind"] = int(PrimitiveKind.GRADIENT_REDUCTION)
+        gradient_batch["reduction_key"] = context.gaussian_ids
+        gradient_batch["resource_class"] = int(ResourceClass.QUERY)
+        gradient_events = self._builder.emit_batch(
+            gradient_batch,
+            dependencies=np.asarray(adjoint_events, dtype=dependency_dtype()),
+            dependency_counts=np.ones(relation_count, dtype=np.int64),
+        )
+        gaussian_order = np.argsort(context.gaussian_ids, kind="stable")
+        sorted_gaussians = context.gaussian_ids[gaussian_order]
+        if relation_count:
+            group_starts = np.flatnonzero(np.r_[True, sorted_gaussians[1:] != sorted_gaussians[:-1]])
+            group_ends = np.r_[group_starts[1:], relation_count]
+            for start, end in zip(group_starts, group_ends):
+                gaussian_id = int(sorted_gaussians[start])
+                self._pending_gradients.setdefault(gaussian_id, []).append(
+                    gradient_events[gaussian_order[start:end]]
+                )
         relation_counts = np.bincount(
             context.relation_query_offsets, minlength=query_count
         )
@@ -868,6 +916,54 @@ class TraceSession:
             return np.asarray(offsets, dtype=np.int64)
         return np.asarray([query_offset], dtype=np.int64)
 
+    @staticmethod
+    def _consumer_dependencies(context: _QueryContext) -> tuple[np.ndarray, np.ndarray]:
+        query_count = int(np.prod(context.query_shape))
+        if context.loss_flags & LOSS_SSIM:
+            height, width = context.query_shape
+            radius = context.ssim_radius
+            y = np.repeat(np.arange(height, dtype=np.int64), width)
+            x = np.tile(np.arange(width, dtype=np.int64), height)
+            deltas = np.arange(-radius, radius + 1, dtype=np.int64)
+            neighbor_y = y[:, None, None] + deltas[None, :, None]
+            neighbor_x = x[:, None, None] + deltas[None, None, :]
+            valid = (
+                (neighbor_y >= 0) & (neighbor_y < height)
+                & (neighbor_x >= 0) & (neighbor_x < width)
+            )
+            offsets = neighbor_y * width + neighbor_x
+            counts = valid.sum(axis=(1, 2), dtype=np.int64)
+            dependencies = context.reduction_events[offsets[valid]]
+        elif context.loss_flags & LOSS_TV:
+            voxel_x, voxel_y, voxel_z = context.query_shape
+            offsets = np.arange(query_count, dtype=np.int64)
+            x, remainder = np.divmod(offsets, voxel_y * voxel_z)
+            y, z = np.divmod(remainder, voxel_z)
+            candidates = np.column_stack((
+                offsets,
+                offsets - voxel_y * voxel_z,
+                offsets + voxel_y * voxel_z,
+                offsets - voxel_z,
+                offsets + voxel_z,
+                offsets - 1,
+                offsets + 1,
+            ))
+            valid = np.column_stack((
+                np.ones(query_count, dtype=bool),
+                x > 0,
+                x + 1 < voxel_x,
+                y > 0,
+                y + 1 < voxel_y,
+                z > 0,
+                z + 1 < voxel_z,
+            ))
+            counts = valid.sum(axis=1, dtype=np.int64)
+            dependencies = context.reduction_events[candidates[valid]]
+        else:
+            counts = np.ones(query_count, dtype=np.int64)
+            dependencies = context.reduction_events
+        return np.asarray(dependencies, dtype=dependency_dtype()), counts
+
     def _capture_update(self, model: Any, *, field_mask: int) -> None:
         self._ensure_gaussians(int(model.get_xyz.shape[0]))
         self._audit_increment("optimizer_steps")
@@ -888,7 +984,14 @@ class TraceSession:
         self._audit_increment("optimizer_updated_gaussians", len(self._gaussian_ids))
         commits: list[int] = []
         for gaussian_id in self._gaussian_ids:
-            dependencies = (begin, *self._pending_gradients.get(gaussian_id, ()))
+            gradient_chunks = self._pending_gradients.get(gaussian_id, ())
+            gradients = (
+                np.concatenate(gradient_chunks)
+                if len(gradient_chunks) > 1
+                else gradient_chunks[0] if gradient_chunks
+                else np.empty(0, dtype=np.int64)
+            )
+            dependencies = (begin, *(int(event) for event in gradients))
             commits.append(self._builder.emit(TraceEvent(
                 iteration_id=self._iteration,
                 primitive_kind=int(PrimitiveKind.UPDATE_COMMIT),
