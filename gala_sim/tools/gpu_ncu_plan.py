@@ -16,8 +16,8 @@ from gala_sim.identity import canonical_json, sha256_bytes, sha256_file
 from gala_sim.tools.gpu_profile_campaign import GpuProfileCampaign
 
 
-CONFIG_SCHEMA_VERSION = "gala-ncu-launch-signature-config-v3"
-PLAN_SCHEMA_VERSION = "gala-ncu-launch-signature-plan-v3"
+CONFIG_SCHEMA_VERSION = "gala-ncu-launch-signature-config-v4"
+PLAN_SCHEMA_VERSION = "gala-ncu-launch-signature-plan-v4"
 _SUPPORTED_SIGNATURE_FIELDS = ("stage", "kernel_name", "grid", "block")
 _SUPPORTED_OCCURRENCES = ("first", "middle", "last")
 _SUPPORTED_NCU_OPTIONS = {
@@ -38,6 +38,7 @@ class NcuPlanConfig:
     counter_scope: str
     validation_occurrences: tuple[str, ...]
     maximum_capture_job_count: int
+    range_capture_stages: tuple[str, ...]
     preflight_profile_launch_count: int
     metrics: tuple[str, ...]
     sections: tuple[str, ...]
@@ -63,6 +64,9 @@ class NcuPlanConfig:
                 str(value) for value in document.get("validation_occurrences", ())
             ),
             maximum_capture_job_count=int(document.get("maximum_capture_job_count", 0)),
+            range_capture_stages=tuple(
+                str(value) for value in document.get("range_capture_stages", ())
+            ),
             preflight_profile_launch_count=int(
                 document.get("preflight_profile_launch_count", 0)
             ),
@@ -88,6 +92,11 @@ class NcuPlanConfig:
             raise ValueError("NCU validation occurrence policy is invalid")
         if self.maximum_capture_job_count <= 0:
             raise ValueError("NCU maximum capture job count must be positive")
+        if len(set(self.range_capture_stages)) != len(self.range_capture_stages) or any(
+            not value or not re.fullmatch(r"[a-z_]+", value)
+            for value in self.range_capture_stages
+        ):
+            raise ValueError("NCU range-capture stages are invalid")
         if self.preflight_profile_launch_count <= 0:
             raise ValueError("NCU preflight profile launch count must be positive")
         if not self.metrics or len(set(self.metrics)) != len(self.metrics):
@@ -171,6 +180,20 @@ def _kernel_id_filter(names: Iterable[str], ordinals: Iterable[int]) -> str:
     return "::regex:" + _regex_alternation(names) + ":" + _ordinal_regex(ordinals)
 
 
+def _all_invocations_filter(names: Iterable[str]) -> str:
+    return "::regex:" + _regex_alternation(names) + ":"
+
+
+def _stage_range_filter(
+    stage: str, iterations: Iterable[int], campaign_sha256: str,
+) -> str:
+    iteration_regex = "(" + "|".join(str(value) for value in sorted(set(iterations))) + ")"
+    return (
+        "regex:^gala_ncu_stage:" + stage + ":iteration=" + iteration_regex
+        + ":call=[0-9]+:campaign=" + campaign_sha256 + "$"
+    )
+
+
 def _load_inventory(path: Path) -> tuple[dict[str, Any], str]:
     path = path.resolve()
     document = json.loads(path.read_text(encoding="utf-8"))
@@ -246,23 +269,144 @@ def _validate_inventory(
     return iteration, kernel_count, validated_calls
 
 
-def build_ncu_plan(
-    config: NcuPlanConfig, inventory_paths: Iterable[Path],
-) -> dict[str, Any]:
-    campaign = GpuProfileCampaign.load(config.campaign)
-    expected_iterations = [item.iteration for item in campaign.representatives]
-    loaded: dict[int, tuple[Path, dict[str, Any], str, int, list[Mapping[str, Any]]]] = {}
-    for raw_path in inventory_paths:
+def _load_inventory_set(
+    paths: Iterable[Path], campaign_sha256: str, expected_iterations: list[int],
+) -> dict[int, tuple[Path, dict[str, Any], str, int, list[Mapping[str, Any]]]]:
+    loaded = {}
+    for raw_path in paths:
         path = raw_path.resolve()
         profile, profile_sha256 = _load_inventory(path)
-        iteration, kernel_count, calls = _validate_inventory(
-            profile, config.campaign_sha256
-        )
+        iteration, kernel_count, calls = _validate_inventory(profile, campaign_sha256)
         if iteration in loaded:
             raise ValueError(f"duplicate NSYS representative iteration: {iteration}")
         loaded[iteration] = (path, profile, profile_sha256, kernel_count, calls)
     if sorted(loaded) != expected_iterations:
         raise ValueError("NSYS inventories do not exactly match representative iterations")
+    return loaded
+
+
+def _stability_validation(
+    primary: Mapping[
+        int, tuple[Path, dict[str, Any], str, int, list[Mapping[str, Any]]]
+    ],
+    repeated: Mapping[
+        int, tuple[Path, dict[str, Any], str, int, list[Mapping[str, Any]]]
+    ],
+    iterations: list[int], range_stages: tuple[str, ...],
+) -> dict[str, Any]:
+    def invocation_sequence(
+        inventories: Mapping[
+            int, tuple[Path, dict[str, Any], str, int, list[Mapping[str, Any]]]
+        ],
+        only_stage: str | None = None,
+    ) -> list[dict[str, Any]]:
+        sequence = []
+        for iteration in iterations:
+            for call in inventories[iteration][4]:
+                stage = str(call["stage"])
+                if stage in range_stages or (only_stage is not None and stage != only_stage):
+                    continue
+                for ordinal, kernel in enumerate(call["kernels"], start=1):
+                    sequence.append({
+                        "iteration": iteration,
+                        "stage": stage,
+                        "call_index": int(call["call_index"]),
+                        "kernel_ordinal_in_call": ordinal,
+                        **_signature_document(_signature(stage, kernel)),
+                    })
+        return sequence
+
+    primary_sequence = invocation_sequence(primary)
+    repeated_sequence = invocation_sequence(repeated)
+    invocation_stages = sorted({
+        str(call["stage"])
+        for iteration in iterations
+        for inventories in (primary, repeated)
+        for call in inventories[iteration][4]
+        if str(call["stage"]) not in range_stages
+    })
+    unstable_invocation_stages = [
+        stage for stage in invocation_stages
+        if invocation_sequence(primary, stage) != invocation_sequence(repeated, stage)
+    ]
+    primary_hash = sha256_bytes(canonical_json(primary_sequence))
+    repeated_hash = sha256_bytes(canonical_json(repeated_sequence))
+    if primary_hash != repeated_hash:
+        suffix = ",".join(unstable_invocation_stages) or "cross_stage_order"
+        raise ValueError(f"NSYS invocation stages are unstable: {suffix}")
+
+    range_records = []
+    for stage in range_stages:
+        for iteration in iterations:
+            def signature_counts(
+                inventories: Mapping[
+                    int,
+                    tuple[Path, dict[str, Any], str, int, list[Mapping[str, Any]]],
+                ],
+            ) -> Counter[str]:
+                return Counter(
+                    _signature_id(_signature(stage, kernel))
+                    for call in inventories[iteration][4]
+                    if str(call["stage"]) == stage
+                    for kernel in call["kernels"]
+                )
+
+            primary_counts = signature_counts(primary)
+            repeated_counts = signature_counts(repeated)
+            if set(primary_counts) != set(repeated_counts):
+                raise ValueError(
+                    f"NSYS range stage signature set is unstable: {stage}:{iteration}"
+                )
+            if primary_counts:
+                range_records.append({
+                    "iteration": iteration,
+                    "stage": stage,
+                    "signature_count": len(primary_counts),
+                    "primary_kernel_launch_count": sum(primary_counts.values()),
+                    "repeated_kernel_launch_count": sum(repeated_counts.values()),
+                    "multiplicity_identical": primary_counts == repeated_counts,
+                })
+
+    repeated_records = []
+    for iteration in iterations:
+        path, profile, digest, kernel_count, _ = repeated[iteration]
+        repeated_records.append({
+            "iteration": iteration,
+            "path": str(path),
+            "sha256": digest,
+            "source": profile.get("source"),
+            "source_sha256": profile.get("source_sha256"),
+            "kernel_count": kernel_count,
+        })
+    return {
+        "status": "passed",
+        "policy": "exact_invocation_sequence_and_range_signature_set",
+        "invocation_sequence_primary_sha256": primary_hash,
+        "invocation_sequence_repeated_sha256": repeated_hash,
+        "invocation_kernel_launch_count": len(primary_sequence),
+        "range_stage_records": range_records,
+        "repeated_nsys_inventories": repeated_records,
+    }
+
+
+def build_ncu_plan(
+    config: NcuPlanConfig, inventory_paths: Iterable[Path],
+    stability_inventory_paths: Iterable[Path] = (),
+) -> dict[str, Any]:
+    campaign = GpuProfileCampaign.load(config.campaign)
+    expected_iterations = [item.iteration for item in campaign.representatives]
+    loaded = _load_inventory_set(
+        inventory_paths, config.campaign_sha256, expected_iterations
+    )
+    stability_paths = tuple(stability_inventory_paths)
+    stability = {"status": "not_provided"}
+    if stability_paths:
+        repeated = _load_inventory_set(
+            stability_paths, config.campaign_sha256, expected_iterations
+        )
+        stability = _stability_validation(
+            loaded, repeated, expected_iterations, config.range_capture_stages
+        )
 
     roles_by_iteration = {
         item.iteration: set(item.roles) for item in campaign.representatives
@@ -285,6 +429,7 @@ def build_ncu_plan(
         list[dict[str, Any]],
     ] = defaultdict(list)
     global_name_ordinals: dict[str, int] = defaultdict(int)
+    invocation_name_ordinals: dict[str, int] = defaultdict(int)
     call_records: dict[tuple[int, str, int], dict[str, Any]] = {}
     for iteration in expected_iterations:
         calls = loaded[iteration][4]
@@ -310,6 +455,10 @@ def build_ncu_plan(
                 signature_counts[_signature_id(key)] += 1
                 name_ordinals[key[1]] += 1
                 global_name_ordinals[key[1]] += 1
+                invocation_ordinal = None
+                if stage not in config.range_capture_stages:
+                    invocation_name_ordinals[key[1]] += 1
+                    invocation_ordinal = invocation_name_ordinals[key[1]]
                 occurrence_key = (iteration, key)
                 occurrences[occurrence_key].append({
                     "call_index": call_index,
@@ -317,6 +466,7 @@ def build_ncu_plan(
                     "kernel_ordinal_in_call": kernel_ordinal,
                     "kernel_name_ordinal_in_call": name_ordinals[key[1]],
                     "kernel_name_ordinal_in_capture": global_name_ordinals[key[1]],
+                    "kernel_name_ordinal_in_invocation_capture": invocation_ordinal,
                 })
             call_records[call_key]["signature_counts"] = [
                 {"signature_id": signature_id, "count": count}
@@ -363,9 +513,19 @@ def build_ncu_plan(
     target_ordinals: dict[str, set[int]] = defaultdict(set)
     required_locations: set[tuple[int, str, int, int]] = set()
     for (iteration, key), values in occurrences.items():
+        if key[0] in config.range_capture_stages:
+            for index in _anchor_indices(len(values), config.validation_occurrences):
+                occurrence = values[index]
+                required_locations.add((
+                    iteration, key[0], int(occurrence["call_index"]),
+                    int(occurrence["kernel_ordinal_in_call"]),
+                ))
+            continue
         for index in _anchor_indices(len(values), config.validation_occurrences):
             occurrence = values[index]
-            target_ordinals[key[1]].add(int(occurrence["kernel_name_ordinal_in_capture"]))
+            target_ordinals[key[1]].add(int(
+                occurrence["kernel_name_ordinal_in_invocation_capture"]
+            ))
             required_locations.add((
                 iteration, key[0], int(occurrence["call_index"]),
                 int(occurrence["kernel_ordinal_in_call"]),
@@ -389,6 +549,11 @@ def build_ncu_plan(
                 "kernel_name_ordinal_in_capture": int(
                     occurrence["kernel_name_ordinal_in_capture"]
                 ),
+                "kernel_name_ordinal_in_invocation_capture": (
+                    int(occurrence["kernel_name_ordinal_in_invocation_capture"])
+                    if occurrence["kernel_name_ordinal_in_invocation_capture"] is not None
+                    else None
+                ),
                 "kernel_name": key[1],
                 "grid": list(key[2]),
                 "block": list(key[3]),
@@ -402,7 +567,7 @@ def build_ncu_plan(
 
     def group_cost(names: set[str], ordinals: set[int]) -> int:
         return sum(
-            sum(ordinal <= global_name_ordinals[name] for ordinal in ordinals)
+            sum(ordinal <= invocation_name_ordinals[name] for ordinal in ordinals)
             for name in names
         )
 
@@ -435,12 +600,25 @@ def build_ncu_plan(
         ] + [merged]
     groups.sort(key=lambda item: (min(item[1]), sorted(item[0])))
 
+    excluded_range_arguments = []
+    for stage in config.range_capture_stages:
+        stage_iterations = sorted({
+            iteration for iteration, key in occurrences if key[0] == stage
+        })
+        if not stage_iterations:
+            raise ValueError(f"NCU range-capture stage has no launches: {stage}")
+        excluded_range_arguments.extend([
+            "--nvtx-exclude",
+            _stage_range_filter(stage, stage_iterations, config.campaign_sha256),
+        ])
+
     capture_groups = []
     for job_index, (names, ordinals) in enumerate(groups, start=1):
         expected_launches = [
             location for location in all_locations
-            if location["kernel_name"] in names
-            and int(location["kernel_name_ordinal_in_capture"]) in ordinals
+            if location["stage"] not in config.range_capture_stages
+            and location["kernel_name"] in names
+            and int(location["kernel_name_ordinal_in_invocation_capture"]) in ordinals
         ]
         expected_launches.sort(key=lambda item: (
             int(item["iteration"]), int(item["call_order"]),
@@ -452,6 +630,7 @@ def build_ncu_plan(
         measured_launch_count = group_cost(names, ordinals)
         capture_groups.append({
             "job_index": job_index,
+            "capture_mode": "kernel_invocations",
             "representative_iterations": expected_iterations,
             "kernel_names": sorted(names),
             "kernel_name_regex": _regex_alternation(names),
@@ -468,6 +647,7 @@ def build_ncu_plan(
             "ncu_arguments": [
                 "--profile-from-start", "off",
                 "--nvtx",
+                *excluded_range_arguments,
                 "--replay-mode", config.ncu_options["replay_mode"],
                 "--cache-control", config.ncu_options["cache_control"],
                 "--clock-control", config.ncu_options["clock_control"],
@@ -481,6 +661,58 @@ def build_ncu_plan(
                 "--metrics", ",".join(config.metrics),
                 "--check-exit-code", "1",
             ],
+        })
+    range_stages = tuple(config.range_capture_stages)
+    if range_stages:
+        range_locations = [
+            location for location in all_locations
+            if location["stage"] in range_stages
+        ]
+        if not range_locations:
+            raise ValueError("configured NCU range-capture stages have no launches")
+        range_iterations = sorted({int(item["iteration"]) for item in range_locations})
+        range_arguments = ["--profile-from-start", "off", "--nvtx"]
+        for stage in range_stages:
+            stage_iterations = sorted({
+                int(item["iteration"]) for item in range_locations
+                if item["stage"] == stage
+            })
+            if not stage_iterations:
+                raise ValueError(f"NCU range-capture stage has no launches: {stage}")
+            range_arguments.extend([
+                "--nvtx-include",
+                _stage_range_filter(stage, stage_iterations, config.campaign_sha256),
+            ])
+        range_arguments.extend([
+            "--replay-mode", config.ncu_options["replay_mode"],
+            "--cache-control", config.ncu_options["cache_control"],
+            "--clock-control", config.ncu_options["clock_control"],
+            "--kernel-name-base", config.ncu_options["kernel_name_base"],
+            *[
+                argument
+                for section in config.sections
+                for argument in ("--section", section)
+            ],
+            "--metrics", ",".join(config.metrics),
+            "--check-exit-code", "1",
+        ])
+        range_locations.sort(key=lambda item: (
+            int(item["iteration"]), int(item["call_order"]),
+            int(item["kernel_ordinal_in_call"]),
+        ))
+        capture_groups.append({
+            "job_index": len(capture_groups) + 1,
+            "capture_mode": "nvtx_ranges",
+            "representative_iterations": range_iterations,
+            "range_stages": list(range_stages),
+            "kernel_names": sorted({str(item["kernel_name"]) for item in range_locations}),
+            "required_sample_count": sum(bool(item["required_sample"]) for item in range_locations),
+            "selected_kernel_launch_count": len(range_locations),
+            "extra_kernel_launch_count": len(range_locations) - sum(
+                bool(item["required_sample"]) for item in range_locations
+            ),
+            "expected_launches": range_locations,
+            "ncu_arguments": range_arguments,
         })
     selected_launch_count = sum(
         int(group["selected_kernel_launch_count"]) for group in capture_groups
@@ -515,6 +747,8 @@ def build_ncu_plan(
         "signature_fields": list(config.signature_fields),
         "counter_scope": config.counter_scope,
         "validation_occurrences": list(config.validation_occurrences),
+        "range_capture_stages": list(config.range_capture_stages),
+        "stability_validation": stability,
         "counter_reuse_gate": {
             "policy": "exact_signature_within_one_representative_iteration",
             "require_all_planned_samples": True,
@@ -538,7 +772,8 @@ def build_ncu_plan(
                 "--metrics", ",".join(config.metrics),
             ],
             "capture_mode": "cuda_profiler_api",
-            "invocation_scope": "all_representative_windows_in_one_process",
+            "invocation_scope": "representative_windows_after_nvtx_range_exclusion",
+            "range_scope": "all_launches_in_configured_cross_thread_start_end_ranges",
             "preflight_profile_launch_count": config.preflight_profile_launch_count,
         },
         "coverage": {
@@ -550,6 +785,14 @@ def build_ncu_plan(
             "required_sample_count": required_sample_count,
             "capture_group_count": len(capture_groups),
             "capture_job_count": len(capture_groups),
+            "invocation_capture_job_count": sum(
+                group["capture_mode"] == "kernel_invocations"
+                for group in capture_groups
+            ),
+            "range_capture_job_count": sum(
+                group["capture_mode"] == "nvtx_ranges"
+                for group in capture_groups
+            ),
             "selected_stage_call_count": len(selected_calls),
             "selected_kernel_launch_count": selected_launch_count,
             "extra_kernel_launch_count": selected_launch_count - required_sample_count,
@@ -578,30 +821,42 @@ def validate_ncu_measurement(
         or sha256_bytes(canonical_json(plan_payload)) != plan_hash
     ):
         reasons.append("ncu_plan_identity_invalid")
+    stability = plan.get("stability_validation")
+    if not isinstance(stability, Mapping) or stability.get("status") != "passed":
+        reasons.append("ncu_plan_stability_invalid")
     expected_campaign = (
         plan.get("campaign", {}).get("sha256")
         if isinstance(plan.get("campaign"), Mapping) else None
     )
     expected_jobs: dict[int, dict[str, Mapping[str, Any]]] = {}
+    expected_job_modes: dict[int, str] = {}
     expected_launches: dict[str, Mapping[str, Any]] = {}
-    expected_signature_counts: Counter[tuple[int, str]] = Counter()
     for group in plan.get("capture_groups", ()):
         if not isinstance(group, Mapping):
             continue
         job_index = int(group["job_index"])
+        capture_mode = str(group.get("capture_mode", ""))
+        expected_job_modes[job_index] = capture_mode
         job_launches: dict[str, Mapping[str, Any]] = {}
         for launch in group.get("expected_launches", ()):
             if not isinstance(launch, Mapping):
+                continue
+            if capture_mode == "nvtx_ranges" and not bool(launch.get("required_sample")):
                 continue
             selected_id = str(launch["selected_launch_id"])
             if selected_id in expected_launches:
                 reasons.append(f"duplicate_planned_launch:{selected_id}")
             expected_launches[selected_id] = launch
             job_launches[selected_id] = launch
-            expected_signature_counts[
-                (int(launch["iteration"]), str(launch["signature_id"]))
-            ] += 1
         expected_jobs[job_index] = job_launches
+
+    valid_signature_iterations = {
+        (int(representative["iteration"]), str(signature["signature_id"]))
+        for signature in plan.get("signatures", ())
+        if isinstance(signature, Mapping)
+        for representative in signature.get("representative_iterations", ())
+        if isinstance(representative, Mapping)
+    }
 
     observed_records: list[Mapping[str, Any]] = []
     observed_ids: set[str] = set()
@@ -645,6 +900,25 @@ def validate_ncu_measurement(
                 continue
             selected_id = str(launch.get("selected_launch_id", ""))
             expected = expected_jobs.get(job_index, {}).get(selected_id)
+            capture_mode = expected_job_modes.get(job_index)
+            if capture_mode == "nvtx_ranges" and not bool(launch.get("required_sample")):
+                try:
+                    signature_key = (int(launch["iteration"]), str(launch["signature_id"]))
+                except (KeyError, TypeError, ValueError):
+                    reasons.append("ncu_range_signature_identity_invalid")
+                    continue
+                if signature_key not in valid_signature_iterations:
+                    reasons.append("ncu_range_signature_identity_invalid")
+                    continue
+                metrics = launch.get("metrics")
+                if not isinstance(metrics, Mapping):
+                    reasons.append("ncu_counter_metrics_missing")
+                else:
+                    metrics_by_signature[signature_key].append(tuple(sorted(
+                        (str(name), float(value)) for name, value in metrics.items()
+                    )))
+                observed_records.append(launch)
+                continue
             if expected is None:
                 reasons.append(f"unexpected_ncu_launch:{job_index}:{selected_id}")
                 continue
@@ -652,7 +926,11 @@ def validate_ncu_measurement(
                 reasons.append(f"duplicate_ncu_launch:{selected_id}")
             observed_ids.add(selected_id)
             try:
-                mismatch = any(launch[field] != expected[field] for field in identity_fields)
+                compared_fields = (
+                    ("iteration", "stage", "kernel_name")
+                    if capture_mode == "nvtx_ranges" else identity_fields
+                )
+                mismatch = any(launch[field] != expected[field] for field in compared_fields)
                 mismatch = mismatch or [int(value) for value in launch["grid_size"]] != [
                     int(value) for value in expected["grid"]
                 ]
@@ -681,7 +959,7 @@ def validate_ncu_measurement(
     missing_launches = set(expected_launches) - observed_ids
     if missing_launches:
         reasons.append("ncu_selected_launches_missing")
-    if len(expected_launches) != len(observed_records):
+    if len(expected_launches) != len(observed_ids):
         reasons.append("ncu_selected_launch_count_mismatch")
 
     agreement: dict[str, Any] = {}
@@ -789,7 +1067,8 @@ def validate_ncu_measurement(
         "campaign_sha256": expected_campaign,
         "profile_count": profile_count,
         "expected_selected_launch_count": len(expected_launches),
-        "observed_selected_launch_count": len(observed_records),
+        "observed_selected_launch_count": len(observed_ids),
+        "observed_profiled_launch_count": len(observed_records),
         "exact_launch_coverage": not any(
             reason.startswith((
                 "unexpected_ncu_launch", "duplicate_ncu_launch",
@@ -819,15 +1098,21 @@ def main(argv: list[str] | None = None) -> int:
     mode.add_argument("--config", type=Path)
     mode.add_argument("--plan", type=Path)
     parser.add_argument("--nsys-profile", type=Path, action="append", default=[])
+    parser.add_argument(
+        "--stability-nsys-profile", type=Path, action="append", default=[]
+    )
     parser.add_argument("--ncu-profile", type=Path, action="append", default=[])
     parser.add_argument("--output", type=Path, required=True)
     args = parser.parse_args(argv)
     if args.config is not None:
         if not args.nsys_profile or args.ncu_profile:
             raise ValueError("plan construction requires NSYS profiles only")
-        result = build_ncu_plan(NcuPlanConfig.load(args.config), args.nsys_profile)
+        result = build_ncu_plan(
+            NcuPlanConfig.load(args.config), args.nsys_profile,
+            args.stability_nsys_profile,
+        )
     else:
-        if args.nsys_profile or not args.ncu_profile:
+        if args.nsys_profile or args.stability_nsys_profile or not args.ncu_profile:
             raise ValueError("plan validation requires NCU profiles only")
         result = validate_ncu_measurement(
             json.loads(args.plan.read_text(encoding="utf-8")),

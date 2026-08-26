@@ -25,8 +25,8 @@ from gala_sim.tools.gpu_ncu_plan import _kernel_id_filter
 from gala_sim.tools.preflight import sample_gpustat
 
 
-RUN_SCHEMA_VERSION = "gala-ncu-invocation-run-v1"
-PLAN_SCHEMA_VERSION = "gala-ncu-launch-signature-plan-v3"
+RUN_SCHEMA_VERSION = "gala-ncu-capture-run-v2"
+PLAN_SCHEMA_VERSION = "gala-ncu-launch-signature-plan-v4"
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -40,10 +40,13 @@ def _load_plan(path: Path) -> dict[str, Any]:
     plan = _read_json(path)
     digest = plan.get("content_sha256")
     payload = {key: value for key, value in plan.items() if key != "content_sha256"}
+    stability = plan.get("stability_validation")
     if (
         plan.get("schema_version") != PLAN_SCHEMA_VERSION
         or not isinstance(digest, str)
         or sha256_bytes(canonical_json(payload)) != digest
+        or not isinstance(stability, Mapping)
+        or stability.get("status") != "passed"
     ):
         raise ValueError("NCU plan identity is invalid")
     return plan
@@ -124,12 +127,14 @@ def _runner_command(
         ncu_arguments = [str(value) for value in job["ncu_arguments"]]
     else:
         ncu_arguments = [str(value) for value in job["ncu_arguments"]]
+        if job.get("capture_mode") != "kernel_invocations":
+            raise ValueError("NCU preflight requires an invocation capture job")
         by_name: dict[str, list[int]] = {}
         for launch in job.get("expected_launches", ()):
             if not isinstance(launch, Mapping) or int(launch.get("iteration", -1)) != 1:
                 continue
             by_name.setdefault(str(launch["kernel_name"]), []).append(
-                int(launch["kernel_name_ordinal_in_capture"])
+                int(launch["kernel_name_ordinal_in_invocation_capture"])
             )
         requested = int(plan.get("ncu", {}).get("preflight_profile_launch_count", 0))
         eligible = sorted(

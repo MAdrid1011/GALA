@@ -1,10 +1,11 @@
-schema_version: gala-ncu-launch-signature-config-v3
+schema_version: gala-ncu-launch-signature-config-v4
 campaign: configs/profiling/r2_gaussian_chest_campaign.yaml
 campaign_sha256: 75d3968373271d8b019f20279ab0aaf47d145fd1d337b02c16f0ce8384ae593d
 signature_fields: [stage, kernel_name, grid, block]
 counter_scope: representative_iteration
 validation_occurrences: [first, middle, last]
 maximum_capture_job_count: 6
+range_capture_stages: [collection]
 preflight_profile_launch_count: 16
 metrics:
   - dram__bytes_read.sum

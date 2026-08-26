@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import argparse
+from dataclasses import replace
 import json
 from pathlib import Path
 import sqlite3
@@ -263,7 +264,7 @@ def test_ncu_plan_preserves_multiplicity_and_selects_validation_occurrences(
     )
     campaign = GpuProfileCampaign.load(config.campaign)
     paths = _nsys_plan_profiles(tmp_path, campaign)
-    result = build_ncu_plan(config, paths)
+    result = build_ncu_plan(config, paths, paths)
     signature = next(
         item for item in result["signatures"]
         if item["stage"] == "projection_forward"
@@ -281,7 +282,8 @@ def test_ncu_plan_preserves_multiplicity_and_selects_validation_occurrences(
     assert result["coverage"]["observed_kernel_launch_count"] == 121
     assert result["coverage"]["representative_iteration_signature_count"] == 117
     assert result["ncu"]["preflight_profile_launch_count"] == 16
-    assert 0 < result["coverage"]["capture_job_count"] <= 6
+    assert 0 < result["coverage"]["invocation_capture_job_count"] <= 6
+    assert result["coverage"]["range_capture_job_count"] == 1
     assert sum(
         group["required_sample_count"] for group in result["capture_groups"]
     ) == result["coverage"]["required_sample_count"]
@@ -293,13 +295,24 @@ def test_ncu_plan_preserves_multiplicity_and_selects_validation_occurrences(
         and group["ncu_arguments"][:2] == ["--profile-from-start", "off"]
         and "--launch-count" not in group["ncu_arguments"]
         and "--kill" not in group["ncu_arguments"]
-        and "--nvtx-include" not in group["ncu_arguments"]
         and "--kernel-name" not in group["ncu_arguments"]
+        for group in result["capture_groups"]
+    )
+    assert all(
+        "--nvtx-include" not in group["ncu_arguments"]
+        and "--nvtx-exclude" in group["ncu_arguments"]
         and "--kernel-id" in group["ncu_arguments"]
         and group["ncu_arguments"][
             group["ncu_arguments"].index("--kernel-id") + 1
         ].startswith("::regex:")
         for group in result["capture_groups"]
+        if group["capture_mode"] == "kernel_invocations"
+    )
+    assert all(
+        "--nvtx-include" in group["ncu_arguments"]
+        and "--kernel-id" not in group["ncu_arguments"]
+        for group in result["capture_groups"]
+        if group["capture_mode"] == "nvtx_ranges"
     )
     assert all(
         "--section" in group["ncu_arguments"]
@@ -321,7 +334,51 @@ def test_ncu_plan_rejects_inexact_nsys_coverage(tmp_path: Path) -> None:
     profile["kernel_coverage"]["records"][0]["assigned_kernel_count"] -= 1
     paths[0].write_text(json.dumps(profile), encoding="utf-8")
     with pytest.raises(ValueError, match="exactly once"):
-        build_ncu_plan(config, paths)
+        build_ncu_plan(config, paths, paths)
+
+
+def test_ncu_plan_requires_repeat_stability_outside_range_stages(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    base = NcuPlanConfig.load(root / "configs/profiling/r2_gaussian_chest_ncu.yaml")
+    config = replace(base, range_capture_stages=("projection_forward",))
+    campaign = GpuProfileCampaign.load(config.campaign)
+    primary_root = tmp_path / "primary"
+    repeated_root = tmp_path / "repeated"
+    primary_root.mkdir()
+    repeated_root.mkdir()
+    primary = _nsys_plan_profiles(primary_root, campaign)
+    repeated = _nsys_plan_profiles(repeated_root, campaign)
+    repeated_initial = json.loads(repeated[0].read_text(encoding="utf-8"))
+    range_call = next(
+        call for call in repeated_initial["stage_calls"]
+        if call["stage"] == "projection_forward"
+    )
+    range_call["kernels"].append(dict(range_call["kernels"][0]))
+    range_call["kernel_launch_count"] += 1
+    repeated_initial["kernel_coverage"]["records"][0]["kernel_count"] += 1
+    repeated_initial["kernel_coverage"]["records"][0]["assigned_kernel_count"] += 1
+    repeated[0].write_text(json.dumps(repeated_initial), encoding="utf-8")
+    plan = build_ncu_plan(config, primary, repeated)
+    changed = next(
+        record for record in plan["stability_validation"]["range_stage_records"]
+        if record["iteration"] == 1 and record["stage"] == "projection_forward"
+    )
+    assert changed["multiplicity_identical"] is False
+
+    repeated_initial = json.loads(repeated[0].read_text(encoding="utf-8"))
+    invocation_call = next(
+        call for call in repeated_initial["stage_calls"]
+        if call["stage"] == "backward"
+    )
+    invocation_call["kernels"].append(dict(invocation_call["kernels"][0]))
+    invocation_call["kernel_launch_count"] += 1
+    repeated_initial["kernel_coverage"]["records"][0]["kernel_count"] += 1
+    repeated_initial["kernel_coverage"]["records"][0]["assigned_kernel_count"] += 1
+    repeated[0].write_text(json.dumps(repeated_initial), encoding="utf-8")
+    with pytest.raises(ValueError, match="invocation stages are unstable"):
+        build_ncu_plan(config, primary, repeated)
 
 
 def test_ncu_runner_rejects_early_termination_options() -> None:
@@ -345,7 +402,8 @@ def test_ncu_job_binding_restores_exact_planned_launch_identity(
     root = Path(__file__).resolve().parents[1]
     config = NcuPlanConfig.load(root / "configs/profiling/r2_gaussian_chest_ncu.yaml")
     campaign = GpuProfileCampaign.load(config.campaign)
-    plan = build_ncu_plan(config, _nsys_plan_profiles(tmp_path, campaign))
+    paths = _nsys_plan_profiles(tmp_path, campaign)
+    plan = build_ncu_plan(config, paths, paths)
     job = plan["capture_groups"][0]
     metrics = {
         "dram_read_bytes": 64.0, "dram_write_bytes": 32.0,
@@ -393,13 +451,119 @@ def test_ncu_job_binding_restores_exact_planned_launch_identity(
     )
     assert invalid["status"] == "failed_preflight"
     assert "ncu_job_run_identity_invalid" in invalid["binding_reasons"]
+    stage_profile["run_identity"]["process_id"] = 123
+    raw_profile["launches"].append({
+        **raw_profile["launches"][0], "launch_id": "unexpected",
+    })
+    mismatched = bind_ncu_profile_to_plan(
+        raw_profile, plan, job["job_index"], stage_profile,
+    )
+    assert mismatched["status"] == "failed_preflight"
+    assert len(mismatched["launches"]) == len(raw_profile["launches"])
+    assert "ncu_job_launch_multiplicity_mismatch" in mismatched["binding_reasons"]
+
+
+def test_ncu_range_job_reanchors_stable_signatures_after_multiplicity_change(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    base = NcuPlanConfig.load(root / "configs/profiling/r2_gaussian_chest_ncu.yaml")
+    config = replace(base, range_capture_stages=("projection_forward",))
+    campaign = GpuProfileCampaign.load(config.campaign)
+    paths = _nsys_plan_profiles(tmp_path, campaign)
+    plan = build_ncu_plan(config, paths, paths)
+    job = next(
+        group for group in plan["capture_groups"]
+        if group["capture_mode"] == "nvtx_ranges"
+    )
+    assert "--kernel-id" not in job["ncu_arguments"]
+    assert "--nvtx-include" in job["ncu_arguments"]
+    assert all(
+        "--nvtx-exclude" in group["ncu_arguments"]
+        for group in plan["capture_groups"]
+        if group["capture_mode"] == "kernel_invocations"
+    )
+    metrics = {
+        "dram_read_bytes": 64.0, "dram_write_bytes": 32.0,
+        "fp32_ffma": 10.0, "fp32_fadd": 4.0, "fp32_fmul": 2.0,
+        "xu_instructions": 8.0, "atomic_requests": 3.0,
+    }
+    raw_launches = [{
+        "stage": launch["stage"], "iteration": launch["iteration"],
+        "call_index": launch["call_index"], "launch_id": str(index),
+        "kernel_name": launch["kernel_name"], "grid_size": launch["grid"],
+        "block_size": launch["block"],
+        "kernel_ordinal_in_call": index + 1,
+        "kernel_name_ordinal_in_call": index + 1,
+        "metrics": metrics,
+    } for index, launch in enumerate(job["expected_launches"])]
+    repeated = next(
+        launch for launch in raw_launches
+        if launch["iteration"] == 1
+    )
+    raw_launches.insert(1, {**repeated, "launch_id": "dynamic-extra"})
+    raw_profile = {
+        "status": "passed", "incomplete_launches": [], "launches": raw_launches,
+        "run_identity": {
+            "status": "passed", "process_ids": [123],
+            "profiling_campaign_sha256": plan["campaign"]["sha256"],
+        },
+    }
+    stage_profile = {
+        "status": "passed",
+        "iteration_ranges": [
+            {"start": value, "end": value}
+            for value in plan["coverage"]["representative_iterations"]
+        ],
+        "run_identity": {
+            "process_id": 123, "cuda_profiler_api_control": True,
+            "profiling_campaign": {
+                "campaign_sha256": plan["campaign"]["sha256"],
+                "profile_mode": "representative", "profile_tool": "ncu",
+            },
+        },
+    }
+    result = bind_ncu_profile_to_plan(
+        raw_profile, plan, job["job_index"], stage_profile,
+    )
+    assert result["status"] == "passed"
+    assert len(result["launches"]) == len(raw_launches)
+    assert sum(
+        launch["required_sample"] for launch in result["launches"]
+    ) == job["required_sample_count"]
+    profiles = [result]
+    for group in plan["capture_groups"]:
+        if group["capture_mode"] != "kernel_invocations":
+            continue
+        profiles.append({
+            "status": "passed",
+            "run_identity": {
+                "status": "passed",
+                "profiling_campaign_sha256": plan["campaign"]["sha256"],
+                "ncu_plan_content_sha256": plan["content_sha256"],
+                "capture_job_index": group["job_index"],
+            },
+            "incomplete_launches": [],
+            "launches": [{
+                **expected,
+                "grid_size": expected["grid"], "block_size": expected["block"],
+                "launch_id": expected["selected_launch_id"], "metrics": metrics,
+            } for expected in group["expected_launches"]],
+        })
+    evidence = validate_ncu_measurement(plan, profiles)
+    assert evidence["status"] == "passed"
+    assert (
+        evidence["observed_profiled_launch_count"]
+        > evidence["observed_selected_launch_count"]
+    )
 
 
 def test_ncu_measurement_validator_requires_exact_call_sequences(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[1]
     config = NcuPlanConfig.load(root / "configs/profiling/r2_gaussian_chest_ncu.yaml")
     campaign = GpuProfileCampaign.load(config.campaign)
-    plan = build_ncu_plan(config, _nsys_plan_profiles(tmp_path, campaign))
+    paths = _nsys_plan_profiles(tmp_path, campaign)
+    plan = build_ncu_plan(config, paths, paths)
     metrics = {
         "dram_read_bytes": 64.0, "dram_write_bytes": 32.0,
         "fp32_ffma": 10.0, "fp32_fadd": 4.0, "fp32_fmul": 2.0,
