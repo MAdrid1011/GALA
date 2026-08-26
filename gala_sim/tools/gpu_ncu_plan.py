@@ -15,8 +15,8 @@ from gala_sim.identity import canonical_json, sha256_bytes, sha256_file
 from gala_sim.tools.gpu_profile_campaign import GpuProfileCampaign
 
 
-CONFIG_SCHEMA_VERSION = "gala-ncu-launch-signature-config-v1"
-PLAN_SCHEMA_VERSION = "gala-ncu-launch-signature-plan-v1"
+CONFIG_SCHEMA_VERSION = "gala-ncu-launch-signature-config-v2"
+PLAN_SCHEMA_VERSION = "gala-ncu-launch-signature-plan-v2"
 _SUPPORTED_SIGNATURE_FIELDS = ("stage", "kernel_name", "grid", "block")
 _SUPPORTED_OCCURRENCES = ("first", "middle", "last")
 _SUPPORTED_NCU_OPTIONS = {
@@ -25,6 +25,7 @@ _SUPPORTED_NCU_OPTIONS = {
     "clock_control": {"base", "none"},
     "kernel_name_base": {"demangled"},
 }
+_SUPPORTED_NCU_SECTIONS = {"SourceCounters"}
 
 
 @dataclass(frozen=True)
@@ -36,6 +37,7 @@ class NcuPlanConfig:
     counter_scope: str
     validation_occurrences: tuple[str, ...]
     metrics: tuple[str, ...]
+    sections: tuple[str, ...]
     ncu_options: Mapping[str, str]
 
     @classmethod
@@ -58,6 +60,7 @@ class NcuPlanConfig:
                 str(value) for value in document.get("validation_occurrences", ())
             ),
             metrics=tuple(str(value) for value in document.get("metrics", ())),
+            sections=tuple(str(value) for value in document.get("sections", ())),
             ncu_options={str(name): str(value) for name, value in options.items()},
         )
         config._validate()
@@ -78,6 +81,12 @@ class NcuPlanConfig:
             raise ValueError("NCU validation occurrence policy is invalid")
         if not self.metrics or len(set(self.metrics)) != len(self.metrics):
             raise ValueError("NCU metrics must be nonempty and unique")
+        if (
+            not self.sections
+            or len(set(self.sections)) != len(self.sections)
+            or any(value not in _SUPPORTED_NCU_SECTIONS for value in self.sections)
+        ):
+            raise ValueError("NCU sections are incomplete or unsupported")
         if set(self.ncu_options) != set(_SUPPORTED_NCU_OPTIONS):
             raise ValueError("NCU tool options are incomplete or unsupported")
         for name, allowed in _SUPPORTED_NCU_OPTIONS.items():
@@ -345,6 +354,11 @@ def build_ncu_plan(
                 "--cache-control", config.ncu_options["cache_control"],
                 "--clock-control", config.ncu_options["clock_control"],
                 "--kernel-name-base", config.ncu_options["kernel_name_base"],
+                *[
+                    argument
+                    for section in config.sections
+                    for argument in ("--section", section)
+                ],
                 "--metrics", ",".join(config.metrics),
                 *[
                     argument
@@ -404,6 +418,11 @@ def build_ncu_plan(
                 "--cache-control", config.ncu_options["cache_control"],
                 "--clock-control", config.ncu_options["clock_control"],
                 "--kernel-name-base", config.ncu_options["kernel_name_base"],
+                *[
+                    argument
+                    for section in config.sections
+                    for argument in ("--section", section)
+                ],
                 "--metrics", ",".join(config.metrics),
             ],
             "nvtx_filter_trailing_slash_required": True,

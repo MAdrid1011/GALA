@@ -282,6 +282,12 @@ def test_ncu_plan_preserves_multiplicity_and_selects_validation_occurrences(
         and "--kill" not in group["ncu_arguments"]
         for group in result["capture_groups"]
     )
+    assert all(
+        "--section" in group["ncu_arguments"]
+        and group["ncu_arguments"][group["ncu_arguments"].index("--section") + 1]
+        == "SourceCounters"
+        for group in result["capture_groups"]
+    )
 
 
 def test_ncu_plan_rejects_inexact_nsys_coverage(tmp_path: Path) -> None:
