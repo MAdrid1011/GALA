@@ -1,0 +1,5 @@
+# GPU profiler artifacts
+
+`python -m gala_sim.tools.gpu_profile_artifacts nsys --input <sqlite> --output <json>` maps detailed `gala_stage` NVTX ranges to CUDA kernels and copies. It also checks every kernel within each outer `gala_iteration:training` range and reports whether it belongs to exactly one detailed stage.
+
+The `ncu` subcommand parses explicitly named DRAM, FP32, XU, and atomic metrics. A push/pop NVTX filter must include the trailing slash, for example `--nvtx-include 'gala_stage:projection_forward/'`; omitting it profiles no kernels with NCU 2022.4. Export SourceCounters as CSV and pass it to the `sass` subcommand with the parsed NCU JSON to classify dynamically executed SASS opcodes. Unclassified XU instructions and unsupported MUFU or atomic semantics keep the affected stage ineligible for formal weights instead of assigning an assumed neighboring operation.

@@ -1,0 +1,9 @@
+schema_version: gala-gpu-calibration-config-v1
+dtype: float32
+batch_sizes: [1, 32, 128, 512, 2048, 8192, 32768, 131072, 524288, 2097152, 8388608, 16777216]
+input_min: 0.5
+input_max: 1.5
+warmup_repetitions: 10
+measure_repetitions: 25
+launches_per_measurement: 256
+atomic_contention_divisor: 32
