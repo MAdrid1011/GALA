@@ -573,13 +573,21 @@ def validate_ncu_measurement(
     for key, values in sorted(metrics_by_signature.items()):
         unique = {value for value in values}
         identifier = f"{key[0]}:{key[1]}"
+        expected_count = expected_signature_counts.get(key)
+        exact_observations = expected_count is not None and len(values) == expected_count
         agreement[identifier] = {
             "iteration": key[0],
             "signature_id": key[1],
             "observed_launch_count": len(values),
             "counter_values_identical": len(unique) == 1,
+            "aggregation_mode": (
+                "exact_observed_launches" if exact_observations else "signature_reuse"
+            ),
         }
-        if len(unique) != 1:
+        # A repeated signature is only reusable when counters agree.  If every
+        # expected ordinal was actually measured, differing counters are valid
+        # workload variation and must be summed per launch instead of reused.
+        if not exact_observations and len(unique) != 1:
             reasons.append(f"counter_reuse_disagreement:{key[0]}:{key[1]}")
 
     aggregated_signatures = []
@@ -601,9 +609,17 @@ def validate_ncu_measurement(
                 multiplicity = int(representative["multiplicity"])
                 samples = metrics_by_signature[(iteration, signature_id)]
                 measured = dict(samples[0])
-                totals = {
-                    name: value * multiplicity for name, value in measured.items()
-                }
+                if len(samples) == multiplicity:
+                    totals: dict[str, float] = defaultdict(float)
+                    for sample in samples:
+                        for name, value in sample:
+                            totals[name] += value
+                    aggregation_mode = "exact_observed_launches"
+                else:
+                    totals = defaultdict(float, {
+                        name: value * multiplicity for name, value in measured.items()
+                    })
+                    aggregation_mode = "signature_reuse"
                 for name, value in totals.items():
                     stage_metrics[stage][name] += value
                 stage_launches[stage] += multiplicity
@@ -618,7 +634,8 @@ def validate_ncu_measurement(
                     "multiplicity": multiplicity,
                     "measured_sample_count": len(samples),
                     "measured_metrics_per_launch": measured,
-                    "multiplicity_expanded_metrics": totals,
+                    "multiplicity_expanded_metrics": dict(totals),
+                    "aggregation_mode": aggregation_mode,
                 })
     stage_summaries = {}
     for stage, totals in sorted(stage_metrics.items()):

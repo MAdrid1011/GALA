@@ -356,11 +356,15 @@ def test_ncu_measurement_validator_requires_exact_call_sequences(tmp_path: Path)
     )
     assert repeated is not None
     launches[repeated]["metrics"] = {**metrics, "dram_read_bytes": 65.0}
-    provisional = validate_ncu_measurement(plan, [profile])
-    assert provisional["status"] == "provisional_ncu_evidence"
-    assert any(
+    measured = validate_ncu_measurement(plan, [profile])
+    assert measured["status"] == "passed"
+    assert not any(
         reason.startswith("counter_reuse_disagreement:")
-        for reason in provisional["reasons"]
+        for reason in measured["reasons"]
+    )
+    assert any(
+        item["aggregation_mode"] == "exact_observed_launches"
+        for item in measured["aggregated_signatures"]
     )
 
 
