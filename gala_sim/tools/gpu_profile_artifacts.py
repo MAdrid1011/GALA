@@ -284,12 +284,17 @@ def _shape_product(shape: tuple[int, int, int]) -> int:
 def parse_ncu_csv(path: Path) -> dict[str, Any]:
     path = path.resolve()
     launches: dict[tuple[str, int, int, str, str], dict[str, Any]] = defaultdict(dict)
+    campaign_hashes: set[str] = set()
     for row in _ncu_rows(path):
         range_column = next((key for key in row if "Push/Pop_Range" in key), None)
-        identity = _stage_identity(row.get(range_column, "") if range_column else "")
+        range_value = row.get(range_column, "") if range_column else ""
+        identity = _stage_identity(range_value)
         metric = row.get("Metric Name", "")
         if identity is None or metric not in _NCU_METRICS:
             continue
+        campaign_match = _CAMPAIGN_PATTERN.search(range_value)
+        if campaign_match is not None:
+            campaign_hashes.add(campaign_match.group("sha256"))
         stage, iteration, call_index = identity
         kernel_name = row.get("Kernel Name", "")
         launch_id = row.get("ID", "")
@@ -307,6 +312,8 @@ def parse_ncu_csv(path: Path) -> dict[str, Any]:
     stage_threads: dict[str, list[int]] = defaultdict(list)
     incomplete_launches: list[dict[str, Any]] = []
     launch_records = []
+    call_kernel_ordinals: dict[tuple[str, int, int], int] = defaultdict(int)
+    call_name_ordinals: dict[tuple[str, int, int, str], int] = defaultdict(int)
     required_fields = set(_NCU_METRICS.values())
     for (stage, iteration, call_index, launch_id, kernel_name), values in launches.items():
         block, grid = values.pop("_shape")
@@ -328,12 +335,18 @@ def parse_ncu_csv(path: Path) -> dict[str, Any]:
         unclassified[stage] += xu
         threads_launched = _shape_product(block) * _shape_product(grid)
         stage_threads[stage].append(threads_launched)
+        call_key = (stage, iteration, call_index)
+        name_key = (*call_key, kernel_name)
+        call_kernel_ordinals[call_key] += 1
+        call_name_ordinals[name_key] += 1
         launch_records.append({
             "stage": stage,
             "iteration": iteration,
             "call_index": call_index,
             "launch_id": launch_id,
             "kernel_name": kernel_name,
+            "kernel_ordinal_in_call": call_kernel_ordinals[call_key],
+            "kernel_name_ordinal_in_call": call_name_ordinals[name_key],
             "block_size": list(block),
             "grid_size": list(grid),
             "threads_launched": threads_launched,
@@ -362,12 +375,23 @@ def parse_ncu_csv(path: Path) -> dict[str, Any]:
                 and not any(item["stage"] == stage for item in incomplete_launches)
             ),
         }
-    status = "passed" if launch_records and not incomplete_launches else "failed_preflight"
+    identity_status = "passed" if len(campaign_hashes) == 1 else "failed_preflight"
+    status = (
+        "passed"
+        if launch_records and not incomplete_launches and identity_status == "passed"
+        else "failed_preflight"
+    )
     return {
         "schema_version": NCU_SCHEMA_VERSION,
         "status": status,
         "source": str(path),
         "source_sha256": sha256_file(path),
+        "run_identity": {
+            "status": identity_status,
+            "profiling_campaign_sha256": (
+                next(iter(campaign_hashes)) if len(campaign_hashes) == 1 else None
+            ),
+        },
         "required_metric_names": list(_NCU_METRICS),
         "stage_summaries": summaries,
         "launches": launch_records,

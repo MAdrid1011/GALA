@@ -1,0 +1,7 @@
+# NCU launch-signature plan
+
+`python -m gala_sim.tools.gpu_ncu_plan --config <yaml> --nsys-profile <json> ... --output <json>` validates every frozen representative NSYS inventory and creates a measured-counter plan. After NCU runs, `python -m gala_sim.tools.gpu_ncu_plan --plan <plan.json> --ncu-profile <json> ... --output <evidence.json>` validates measured CSV-derived profiles against the exact call and signature plan.
+
+The signature retains stage, demangled kernel name, grid, and block. Multiplicity remains separate for every representative iteration. First, middle, and last observed occurrences are selected to test counter reuse; a signature may be multiplied by its exact NSYS multiplicity only after every planned sample is present and its counters agree. Selected occurrences are grouped into exact detailed NVTX call ranges so one continuous official training run per representative iteration can collect them. All launches in those selected calls are measured and retained as evidence; the plan never treats an unmeasured launch as measured. The generated NCU arguments do not use `--launch-count` or `--kill`: the official process must execute the complete training path, including backward, optimizer, collection, and final reconstruction. Every generated NCU NVTX filter includes the trailing slash required by NCU 2022.4.
+
+The plan is not performance evidence. It remains ineligible until counters, dynamic SASS semantics, local calibration, and AGX Orin calibration pass their gates.

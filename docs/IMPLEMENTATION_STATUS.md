@@ -60,7 +60,7 @@ R²-Gaussian 的官方 CUDA 扩展仍没有直接导出完整 CLAMP 事件缓冲
 
 ## 下一步入口条件
 
-1. 运行已冻结的完整 CUDA Event 与九窗口 NSYS/NCU campaign，并补齐 AGX Orin 校准向量；campaign 与双窗口 exact-kernel capture 已通过，但正式测量和步骤 2 仍未完整闭环。
+1. 运行已冻结的完整 CUDA Event 与九窗口 NSYS/NCU campaign，并补齐 AGX Orin 校准向量；完整 CUDA Event、九窗口 NSYS exact-kernel capture 和基于真实 inventory 的 NCU launch-signature plan 已通过结构门，但正式 NCU 计数、动态 SASS 完整分类和步骤 2 仍未完整闭环。计划记录 `GALA-runtime/records/r2_gaussian_chest_ncu_signature_plan_v1.json`（仓库外）绑定 campaign `75d3968373271d8b019f20279ab0aaf47d145fd1d337b02c16f0ce8384ae593d`，覆盖 `174421` 个 NSYS kernel，重建 `1173` 个全局签名、`2400` 个代表迭代签名，选择 `4515` 个 first/middle/last 校验样本；所有 NCU 作业必须继续执行完整官方训练，不得使用 `--launch-count` 或 `--kill` 提前终止。
 2. 冻结 `relation.seed_fifo_entries`、模块时序、trace chunk 容量和 `memory.ramulator_config_sha256` 等 pending hardware/timing/chunk 参数。
 3. 设计并运行正式完整 30k stream-only trace 获取策略；窗口 trace 只能作为 quick validation，不能替代正式 trace。
 4. 在完整真实 trace 上通过依赖、状态、释放和动态事件计数检查，再运行 `0000` Base ASIC 和两个受资源约束 Oracle。

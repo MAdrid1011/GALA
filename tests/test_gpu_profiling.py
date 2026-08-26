@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import csv
 import argparse
+import json
 from pathlib import Path
 import sqlite3
 
@@ -16,6 +17,10 @@ from gala_sim.tools.gpu_calibration import CalibrationConfig
 from gala_sim.tools.gpu_profile_artifacts import parse_ncu_csv, parse_nsys_sqlite
 from gala_sim.tools.gpu_profile_artifacts import classify_sass_csv
 from gala_sim.tools.gpu_profile_campaign import GpuProfileCampaign
+from gala_sim.tools.gpu_ncu_plan import (
+    NcuPlanConfig, build_ncu_plan, main as ncu_plan_main,
+    validate_ncu_measurement,
+)
 from gala_sim.adapters.stage_runner import _frozen_profile_identity, _profile_selection
 from gala_sim.tools.gpu_normalization import normalize_stage_profiles
 
@@ -199,6 +204,184 @@ def test_gpu_profile_campaign_evidence_requires_every_role() -> None:
     assert "missing_nsys_iteration:30000" in incomplete["reasons"]
 
 
+def _nsys_plan_profiles(tmp_path: Path, campaign: GpuProfileCampaign) -> list[Path]:
+    paths = []
+    campaign_sha256 = campaign.manifest()["campaign_sha256"]
+    stages = tuple(campaign.required_stage_roles)
+    for item in campaign.representatives:
+        calls = []
+        kernel_count = 0
+        call_index = 1
+        for stage in stages:
+            repeat = 5 if item.iteration == 1 and stage == "projection_forward" else 1
+            kernels = [{
+                "name": f"{stage}_kernel", "grid": [4, 1, 1],
+                "block": [32, 1, 1], "duration_ms": 0.1,
+            } for _ in range(repeat)]
+            calls.append({
+                "stage": stage, "iteration": item.iteration,
+                "call_index": call_index, "kernel_launch_count": len(kernels),
+                "kernels": kernels,
+            })
+            kernel_count += len(kernels)
+            call_index += 1
+        profile = {
+            "schema_version": "fixture", "status": "passed",
+            "source": str(tmp_path / f"profile.{item.iteration}.sqlite"),
+            "source_sha256": str(item.iteration) * 64,
+            "run_identity": {
+                "status": "passed",
+                "profiling_campaign_sha256": campaign_sha256,
+            },
+            "kernel_coverage": {"status": "complete", "records": [{
+                "iteration": item.iteration, "kernel_count": kernel_count,
+                "assigned_kernel_count": kernel_count, "unassigned_kernel_count": 0,
+                "multiply_assigned_kernel_count": 0,
+            }]},
+            "stage_calls": calls,
+        }
+        path = tmp_path / f"inventory.{item.iteration}.json"
+        path.write_text(json.dumps(profile), encoding="utf-8")
+        paths.append(path)
+    return paths
+
+
+def test_ncu_plan_preserves_multiplicity_and_selects_validation_occurrences(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = NcuPlanConfig.load(
+        root / "configs/profiling/r2_gaussian_chest_ncu.yaml"
+    )
+    campaign = GpuProfileCampaign.load(config.campaign)
+    paths = _nsys_plan_profiles(tmp_path, campaign)
+    result = build_ncu_plan(config, paths)
+    signature = next(
+        item for item in result["signatures"]
+        if item["stage"] == "projection_forward"
+    )
+    initial = next(
+        item for item in signature["representative_iterations"]
+        if item["iteration"] == 1
+    )
+    assert result["status"] == "planned"
+    assert result["formal_performance_eligible"] is False
+    assert initial["multiplicity"] == 5
+    assert [
+        item["signature_occurrence_ordinal"] for item in initial["required_samples"]
+    ] == [1, 3, 5]
+    assert result["coverage"]["observed_kernel_launch_count"] == 121
+    assert result["coverage"]["representative_iteration_signature_count"] == 117
+    assert all(
+        include["filter"].endswith("/")
+        for group in result["capture_groups"] for include in group["nvtx_includes"]
+    )
+    assert all(
+        group["ncu_arguments"][-2:] == ["--check-exit-code", "1"]
+        and "--launch-count" not in group["ncu_arguments"]
+        and "--kill" not in group["ncu_arguments"]
+        for group in result["capture_groups"]
+    )
+
+
+def test_ncu_plan_rejects_inexact_nsys_coverage(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = NcuPlanConfig.load(
+        root / "configs/profiling/r2_gaussian_chest_ncu.yaml"
+    )
+    campaign = GpuProfileCampaign.load(config.campaign)
+    paths = _nsys_plan_profiles(tmp_path, campaign)
+    profile = json.loads(paths[0].read_text(encoding="utf-8"))
+    profile["kernel_coverage"]["records"][0]["assigned_kernel_count"] -= 1
+    paths[0].write_text(json.dumps(profile), encoding="utf-8")
+    with pytest.raises(ValueError, match="exactly once"):
+        build_ncu_plan(config, paths)
+
+
+def test_ncu_measurement_validator_requires_exact_call_sequences(tmp_path: Path) -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = NcuPlanConfig.load(root / "configs/profiling/r2_gaussian_chest_ncu.yaml")
+    campaign = GpuProfileCampaign.load(config.campaign)
+    plan = build_ncu_plan(config, _nsys_plan_profiles(tmp_path, campaign))
+    metrics = {
+        "dram_read_bytes": 64.0, "dram_write_bytes": 32.0,
+        "fp32_ffma": 10.0, "fp32_fadd": 4.0, "fp32_fmul": 2.0,
+        "xu_instructions": 8.0, "atomic_requests": 3.0,
+    }
+    launches = []
+    launch_id = 0
+    for group in plan["capture_groups"]:
+        iteration = int(group["iteration"])
+        for call in group["nvtx_includes"]:
+            for ordinal, signature in enumerate(call["kernel_sequence"], start=1):
+                launch_id += 1
+                launches.append({
+                    "stage": signature["stage"], "iteration": iteration,
+                    "call_index": int(call["call_index"]), "launch_id": str(launch_id),
+                    "kernel_name": signature["kernel_name"],
+                    "grid_size": signature["grid"], "block_size": signature["block"],
+                    "kernel_ordinal_in_call": ordinal,
+                    "metrics": metrics,
+                })
+    profile = {
+        "status": "passed",
+        "run_identity": {
+            "status": "passed", "profiling_campaign_sha256": plan["campaign"]["sha256"],
+        },
+        "incomplete_launches": [], "launches": launches,
+    }
+    result = validate_ncu_measurement(plan, [profile])
+    assert result["status"] == "passed"
+    assert result["exact_call_coverage"] is True
+    assert result["counter_reuse_gate"]["status"] == "passed"
+    assert sum(
+        item["multiplicity"] for item in result["aggregated_signatures"]
+    ) == plan["coverage"]["observed_kernel_launch_count"]
+    assert sum(
+        item["kernel_launch_count"] for item in result["stage_summaries"].values()
+    ) == plan["coverage"]["observed_kernel_launch_count"]
+    assert all(
+        item["weight_eligible"] is False
+        for item in result["stage_summaries"].values()
+    )
+    tampered_plan = {**plan, "content_sha256": "0" * 64}
+    invalid_plan = validate_ncu_measurement(tampered_plan, [profile])
+    assert "ncu_plan_identity_invalid" in invalid_plan["reasons"]
+    repeated = next(
+        (index for index in range(1, len(launches))
+         if launches[index]["iteration"] == launches[index - 1]["iteration"]
+         and launches[index]["stage"] == launches[index - 1]["stage"]
+         and launches[index]["kernel_name"] == launches[index - 1]["kernel_name"]),
+        None,
+    )
+    assert repeated is not None
+    launches[repeated]["metrics"] = {**metrics, "dram_read_bytes": 65.0}
+    provisional = validate_ncu_measurement(plan, [profile])
+    assert provisional["status"] == "provisional_ncu_evidence"
+    assert any(
+        reason.startswith("counter_reuse_disagreement:")
+        for reason in provisional["reasons"]
+    )
+
+
+def test_ncu_plan_validation_cli_returns_nonzero_for_provisional(
+    tmp_path: Path,
+) -> None:
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps({
+        "schema_version": "invalid", "content_sha256": "0" * 64,
+        "campaign": {"sha256": "a" * 64}, "capture_groups": [],
+    }), encoding="utf-8")
+    profile_path = tmp_path / "profile.json"
+    profile_path.write_text(json.dumps({
+        "status": "failed_preflight", "launches": [], "incomplete_launches": [],
+    }), encoding="utf-8")
+    assert ncu_plan_main([
+        "--plan", str(plan_path), "--ncu-profile", str(profile_path),
+        "--output", str(tmp_path / "evidence.json"),
+    ]) == 2
+
+
 def test_frozen_profile_identity_allows_only_model_output_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -326,7 +509,10 @@ def test_ncu_stage_parser_builds_counter_inputs(tmp_path: Path) -> None:
         for name, value in metrics.items():
             writer.writerow({
                 "ID": "0",
-                    range_column: "gala_stage:projection_forward:iteration=600:call=1",
+                    range_column: (
+                        "gala_stage:projection_forward:iteration=600:call=1:campaign="
+                        + "a" * 64
+                    ),
                     "Kernel Name": "exp_kernel",
                     "Block Size": "(32, 1, 1)",
                     "Grid Size": "(4, 1, 1)",
@@ -342,6 +528,8 @@ def test_ncu_stage_parser_builds_counter_inputs(tmp_path: Path) -> None:
     assert stage["atomic_requests"] == 3
     assert stage["unclassified_transcendental_operations"] == 8
     assert stage["weight_eligible"] is False
+    assert result["run_identity"]["profiling_campaign_sha256"] == "a" * 64
+    assert result["launches"][0]["kernel_ordinal_in_call"] == 1
 
 
 def test_ncu_sass_parser_keeps_dynamic_opcode_evidence_provisional(tmp_path: Path) -> None:
