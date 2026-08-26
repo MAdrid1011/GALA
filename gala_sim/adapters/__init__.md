@@ -1,6 +1,6 @@
 # adapters/__init__.py
 
-导出模型适配器合同、Chest 数据清单、R²-Gaussian 追踪适配器、native-reference 运行器和带 NVTX 边界的阶段 GPU profiler。
+导出模型适配器合同、Chest 数据清单、R²-Gaussian 追踪适配器、native-reference 运行器和带 NVTX/CUDA Profiler API 边界的阶段 GPU profiler。
 
 ## External Interfaces
 

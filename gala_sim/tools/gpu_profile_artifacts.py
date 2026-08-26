@@ -23,6 +23,7 @@ _STAGE_PATTERN = re.compile(
 _ITERATION_PATTERN = re.compile(
     r"gala_iteration:training:iteration=(?P<iteration>[0-9]+):call=(?P<call>[0-9]+)"
 )
+_CAMPAIGN_PATTERN = re.compile(r":campaign=(?P<sha256>[0-9a-f]{64})(?:$|:)")
 _NCU_METRICS = {
     "dram__bytes_read.sum": "dram_read_bytes",
     "dram__bytes_write.sum": "dram_write_bytes",
@@ -65,6 +66,7 @@ def parse_nsys_sqlite(path: Path) -> dict[str, Any]:
             if identity is not None:
                 ranges.append((identity, int(row["start"]), int(row["end"])))
         iteration_ranges = []
+        campaign_hashes: set[str] = set()
         for row in connection.execute(
             "SELECT start, end, text FROM NVTX_EVENTS "
             "WHERE text LIKE 'gala_iteration:training:iteration=%' "
@@ -72,6 +74,9 @@ def parse_nsys_sqlite(path: Path) -> dict[str, Any]:
         ):
             match = _ITERATION_PATTERN.search(str(row["text"]))
             if match is not None:
+                campaign_match = _CAMPAIGN_PATTERN.search(str(row["text"]))
+                if campaign_match is not None:
+                    campaign_hashes.add(campaign_match.group("sha256"))
                 iteration_ranges.append((
                     int(match.group("iteration")), int(match.group("call")),
                     int(row["start"]), int(row["end"]),
@@ -223,11 +228,18 @@ def parse_nsys_sqlite(path: Path) -> dict[str, Any]:
             "unassigned_kernels": unassigned_kernels,
             "multiply_assigned_kernels": multiply_assigned_kernels,
         }
+        identity_status = "passed" if len(campaign_hashes) <= 1 else "failed_preflight"
         return {
             "schema_version": NSYS_SCHEMA_VERSION,
-            "status": "passed" if calls else "failed_preflight",
+            "status": "passed" if calls and identity_status == "passed" else "failed_preflight",
             "source": str(path),
             "source_sha256": sha256_file(path),
+            "run_identity": {
+                "status": identity_status,
+                "profiling_campaign_sha256": (
+                    next(iter(campaign_hashes)) if len(campaign_hashes) == 1 else None
+                ),
+            },
             "stage_summaries": summaries,
             "stage_calls": calls,
             "kernel_coverage": kernel_coverage,

@@ -51,6 +51,7 @@ class GpuStageProfileSession:
     output: Path
     iteration_ranges: tuple[IterationRange, ...]
     run_identity: dict[str, Any]
+    control_cuda_profiler: bool = False
     _patches: list[tuple[Any, str, Any]] = field(default_factory=list, init=False)
     _pending: list[_PendingMeasurement] = field(default_factory=list, init=False)
     _records: list[dict[str, Any]] = field(default_factory=list, init=False)
@@ -64,6 +65,7 @@ class GpuStageProfileSession:
     _overhead_start: Any | None = field(default=None, init=False)
     _overhead_call_index: int = field(default=0, init=False)
     _stage_depth: int = field(default=0, init=False)
+    _cuda_profiler_active: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         if not self.iteration_ranges:
@@ -120,6 +122,8 @@ class GpuStageProfileSession:
         self._patch(torch.cuda, "synchronize", self._wrap_synchronize)
 
     def restore(self) -> None:
+        if self._cuda_profiler_active:
+            self._stop_cuda_profiler()
         while self._patches:
             owner, name, original = self._patches.pop()
             setattr(owner, name, original)
@@ -145,6 +149,13 @@ class GpuStageProfileSession:
     def _selected(self) -> bool:
         return any(item.contains(self._current_iteration) for item in self.iteration_ranges)
 
+    def _campaign_label_suffix(self) -> str:
+        campaign = self.run_identity.get("profiling_campaign")
+        if not isinstance(campaign, dict):
+            return ""
+        digest = campaign.get("campaign_sha256")
+        return f":campaign={digest}" if isinstance(digest, str) else ""
+
     def _measure(self, stage: str, call: Callable[[], Any]) -> Any:
         if not self._selected():
             return call()
@@ -158,6 +169,7 @@ class GpuStageProfileSession:
         stable_label = f"gala_stage:{stage}"
         detailed_label = (
             f"gala_stage:{stage}:iteration={self._current_iteration}:call={call_index}"
+            f"{self._campaign_label_suffix()}"
         )
         start.record()
         torch.cuda.nvtx.range_push(stable_label)
@@ -232,6 +244,8 @@ class GpuStageProfileSession:
     def _start_iteration(self) -> None:
         if not self._selected():
             return
+        if self.control_cuda_profiler:
+            self._start_cuda_profiler()
         self._iteration_call_index += 1
         self._iteration_start = self._torch.cuda.Event(enable_timing=True)
         self._iteration_start.record()
@@ -239,6 +253,7 @@ class GpuStageProfileSession:
         self._torch.cuda.nvtx.range_push(
             f"gala_iteration:training:iteration={self._current_iteration}:"
             f"call={self._iteration_call_index}"
+            f"{self._campaign_label_suffix()}"
         )
         self._start_overhead()
 
@@ -258,6 +273,24 @@ class GpuStageProfileSession:
             end=end,
         ))
         self._iteration_start = None
+        if self.control_cuda_profiler:
+            self._stop_cuda_profiler()
+
+    def _start_cuda_profiler(self) -> None:
+        if self._cuda_profiler_active:
+            raise RuntimeError("CUDA profiler capture range is already active")
+        status = int(self._torch.cuda.cudart().cudaProfilerStart())
+        if status != 0:
+            raise RuntimeError(f"cudaProfilerStart failed with status {status}")
+        self._cuda_profiler_active = True
+
+    def _stop_cuda_profiler(self) -> None:
+        if not self._cuda_profiler_active:
+            return
+        status = int(self._torch.cuda.cudart().cudaProfilerStop())
+        if status != 0:
+            raise RuntimeError(f"cudaProfilerStop failed with status {status}")
+        self._cuda_profiler_active = False
 
     def _start_overhead(self) -> None:
         if self._iteration_start is None or self._overhead_start is not None:
@@ -269,6 +302,7 @@ class GpuStageProfileSession:
         self._torch.cuda.nvtx.range_push(
             f"gala_stage:iteration_overhead:iteration={self._current_iteration}:"
             f"call={self._overhead_call_index}"
+            f"{self._campaign_label_suffix()}"
         )
 
     def _close_overhead(self) -> None:
@@ -370,9 +404,28 @@ class GpuStageProfileSession:
                 ) else "partial"
             )
         coverage["complete"] = coverage["status"] == "complete"
+        observed_iterations = set(iteration_totals)
+        requested_iteration_count = sum(
+            item.end - item.start + 1 for item in self.iteration_ranges
+        )
+        missing_iterations = [
+            iteration
+            for item in self.iteration_ranges
+            for iteration in range(item.start, item.end + 1)
+            if iteration not in observed_iterations
+        ]
+        requested_coverage = {
+            "status": "complete" if not missing_iterations else "incomplete",
+            "requested_iteration_count": requested_iteration_count,
+            "observed_iteration_count": requested_iteration_count - len(missing_iterations),
+            "missing_iterations": missing_iterations,
+        }
         return {
             "schema_version": STAGE_SCHEMA_VERSION,
-            "status": "passed",
+            "status": (
+                "passed" if requested_coverage["status"] == "complete"
+                else "failed_preflight"
+            ),
             "result_scope": "gpu_stage_characterization",
             "formal_performance_eligible": False,
             "quality_eligible": False,
@@ -384,6 +437,7 @@ class GpuStageProfileSession:
             "stage_summaries": summaries,
             "stage_records": self._records,
             "stage_coverage": coverage,
+            "requested_iteration_coverage": requested_coverage,
             "kernel_inventory": {
                 "status": "pending_nsys_or_ncu",
                 "required_fields": [

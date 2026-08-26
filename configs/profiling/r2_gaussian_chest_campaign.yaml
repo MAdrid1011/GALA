@@ -1,0 +1,28 @@
+schema_version: gala-gpu-profiling-campaign-v1
+training_campaign: configs/campaigns/r2_gaussian_chest.yaml
+calibration_config: configs/profiling/r2_gaussian_gpu.yaml
+cuda_event_iteration_ranges: ["1:30000"]
+representative_iterations:
+  - {iteration: 1, roles: [initial, periodic_evaluation]}
+  - {iteration: 499, roles: [pre_densification]}
+  - {iteration: 600, roles: [early_densification, collection]}
+  - {iteration: 5000, roles: [early_densification, collection, periodic_evaluation]}
+  - {iteration: 10000, roles: [late_densification, collection, periodic_evaluation]}
+  - {iteration: 14900, roles: [late_densification, collection]}
+  - {iteration: 15001, roles: [post_densification]}
+  - {iteration: 20000, roles: [post_densification, periodic_evaluation]}
+  - {iteration: 30000, roles: [post_densification, periodic_evaluation, final_reconstruction]}
+required_stage_roles:
+  projection_forward: [initial, pre_densification, early_densification, late_densification, post_densification]
+  projection_loss: [initial, pre_densification, early_densification, late_densification, post_densification]
+  volume_forward: [initial, pre_densification, early_densification, late_densification, post_densification]
+  volume_loss: [initial, pre_densification, early_densification, late_densification, post_densification]
+  backward: [initial, pre_densification, early_densification, late_densification, post_densification]
+  adaptive_control: [initial, pre_densification, early_densification, late_densification, post_densification]
+  optimizer: [initial, pre_densification, early_densification, late_densification, post_densification]
+  collection: [collection]
+  projection_evaluation: [periodic_evaluation]
+  volume_evaluation: [periodic_evaluation]
+  evaluation_metric: [periodic_evaluation]
+  reconstruction: [final_reconstruction]
+  iteration_overhead: [initial, pre_densification, early_densification, late_densification, post_densification]

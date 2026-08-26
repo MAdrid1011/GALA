@@ -39,6 +39,7 @@
 - 大型 raw-column 生命周期 pass 已实现当前版本、active/known Gaussian、cache read 闭合、gradient→optimizer commit 集合、update begin/end、Clone/Split/Prune lineage 和后继查询状态屏障检查。小型 raw trace 覆盖 optimizer、no-op optimizer、collection 及故障注入；真实一迭代 v9 的结构+生命周期全量回归耗时 `325.30 s`、峰值 RSS `8,803,612 KB`、进程 swap 0。该真实 trace 没有 optimizer/collection 事务，因此只证明无事务大规模回归；仓库外日志 SHA-256 为 `9d7638ba704efddbf02528a6777353a3f946de03b05ebfe464448814d3514721`，结构化记录 SHA-256 为 `6e67709cd45283dfcf8bf2836d4dae4f78301184d50325fb7732c5b77a652676`。
 - 官方 30,000 iteration native reference 已在通过 v3 preflight 后完成，记录位于 `GALA-runtime/records/r2_gaussian_chest_native_reference/`，状态为 `passed`。端到端 wall time 为 `1629.5491471290588 s`，TensorBoard iteration time 总和为 `1494400.0303459167 ms`，GPU 样本数 `1356`、利用率中位数 `96%`、峰值显存 `2043674624 bytes`；统一质量为 PSNR `35.200574854081545`、SSIM `0.9380215966065076`、LPIPS `0.08493900671601295`。manifest、status、quality、gpu_reference 的 SHA-256 分别为 `ddb3cfb6b2cfd95140e2957a5588005c0a52cc815a7f7cee3f48c21e1ac11c1e`、`2bfdc8988831355d70f7c383dbb65db4b181147711e9edf026a4263aa63de7fa`、`9be91364fb69e989191d567160a934f1445dc4977c9002bb969d43c19c82c5b5` 和 `519404be6acb02dd3f53382dc03a954af41a4f3300fe5403c3019d1ca462eb06`。该结果闭合了官方训练与质量，但阶段 kernel/访存权重和 AGX Orin 校准向量仍 pending。
 - 中间迭代 NSYS smoke 已使用 `iteration_overhead` 重新采集并导出；iteration 2 的 302 个 CUDA kernel 全部且唯一归属到详细 `gala_stage`，`kernel_coverage.status=complete`，未归属与多重归属均为 0。CUDA Event 的 0.1756 ms 边界残差只保留为诊断，不作为 kernel 覆盖 gate；归一化器现要求独立 NSYS exact-coverage 证据。
+- 正式 GPU profiling campaign 已版本化：CUDA Event 计时覆盖完整 `1:30000`，9 个离散代表迭代覆盖初始化、增密前、早/晚增密、增密后、全部五个评估点、collection 和最终重建。NSYS bounded capture 使用同一连续官方训练进程内的 CUDA Profiler API 边界；双窗口 smoke 分别导出 iteration 2/3，两个窗口均为 302/302 kernel 唯一归属，对应 inventory JSON SHA-256 为 `6136d7bde9c833531be64f5520106c4046d4131cc4cb24eb33360f0d14abe2ab` 和 `9d776592250482cef0e99da2ed9481b24c1ecc9b71cd97d10b7bf6ba414a367a`。仓库外 campaign manifest SHA-256 为 `0f11a8f558e4cb2a7f4db37bff3bdf47c29ec8d08255604fe4c248c2e6a39980`；runner 绑定 input-freeze，拒绝手工 range、训练参数漂移、源码/数据身份漂移和请求迭代未实际执行。
 - `600:601` 跨迭代真实窗口 trace 已完成 quick validation，结构化记录位于 `GALA-runtime/records/r2_gaussian_chest_trace_window_600_601.json`，SHA-256 为 `b80547658c5fbe4af69ae7864309fd5c97ed6563712a146316ecdba0ca59c947`。捕获包含 `872588146` 个事件、`1430920031` 条依赖、`589824` 个 query、`144911313` 条真实 relation，并覆盖一次 collection、clone/prune、optimizer/no-op optimizer、update begin/end 和后继 query 屏障；全量 validator 修复后 PASS。插桩与两次未插桩 601-iteration 运行的质量差异为 PSNR `-0.000180522587961 dB`、SSIM `-0.000003659142978`、LPIPS `-0.000018147627513`，低于冻结阈值；由于上游 backward CUDA 使用 `atomicAdd`，不宣称 bitwise identical。该窗口明确 `formal_performance_eligible=false`、`quality_eligible=false`，不能作为正式完整 trace、Base ASIC、Oracle、消融或论文结果。
 
 ## 当前入口
@@ -59,7 +60,7 @@ R²-Gaussian 的官方 CUDA 扩展仍没有直接导出完整 CLAMP 事件缓冲
 
 ## 下一步入口条件
 
-1. 补齐模型分阶段 GPU kernel/访存 profiling 与 AGX Orin 校准向量；中间迭代 exact-kernel coverage 已通过，但正式阶段代表性覆盖和步骤 2 仍未完整闭环。
+1. 运行已冻结的完整 CUDA Event 与九窗口 NSYS/NCU campaign，并补齐 AGX Orin 校准向量；campaign 与双窗口 exact-kernel capture 已通过，但正式测量和步骤 2 仍未完整闭环。
 2. 冻结 `relation.seed_fifo_entries`、模块时序、trace chunk 容量和 `memory.ramulator_config_sha256` 等 pending hardware/timing/chunk 参数。
 3. 设计并运行正式完整 30k stream-only trace 获取策略；窗口 trace 只能作为 quick validation，不能替代正式 trace。
 4. 在完整真实 trace 上通过依赖、状态、释放和动态事件计数检查，再运行 `0000` Base ASIC 和两个受资源约束 Oracle。
