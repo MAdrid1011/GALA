@@ -25,7 +25,7 @@ def load_buffer_decoder() -> Any:
     source = Path(__file__).with_name("_trace_buffers.cpp")
     if not source.is_file():
         raise FileNotFoundError(f"trace buffer decoder source is missing: {source}")
-    name = "gala_trace_buffers_v7"
+    name = "gala_trace_buffers_v8"
     try:
         from torch.utils.cpp_extension import get_default_build_root
         cache_root = Path(get_default_build_root())

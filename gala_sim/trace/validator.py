@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from collections import defaultdict
 from dataclasses import dataclass
+import tempfile
+import mmap
+
+import numpy as np
 
 from gala_sim.clamp.events import ModificationKind, PrimitiveKind, UpdateBeginKind
 
@@ -25,6 +29,15 @@ class TraceValidationReport:
 
 
 def validate_trace(trace: Trace) -> TraceValidationReport:
+    # Large raw-column captures are mmap-backed.  Keeping a Python set for
+    # every relation or forward event defeats the bounded trace writer, so
+    # validate them with chunked NumPy passes that retain the same dependency
+    # and audit invariants without materializing event IDs as Python objects.
+    if (
+        trace.metadata.get("trace_storage_format") == "raw_columns"
+        and trace.metadata.get("capture_audit_schema_version") == "gala-r2-capture-audit-v4"
+    ):
+        return _validate_large_capture_trace_streaming(trace)
     events = trace.events
     counts: dict[str, int] = defaultdict(int)
     relation_event_by_id: dict[int, int] = {}
@@ -375,6 +388,617 @@ def validate_trace(trace: Trace) -> TraceValidationReport:
         query_count=len({int(value) for value in events["query_id"] if int(value) >= 0}),
         gaussian_count=len({int(value) for value in events["gaussian_id"] if int(value) >= 0}),
         update_count=counts.get(PrimitiveKind.UPDATE_COMMIT.name, 0),
+    )
+
+
+def _validate_large_capture_trace_streaming(trace: Trace) -> TraceValidationReport:
+    """Validate a real raw capture with bounded chunks and a disk-backed relation index."""
+
+    source_events = trace.events
+    source_dependencies = trace.dependencies
+    if isinstance(source_events, np.memmap) and isinstance(source_dependencies, np.memmap):
+        events = np.memmap(
+            source_events.filename, dtype=source_events.dtype, mode="c",
+            shape=source_events.shape,
+        )
+        dependencies = np.memmap(
+            source_dependencies.filename, dtype=source_dependencies.dtype, mode="c",
+            shape=source_dependencies.shape,
+        )
+    else:
+        events = source_events
+        dependencies = source_dependencies
+    payload = trace.payload
+    audit = trace.metadata.get("capture_audit")
+    if not isinstance(audit, dict):
+        raise TraceValidationError("capture audit metadata is malformed")
+    relation_count = int(audit.get("cuda_valid_relations", -1))
+    query_count = int(audit.get("captured_logical_queries", -1))
+    initial_gaussian_count = trace.metadata.get("initial_gaussian_count")
+    if relation_count < 0 or query_count < 0:
+        raise TraceValidationError("capture audit relation/query totals are missing")
+    if not isinstance(initial_gaussian_count, int) or initial_gaussian_count < 0:
+        raise TraceValidationError("initial Gaussian count metadata is invalid")
+    if any(int(audit.get(name, 0)) for name in (
+        "optimizer_steps", "collection_modification_transactions",
+        "update_begin_events", "update_end_events", "collection_modification_events",
+    )):
+        raise TraceValidationError(
+            "large mmap validator requires a state-transition pass for update events"
+        )
+
+    event_count = int(events.size)
+    dependency_count = int(dependencies.size)
+    payload_count = int(payload.size)
+    chunk_size = max(1, int(trace.metadata.get("trace_chunk_events", 1)))
+    dependency_chunk_size = max(chunk_size, 1_048_576)
+    counts_array = np.zeros(len(PrimitiveKind) + 1, dtype=np.int64)
+    relation_query_counts = np.zeros(query_count, dtype=np.uint64)
+    query_close_seen = np.zeros(query_count, dtype=bool)
+    consumer_seen = np.zeros(query_count, dtype=bool)
+    backward_pending = np.zeros(relation_count, dtype=bool)
+    next_relation = {
+        kind: 0 for kind in (
+            PrimitiveKind.RELATION, PrimitiveKind.CACHE_REQUEST,
+            PrimitiveKind.CACHE_RETURN, PrimitiveKind.FORWARD,
+        )
+    }
+    relation_index_directory = None
+    filename = getattr(events, "filename", None)
+    if filename is not None:
+        relation_index_directory = str(__import__("pathlib").Path(filename).parent)
+    with tempfile.TemporaryFile(dir=relation_index_directory) as relation_index_file:
+        relation_event_ids = np.memmap(
+            relation_index_file, dtype=np.uint64, mode="w+", shape=(relation_count,)
+        )
+        relation_event_ids[:] = np.iinfo(np.uint64).max
+        start = 0
+        while start < event_count:
+            end = min(start + chunk_size, event_count)
+            rows = events[start:end]
+            begins = np.asarray(rows["dependency_begin"], dtype=np.int64)
+            dep_counts = np.asarray(rows["dependency_count"], dtype=np.int64)
+            dep_ends = begins + dep_counts
+            bounded_count = int(np.searchsorted(
+                dep_ends, int(begins[0]) + dependency_chunk_size, side="right"
+            ))
+            if bounded_count == 0:
+                bounded_count = 1
+            if bounded_count < rows.size:
+                end = start + bounded_count
+                rows = rows[:bounded_count]
+                begins = begins[:bounded_count]
+                dep_counts = dep_counts[:bounded_count]
+                dep_ends = dep_ends[:bounded_count]
+            event_ids = np.arange(start, end, dtype=np.uint64)
+            if not np.array_equal(rows["event_id"], event_ids):
+                mismatch = int(start + np.flatnonzero(rows["event_id"] != event_ids)[0])
+                raise TraceValidationError(
+                    f"event_id must be a dense capture-order sequence at event {mismatch}"
+                )
+            kinds = np.asarray(rows["primitive_kind"], dtype=np.int64)
+            if kinds.size and (int(kinds.min()) < 1 or int(kinds.max()) > len(PrimitiveKind)):
+                raise TraceValidationError(f"unknown primitive kind at event {start}")
+            counts_array += np.bincount(kinds, minlength=len(PrimitiveKind) + 1)
+            expected_begin = 0 if start == 0 else int(
+                events[start - 1]["dependency_begin"]
+                + events[start - 1]["dependency_count"]
+            )
+            if (
+                int(begins[0]) != expected_begin
+                or bool((begins < 0).any())
+                or bool((dep_ends > dependency_count).any())
+                or (begins.size > 1 and bool((begins[1:] != dep_ends[:-1]).any()))
+            ):
+                raise TraceValidationError(f"dependency range is invalid at event {start}")
+            flat_dependencies = np.asarray(
+                dependencies[int(begins[0]):int(dep_ends[-1])], dtype=np.uint64
+            )
+            if flat_dependencies.size:
+                owners = np.repeat(event_ids, dep_counts)
+                if bool((flat_dependencies >= owners).any()):
+                    raise TraceValidationError(
+                        f"dependency is not a prior event at event {start}"
+                    )
+            payload_begins = np.asarray(rows["payload_offset"], dtype=np.int64)
+            payload_counts = np.asarray(rows["payload_length"], dtype=np.int64)
+            payload_ends = payload_begins + payload_counts
+            expected_payload = 0 if start == 0 else int(
+                events[start - 1]["payload_offset"]
+                + events[start - 1]["payload_length"]
+            )
+            if (
+                int(payload_begins[0]) != expected_payload
+                or bool((payload_begins < 0).any())
+                or bool((payload_ends > payload_count).any())
+                or (
+                    payload_begins.size > 1
+                    and bool((payload_begins[1:] != payload_ends[:-1]).any())
+                )
+            ):
+                raise TraceValidationError(f"payload range is invalid at event {start}")
+
+            def positions(kind: PrimitiveKind) -> np.ndarray:
+                return np.flatnonzero(kinds == int(kind))
+
+            def one_dependency(pos: np.ndarray, owner: PrimitiveKind,
+                               expected: PrimitiveKind) -> np.ndarray:
+                if pos.size == 0:
+                    return np.empty(0, dtype=np.uint64)
+                if bool((dep_counts[pos] != 1).any()):
+                    raise TraceValidationError(
+                        f"{owner.name} must have exactly one dependency"
+                    )
+                deps = np.asarray(dependencies[begins[pos]], dtype=np.uint64)
+                if bool((events["primitive_kind"][deps] != int(expected)).any()):
+                    raise TraceValidationError(
+                        f"{owner.name} has an invalid dependency kind"
+                    )
+                return deps
+
+            candidate_pos = positions(PrimitiveKind.RELATION_CANDIDATE)
+            if candidate_pos.size:
+                gaussian_ids = np.asarray(rows["gaussian_id"][candidate_pos], dtype=np.int64)
+                if bool((gaussian_ids < 0).any()) or bool((gaussian_ids >= initial_gaussian_count).any()):
+                    raise TraceValidationError("relation candidate uses an inactive Gaussian")
+
+            relation_pos = positions(PrimitiveKind.RELATION)
+            relation_deps = one_dependency(
+                relation_pos, PrimitiveKind.RELATION, PrimitiveKind.RELATION_CANDIDATE
+            )
+            if relation_pos.size:
+                ids = np.asarray(rows["relation_id"][relation_pos], dtype=np.int64)
+                expected = np.arange(
+                    next_relation[PrimitiveKind.RELATION],
+                    next_relation[PrimitiveKind.RELATION] + ids.size,
+                    dtype=np.int64,
+                )
+                if not np.array_equal(ids, expected):
+                    raise TraceValidationError("relation_id is not dense in capture order")
+                queries = np.asarray(rows["query_id"][relation_pos], dtype=np.int64)
+                gaussians = np.asarray(rows["gaussian_id"][relation_pos], dtype=np.int64)
+                if (
+                    bool((queries < 0).any()) or bool((queries >= query_count).any())
+                    or bool((gaussians < 0).any())
+                    or bool((gaussians >= initial_gaussian_count).any())
+                ):
+                    raise TraceValidationError("relation IDs are outside the active domains")
+                if bool((events["gaussian_id"][relation_deps] != gaussians).any()):
+                    raise TraceValidationError("relation Gaussian does not match its candidate")
+                relation_event_ids[ids] = event_ids[relation_pos]
+                np.add.at(relation_query_counts, queries, 1)
+                next_relation[PrimitiveKind.RELATION] += int(ids.size)
+
+            close_pos = positions(PrimitiveKind.QUERY_CLOSE)
+            if close_pos.size:
+                queries = np.asarray(rows["query_id"][close_pos], dtype=np.int64)
+                if bool((queries < 0).any()) or bool((queries >= query_count).any()):
+                    raise TraceValidationError("query close ID is outside the captured domain")
+                if bool(query_close_seen[queries].any()):
+                    raise TraceValidationError("query has multiple close events")
+                if bool((dep_counts[close_pos] != relation_query_counts[queries]).any()):
+                    raise TraceValidationError("query close does not depend on every relation")
+                for first, last in _contiguous_position_runs(close_pos):
+                    run_queries = np.asarray(rows["query_id"][first:last], dtype=np.int64)
+                    run_counts = dep_counts[first:last]
+                    run_deps = dependencies[int(begins[first]):int(dep_ends[last - 1])]
+                    if bool((events["primitive_kind"][run_deps] != int(PrimitiveKind.RELATION)).any()):
+                        raise TraceValidationError("query close has a non-relation dependency")
+                    if bool((events["query_id"][run_deps] != np.repeat(run_queries, run_counts)).any()):
+                        raise TraceValidationError("query close relation belongs to another query")
+                query_close_seen[queries] = True
+
+            for owner, expected_kind in (
+                (PrimitiveKind.CACHE_REQUEST, PrimitiveKind.RELATION),
+                (PrimitiveKind.CACHE_RETURN, PrimitiveKind.CACHE_REQUEST),
+            ):
+                pos = positions(owner)
+                deps = one_dependency(pos, owner, expected_kind)
+                if pos.size:
+                    ids = np.asarray(rows["relation_id"][pos], dtype=np.int64)
+                    expected = np.arange(
+                        next_relation[owner], next_relation[owner] + ids.size,
+                        dtype=np.int64,
+                    )
+                    if not np.array_equal(ids, expected):
+                        raise TraceValidationError(f"{owner.name} relation IDs are not dense")
+                    if bool((events["relation_id"][deps] != ids).any()):
+                        raise TraceValidationError(f"{owner.name} relation dependency is mismatched")
+                    if bool((events["gaussian_id"][deps] != rows["gaussian_id"][pos]).any()):
+                        raise TraceValidationError(f"{owner.name} Gaussian dependency is mismatched")
+                    next_relation[owner] += int(ids.size)
+
+            forward_pos = positions(PrimitiveKind.FORWARD)
+            if forward_pos.size:
+                if bool((dep_counts[forward_pos] != 2).any()):
+                    raise TraceValidationError("forward must have two dependencies")
+                ids = np.asarray(rows["relation_id"][forward_pos], dtype=np.int64)
+                expected = np.arange(
+                    next_relation[PrimitiveKind.FORWARD],
+                    next_relation[PrimitiveKind.FORWARD] + ids.size,
+                    dtype=np.int64,
+                )
+                if not np.array_equal(ids, expected):
+                    raise TraceValidationError("forward relation IDs are not dense")
+                deps = np.column_stack((
+                    np.asarray(dependencies[begins[forward_pos]], dtype=np.uint64),
+                    np.asarray(dependencies[begins[forward_pos] + 1], dtype=np.uint64),
+                ))
+                if (
+                    bool((events["primitive_kind"][deps[:, 0]] != int(PrimitiveKind.RELATION)).any())
+                    or bool((events["primitive_kind"][deps[:, 1]] != int(PrimitiveKind.CACHE_RETURN)).any())
+                    or bool((events["relation_id"][deps] != ids[:, None]).any())
+                ):
+                    raise TraceValidationError("forward dependencies are mismatched")
+                next_relation[PrimitiveKind.FORWARD] += int(ids.size)
+
+            reduction_pos = positions(PrimitiveKind.QUERY_REDUCTION)
+            if reduction_pos.size:
+                queries = np.asarray(rows["query_id"][reduction_pos], dtype=np.int64)
+                if bool((dep_counts[reduction_pos] != relation_query_counts[queries] + 1).any()):
+                    raise TraceValidationError("query reduction does not wait for every forward")
+                for first, last in _contiguous_position_runs(reduction_pos):
+                    run_queries = np.asarray(rows["query_id"][first:last], dtype=np.int64)
+                    run_counts = dep_counts[first:last]
+                    run_deps = dependencies[int(begins[first]):int(dep_ends[last - 1])]
+                    run_kinds = events["primitive_kind"][run_deps]
+                    if not bool(np.isin(
+                        run_kinds,
+                        [int(PrimitiveKind.QUERY_CLOSE), int(PrimitiveKind.FORWARD)],
+                    ).all()):
+                        raise TraceValidationError("query reduction dependency kind is invalid")
+                    if bool((events["query_id"][run_deps] != np.repeat(run_queries, run_counts)).any()):
+                        raise TraceValidationError("query reduction dependency belongs to another query")
+
+            consumer_pos = positions(PrimitiveKind.CONSUMER)
+            if consumer_pos.size:
+                queries = np.asarray(rows["query_id"][consumer_pos], dtype=np.int64)
+                if bool((queries < 0).any()) or bool((queries >= query_count).any()):
+                    raise TraceValidationError("consumer query ID is outside the captured domain")
+                if bool(consumer_seen[queries].any()):
+                    raise TraceValidationError("query has multiple consumers")
+                for first, last in _contiguous_position_runs(consumer_pos):
+                    run_deps = dependencies[int(begins[first]):int(dep_ends[last - 1])]
+                    if bool((events["primitive_kind"][run_deps] != int(PrimitiveKind.QUERY_REDUCTION)).any()):
+                        raise TraceValidationError("consumer has a non-reduction dependency")
+                consumer_seen[queries] = True
+
+            adjoint_pos = positions(PrimitiveKind.ADJOINT)
+            adjoint_deps = one_dependency(
+                adjoint_pos, PrimitiveKind.ADJOINT, PrimitiveKind.CONSUMER
+            )
+            if adjoint_pos.size:
+                ids = np.asarray(rows["relation_id"][adjoint_pos], dtype=np.int64)
+                if bool((ids < 0).any()) or bool((ids >= relation_count).any()):
+                    raise TraceValidationError("adjoint relation ID is outside the captured domain")
+                if bool(backward_pending[ids].any()):
+                    raise TraceValidationError("relation has multiple pending adjoints")
+                relation_events = np.asarray(relation_event_ids[ids], dtype=np.uint64)
+                if bool((relation_events == np.iinfo(np.uint64).max).any()):
+                    raise TraceValidationError("adjoint precedes its relation")
+                if (
+                    bool((events["query_id"][adjoint_deps] != rows["query_id"][adjoint_pos]).any())
+                    or bool((events["query_id"][relation_events] != rows["query_id"][adjoint_pos]).any())
+                    or bool((events["gaussian_id"][relation_events] != rows["gaussian_id"][adjoint_pos]).any())
+                ):
+                    raise TraceValidationError("adjoint relation or consumer identity is mismatched")
+                backward_pending[ids] = True
+
+            gradient_pos = positions(PrimitiveKind.GRADIENT_REDUCTION)
+            gradient_deps = one_dependency(
+                gradient_pos, PrimitiveKind.GRADIENT_REDUCTION, PrimitiveKind.ADJOINT
+            )
+            if gradient_pos.size:
+                ids = np.asarray(rows["relation_id"][gradient_pos], dtype=np.int64)
+                if bool((ids < 0).any()) or bool((ids >= relation_count).any()):
+                    raise TraceValidationError("gradient relation ID is outside the captured domain")
+                if not bool(backward_pending[ids].all()):
+                    raise TraceValidationError("gradient has no unique pending adjoint")
+                if (
+                    bool((events["relation_id"][gradient_deps] != ids).any())
+                    or bool((events["gaussian_id"][gradient_deps] != rows["gaussian_id"][gradient_pos]).any())
+                    or bool((events["query_id"][gradient_deps] != rows["query_id"][gradient_pos]).any())
+                ):
+                    raise TraceValidationError("gradient and adjoint identities are mismatched")
+                backward_pending[ids] = False
+
+            _release_mmap_pages(events)
+            _release_mmap_pages(dependencies)
+            # The original read-only mappings remain live on the Trace object;
+            # release their sequentially scanned pages as well as the COW views.
+            _release_mmap_pages(source_events)
+            _release_mmap_pages(source_dependencies)
+            start = end
+
+        relation_event_ids.flush()
+        if any(value != relation_count for value in next_relation.values()):
+            raise TraceValidationError("relation pipeline counts are inconsistent")
+        if bool((relation_event_ids == np.iinfo(np.uint64).max).any()):
+            raise TraceValidationError("relation index is incomplete")
+    if not bool(query_close_seen.all()):
+        raise TraceValidationError("captured query is missing its close event")
+    if not bool(consumer_seen.all()):
+        raise TraceValidationError("captured query is missing its consumer")
+    if bool(backward_pending.any()):
+        raise TraceValidationError("captured relation is missing its gradient")
+    counts = {
+        PrimitiveKind(kind).name: int(counts_array[kind])
+        for kind in range(1, len(PrimitiveKind) + 1)
+        if counts_array[kind]
+    }
+    _validate_capture_audit(trace, counts)
+    return TraceValidationReport(
+        event_count=event_count,
+        dependency_count=dependency_count,
+        counts=counts,
+        query_count=query_count,
+        gaussian_count=initial_gaussian_count,
+        update_count=0,
+    )
+
+
+def _contiguous_position_runs(positions: np.ndarray):
+    if positions.size == 0:
+        return
+    splits = np.flatnonzero(np.diff(positions) != 1) + 1
+    for run in np.split(positions, splits):
+        yield int(run[0]), int(run[-1]) + 1
+
+
+def _release_mmap_pages(array: object) -> None:
+    mapping = getattr(array, "_mmap", None)
+    if mapping is not None and hasattr(mapping, "madvise"):
+        mapping.madvise(mmap.MADV_DONTNEED)
+
+
+def _validate_large_capture_trace(trace: Trace) -> TraceValidationReport:
+    """Validate a raw-column capture without relation-sized Python objects.
+
+    The real R²-Gaussian capture emits the query pipeline in contiguous
+    primitive sections.  This validator checks each section's exact IDs,
+    dependency kinds, query/Gaussian identity and audit totals in bounded
+    chunks.  It deliberately rejects update-containing large traces until
+    their state-transition pass is available instead of silently weakening
+    lifecycle checks.
+    """
+
+    events = trace.events
+    dependencies = trace.dependencies
+    payload = trace.payload
+    chunk_size = max(1, int(trace.metadata.get("trace_chunk_events", 1)))
+    event_count = int(events.size)
+    dependency_count = int(dependencies.size)
+    payload_count = int(payload.size)
+    kind_values = np.asarray(events["primitive_kind"], dtype=np.uint16)
+    if kind_values.size:
+        known_kinds = np.isin(kind_values, np.arange(1, len(PrimitiveKind) + 1))
+        if not bool(known_kinds.all()):
+            bad = int(np.flatnonzero(~known_kinds)[0])
+            raise TraceValidationError(f"unknown primitive kind at event {bad}")
+    counts_array = np.bincount(kind_values.astype(np.int64), minlength=len(PrimitiveKind) + 1)
+    counts = {
+        PrimitiveKind(kind).name: int(counts_array[kind])
+        for kind in range(1, len(PrimitiveKind) + 1)
+        if counts_array[kind]
+    }
+
+    for start in range(0, event_count, chunk_size):
+        end = min(start + chunk_size, event_count)
+        rows = events[start:end]
+        expected_ids = np.arange(start, end, dtype=np.uint64)
+        if not np.array_equal(rows["event_id"], expected_ids):
+            mismatch = int(start + np.flatnonzero(rows["event_id"] != expected_ids)[0])
+            raise TraceValidationError(f"event_id must be a dense capture-order sequence at event {mismatch}")
+        begins = np.asarray(rows["dependency_begin"], dtype=np.int64)
+        dep_counts = np.asarray(rows["dependency_count"], dtype=np.int64)
+        ends = begins + dep_counts
+        if bool((begins < 0).any()) or bool((dep_counts < 0).any()) or bool((ends > dependency_count).any()):
+            raise TraceValidationError(f"dependency range is invalid at event {start}")
+        if start == 0:
+            expected_begin = 0
+        else:
+            expected_begin = int(events[start - 1]["dependency_begin"] + events[start - 1]["dependency_count"])
+        if int(begins[0]) != expected_begin or (
+            begins.size > 1 and bool(begins[1:] != ends[:-1]).any()
+        ):
+            raise TraceValidationError(f"dependency columns are not contiguous at event {start}")
+        if ends.size:
+            flat_dependencies = dependencies[int(begins[0]):int(ends[-1])]
+            flat_event_ids = np.repeat(expected_ids, dep_counts)
+            if flat_dependencies.size and bool((flat_dependencies >= flat_event_ids).any()):
+                raise TraceValidationError(f"dependency is not a prior event at event {start}")
+        payload_begins = np.asarray(rows["payload_offset"], dtype=np.int64)
+        payload_counts = np.asarray(rows["payload_length"], dtype=np.int64)
+        payload_ends = payload_begins + payload_counts
+        if bool((payload_begins < 0).any()) or bool((payload_counts < 0).any()) or bool((payload_ends > payload_count).any()):
+            raise TraceValidationError(f"payload range is invalid at event {start}")
+        if start == 0:
+            expected_payload_begin = 0
+        else:
+            expected_payload_begin = int(events[start - 1]["payload_offset"] + events[start - 1]["payload_length"])
+        if int(payload_begins[0]) != expected_payload_begin or (
+            payload_begins.size > 1 and bool(payload_begins[1:] != payload_ends[:-1]).any()
+        ):
+            raise TraceValidationError(f"payload columns are not contiguous at event {start}")
+
+    if any(counts.get(PrimitiveKind(kind).name, 0) for kind in (
+        PrimitiveKind.UPDATE_BEGIN, PrimitiveKind.UPDATE_COMMIT,
+        PrimitiveKind.UPDATE_END, PrimitiveKind.SET_MODIFICATION,
+    )):
+        raise TraceValidationError(
+            "large mmap validator requires a state-transition pass for update events"
+        )
+
+    def rows_for(kind: PrimitiveKind) -> np.ndarray:
+        return np.flatnonzero(kind_values == int(kind)).astype(np.int64, copy=False)
+
+    def dependency_slice(event_ids: np.ndarray) -> np.ndarray:
+        if event_ids.size == 0:
+            return np.empty(0, dtype=np.uint64)
+        begins = np.asarray(events["dependency_begin"][event_ids], dtype=np.int64)
+        counts_local = np.asarray(events["dependency_count"][event_ids], dtype=np.int64)
+        if event_ids.size > 1 and bool(
+            (begins[1:] != begins[:-1] + counts_local[:-1]).any()
+        ):
+            raise TraceValidationError("selected event dependencies are not contiguous")
+        return np.asarray(dependencies[int(begins[0]):int(begins[-1] + counts_local[-1])], dtype=np.uint64)
+
+    candidate_ids = rows_for(PrimitiveKind.RELATION_CANDIDATE)
+    relation_ids = rows_for(PrimitiveKind.RELATION)
+    close_ids = rows_for(PrimitiveKind.QUERY_CLOSE)
+    request_ids = rows_for(PrimitiveKind.CACHE_REQUEST)
+    return_ids = rows_for(PrimitiveKind.CACHE_RETURN)
+    forward_ids = rows_for(PrimitiveKind.FORWARD)
+    reduction_ids = rows_for(PrimitiveKind.QUERY_REDUCTION)
+    consumer_ids = rows_for(PrimitiveKind.CONSUMER)
+    adjoint_ids = rows_for(PrimitiveKind.ADJOINT)
+    gradient_ids = rows_for(PrimitiveKind.GRADIENT_REDUCTION)
+
+    initial_gaussian_count = trace.metadata.get("initial_gaussian_count")
+    if initial_gaussian_count is not None and (
+        not isinstance(initial_gaussian_count, int) or initial_gaussian_count < 0
+    ):
+        raise TraceValidationError("initial Gaussian count metadata is invalid")
+    if initial_gaussian_count is not None:
+        gaussian_values = np.asarray(events["gaussian_id"], dtype=np.int64)
+        used = gaussian_values[gaussian_values >= 0]
+        if used.size and int(used.max()) >= initial_gaussian_count:
+            raise TraceValidationError("large trace uses a Gaussian outside the initial active set")
+
+    def require_ids_dense(ids: np.ndarray, field: str) -> None:
+        values = np.asarray(events[field][ids], dtype=np.int64)
+        if values.size and not np.array_equal(values, np.arange(values.size, dtype=np.int64)):
+            raise TraceValidationError(f"{field} is not dense in capture order")
+
+    require_ids_dense(relation_ids, "relation_id")
+    require_ids_dense(request_ids, "relation_id")
+    require_ids_dense(return_ids, "relation_id")
+    require_ids_dense(forward_ids, "relation_id")
+    require_ids_dense(adjoint_ids, "relation_id")
+    require_ids_dense(gradient_ids, "relation_id")
+    if relation_ids.size != request_ids.size or relation_ids.size != return_ids.size or relation_ids.size != forward_ids.size:
+        raise TraceValidationError("relation pipeline counts are inconsistent")
+    if relation_ids.size != adjoint_ids.size or relation_ids.size != gradient_ids.size:
+        raise TraceValidationError("backward relation counts are inconsistent")
+
+    def check_dependencies(kind: PrimitiveKind, ids: np.ndarray, expected: PrimitiveKind) -> np.ndarray:
+        deps = dependency_slice(ids)
+        counts_local = np.asarray(events["dependency_count"][ids], dtype=np.int64)
+        dep_kinds = np.asarray(kind_values[deps], dtype=np.uint16) if deps.size else np.empty(0, dtype=np.uint16)
+        if dep_kinds.size and bool((dep_kinds != int(expected)).any()):
+            raise TraceValidationError(f"{kind.name} has an invalid dependency kind")
+        return deps
+
+    relation_dependencies = check_dependencies(
+        PrimitiveKind.RELATION, relation_ids, PrimitiveKind.RELATION_CANDIDATE
+    )
+    relation_dep_counts = np.asarray(events["dependency_count"][relation_ids], dtype=np.int64)
+    if relation_dep_counts.size and bool((relation_dep_counts != 1).any()):
+        raise TraceValidationError("relation must depend on exactly one candidate")
+    if relation_ids.size:
+        relation_candidate_ids = relation_dependencies
+        if bool((events["gaussian_id"][relation_ids] != events["gaussian_id"][relation_candidate_ids]).any()):
+            raise TraceValidationError("relation Gaussian does not match its candidate")
+
+    relation_query = np.asarray(events["query_id"][relation_ids], dtype=np.int64)
+    close_query = np.asarray(events["query_id"][close_ids], dtype=np.int64)
+    if close_query.size and not np.array_equal(close_query, np.arange(close_query.size, dtype=np.int64)):
+        raise TraceValidationError("query close IDs are not dense")
+    relation_query_counts = np.bincount(
+        relation_query - int(relation_query.min()) if relation_query.size else np.empty(0, dtype=np.int64),
+        minlength=int(close_query.size),
+    )
+    close_dependencies = dependency_slice(close_ids)
+    close_dep_counts = np.asarray(events["dependency_count"][close_ids], dtype=np.int64)
+    if close_dep_counts.size and bool((close_dep_counts != relation_query_counts).any()):
+        raise TraceValidationError("query close does not depend on every relation")
+    if close_dependencies.size:
+        close_dep_kinds = kind_values[close_dependencies]
+        if bool((close_dep_kinds != int(PrimitiveKind.RELATION)).any()):
+            raise TraceValidationError("query close has a non-relation dependency")
+        dep_query = np.asarray(events["query_id"][close_dependencies], dtype=np.int64)
+        repeated_queries = np.repeat(close_query, close_dep_counts)
+        if bool((dep_query != repeated_queries).any()):
+            raise TraceValidationError("query close relation belongs to a different query")
+
+    forward_dependencies = dependency_slice(forward_ids)
+    forward_dep_counts = np.asarray(events["dependency_count"][forward_ids], dtype=np.int64)
+    if forward_dep_counts.size and bool((forward_dep_counts != 2).any()):
+        raise TraceValidationError("forward must depend on relation and cache return")
+    if forward_dependencies.size:
+        reshaped = forward_dependencies.reshape(-1, 2)
+        if bool((kind_values[reshaped[:, 0]] != int(PrimitiveKind.RELATION)).any()) or bool((kind_values[reshaped[:, 1]] != int(PrimitiveKind.CACHE_RETURN)).any()):
+            raise TraceValidationError("forward dependency kinds are invalid")
+        if bool((events["relation_id"][forward_ids] != events["relation_id"][reshaped[:, 0]]).any()):
+            raise TraceValidationError("forward relation IDs do not match relation dependencies")
+        if bool((events["relation_id"][forward_ids] != events["relation_id"][reshaped[:, 1]]).any()):
+            raise TraceValidationError("forward relation IDs do not match cache returns")
+
+    request_dependencies = check_dependencies(
+        PrimitiveKind.CACHE_REQUEST, request_ids, PrimitiveKind.RELATION
+    )
+    return_dependencies = check_dependencies(
+        PrimitiveKind.CACHE_RETURN, return_ids, PrimitiveKind.CACHE_REQUEST
+    )
+    if request_ids.size and bool((events["relation_id"][request_ids] != events["relation_id"][relation_ids]).any()):
+        raise TraceValidationError("cache request relation IDs do not match relations")
+    if return_ids.size and bool((events["relation_id"][return_ids] != events["relation_id"][request_ids]).any()):
+        raise TraceValidationError("cache return relation IDs do not match requests")
+    if return_dependencies.size:
+        expected_requests = request_ids
+        if not np.array_equal(return_dependencies, expected_requests):
+            raise TraceValidationError("cache return does not depend on its request")
+
+    reduction_query = np.asarray(events["query_id"][reduction_ids], dtype=np.int64)
+    if reduction_query.size and not np.array_equal(reduction_query, close_query):
+        raise TraceValidationError("query reduction IDs do not match query closes")
+    reduction_dependencies = dependency_slice(reduction_ids)
+    reduction_dep_counts = np.asarray(events["dependency_count"][reduction_ids], dtype=np.int64)
+    if reduction_dependencies.size:
+        reduction_kinds = kind_values[reduction_dependencies]
+        if not bool(np.isin(
+            reduction_kinds,
+            [int(PrimitiveKind.FORWARD), int(PrimitiveKind.QUERY_CLOSE)],
+        ).all()):
+            raise TraceValidationError("query reduction has an invalid dependency kind")
+        close_dep_mask = reduction_kinds == int(PrimitiveKind.QUERY_CLOSE)
+        if bool(close_dep_mask.sum() != reduction_ids.size):
+            raise TraceValidationError("query reduction does not depend on exactly one query close")
+    if consumer_ids.size != close_ids.size:
+        raise TraceValidationError("consumer count does not match query count")
+    consumer_query = np.asarray(events["query_id"][consumer_ids], dtype=np.int64)
+    if consumer_query.size and not np.array_equal(consumer_query, close_query):
+        raise TraceValidationError("consumer IDs do not match query closes")
+    consumer_dependencies = dependency_slice(consumer_ids)
+    if consumer_dependencies.size and bool((kind_values[consumer_dependencies] != int(PrimitiveKind.QUERY_REDUCTION)).any()):
+        raise TraceValidationError("consumer has a non-reduction dependency")
+
+    adjoint_dependencies = check_dependencies(
+        PrimitiveKind.ADJOINT, adjoint_ids, PrimitiveKind.CONSUMER
+    )
+    if adjoint_dependencies.size:
+        if bool((events["query_id"][adjoint_ids] != events["query_id"][adjoint_dependencies]).any()):
+            raise TraceValidationError("adjoint consumer query does not match relation query")
+    gradient_dependencies = check_dependencies(
+        PrimitiveKind.GRADIENT_REDUCTION, gradient_ids, PrimitiveKind.ADJOINT
+    )
+    if gradient_dependencies.size and bool((events["relation_id"][gradient_ids] != events["relation_id"][gradient_dependencies]).any()):
+        raise TraceValidationError("gradient relation IDs do not match adjoints")
+
+    _validate_capture_audit(trace, counts)
+    query_count = int(close_ids.size)
+    gaussian_count = int(initial_gaussian_count or 0)
+    if initial_gaussian_count is None:
+        gaussian_values = np.asarray(events["gaussian_id"], dtype=np.int64)
+        used = gaussian_values[gaussian_values >= 0]
+        gaussian_count = int(used.max()) + 1 if used.size else 0
+    return TraceValidationReport(
+        event_count=event_count,
+        dependency_count=dependency_count,
+        counts=counts,
+        query_count=query_count,
+        gaussian_count=gaussian_count,
+        update_count=0,
     )
 
 

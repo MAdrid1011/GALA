@@ -284,7 +284,11 @@ class ChunkedTraceBuilder:
             raise ValueError("stream-only builder cannot materialize merged arrays")
         if self.chunk_root is not None:
             self._flush_current()
-            event_metadata = {"schema_version": EVENT_SCHEMA_VERSION, **(metadata or {})}
+            event_metadata = {
+                "schema_version": EVENT_SCHEMA_VERSION,
+                "trace_storage_format": "raw_columns" if self.stream_only else "npy_chunks",
+                **(metadata or {}),
+            }
             if not materialize:
                 if self.stream_only:
                     root = self.chunk_root.parent

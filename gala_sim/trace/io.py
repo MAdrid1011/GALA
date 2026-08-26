@@ -85,6 +85,10 @@ class TraceReader:
         metadata = manifest.get("metadata")
         if not isinstance(metadata, dict) or metadata.get("schema_version") is None:
             raise ValueError("raw trace metadata is malformed")
+        # Older stream-only manifests predate the explicit metadata marker;
+        # derive it from the manifest so the bounded validator is selected.
+        metadata = dict(metadata)
+        metadata.setdefault("trace_storage_format", manifest["storage_format"])
         def raw_array(name: str, dtype: np.dtype, count: int) -> np.ndarray:
             if count == 0:
                 return np.empty(0, dtype=dtype)

@@ -230,6 +230,49 @@ def test_pending_queries_share_one_host_copy_and_preserve_event_order(
         assert _rows(trace, kind).size == _rows(immediate_trace, kind).size
 
 
+def test_candidate_chunk_capture_restores_global_indexes_and_streams_to_disk(
+    tmp_path: Path,
+) -> None:
+    session = TraceSession(tmp_path / "trace", chunk_events=1)
+    chunks: list[tuple[int, int]] = []
+
+    def decode_chunk(start: int, count: int) -> np.ndarray:
+        chunks.append((start, count))
+        return np.asarray([
+            [0, 0, start, np.int64(np.uint64(start) << np.uint64(32))],
+            [1, 0, 0, 0],
+        ], dtype=np.int64)
+
+    output = _ArrayRef((1, 17), 20)
+    session._capture_query(
+        _ArrayRef((2, 3), 0), _ArrayRef((2,), 10), output, 2, (1, 17),
+        lambda: pytest.fail("full decoder must not run for chunked capture"),
+        template_id=RASTER_TEMPLATE_ID, field_mask=STATE_FIELD_MASK,
+        record_chunk_fn=decode_chunk,
+    )
+    pending = session._pending_queries[0]
+    assert pending.records is None
+    assert pending.candidate_records_path is not None
+    assert pending.relation_records_path is not None
+    session._audit.update({
+        "official_raster_kernel_calls": 1,
+        "captured_raster_kernel_calls": 1,
+        "captured_query_kernel_calls": 1,
+        "cuda_relation_candidates": 2,
+    })
+    session._wrap_loss(lambda _output: None, LOSS_L1)(output)
+    session._capture_backward(10, voxel=False)
+    trace = session.finish()
+
+    assert chunks == [(0, 1), (1, 1)]
+    assert _rows(trace, PrimitiveKind.RELATION)["query_id"].tolist() == [0, 16]
+    assert _rows(trace, PrimitiveKind.RELATION_CANDIDATE)["gaussian_id"].tolist() == [0, 1]
+    assert session._audit["relation_record_device_chunks"] == 2
+    assert session._audit["relation_record_d2h_chunks"] == 2
+    assert not pending.candidate_records_path.exists()
+    assert not pending.relation_records_path.exists()
+
+
 def test_finish_rejects_pending_query_without_backward(tmp_path: Path) -> None:
     session = TraceSession(tmp_path / "trace")
     _queue_query(

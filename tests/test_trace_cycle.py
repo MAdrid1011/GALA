@@ -172,6 +172,7 @@ def test_stream_only_builder_writes_raw_columns_readable_as_mmap(tmp_path: Path)
     assert (root / "events.raw").is_file()
     loaded = TraceReader().read(root, mmap_mode="r")
     assert isinstance(loaded.events, np.memmap)
+    assert loaded.metadata["trace_storage_format"] == "raw_columns"
     assert loaded.event_count == 2
     assert validate_trace(loaded).event_count == 2
 

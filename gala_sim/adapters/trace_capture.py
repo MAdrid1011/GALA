@@ -74,6 +74,8 @@ class _PendingQuery:
     field_mask: int
     loss_flags: int = 0
     ssim_radius: int = 0
+    candidate_records_path: Path | None = None
+    relation_records_path: Path | None = None
 
 
 @dataclass
@@ -101,7 +103,7 @@ class TraceSession:
     _pending_backward_buffers: set[int] = field(default_factory=set, init=False)
     _completed_backward_buffers: set[int] = field(default_factory=set, init=False)
     _pending_gradients: dict[int, list[np.ndarray]] = field(default_factory=dict, init=False)
-    _pending_backward_events: list[int] = field(default_factory=list, init=False)
+    _pending_backward_events: list[np.ndarray] = field(default_factory=list, init=False)
     _gaussian_ids: list[int] = field(default_factory=list, init=False)
     _gaussian_ids_initialized: bool = field(default=False, init=False)
     _initial_gaussian_count: int = field(default=0, init=False)
@@ -173,6 +175,8 @@ class TraceSession:
         audit = dict(self._audit)
         audit.setdefault("relation_record_device_batches", 0)
         audit.setdefault("relation_record_d2h_batches", 0)
+        audit.setdefault("relation_record_device_chunks", 0)
+        audit.setdefault("relation_record_d2h_chunks", 0)
         trace = self._builder.finish(metadata={
             "model": "R2-Gaussian",
             "dataset": "Chest",
@@ -442,6 +446,10 @@ class TraceSession:
             ),
             template_id=RASTER_TEMPLATE_ID,
             field_mask=STATE_FIELD_MASK,
+            record_chunk_fn=lambda start, count: self._decoder.raster_trace_records_chunk(
+                geometry, binning, int(means.shape[0]), int(rendered),
+                int(start), int(count), height, width
+            ),
         )
 
     def _capture_voxel(self, args: tuple[Any, ...], result: tuple[Any, ...]) -> None:
@@ -456,12 +464,17 @@ class TraceSession:
             ),
             template_id=VOXEL_TEMPLATE_ID,
             field_mask=STATE_FIELD_MASK,
+            record_chunk_fn=lambda start, count: self._decoder.voxel_trace_records_chunk(
+                geometry, binning, int(means.shape[0]), int(rendered),
+                int(start), int(count), *dimensions
+            ),
         )
 
     def _capture_query(
         self, means: Any, binning: Any, output: Any, rendered: int,
         query_shape: tuple[int, ...], records_fn: Callable[[], Any],
         *, template_id: int, field_mask: int,
+        record_chunk_fn: Callable[[int, int], Any] | None = None,
     ) -> None:
         if rendered < 0 or not query_shape or any(value <= 0 for value in query_shape):
             raise ValueError("decoded trace dimensions and candidate count must be positive")
@@ -478,13 +491,24 @@ class TraceSession:
         self._completed_backward_buffers.discard(binning_pointer)
         if output_pointer in self._pending_query_by_output or output_pointer in self._output_contexts:
             raise RuntimeError("captured query reused a live output buffer pointer")
-        pending = _PendingQuery(
-            records_fn() if rendered > 0 else None,
-            rendered, query_base, query_shape, binning_pointer, output_pointer,
-            template_id, field_mask,
-        )
-        if pending.records is not None:
+        candidate_records_path: Path | None = None
+        relation_records_path: Path | None = None
+        records: Any | None = None
+        if rendered > 0 and record_chunk_fn is not None:
+            candidate_records_path, relation_records_path = self._capture_record_chunks(
+                query_base, rendered, record_chunk_fn,
+            )
             self._audit_increment("relation_record_device_batches")
+            self._audit_increment("relation_record_d2h_batches")
+        elif rendered > 0:
+            records = records_fn()
+            if records is not None:
+                self._audit_increment("relation_record_device_batches")
+        pending = _PendingQuery(
+            records, rendered, query_base, query_shape, binning_pointer, output_pointer,
+            template_id, field_mask, candidate_records_path=candidate_records_path,
+            relation_records_path=relation_records_path,
+        )
         self._pending_queries.append(pending)
         self._pending_query_by_buffer[binning_pointer] = pending
         self._pending_query_by_output[output_pointer] = pending
@@ -513,32 +537,57 @@ class TraceSession:
             if item.template_id != expected_template:
                 raise RuntimeError("captured backward kind does not match its forward context")
 
-        records_by_query: list[np.ndarray] = []
+        empty_records = (
+            np.empty((0, 4), dtype=np.int64), np.empty((0, 4), dtype=np.int64)
+        )
+        records_by_query: list[tuple[np.ndarray, np.ndarray]] = [
+            empty_records for _ in self._pending_queries
+        ]
         device_records = [item.records for item in self._pending_queries if item.records is not None]
         if device_records:
             host_records = self._copy_record_batches(device_records)
             self._audit_increment("relation_record_d2h_batches")
             cursor = 0
-            for item in self._pending_queries:
-                if item.records is None:
-                    records_by_query.append(np.empty((0, 4), dtype=np.int64))
-                else:
+            for index, item in enumerate(self._pending_queries):
+                if item.records is not None:
                     record_count = int(item.records.shape[0])
-                    records_by_query.append(np.asarray(host_records[cursor:cursor + record_count], dtype=np.int64))
+                    query_records = np.asarray(
+                        host_records[cursor:cursor + record_count], dtype=np.int64
+                    )
+                    records_by_query[index] = (
+                        query_records[:item.rendered], query_records[item.rendered:]
+                    )
                     cursor += record_count
                     # The CUDA tensor can be hundreds of MB for a dense view;
                     # release it before emitting the structured event batches.
                     item.records = None
-        else:
-            records_by_query = [np.empty((0, 4), dtype=np.int64) for _ in self._pending_queries]
+        for index, item in enumerate(self._pending_queries):
+            if item.candidate_records_path is None or item.relation_records_path is None:
+                continue
+            candidate_bytes = item.candidate_records_path.stat().st_size
+            relation_bytes = item.relation_records_path.stat().st_size
+            record_bytes = np.dtype(np.int64).itemsize * 4
+            if candidate_bytes != item.rendered * record_bytes or relation_bytes % record_bytes:
+                raise ValueError("decoded trace chunk files have invalid sizes")
+            relation_count = relation_bytes // record_bytes
+            records_by_query[index] = (
+                np.memmap(
+                    item.candidate_records_path, dtype=np.int64, mode="r",
+                    shape=(item.rendered, 4),
+                ),
+                np.memmap(
+                    item.relation_records_path, dtype=np.int64, mode="r",
+                    shape=(relation_count, 4),
+                ),
+            )
         pending = tuple(self._pending_queries)
         self._pending_queries.clear()
         self._pending_query_by_buffer.clear()
         self._pending_query_by_output.clear()
         self._pending_backward_buffers.clear()
         for item, records in zip(pending, records_by_query):
-            self._emit_query_records(
-                records, rendered=item.rendered, query_base=item.query_base,
+            self._emit_query_record_parts(
+                records[0], records[1], rendered=item.rendered, query_base=item.query_base,
                 query_shape=item.query_shape, binning_pointer=item.binning_pointer,
                 output_pointer=item.output_pointer, template_id=item.template_id,
                 field_mask=item.field_mask,
@@ -552,6 +601,38 @@ class TraceSession:
             self._emit_backward(buffer_pointer, voxel=voxel)
         if device_records:
             del host_records
+
+        for item in pending:
+            for path in (item.candidate_records_path, item.relation_records_path):
+                if path is not None:
+                    path.unlink(missing_ok=True)
+
+    def _capture_record_chunks(
+        self, query_base: int, rendered: int,
+        record_chunk_fn: Callable[[int, int], Any],
+    ) -> tuple[Path, Path]:
+        root = self.output_root / ".capture_records"
+        root.mkdir(parents=True, exist_ok=True)
+        candidate_path = root / f"{query_base:020d}.candidates.raw"
+        relation_path = root / f"{query_base:020d}.relations.raw"
+        with candidate_path.open("wb") as candidate_output, relation_path.open("wb") as relation_output:
+            for start in range(0, rendered, self.chunk_events):
+                end = min(start + self.chunk_events, rendered)
+                records = record_chunk_fn(start, end - start)
+                if hasattr(records, "detach"):
+                    records = records.detach().cpu().numpy()
+                records = np.asarray(records, dtype=np.int64)
+                expected_candidates = end - start
+                if records.ndim != 2 or records.shape[1] != 4 or records.shape[0] < expected_candidates:
+                    raise ValueError("decoded trace chunk has an invalid shape")
+                records[:expected_candidates, 1] += start
+                records[expected_candidates:, 1] += start
+                records[:expected_candidates].tofile(candidate_output)
+                records[expected_candidates:].tofile(relation_output)
+                self._audit_increment("relation_record_device_chunks")
+                self._audit_increment("relation_record_d2h_chunks")
+                del records
+        return candidate_path, relation_path
 
     @staticmethod
     def _copy_record_batches(record_batches: list[Any]) -> np.ndarray:
@@ -577,8 +658,18 @@ class TraceSession:
     ) -> None:
         if records.ndim != 2 or records.shape[1] != 4:
             raise ValueError("decoded trace records must have shape [N, 4]")
-        candidate_records = records[:rendered]
-        relation_records = records[rendered:]
+        self._emit_query_record_parts(
+            records[:rendered], records[rendered:], rendered=rendered,
+            query_base=query_base, query_shape=query_shape,
+            binning_pointer=binning_pointer, output_pointer=output_pointer,
+            template_id=template_id, field_mask=field_mask,
+        )
+
+    def _emit_query_record_parts(
+        self, candidate_records: np.ndarray, relation_records: np.ndarray, *, rendered: int,
+        query_base: int, query_shape: tuple[int, ...], binning_pointer: int,
+        output_pointer: int, template_id: int, field_mask: int,
+    ) -> None:
         if (
             candidate_records.shape[0] != rendered
             or (rendered and not np.array_equal(candidate_records[:, 0], np.zeros(rendered)))
@@ -904,10 +995,15 @@ class TraceSession:
         relation_counts = np.bincount(
             context.relation_query_offsets, minlength=query_count
         )
-        self._pending_backward_events.extend(
-            int(event) for event in consumer_events[relation_counts == 0]
+        zero_relation_consumers = np.asarray(
+            consumer_events[relation_counts == 0], dtype=dependency_dtype()
         )
-        self._pending_backward_events.extend(int(event) for event in gradient_events)
+        if zero_relation_consumers.size:
+            self._pending_backward_events.append(zero_relation_consumers)
+        if gradient_events.size:
+            self._pending_backward_events.append(
+                np.asarray(gradient_events, dtype=dependency_dtype())
+            )
         self._output_contexts.pop(context.output_pointer, None)
         self._contexts.pop(buffer_pointer, None)
         self._completed_backward_buffers.add(buffer_pointer)
@@ -1027,8 +1123,7 @@ class TraceSession:
         self._ensure_gaussians(int(model.get_xyz.shape[0]))
         self._audit_increment("optimizer_steps")
         begin = self._emit_update_begin(
-            flags=UPDATE_BEGIN_OPTIMIZER,
-            dependencies=(*self._pending_backward_events, *self._prior_transition_events),
+            flags=UPDATE_BEGIN_OPTIMIZER, dependencies=self._backward_dependencies(),
         )
         if field_mask == 0:
             self._audit_increment("optimizer_noop_steps")
@@ -1050,16 +1145,23 @@ class TraceSession:
                 else gradient_chunks[0] if gradient_chunks
                 else np.empty(0, dtype=np.int64)
             )
-            dependencies = (begin, *(int(event) for event in gradients))
-            commits.append(self._builder.emit(TraceEvent(
-                iteration_id=self._iteration,
-                primitive_kind=int(PrimitiveKind.UPDATE_COMMIT),
-                gaussian_id=gaussian_id, state_version=self._state_version,
-                resource_class=int(ResourceClass.UPDATE),
-                address_token=gaussian_id * self.state_record_bytes,
-                data_bytes=self.state_record_bytes,
-                template_id=UPDATE_TEMPLATE_ID, field_mask=field_mask,
-            ), dependencies=dependencies))
+            dependencies = np.empty(gradients.size + 1, dtype=dependency_dtype())
+            dependencies[0] = begin
+            dependencies[1:] = gradients
+            event = self._new_event_batch(1)
+            event["iteration_id"] = self._iteration
+            event["primitive_kind"] = int(PrimitiveKind.UPDATE_COMMIT)
+            event["gaussian_id"] = gaussian_id
+            event["state_version"] = self._state_version
+            event["resource_class"] = int(ResourceClass.UPDATE)
+            event["address_token"] = gaussian_id * self.state_record_bytes
+            event["data_bytes"] = self.state_record_bytes
+            event["template_id"] = UPDATE_TEMPLATE_ID
+            event["field_mask"] = field_mask
+            commits.append(int(self._builder.emit_batch(
+                event, dependencies=dependencies,
+                dependency_counts=np.asarray([dependencies.size], dtype=np.int64),
+            )[0]))
         self._state_ready_event = self._emit_update_end(
             flags=UPDATE_BEGIN_OPTIMIZER, begin=begin,
             dependencies=commits or [begin], field_mask=field_mask,
@@ -1070,16 +1172,33 @@ class TraceSession:
         self._state_version += 1
 
     def _emit_update_begin(self, *, flags: int, dependencies: Any) -> int:
-        event = self._builder.emit(TraceEvent(
-            iteration_id=self._iteration,
-            primitive_kind=int(PrimitiveKind.UPDATE_BEGIN),
-            state_version=self._state_version,
-            resource_class=int(ResourceClass.UPDATE),
-            template_id=UPDATE_TEMPLATE_ID,
-            flags=int(flags),
-        ), dependencies=dependencies)
+        dependency_array = np.asarray(dependencies, dtype=dependency_dtype())
+        event_batch = self._new_event_batch(1)
+        event_batch["iteration_id"] = self._iteration
+        event_batch["primitive_kind"] = int(PrimitiveKind.UPDATE_BEGIN)
+        event_batch["state_version"] = self._state_version
+        event_batch["resource_class"] = int(ResourceClass.UPDATE)
+        event_batch["template_id"] = UPDATE_TEMPLATE_ID
+        event_batch["flags"] = int(flags)
+        event = int(self._builder.emit_batch(
+            event_batch, dependencies=dependency_array,
+            dependency_counts=np.asarray([dependency_array.size], dtype=np.int64),
+        )[0])
         self._audit_increment("update_begin_events")
         return event
+
+    def _backward_dependencies(self) -> np.ndarray:
+        chunks = [
+            np.asarray(chunk, dtype=dependency_dtype())
+            for chunk in self._pending_backward_events if chunk.size
+        ]
+        if self._prior_transition_events:
+            chunks.append(np.asarray(self._prior_transition_events, dtype=dependency_dtype()))
+        if not chunks:
+            return np.empty(0, dtype=dependency_dtype())
+        if len(chunks) == 1:
+            return chunks[0]
+        return np.concatenate(chunks)
 
     def _emit_update_end(self, *, flags: int, begin: int, dependencies: Any,
                          field_mask: int) -> int:
@@ -1099,8 +1218,7 @@ class TraceSession:
             raise RuntimeError("collection modification occurred outside densify_and_prune")
         if self._collection_begin_event is None:
             self._collection_begin_event = self._emit_update_begin(
-                flags=UPDATE_BEGIN_COLLECTION,
-                dependencies=(*self._pending_backward_events, *self._prior_transition_events),
+                flags=UPDATE_BEGIN_COLLECTION, dependencies=self._backward_dependencies(),
             )
             self._pending_backward_events.clear()
         return self._collection_begin_event
