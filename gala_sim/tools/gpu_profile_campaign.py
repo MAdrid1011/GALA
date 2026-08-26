@@ -134,7 +134,7 @@ class GpuProfileCampaign:
                 f"{item.start}:{item.end}" for item in self.cuda_event_ranges
             ],
             "nsys_capture_mode": "cudaProfilerApi",
-            "nsys_capture_range_end": f"repeat-shutdown:{len(self.representatives)}",
+            "nsys_capture_range_end": f"repeat:{len(self.representatives)}",
             "representative_iterations": [
                 {"iteration": item.iteration, "roles": list(item.roles)}
                 for item in self.representatives

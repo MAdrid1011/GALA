@@ -8,6 +8,7 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
+import subprocess
 from typing import Any, Iterable, Mapping
 
 import yaml
@@ -27,6 +28,21 @@ _SUPPORTED_NCU_OPTIONS = {
     "kernel_name_base": {"demangled"},
 }
 _SUPPORTED_NCU_SECTIONS = {"SourceCounters"}
+_IMPLEMENTATION_PATHS = (
+    "gala_sim/adapters/stage_profile.py",
+    "gala_sim/adapters/stage_runner.py",
+    "gala_sim/tools/gpu_ncu_plan.py",
+    "gala_sim/tools/gpu_ncu_runner.py",
+    "gala_sim/tools/gpu_profile_artifacts.py",
+    "gala_sim/tools/gpu_profile_campaign.py",
+)
+
+
+def _implementation_hashes(repository: Path) -> dict[str, str]:
+    return {
+        relative: sha256_file(repository / relative)
+        for relative in _IMPLEMENTATION_PATHS
+    }
 
 
 @dataclass(frozen=True)
@@ -299,6 +315,7 @@ def _stability_validation(
             int, tuple[Path, dict[str, Any], str, int, list[Mapping[str, Any]]]
         ],
         only_stage: str | None = None,
+        *, include_grid: bool = False,
     ) -> list[dict[str, Any]]:
         sequence = []
         for iteration in iterations:
@@ -307,12 +324,19 @@ def _stability_validation(
                 if stage in range_stages or (only_stage is not None and stage != only_stage):
                     continue
                 for ordinal, kernel in enumerate(call["kernels"], start=1):
-                    sequence.append({
+                    signature = _signature(stage, kernel)
+                    selection = {
                         "iteration": iteration,
                         "stage": stage,
                         "call_index": int(call["call_index"]),
                         "kernel_ordinal_in_call": ordinal,
-                        **_signature_document(_signature(stage, kernel)),
+                        "kernel_name": signature[1],
+                        "block": list(signature[3]),
+                    }
+                    if include_grid:
+                        selection["grid"] = list(signature[2])
+                    sequence.append({
+                        **selection,
                     })
         return sequence
 
@@ -335,36 +359,56 @@ def _stability_validation(
         suffix = ",".join(unstable_invocation_stages) or "cross_stage_order"
         raise ValueError(f"NSYS invocation stages are unstable: {suffix}")
 
+    primary_grid_sequence = invocation_sequence(primary, include_grid=True)
+    repeated_grid_sequence = invocation_sequence(repeated, include_grid=True)
+    grid_variation_count = sum(
+        left.get("grid") != right.get("grid")
+        for left, right in zip(primary_grid_sequence, repeated_grid_sequence, strict=True)
+    )
+
     range_records = []
     for stage in range_stages:
         for iteration in iterations:
-            def signature_counts(
+            def range_calls(
                 inventories: Mapping[
                     int,
                     tuple[Path, dict[str, Any], str, int, list[Mapping[str, Any]]],
                 ],
-            ) -> Counter[str]:
-                return Counter(
-                    _signature_id(_signature(stage, kernel))
+            ) -> list[Mapping[str, Any]]:
+                return [
+                    call
                     for call in inventories[iteration][4]
                     if str(call["stage"]) == stage
-                    for kernel in call["kernels"]
-                )
+                ]
 
-            primary_counts = signature_counts(primary)
-            repeated_counts = signature_counts(repeated)
-            if set(primary_counts) != set(repeated_counts):
-                raise ValueError(
-                    f"NSYS range stage signature set is unstable: {stage}:{iteration}"
-                )
-            if primary_counts:
+            primary_calls = range_calls(primary)
+            repeated_calls = range_calls(repeated)
+            primary_call_ids = [int(call["call_index"]) for call in primary_calls]
+            repeated_call_ids = [int(call["call_index"]) for call in repeated_calls]
+            if primary_call_ids != repeated_call_ids:
+                raise ValueError(f"NSYS range stage calls are unstable: {stage}:{iteration}")
+            if primary_calls:
+                primary_signatures = {
+                    _signature_id(_signature(stage, kernel))
+                    for call in primary_calls for kernel in call["kernels"]
+                }
+                repeated_signatures = {
+                    _signature_id(_signature(stage, kernel))
+                    for call in repeated_calls for kernel in call["kernels"]
+                }
                 range_records.append({
                     "iteration": iteration,
                     "stage": stage,
-                    "signature_count": len(primary_counts),
-                    "primary_kernel_launch_count": sum(primary_counts.values()),
-                    "repeated_kernel_launch_count": sum(repeated_counts.values()),
-                    "multiplicity_identical": primary_counts == repeated_counts,
+                    "call_indices": primary_call_ids,
+                    "primary_kernel_launch_count": sum(
+                        len(call["kernels"]) for call in primary_calls
+                    ),
+                    "repeated_kernel_launch_count": sum(
+                        len(call["kernels"]) for call in repeated_calls
+                    ),
+                    "exact_signature_sets_identical": (
+                        primary_signatures == repeated_signatures
+                    ),
                 })
 
     repeated_records = []
@@ -380,10 +424,16 @@ def _stability_validation(
         })
     return {
         "status": "passed",
-        "policy": "exact_invocation_sequence_and_range_signature_set",
-        "invocation_sequence_primary_sha256": primary_hash,
-        "invocation_sequence_repeated_sha256": repeated_hash,
+        "policy": "exact_invocation_selection_sequence_and_range_call_identity",
+        "invocation_selection_fields": [
+            "iteration", "stage", "call_index", "kernel_ordinal_in_call",
+            "kernel_name", "block",
+        ],
+        "invocation_selection_sequence_primary_sha256": primary_hash,
+        "invocation_selection_sequence_repeated_sha256": repeated_hash,
         "invocation_kernel_launch_count": len(primary_sequence),
+        "dynamic_grid_shape_variation_count": grid_variation_count,
+        "exact_grid_sequence_identical": grid_variation_count == 0,
         "range_stage_records": range_records,
         "repeated_nsys_inventories": repeated_records,
     }
@@ -394,6 +444,10 @@ def build_ncu_plan(
     stability_inventory_paths: Iterable[Path] = (),
 ) -> dict[str, Any]:
     campaign = GpuProfileCampaign.load(config.campaign)
+    repository = config.path.parents[2]
+    repository_commit = subprocess.check_output(
+        ["git", "-C", str(repository), "rev-parse", "HEAD"], text=True,
+    ).strip()
     expected_iterations = [item.iteration for item in campaign.representatives]
     loaded = _load_inventory_set(
         inventory_paths, config.campaign_sha256, expected_iterations
@@ -477,7 +531,6 @@ def build_ncu_plan(
         tuple[str, str, tuple[int, ...], tuple[int, ...]], dict[str, Any]
     ] = {}
     selected_calls: set[tuple[int, str, int]] = set()
-    required_sample_count = 0
     iteration_signature_count: dict[int, int] = defaultdict(int)
     for (iteration, key), values in sorted(
         occurrences.items(), key=lambda item: (item[0][0], item[0][1])
@@ -491,7 +544,6 @@ def build_ncu_plan(
                 "signature_occurrence_ordinal": index + 1,
                 **occurrence,
             })
-        required_sample_count += len(samples)
         iteration_signature_count[iteration] += 1
         record = signatures.setdefault(key, {
             "signature_id": _signature_id(key),
@@ -705,17 +757,29 @@ def build_ncu_plan(
             "capture_mode": "nvtx_ranges",
             "representative_iterations": range_iterations,
             "range_stages": list(range_stages),
+            "range_calls": [
+                {"iteration": iteration, "stage": stage, "call_index": call_index}
+                for iteration, stage, call_index in sorted({
+                    (
+                        int(item["iteration"]), str(item["stage"]),
+                        int(item["call_index"]),
+                    )
+                    for item in range_locations
+                })
+            ],
             "kernel_names": sorted({str(item["kernel_name"]) for item in range_locations}),
-            "required_sample_count": sum(bool(item["required_sample"]) for item in range_locations),
+            "required_sample_count": len(range_locations),
             "selected_kernel_launch_count": len(range_locations),
-            "extra_kernel_launch_count": len(range_locations) - sum(
-                bool(item["required_sample"]) for item in range_locations
-            ),
+            "extra_kernel_launch_count": 0,
+            "binding_policy": "exact_observed_launches_with_dynamic_signatures",
             "expected_launches": range_locations,
             "ncu_arguments": range_arguments,
         })
     selected_launch_count = sum(
         int(group["selected_kernel_launch_count"]) for group in capture_groups
+    )
+    required_capture_count = sum(
+        int(group["required_sample_count"]) for group in capture_groups
     )
 
     inventory_records = []
@@ -736,6 +800,8 @@ def build_ncu_plan(
         "status": "planned",
         "formal_performance_eligible": False,
         "eligibility_reason": "pending_measured_ncu_counters_and_signature_reuse_validation",
+        "repository_commit": repository_commit,
+        "implementation_sha256": _implementation_hashes(repository),
         "campaign": {
             "path": str(config.campaign),
             "sha256": config.campaign_sha256,
@@ -750,10 +816,15 @@ def build_ncu_plan(
         "range_capture_stages": list(config.range_capture_stages),
         "stability_validation": stability,
         "counter_reuse_gate": {
-            "policy": "exact_signature_within_one_representative_iteration",
+            "policy": (
+                "invocation_semantic_anchor_reuse_and_exact_dynamic_range_observation"
+            ),
             "require_all_planned_samples": True,
             "require_counter_agreement_before_multiplicity_expansion": True,
-            "aggregation": "measured_signature_counters_times_exact_nsys_multiplicity",
+            "aggregation": (
+                "invocation_counters_times_primary_nsys_multiplicity_plus_"
+                "exact_observed_range_launches"
+            ),
         },
         "ncu": {
             **dict(config.ncu_options),
@@ -782,7 +853,7 @@ def build_ncu_plan(
             "observed_kernel_launch_count": observed_kernel_count,
             "global_signature_count": len(signatures),
             "representative_iteration_signature_count": len(occurrences),
-            "required_sample_count": required_sample_count,
+            "required_sample_count": required_capture_count,
             "capture_group_count": len(capture_groups),
             "capture_job_count": len(capture_groups),
             "invocation_capture_job_count": sum(
@@ -795,7 +866,7 @@ def build_ncu_plan(
             ),
             "selected_stage_call_count": len(selected_calls),
             "selected_kernel_launch_count": selected_launch_count,
-            "extra_kernel_launch_count": selected_launch_count - required_sample_count,
+            "extra_kernel_launch_count": selected_launch_count - required_capture_count,
             "stage_role_coverage": observed_stage_roles,
         },
         "nsys_inventories": inventory_records,
@@ -830,18 +901,38 @@ def validate_ncu_measurement(
     )
     expected_jobs: dict[int, dict[str, Mapping[str, Any]]] = {}
     expected_job_modes: dict[int, str] = {}
+    expected_range_scopes: dict[
+        int, tuple[set[str], set[int], set[tuple[int, str, int]]]
+    ] = {}
     expected_launches: dict[str, Mapping[str, Any]] = {}
+    predicted_range_launch_count = 0
     for group in plan.get("capture_groups", ()):
         if not isinstance(group, Mapping):
             continue
         job_index = int(group["job_index"])
         capture_mode = str(group.get("capture_mode", ""))
         expected_job_modes[job_index] = capture_mode
+        if capture_mode == "nvtx_ranges":
+            expected_range_scopes[job_index] = (
+                {str(value) for value in group.get("range_stages", ())},
+                {int(value) for value in group.get("representative_iterations", ())},
+                {
+                    (
+                        int(item["iteration"]), str(item["stage"]),
+                        int(item["call_index"]),
+                    )
+                    for item in group.get("range_calls", ())
+                    if isinstance(item, Mapping)
+                },
+            )
+            predicted_range_launch_count += int(
+                group.get("selected_kernel_launch_count", 0)
+            )
         job_launches: dict[str, Mapping[str, Any]] = {}
         for launch in group.get("expected_launches", ()):
             if not isinstance(launch, Mapping):
                 continue
-            if capture_mode == "nvtx_ranges" and not bool(launch.get("required_sample")):
+            if capture_mode == "nvtx_ranges":
                 continue
             selected_id = str(launch["selected_launch_id"])
             if selected_id in expected_launches:
@@ -850,19 +941,19 @@ def validate_ncu_measurement(
             job_launches[selected_id] = launch
         expected_jobs[job_index] = job_launches
 
-    valid_signature_iterations = {
-        (int(representative["iteration"]), str(signature["signature_id"]))
-        for signature in plan.get("signatures", ())
-        if isinstance(signature, Mapping)
-        for representative in signature.get("representative_iterations", ())
-        if isinstance(representative, Mapping)
-    }
-
     observed_records: list[Mapping[str, Any]] = []
     observed_ids: set[str] = set()
+    observed_planned_ids: set[str] = set()
     observed_jobs: set[int] = set()
     metrics_by_signature: dict[
         tuple[int, str], list[tuple[tuple[str, float], ...]]
+    ] = defaultdict(list)
+    observed_grids_by_signature: dict[
+        tuple[int, str], list[tuple[int, int, int]]
+    ] = defaultdict(list)
+    range_metrics_by_signature: dict[
+        tuple[int, str, str, str, tuple[int, int, int], tuple[int, int, int]],
+        list[tuple[tuple[str, float], ...]],
     ] = defaultdict(list)
     profile_count = 0
     identity_fields = (
@@ -900,21 +991,51 @@ def validate_ncu_measurement(
                 continue
             selected_id = str(launch.get("selected_launch_id", ""))
             expected = expected_jobs.get(job_index, {}).get(selected_id)
-            capture_mode = expected_job_modes.get(job_index)
-            if capture_mode == "nvtx_ranges" and not bool(launch.get("required_sample")):
+            job_mode = expected_job_modes.get(job_index)
+            if job_mode == "nvtx_ranges":
                 try:
-                    signature_key = (int(launch["iteration"]), str(launch["signature_id"]))
+                    iteration = int(launch["iteration"])
+                    stage = str(launch["stage"])
+                    name = str(launch["kernel_name"])
+                    grid_values = tuple(int(value) for value in launch["grid_size"])
+                    block_values = tuple(int(value) for value in launch["block_size"])
+                    call_index = int(launch["call_index"])
+                    if (
+                        len(grid_values) != 3 or len(block_values) != 3
+                        or any(value <= 0 for value in (*grid_values, *block_values))
+                    ):
+                        raise ValueError("invalid NCU launch shape")
+                    grid = (grid_values[0], grid_values[1], grid_values[2])
+                    block = (block_values[0], block_values[1], block_values[2])
+                    signature_document = {
+                        "stage": stage, "kernel_name": name,
+                        "grid": list(grid), "block": list(block),
+                    }
+                    signature_id = sha256_bytes(canonical_json(signature_document))
+                    allowed_stages, allowed_iterations, allowed_calls = (
+                        expected_range_scopes[job_index]
+                    )
                 except (KeyError, TypeError, ValueError):
                     reasons.append("ncu_range_signature_identity_invalid")
                     continue
-                if signature_key not in valid_signature_iterations:
-                    reasons.append("ncu_range_signature_identity_invalid")
+                if (
+                    not selected_id
+                    or selected_id in observed_ids
+                    or launch.get("signature_id") != signature_id
+                    or stage not in allowed_stages
+                    or iteration not in allowed_iterations
+                    or (iteration, stage, call_index) not in allowed_calls
+                ):
+                    reasons.append("ncu_range_launch_identity_invalid")
                     continue
+                observed_ids.add(selected_id)
                 metrics = launch.get("metrics")
                 if not isinstance(metrics, Mapping):
                     reasons.append("ncu_counter_metrics_missing")
                 else:
-                    metrics_by_signature[signature_key].append(tuple(sorted(
+                    range_metrics_by_signature[
+                        (iteration, stage, signature_id, name, grid, block)
+                    ].append(tuple(sorted(
                         (str(name), float(value)) for name, value in metrics.items()
                     )))
                 observed_records.append(launch)
@@ -925,16 +1046,17 @@ def validate_ncu_measurement(
             if selected_id in observed_ids:
                 reasons.append(f"duplicate_ncu_launch:{selected_id}")
             observed_ids.add(selected_id)
+            observed_planned_ids.add(selected_id)
             try:
-                compared_fields = (
-                    ("iteration", "stage", "kernel_name")
-                    if capture_mode == "nvtx_ranges" else identity_fields
+                mismatch = any(launch[field] != expected[field] for field in identity_fields)
+                observed_grid_values = tuple(
+                    int(value) for value in launch["grid_size"]
                 )
-                mismatch = any(launch[field] != expected[field] for field in compared_fields)
-                mismatch = mismatch or [int(value) for value in launch["grid_size"]] != [
-                    int(value) for value in expected["grid"]
-                ]
-                mismatch = mismatch or [int(value) for value in launch["block_size"]] != [
+                observed_block = tuple(int(value) for value in launch["block_size"])
+                mismatch = mismatch or len(observed_grid_values) != 3 or any(
+                    value <= 0 for value in observed_grid_values
+                )
+                mismatch = mismatch or list(observed_block) != [
                     int(value) for value in expected["block"]
                 ]
             except (KeyError, TypeError, ValueError):
@@ -942,29 +1064,36 @@ def validate_ncu_measurement(
             if mismatch:
                 reasons.append(f"ncu_launch_identity_mismatch:{selected_id}")
                 continue
+            observed_grid = (
+                observed_grid_values[0], observed_grid_values[1],
+                observed_grid_values[2],
+            )
             metrics = launch.get("metrics")
             if not isinstance(metrics, Mapping):
                 reasons.append("ncu_counter_metrics_missing")
             else:
-                metrics_by_signature[
-                    (int(expected["iteration"]), str(expected["signature_id"]))
-                ].append(tuple(sorted(
+                signature_key = (
+                    int(expected["iteration"]), str(expected["signature_id"])
+                )
+                metrics_by_signature[signature_key].append(tuple(sorted(
                     (str(name), float(value)) for name, value in metrics.items()
                 )))
+                observed_grids_by_signature[signature_key].append(observed_grid)
             observed_records.append(launch)
 
     missing_jobs = set(expected_jobs) - observed_jobs
     if missing_jobs:
         reasons.append("ncu_capture_jobs_missing")
-    missing_launches = set(expected_launches) - observed_ids
+    missing_launches = set(expected_launches) - observed_planned_ids
     if missing_launches:
         reasons.append("ncu_selected_launches_missing")
-    if len(expected_launches) != len(observed_ids):
+    if len(expected_launches) != len(observed_planned_ids):
         reasons.append("ncu_selected_launch_count_mismatch")
 
     agreement: dict[str, Any] = {}
     for key, values in sorted(metrics_by_signature.items()):
         unique = {value for value in values}
+        measured_grids = sorted(set(observed_grids_by_signature[key]))
         identifier = f"{key[0]}:{key[1]}"
         exact_observations = False
         for signature in plan.get("signatures", ()):
@@ -984,6 +1113,8 @@ def validate_ncu_measurement(
             "signature_id": key[1],
             "observed_launch_count": len(values),
             "counter_values_identical": len(unique) == 1,
+            "measured_grid_sizes": [list(value) for value in measured_grids],
+            "dynamic_grid_shape_observed": bool(measured_grids),
             "aggregation_mode": (
                 "exact_observed_launches" if exact_observations else "signature_reuse"
             ),
@@ -997,21 +1128,32 @@ def validate_ncu_measurement(
     aggregated_signatures = []
     stage_metrics: dict[str, dict[str, float]] = defaultdict(lambda: defaultdict(float))
     stage_launches: Counter[str] = Counter()
+    range_stages = {
+        str(value) for value in plan.get("range_capture_stages", ())
+    }
     if not reasons:
         for signature in plan.get("signatures", ()):
             if not isinstance(signature, Mapping):
                 continue
             signature_id = str(signature["signature_id"])
             stage = str(signature["stage"])
-            grid = [int(value) for value in signature["grid"]]
-            block = [int(value) for value in signature["block"]]
-            threads = grid[0] * grid[1] * grid[2] * block[0] * block[1] * block[2]
+            if stage in range_stages:
+                continue
+            planned_grid = [int(value) for value in signature["grid"]]
+            planned_block = [int(value) for value in signature["block"]]
+            threads = (
+                planned_grid[0] * planned_grid[1] * planned_grid[2]
+                * planned_block[0] * planned_block[1] * planned_block[2]
+            )
             for representative in signature.get("representative_iterations", ()):
                 if not isinstance(representative, Mapping):
                     continue
                 iteration = int(representative["iteration"])
                 multiplicity = int(representative["multiplicity"])
                 samples = metrics_by_signature[(iteration, signature_id)]
+                measured_grids = sorted(set(
+                    observed_grids_by_signature[(iteration, signature_id)]
+                ))
                 measured = dict(samples[0])
                 if len(samples) == multiplicity:
                     totals: dict[str, float] = defaultdict(float)
@@ -1032,8 +1174,9 @@ def validate_ncu_measurement(
                     "stage": stage,
                     "signature_id": signature_id,
                     "kernel_name": signature["kernel_name"],
-                    "grid_size": grid,
-                    "block_size": block,
+                    "grid_size": planned_grid,
+                    "measured_grid_sizes": [list(value) for value in measured_grids],
+                    "block_size": planned_block,
                     "threads_launched_per_launch": threads,
                     "multiplicity": multiplicity,
                     "measured_sample_count": len(samples),
@@ -1041,6 +1184,39 @@ def validate_ncu_measurement(
                     "multiplicity_expanded_metrics": dict(totals),
                     "aggregation_mode": aggregation_mode,
                 })
+        for range_key, samples in sorted(range_metrics_by_signature.items()):
+            iteration, stage, signature_id, kernel_name, grid_tuple, block_tuple = (
+                range_key
+            )
+            range_totals: dict[str, float] = defaultdict(float)
+            for sample in samples:
+                for name, value in sample:
+                    range_totals[name] += value
+            for name, value in range_totals.items():
+                stage_metrics[stage][name] += value
+            multiplicity = len(samples)
+            stage_launches[stage] += multiplicity
+            range_grid = list(grid_tuple)
+            range_block = list(block_tuple)
+            threads = (
+                range_grid[0] * range_grid[1] * range_grid[2]
+                * range_block[0] * range_block[1] * range_block[2]
+            )
+            aggregated_signatures.append({
+                "iteration": iteration,
+                "stage": stage,
+                "signature_id": signature_id,
+                "kernel_name": kernel_name,
+                "grid_size": range_grid,
+                "measured_grid_sizes": [range_grid],
+                "block_size": range_block,
+                "threads_launched_per_launch": threads,
+                "multiplicity": multiplicity,
+                "measured_sample_count": multiplicity,
+                "measured_metrics_per_launch": None,
+                "multiplicity_expanded_metrics": dict(range_totals),
+                "aggregation_mode": "exact_observed_range_launches",
+            })
     stage_summaries = {}
     for stage, totals in sorted(stage_metrics.items()):
         ffma = totals.get("fp32_ffma", 0.0)
@@ -1067,13 +1243,19 @@ def validate_ncu_measurement(
         "campaign_sha256": expected_campaign,
         "profile_count": profile_count,
         "expected_selected_launch_count": len(expected_launches),
+        "expected_invocation_launch_count": len(expected_launches),
+        "predicted_range_launch_count": predicted_range_launch_count,
         "observed_selected_launch_count": len(observed_ids),
+        "observed_invocation_launch_count": len(observed_planned_ids),
+        "observed_range_launch_count": sum(
+            len(values) for values in range_metrics_by_signature.values()
+        ),
         "observed_profiled_launch_count": len(observed_records),
         "exact_launch_coverage": not any(
             reason.startswith((
                 "unexpected_ncu_launch", "duplicate_ncu_launch",
                 "ncu_launch_identity", "ncu_selected_launch",
-                "ncu_capture_jobs",
+                "ncu_capture_jobs", "ncu_range_",
             ))
             for reason in reasons
         ),
@@ -1082,7 +1264,10 @@ def validate_ncu_measurement(
                 reason.startswith(("counter_reuse_disagreement", "ncu_signature_multiplicity"))
                 for reason in reasons
             ) and not reasons else "provisional",
-            "aggregation": "measured_counters_times_exact_nsys_multiplicity",
+            "aggregation": (
+                "invocation_samples_times_primary_nsys_multiplicity_plus_"
+                "exact_observed_range_launches"
+            ),
             "signature_iteration_checks": list(agreement.values()),
         },
         "aggregation_scope": "frozen_representative_iterations_only",

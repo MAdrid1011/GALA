@@ -485,14 +485,28 @@ def bind_ncu_profile_to_plan(
         reasons.append("ncu_job_run_identity_invalid")
 
     def launch_key(launch: Mapping[str, Any], *, expected: bool) -> tuple[Any, ...]:
-        grid_name = "grid" if expected else "grid_size"
         block_name = "block" if expected else "block_size"
         return (
             int(launch["iteration"]), str(launch["stage"]), int(launch["call_index"]),
             str(launch["kernel_name"]),
-            tuple(int(value) for value in launch[grid_name]),
             tuple(int(value) for value in launch[block_name]),
         )
+
+    def observed_signature(launch: Mapping[str, Any]) -> tuple[str, dict[str, Any]]:
+        grid = [int(value) for value in launch["grid_size"]]
+        block = [int(value) for value in launch["block_size"]]
+        if (
+            len(grid) != 3 or len(block) != 3
+            or any(value <= 0 for value in (*grid, *block))
+        ):
+            raise ValueError("NCU launch shape is invalid")
+        document = {
+            "stage": str(launch["stage"]),
+            "kernel_name": str(launch["kernel_name"]),
+            "grid": grid,
+            "block": block,
+        }
+        return sha256_bytes(canonical_json(document)), document
 
     raw_launches = [
         launch for launch in ncu_profile.get("launches", ())
@@ -568,6 +582,7 @@ def bind_ncu_profile_to_plan(
                 **dict(actual),
                 "selected_launch_id": str(expected["selected_launch_id"]),
                 "signature_id": str(expected["signature_id"]),
+                "observed_signature_id": observed_signature(actual)[0],
                 "iteration": int(expected["iteration"]),
                 "stage": str(expected["stage"]),
                 "call_index": int(expected["call_index"]),
@@ -581,64 +596,46 @@ def bind_ncu_profile_to_plan(
                 "kernel_name_ordinal_in_invocation_capture": int(
                     expected["kernel_name_ordinal_in_invocation_capture"]
                 ),
+                "planned_grid_size": [int(value) for value in expected["grid"]],
+                "grid_shape_matches_primary_nsys": (
+                    [int(value) for value in actual["grid_size"]]
+                    == [int(value) for value in expected["grid"]]
+                ),
                 "required_sample": bool(expected["required_sample"]),
             })
         if matched_count != len(expected_launches):
             reasons.append("ncu_job_selected_launch_count_mismatch")
     elif capture_mode == "nvtx_ranges":
-        def signature_key(launch: Mapping[str, Any], *, expected: bool) -> tuple[Any, ...]:
-            grid_name = "grid" if expected else "grid_size"
-            block_name = "block" if expected else "block_size"
-            return (
-                int(launch["iteration"]), str(launch["stage"]),
-                str(launch["kernel_name"]),
-                tuple(int(value) for value in launch[grid_name]),
-                tuple(int(value) for value in launch[block_name]),
-            )
-
-        planned_groups: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
-        observed_groups: dict[tuple[Any, ...], list[Mapping[str, Any]]] = defaultdict(list)
-        try:
-            for launch in expected_launches:
-                planned_groups[signature_key(launch, expected=True)].append(launch)
-            for launch in raw_launches:
-                observed_groups[signature_key(launch, expected=False)].append(launch)
-        except (KeyError, TypeError, ValueError):
-            reasons.append("ncu_job_launch_identity_invalid")
-        if set(planned_groups) != set(observed_groups):
-            reasons.append("ncu_range_signature_set_mismatch")
-        anchor_bindings: dict[int, Mapping[str, Any]] = {}
-        signature_ids: dict[tuple[Any, ...], str] = {}
-        policy = tuple(str(value) for value in plan.get("validation_occurrences", ()))
-        for key in set(planned_groups) & set(observed_groups):
-            planned = planned_groups[key]
-            observed = observed_groups[key]
-            signature_ids[key] = str(planned[0]["signature_id"])
-            required = sorted(
-                (item for item in planned if bool(item["required_sample"])),
-                key=lambda item: (
-                    int(item["call_order"]), int(item["kernel_ordinal_in_call"]),
-                ),
-            )
-            positions = {
-                "first": 0, "middle": (len(observed) - 1) // 2,
-                "last": len(observed) - 1,
-            }
-            indices = sorted({positions[name] for name in policy}) if observed else []
-            if len(required) != len(indices):
-                reasons.append("ncu_range_anchor_count_mismatch")
-                continue
-            for index, expected in zip(indices, required):
-                anchor_bindings[id(observed[index])] = expected
+        range_stages = {
+            str(value) for value in jobs[0].get("range_stages", ())
+        } if jobs else set()
+        range_iterations = {
+            int(value) for value in jobs[0].get("representative_iterations", ())
+        } if jobs else set()
+        range_calls = {
+            (int(item["iteration"]), str(item["stage"]), int(item["call_index"]))
+            for item in jobs[0].get("range_calls", ())
+            if isinstance(item, Mapping)
+        } if jobs else set()
+        if not raw_launches:
+            reasons.append("ncu_range_launches_missing")
         for actual in raw_launches:
             try:
-                key = signature_key(actual, expected=False)
+                signature_id, signature = observed_signature(actual)
+                iteration = int(actual["iteration"])
+                stage = str(actual["stage"])
+                call_index = int(actual["call_index"])
             except (KeyError, TypeError, ValueError):
+                reasons.append("ncu_job_launch_identity_invalid")
                 continue
-            signature_id = signature_ids.get(key)
-            if signature_id is None:
+            if (
+                stage not in range_stages
+                or iteration not in range_iterations
+                or call_index <= 0
+                or (iteration, stage, call_index) not in range_calls
+            ):
+                reasons.append("ncu_range_scope_mismatch")
                 continue
-            expected = anchor_bindings.get(id(actual))
             observed_identity = {
                 "capture_job_index": job_index,
                 "process_id": stage_process_id,
@@ -652,17 +649,12 @@ def bind_ncu_profile_to_plan(
             }
             bound_launches.append({
                 **dict(actual),
-                "selected_launch_id": (
-                    str(expected["selected_launch_id"])
-                    if expected is not None
-                    else sha256_bytes(canonical_json(observed_identity))
-                ),
+                "selected_launch_id": sha256_bytes(canonical_json(observed_identity)),
                 "signature_id": signature_id,
-                "required_sample": expected is not None,
-                "planned_anchor": dict(expected) if expected is not None else None,
+                "observed_signature": signature,
+                "required_sample": True,
+                "planned_anchor": None,
             })
-        if len(bound_launches) != len(raw_launches):
-            reasons.append("ncu_range_launch_binding_incomplete")
     return {
         **dict(ncu_profile),
         "schema_version": NCU_SELECTED_SCHEMA_VERSION,
@@ -675,6 +667,8 @@ def bind_ncu_profile_to_plan(
             "capture_job_index": job_index,
             "capture_mode": capture_mode,
             "process_id": stage_process_id,
+            "repository_commit": stage_identity.get("repository_commit")
+            if isinstance(stage_identity, Mapping) else None,
             "stage_profile_source": stage_profile.get("source"),
             "stage_profile_source_sha256": stage_profile.get("source_sha256"),
         },

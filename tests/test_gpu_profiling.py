@@ -24,7 +24,7 @@ from gala_sim.tools.gpu_ncu_plan import (
     NcuPlanConfig, _regex_alternation, build_ncu_plan, main as ncu_plan_main,
     validate_ncu_measurement,
 )
-from gala_sim.tools.gpu_ncu_runner import _capture_job, _sample_summary
+from gala_sim.tools.gpu_ncu_runner import _capture_job, _load_plan, _sample_summary
 from gala_sim.adapters.stage_runner import _frozen_profile_identity, _profile_selection
 from gala_sim.tools.gpu_normalization import normalize_stage_profiles
 
@@ -129,7 +129,7 @@ def test_formal_gpu_profile_campaign_covers_frozen_schedule() -> None:
     )
     manifest = campaign.manifest()
     assert manifest["cuda_event_iteration_ranges"] == ["1:30000"]
-    assert manifest["nsys_capture_range_end"] == "repeat-shutdown:9"
+    assert manifest["nsys_capture_range_end"] == "repeat:9"
     assert {
         item["iteration"] for item in manifest["representative_iterations"]
         if "periodic_evaluation" in item["roles"]
@@ -365,15 +365,28 @@ def test_ncu_plan_requires_repeat_stability_outside_range_stages(
         record for record in plan["stability_validation"]["range_stage_records"]
         if record["iteration"] == 1 and record["stage"] == "projection_forward"
     )
-    assert changed["multiplicity_identical"] is False
+    assert changed["primary_kernel_launch_count"] == 5
+    assert changed["repeated_kernel_launch_count"] == 6
 
     repeated_initial = json.loads(repeated[0].read_text(encoding="utf-8"))
     invocation_call = next(
         call for call in repeated_initial["stage_calls"]
         if call["stage"] == "backward"
     )
-    invocation_call["kernels"].append(dict(invocation_call["kernels"][0]))
-    invocation_call["kernel_launch_count"] += 1
+    invocation_call["kernels"][0]["grid"] = [8, 1, 1]
+    repeated[0].write_text(json.dumps(repeated_initial), encoding="utf-8")
+    grid_drift_plan = build_ncu_plan(config, primary, repeated)
+    assert grid_drift_plan["stability_validation"][
+        "dynamic_grid_shape_variation_count"
+    ] == 1
+
+    repeated_initial = json.loads(repeated[0].read_text(encoding="utf-8"))
+    unstable_call = next(
+        call for call in repeated_initial["stage_calls"]
+        if call["stage"] == "backward"
+    )
+    unstable_call["kernels"].append(dict(unstable_call["kernels"][0]))
+    unstable_call["kernel_launch_count"] += 1
     repeated_initial["kernel_coverage"]["records"][0]["kernel_count"] += 1
     repeated_initial["kernel_coverage"]["records"][0]["assigned_kernel_count"] += 1
     repeated[0].write_text(json.dumps(repeated_initial), encoding="utf-8")
@@ -394,6 +407,29 @@ def test_ncu_runner_rejects_early_termination_options() -> None:
     ])
     assert summary["mean_utilization_percent"] == 60
     assert summary["maximum_memory_used_bytes"] == 200
+
+
+def test_ncu_runner_requires_clean_matching_implementation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = NcuPlanConfig.load(root / "configs/profiling/r2_gaussian_chest_ncu.yaml")
+    campaign = GpuProfileCampaign.load(config.campaign)
+    paths = _nsys_plan_profiles(tmp_path, campaign)
+    plan = build_ncu_plan(config, paths, paths)
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+    monkeypatch.setattr(
+        "gala_sim.tools.gpu_ncu_runner.subprocess.check_output",
+        lambda command, text: "",
+    )
+    assert _load_plan(plan_path)["content_sha256"] == plan["content_sha256"]
+    monkeypatch.setattr(
+        "gala_sim.tools.gpu_ncu_runner.subprocess.check_output",
+        lambda command, text: " M docs/status.md\n",
+    )
+    with pytest.raises(ValueError, match="clean profiling implementation"):
+        _load_plan(plan_path)
 
 
 def test_ncu_job_binding_restores_exact_planned_launch_identity(
@@ -417,6 +453,7 @@ def test_ncu_job_binding_restores_exact_planned_launch_identity(
         "block_size": launch["block"], "kernel_ordinal_in_call": index + 1,
         "metrics": metrics,
     } for index, launch in enumerate(job["expected_launches"])]
+    raw_launches[0]["grid_size"] = [8, 1, 1]
     raw_profile = {
         "status": "passed", "incomplete_launches": [], "launches": raw_launches,
         "run_identity": {
@@ -431,7 +468,9 @@ def test_ncu_job_binding_restores_exact_planned_launch_identity(
             for value in plan["coverage"]["representative_iterations"]
         ],
         "run_identity": {
-            "process_id": 123, "cuda_profiler_api_control": True,
+            "process_id": 123,
+            "repository_commit": plan["repository_commit"],
+            "cuda_profiler_api_control": True,
             "profiling_campaign": {
                 "campaign_sha256": plan["campaign"]["sha256"],
                 "profile_mode": "representative", "profile_tool": "ncu",
@@ -445,6 +484,7 @@ def test_ncu_job_binding_restores_exact_planned_launch_identity(
     assert [item["selected_launch_id"] for item in result["launches"]] == [
         item["selected_launch_id"] for item in job["expected_launches"]
     ]
+    assert result["launches"][0]["grid_shape_matches_primary_nsys"] is False
     stage_profile["run_identity"]["process_id"] = 124
     invalid = bind_ncu_profile_to_plan(
         raw_profile, plan, job["job_index"], stage_profile,
@@ -463,7 +503,7 @@ def test_ncu_job_binding_restores_exact_planned_launch_identity(
     assert "ncu_job_launch_multiplicity_mismatch" in mismatched["binding_reasons"]
 
 
-def test_ncu_range_job_reanchors_stable_signatures_after_multiplicity_change(
+def test_ncu_range_job_binds_every_dynamic_launch_without_cross_run_shape_assumptions(
     tmp_path: Path,
 ) -> None:
     root = Path(__file__).resolve().parents[1]
@@ -501,7 +541,12 @@ def test_ncu_range_job_reanchors_stable_signatures_after_multiplicity_change(
         launch for launch in raw_launches
         if launch["iteration"] == 1
     )
-    raw_launches.insert(1, {**repeated, "launch_id": "dynamic-extra"})
+    raw_launches.insert(1, {
+        **repeated,
+        "launch_id": "dynamic-extra",
+        "kernel_name": "dynamic_collection_kernel",
+        "grid_size": [7, 1, 1],
+    })
     raw_profile = {
         "status": "passed", "incomplete_launches": [], "launches": raw_launches,
         "run_identity": {
@@ -516,7 +561,9 @@ def test_ncu_range_job_reanchors_stable_signatures_after_multiplicity_change(
             for value in plan["coverage"]["representative_iterations"]
         ],
         "run_identity": {
-            "process_id": 123, "cuda_profiler_api_control": True,
+            "process_id": 123,
+            "repository_commit": plan["repository_commit"],
+            "cuda_profiler_api_control": True,
             "profiling_campaign": {
                 "campaign_sha256": plan["campaign"]["sha256"],
                 "profile_mode": "representative", "profile_tool": "ncu",
@@ -530,7 +577,12 @@ def test_ncu_range_job_reanchors_stable_signatures_after_multiplicity_change(
     assert len(result["launches"]) == len(raw_launches)
     assert sum(
         launch["required_sample"] for launch in result["launches"]
-    ) == job["required_sample_count"]
+    ) == len(raw_launches)
+    assert any(
+        launch["kernel_name"] == "dynamic_collection_kernel"
+        and launch["planned_anchor"] is None
+        for launch in result["launches"]
+    )
     profiles = [result]
     for group in plan["capture_groups"]:
         if group["capture_mode"] != "kernel_invocations":
@@ -541,6 +593,7 @@ def test_ncu_range_job_reanchors_stable_signatures_after_multiplicity_change(
                 "status": "passed",
                 "profiling_campaign_sha256": plan["campaign"]["sha256"],
                 "ncu_plan_content_sha256": plan["content_sha256"],
+                "repository_commit": plan["repository_commit"],
                 "capture_job_index": group["job_index"],
             },
             "incomplete_launches": [],
@@ -552,10 +605,12 @@ def test_ncu_range_job_reanchors_stable_signatures_after_multiplicity_change(
         })
     evidence = validate_ncu_measurement(plan, profiles)
     assert evidence["status"] == "passed"
-    assert (
-        evidence["observed_profiled_launch_count"]
-        > evidence["observed_selected_launch_count"]
+    assert evidence["observed_profiled_launch_count"] == len(raw_launches) + sum(
+        len(group["expected_launches"])
+        for group in plan["capture_groups"]
+        if group["capture_mode"] == "kernel_invocations"
     )
+    assert evidence["observed_range_launch_count"] == len(raw_launches)
 
 
 def test_ncu_measurement_validator_requires_exact_call_sequences(tmp_path: Path) -> None:
@@ -587,6 +642,7 @@ def test_ncu_measurement_validator_requires_exact_call_sequences(tmp_path: Path)
                 "status": "passed",
                 "profiling_campaign_sha256": plan["campaign"]["sha256"],
                 "ncu_plan_content_sha256": plan["content_sha256"],
+                "repository_commit": plan["repository_commit"],
                 "capture_job_index": group["job_index"],
             },
             "incomplete_launches": [], "launches": group_launches,

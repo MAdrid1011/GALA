@@ -21,7 +21,7 @@ from gala_sim.manifest import verify_freeze_record
 from gala_sim.tools.gpu_profile_artifacts import (
     bind_ncu_profile_to_plan, classify_sass_csv, parse_ncu_csv,
 )
-from gala_sim.tools.gpu_ncu_plan import _kernel_id_filter
+from gala_sim.tools.gpu_ncu_plan import _implementation_hashes, _kernel_id_filter
 from gala_sim.tools.preflight import sample_gpustat
 
 
@@ -49,6 +49,15 @@ def _load_plan(path: Path) -> dict[str, Any]:
         or stability.get("status") != "passed"
     ):
         raise ValueError("NCU plan identity is invalid")
+    repository = Path(__file__).resolve().parents[2]
+    repository_status = subprocess.check_output(
+        ["git", "-C", str(repository), "status", "--porcelain"], text=True,
+    ).strip()
+    if (
+        plan.get("implementation_sha256") != _implementation_hashes(repository)
+        or repository_status
+    ):
+        raise ValueError("NCU plan requires its clean profiling implementation")
     return plan
 
 
