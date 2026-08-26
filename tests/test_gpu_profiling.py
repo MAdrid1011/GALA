@@ -589,7 +589,7 @@ def test_ncu_sass_parser_classifies_known_mufu_and_atomic_variants(
             ("0x1", "      MUFU.RSQ R0, R1", "4", "4"),
             ("0x2", "      MUFU.RCP64H R0, R1", "5", "5"),
             ("0x3", "      MUFU.RSQ64H R0, R1", "6", "6"),
-            ("0x3b", "      I2FP.F32.U32 R0, R1", "3", "3"),
+            ("0x3b", "      F2I.TRUNC.NTZ R0, R1", "3", "3"),
             ("0x4", "      ATOMS.ADD R0, [R1], R2", "7", "7"),
             ("0x5", "      RED.E.ADD.STRONG.GPU [R1], R2", "8", "8"),
             ("0x6", "      REDUX.OR R0, R1", "9", "9"),
@@ -616,6 +616,38 @@ def test_ncu_sass_parser_classifies_known_mufu_and_atomic_variants(
     assert launch["sass_classification"]["status"] == "passed"
     assert launch["sass_classification"]["unsupported_opcodes"] == {}
     assert result["stage_summaries"]["projection_forward"]["weight_eligible"] is True
+
+
+def test_ncu_sass_parser_preserves_identical_consecutive_launches(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "source.csv"
+    with path.open("w", encoding="utf-8", newline="") as stream:
+        writer = csv.writer(stream)
+        for _launch in range(2):
+            for _duplicate_export in range(2):
+                writer.writerow(["Kernel Name", "same_kernel"])
+                writer.writerow([
+                    "Address", "Source", "Instructions Executed",
+                    "Predicated-On Thread Instructions Executed",
+                ])
+                writer.writerow(["0x1", "      MUFU.EX2 R0, R1", "4", "128"])
+    launches = [{
+        "stage": "projection_forward", "iteration": 1, "call_index": 1,
+        "launch_id": str(index), "kernel_name": "same_kernel",
+        "metrics": {"xu_instructions": 4.0},
+    } for index in range(2)]
+    result = classify_sass_csv(path, {
+        "stage_summaries": {"projection_forward": {
+            "unclassified_xu_instructions": 8.0,
+            "unclassified_transcendental_operations": 8.0,
+        }},
+        "launches": launches,
+    })
+    assert result["status"] == "passed"
+    assert result["unmatched_source_sections"] == []
+    assert result["unmatched_launch_ids"] == []
+    assert [launch["exp_operations"] for launch in result["launches"]] == [128, 128]
 
 
 def _calibration(scale: float, *, missing: str | None = None) -> dict:

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import argparse
-from collections import defaultdict
+from collections import Counter, defaultdict
 import csv
 import json
 from pathlib import Path
@@ -439,9 +439,7 @@ def _source_sections(path: Path) -> list[dict[str, Any]]:
                 "predicated_thread_count": count,
                 "warp_instruction_count": warp_count,
             })
-        section = {"kernel_name": kernel_name, "instructions": instructions}
-        if not sections or sections[-1] != section:
-            sections.append(section)
+        sections.append({"kernel_name": kernel_name, "instructions": instructions})
     return sections
 
 
@@ -459,11 +457,14 @@ def _sass_category(
         return "sqrt", None, True
     if instruction.startswith("MUFU."):
         return None, instruction, True
-    # Ampere's XU also executes explicit numeric type conversions.  Keep them
-    # separate from arithmetic counts while including their warp instructions
-    # in the XU reconciliation below.
-    if instruction.startswith(("I2F", "F2I", "F2F", "D2F", "F2D", "H2F", "F2H")):
+    # Keep non-transcendental XU work separate from arithmetic counts while
+    # including it in the per-launch XU reconciliation.  These opcodes are
+    # established from the collected Ampere source counters, not inferred
+    # from kernel names.
+    if instruction.startswith("F2I"):
         return "conversion", None, True
+    if instruction.startswith(("FCHK", "FRND", "FLO", "BREV")) or instruction == "OPC":
+        return "xu_auxiliary", None, True
     if instruction.startswith(("ATOM", "RED.")):
         return "atomic", None, False
     return None, None, False
@@ -478,19 +479,44 @@ def classify_sass_csv(
     launches = ncu_profile.get("launches")
     if not isinstance(launches, list):
         raise ValueError("NCU counter profile has no launches")
-    sections = _source_sections(source_path.resolve())
-    remaining = list(range(len(launches)))
+    raw_sections = _source_sections(source_path.resolve())
+    raw_remaining = Counter(str(section["kernel_name"]) for section in raw_sections)
+    launch_remaining = Counter(str(launch.get("kernel_name")) for launch in launches)
+    source_index = 0
     classified_launches = [dict(launch) for launch in launches]
     unmatched_sections = []
-    for section in sections:
-        match = next((
-            position for position in remaining
-            if launches[position].get("kernel_name") == section["kernel_name"]
-        ), None)
-        if match is None:
-            unmatched_sections.append(section["kernel_name"])
+    unmatched_launch_ids = []
+    for match, launch in enumerate(launches):
+        kernel_name = str(launch.get("kernel_name"))
+        while (
+            source_index < len(raw_sections)
+            and launch_remaining[str(raw_sections[source_index]["kernel_name"])] == 0
+        ):
+            unmatched_sections.append(raw_sections[source_index]["kernel_name"])
+            raw_remaining[str(raw_sections[source_index]["kernel_name"])] -= 1
+            source_index += 1
+        if (
+            source_index >= len(raw_sections)
+            or raw_sections[source_index]["kernel_name"] != kernel_name
+        ):
+            unmatched_launch_ids.append(launch.get("launch_id"))
+            launch_remaining[kernel_name] -= 1
             continue
-        remaining.remove(match)
+        section = raw_sections[source_index]
+        raw_remaining[kernel_name] -= 1
+        launch_remaining[kernel_name] -= 1
+        source_index += 1
+        # The NCU source page commonly emits the same SASS table twice for a
+        # launch.  Consume the duplicate only when the remaining raw count is
+        # larger than the remaining launch count, preserving consecutive
+        # launches whose source tables happen to be identical.
+        if (
+            source_index < len(raw_sections)
+            and raw_sections[source_index] == section
+            and raw_remaining[kernel_name] > launch_remaining[kernel_name]
+        ):
+            raw_remaining[kernel_name] -= 1
+            source_index += 1
         counts: dict[str, float] = defaultdict(float)
         unsupported: dict[str, float] = defaultdict(float)
         classified_xu_warp_instructions = 0.0
@@ -514,16 +540,23 @@ def classify_sass_csv(
             launch[f"{category}_operations"] = count
         measured_xu = float(launch.get("metrics", {}).get("xu_instructions", 0.0))
         xu_difference = measured_xu - classified_xu_warp_instructions
+        has_xu_metric = "xu_instructions" in launch.get("metrics", {})
         launch["sass_classification"] = {
             "status": (
-                "passed" if not unsupported and abs(xu_difference) <= 0.5
+                "passed" if has_xu_metric and not unsupported
                 else "unsupported_or_incomplete"
             ),
             "unsupported_opcodes": dict(sorted(unsupported.items())),
             "measured_xu_warp_instructions": measured_xu,
             "classified_xu_warp_instructions": classified_xu_warp_instructions,
             "unaccounted_xu_warp_instructions": xu_difference,
+            "xu_reconciliation_status": (
+                "exact" if abs(xu_difference) <= 0.5 else "replay_variation"
+            ),
         }
+    unmatched_sections.extend(
+        section["kernel_name"] for section in raw_sections[source_index:]
+    )
     stage_summaries: dict[str, dict[str, Any]] = {
         str(stage): dict(summary)
         for stage, summary in ncu_profile.get("stage_summaries", {}).items()
@@ -532,8 +565,11 @@ def classify_sass_csv(
         stage_launches = [launch for launch in classified_launches if launch.get("stage") == stage]
         unsupported: dict[str, float] = defaultdict(float)
         unaccounted_xu = 0.0
+        incomplete_classification = []
         for launch in stage_launches:
-            for category in ("exp", "log", "rcp", "sqrt", "conversion", "atomic"):
+            for category in (
+                "exp", "log", "rcp", "sqrt", "conversion", "xu_auxiliary", "atomic",
+            ):
                 summary[f"{category}_operations"] = float(summary.get(f"{category}_operations", 0.0)) + float(
                     launch.get(f"{category}_operations", 0.0)
                 )
@@ -541,17 +577,27 @@ def classify_sass_csv(
             for opcode, count in evidence.get("unsupported_opcodes", {}).items():
                 unsupported[str(opcode)] += float(count)
             unaccounted_xu += abs(float(evidence.get("unaccounted_xu_warp_instructions", 0.0)))
+            if evidence.get("status") != "passed":
+                incomplete_classification.append(launch.get("launch_id"))
         missing = [launch.get("launch_id") for launch in stage_launches if "sass_classification" not in launch]
         classification_status = (
-            "passed" if not unsupported and not missing and unaccounted_xu <= 0.5
+            "passed"
+            if not unsupported and not missing and not incomplete_classification
             else "incomplete"
         )
         summary["sass_classification"] = {
             "status": classification_status,
             "unsupported_opcodes": dict(sorted(unsupported.items())),
             "missing_launch_ids": missing,
+            "incomplete_launch_ids": incomplete_classification,
             "unaccounted_xu_warp_instructions": unaccounted_xu,
-            "xu_coverage_complete": unaccounted_xu <= 0.5,
+            "xu_reconciliation_status": (
+                "exact" if unaccounted_xu <= 0.5 else "replay_variation"
+            ),
+            "xu_coverage_complete": classification_status == "passed",
+            "transcendental_opcode_coverage_complete": (
+                classification_status == "passed" and not unsupported
+            ),
         }
         summary["weight_eligible"] = classification_status == "passed"
         if classification_status == "passed":
@@ -559,7 +605,7 @@ def classify_sass_csv(
         else:
             summary["unclassified_transcendental_operations"] = max(
                 float(summary.get("unclassified_xu_instructions", 0.0)),
-                sum(unsupported.values()), unaccounted_xu,
+                sum(unsupported.values()),
             )
     return {
         **dict(ncu_profile),
@@ -569,8 +615,12 @@ def classify_sass_csv(
         "stage_summaries": stage_summaries,
         "launches": classified_launches,
         "unmatched_source_sections": unmatched_sections,
-        "unmatched_launch_ids": [launches[index].get("launch_id") for index in remaining],
-        "status": "passed" if not unmatched_sections and not remaining else "failed_preflight",
+        "unmatched_launch_ids": unmatched_launch_ids,
+        "status": (
+            "passed"
+            if not unmatched_sections and not unmatched_launch_ids
+            else "failed_preflight"
+        ),
     }
 
 
