@@ -352,6 +352,9 @@ def test_capture_iteration_window_is_explicit_and_audited(
     session._iteration = 2
     session._begin_capture_window(1)
     query(object())
+    assert session._audit["official_raster_kernel_calls"] == 2
+    assert session._audit["captured_raster_kernel_calls"] == 1
+    assert session._audit["captured_query_kernel_calls"] == 1
     session._audit.update({
         "cuda_relation_candidates": 1,
         "captured_logical_queries": 1,
