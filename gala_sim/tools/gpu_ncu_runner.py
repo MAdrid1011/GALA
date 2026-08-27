@@ -108,7 +108,7 @@ def _freeze_command(
 def _runner_command(
     repository: Path, plan: Mapping[str, Any], job: Mapping[str, Any],
     freeze_path: Path, output: Path, *, preflight_iterations: int | None,
-) -> tuple[list[str], Path, dict[str, str]]:
+) -> tuple[list[str], Path, dict[str, str], dict[str, Any] | None]:
     ncu = shutil.which("ncu")
     if ncu is None:
         raise FileNotFoundError("ncu")
@@ -133,6 +133,7 @@ def _runner_command(
         stage_arguments.extend(["--profile-iteration-range", "1:1"])
     stage_arguments.extend([train_script, *train_args])
     report_base = output / "profile"
+    preflight_selection = None
     if preflight_iterations is None:
         ncu_arguments = [str(value) for value in job["ncu_arguments"]]
     else:
@@ -151,11 +152,18 @@ def _runner_command(
             ((len(ordinals), name, sorted(set(ordinals))) for name, ordinals in by_name.items()),
             reverse=True,
         )
-        if requested <= 0 or not eligible or eligible[0][0] < requested:
-            raise ValueError("NCU job cannot provide the frozen preflight launch count")
+        if requested <= 0 or not eligible:
+            raise ValueError("NCU job cannot provide an iteration-1 preflight launch")
         _, name, ordinals = eligible[0]
+        selected_ordinals = ordinals[:requested]
         index = ncu_arguments.index("--kernel-id") + 1
-        ncu_arguments[index] = _kernel_id_filter([name], ordinals[:requested])
+        ncu_arguments[index] = _kernel_id_filter([name], selected_ordinals)
+        preflight_selection = {
+            "requested_maximum_launch_count": requested,
+            "selected_launch_count": len(selected_ordinals),
+            "kernel_name": name,
+            "invocation_ordinals": selected_ordinals,
+        }
     command = [
         ncu, "--force-overwrite", "--export", str(report_base),
         *ncu_arguments, *stage_arguments,
@@ -165,7 +173,7 @@ def _runner_command(
     environment["PYTHONPATH"] = (
         str(repository) if not previous else str(repository) + os.pathsep + previous
     )
-    return command, working_directory, environment
+    return command, working_directory, environment, preflight_selection
 
 
 def _export_report(report: Path, page: str, output: Path) -> None:
@@ -324,7 +332,7 @@ def _run(args: argparse.Namespace) -> int:
         preflight_iterations = int(config.value("preflight.warmup_iterations")) + int(
             config.value("preflight.measure_iterations")
         )
-    command, working_directory, environment = _runner_command(
+    command, working_directory, environment, preflight_selection = _runner_command(
         repository, plan, job, freeze_path, output,
         preflight_iterations=preflight_iterations,
     )
@@ -344,6 +352,7 @@ def _run(args: argparse.Namespace) -> int:
         ).strip(),
         "command": command, "working_directory": str(working_directory),
         "preflight_iterations": preflight_iterations,
+        "preflight_selection": preflight_selection,
     }
     _write_status(output / "status.json", running)
     returncode, duration, samples, watchdog = _run_and_sample(
@@ -373,7 +382,13 @@ def _run(args: argparse.Namespace) -> int:
                 native = _read_json(args.native_preflight.resolve())
                 native_wall = float(native["calibration"]["wall_seconds"])
                 native_prediction = float(native["prediction"]["predicted_seconds"])
-                if native.get("status") != "passed" or observed_launches <= 0:
+                expected_preflight_launches = int(
+                    (preflight_selection or {}).get("selected_launch_count", 0)
+                )
+                if (
+                    native.get("status") != "passed"
+                    or observed_launches != expected_preflight_launches
+                ):
                     raise ValueError("native preflight or NCU launch count is invalid")
                 overhead = max(0.0, duration - native_wall)
                 prediction = {
@@ -388,7 +403,9 @@ def _run(args: argparse.Namespace) -> int:
                         + overhead * int(job["selected_kernel_launch_count"])
                         / observed_launches
                     ),
-                    "uncertainty": "linear_kernel_replay_overhead_from_one_real_launch",
+                    "uncertainty": (
+                        "linear_kernel_replay_overhead_from_bounded_iteration_1_launches"
+                    ),
                 }
             if args.mode == "run":
                 _export_report(report, "source", source)

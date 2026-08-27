@@ -25,8 +25,8 @@ from gala_sim.tools.gpu_ncu_plan import (
     validate_ncu_measurement,
 )
 from gala_sim.tools.gpu_ncu_runner import (
-    _capture_job, _load_plan, _run_and_sample, _sample_has_job_gpu_activity,
-    _sample_summary,
+    _capture_job, _load_plan, _run_and_sample, _runner_command,
+    _sample_has_job_gpu_activity, _sample_summary,
 )
 from gala_sim.tools.preflight import GpuSample
 from gala_sim.adapters.stage_runner import _frozen_profile_identity, _profile_selection
@@ -447,6 +447,45 @@ def test_ncu_runner_watchdog_ignores_unrelated_gpu_activity(
     assert _sample_has_job_gpu_activity(sample, 20) is True
     assert _sample_has_job_gpu_activity(sample, 30) is False
     assert _sample_has_job_gpu_activity({**sample, "utilization_percent": 0.0}, 20) is False
+
+
+def test_ncu_runner_preflight_uses_all_available_launches_for_sparse_job(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    config = NcuPlanConfig.load(root / "configs/profiling/r2_gaussian_chest_ncu.yaml")
+    campaign = GpuProfileCampaign.load(config.campaign)
+    plan = build_ncu_plan(config, _nsys_plan_profiles(tmp_path, campaign))
+    job = next(
+        item for item in plan["capture_groups"]
+        if item["capture_mode"] == "kernel_invocations"
+    )
+    first_name = next(
+        launch["kernel_name"] for launch in job["expected_launches"]
+        if launch["iteration"] == 1
+    )
+    first_launches = [
+        launch for launch in job["expected_launches"]
+        if launch["iteration"] == 1 and launch["kernel_name"] == first_name
+    ][:2]
+    sparse_job = {**job, "expected_launches": first_launches}
+    monkeypatch.setattr("gala_sim.tools.gpu_ncu_runner.shutil.which", lambda _: "/usr/bin/ncu")
+    monkeypatch.setattr(
+        "gala_sim.tools.gpu_ncu_runner._freeze_command",
+        lambda *_: (["/usr/bin/python", "train.py", "-s", "data", "-m", "model"], tmp_path),
+    )
+    command, _, _, selection = _runner_command(
+        root, plan, sparse_job, tmp_path / "freeze.json", tmp_path / "output",
+        preflight_iterations=60,
+    )
+    assert selection is not None
+    assert selection["requested_maximum_launch_count"] == 16
+    assert selection["selected_launch_count"] == len(first_launches)
+    assert selection["invocation_ordinals"] == [
+        launch["kernel_name_ordinal_in_invocation_capture"]
+        for launch in first_launches
+    ]
+    assert "--launch-count" not in command
 
 
 def test_ncu_runner_requires_clean_matching_implementation(
