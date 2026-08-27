@@ -4,7 +4,7 @@ campaign_sha256: 75d3968373271d8b019f20279ab0aaf47d145fd1d337b02c16f0ce8384ae593
 signature_fields: [stage, kernel_name, grid, block]
 counter_scope: representative_iteration
 validation_occurrences: [first, middle, last]
-maximum_capture_job_count: 22
+maximum_capture_job_count: 36
 maximum_single_kernel_group_launch_count: 128
 range_capture_stages: [collection]
 preflight_profile_launch_count: 16
