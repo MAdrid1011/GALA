@@ -54,6 +54,7 @@ class NcuPlanConfig:
     counter_scope: str
     validation_occurrences: tuple[str, ...]
     maximum_capture_job_count: int
+    maximum_single_kernel_group_launch_count: int
     range_capture_stages: tuple[str, ...]
     preflight_profile_launch_count: int
     watchdog_inactivity_seconds: float
@@ -82,6 +83,9 @@ class NcuPlanConfig:
                 str(value) for value in document.get("validation_occurrences", ())
             ),
             maximum_capture_job_count=int(document.get("maximum_capture_job_count", 0)),
+            maximum_single_kernel_group_launch_count=int(
+                document.get("maximum_single_kernel_group_launch_count", 0)
+            ),
             range_capture_stages=tuple(
                 str(value) for value in document.get("range_capture_stages", ())
             ),
@@ -116,6 +120,10 @@ class NcuPlanConfig:
             raise ValueError("NCU validation occurrence policy is invalid")
         if self.maximum_capture_job_count <= 0:
             raise ValueError("NCU maximum capture job count must be positive")
+        if self.maximum_single_kernel_group_launch_count <= 0:
+            raise ValueError(
+                "NCU maximum single-kernel group launch count must be positive"
+            )
         if len(set(self.range_capture_stages)) != len(self.range_capture_stages) or any(
             not value or not re.fullmatch(r"[a-z_]+", value)
             for value in self.range_capture_stages
@@ -639,20 +647,48 @@ def build_ncu_plan(
     grouped_names: dict[tuple[int, ...], set[str]] = defaultdict(set)
     for name, ordinals in target_ordinals.items():
         grouped_names[tuple(sorted(ordinals))].add(name)
-    groups: list[tuple[set[str], set[int]]] = [
-        (set(names), set(ordinals))
-        for ordinals, names in grouped_names.items()
-    ]
+    # Keep large single-kernel groups split by their real invocation ordinals.
+    # NCU replays every selected ordinal, so this bound controls replay pressure
+    # without changing the required launch set or inventing a sampling subset.
+    groups: list[tuple[set[str], set[int], bool]] = []
+    for ordinals, names in grouped_names.items():
+        ordered_ordinals = sorted(ordinals)
+        is_single_kernel = len(names) == 1
+        if (
+            is_single_kernel
+            and len(ordered_ordinals)
+            > config.maximum_single_kernel_group_launch_count
+        ):
+            for start in range(
+                0, len(ordered_ordinals),
+                config.maximum_single_kernel_group_launch_count,
+            ):
+                groups.append((
+                    set(names),
+                    set(ordered_ordinals[
+                        start:start + config.maximum_single_kernel_group_launch_count
+                    ]),
+                    True,
+                ))
+        else:
+            groups.append((set(names), set(ordinals), False))
     while len(groups) > config.maximum_capture_job_count:
-        best: tuple[int, int, int, tuple[set[str], set[int]]] | None = None
+        best: tuple[int, int, int, int, tuple[set[str], set[int], bool]] | None = None
         for left in range(len(groups)):
             for right in range(left):
+                # A protected shard is deliberately kept independent.  If the
+                # configured job budget cannot hold these shards, fail plan
+                # generation instead of silently recreating the unsafe group.
+                if groups[left][2] or groups[right][2]:
+                    continue
                 names = groups[left][0] | groups[right][0]
                 ordinals = groups[left][1] | groups[right][1]
                 candidate = (
                     group_cost(names, ordinals)
-                    - group_cost(*groups[left]) - group_cost(*groups[right]),
-                    group_cost(names, ordinals), left, right, (names, ordinals),
+                    - group_cost(groups[left][0], groups[left][1])
+                    - group_cost(groups[right][0], groups[right][1]),
+                    group_cost(names, ordinals), left, right,
+                    (names, ordinals, False),
                 )
                 if best is None or candidate[:2] < best[:2]:
                     best = candidate
@@ -678,7 +714,7 @@ def build_ncu_plan(
         ])
 
     capture_groups = []
-    for job_index, (names, ordinals) in enumerate(groups, start=1):
+    for job_index, (names, ordinals, _) in enumerate(groups, start=1):
         expected_launches = [
             location for location in all_locations
             if location["stage"] not in config.range_capture_stages
@@ -827,6 +863,10 @@ def build_ncu_plan(
         "counter_scope": config.counter_scope,
         "validation_occurrences": list(config.validation_occurrences),
         "range_capture_stages": list(config.range_capture_stages),
+        "maximum_capture_job_count": config.maximum_capture_job_count,
+        "maximum_single_kernel_group_launch_count": (
+            config.maximum_single_kernel_group_launch_count
+        ),
         "stability_validation": stability,
         "counter_reuse_gate": {
             "policy": (
@@ -855,6 +895,10 @@ def build_ncu_plan(
                 ],
                 "--metrics", ",".join(config.metrics),
             ],
+            "maximum_capture_job_count": config.maximum_capture_job_count,
+            "maximum_single_kernel_group_launch_count": (
+                config.maximum_single_kernel_group_launch_count
+            ),
             "capture_mode": "cuda_profiler_api",
             "invocation_scope": "representative_windows_after_nvtx_range_exclusion",
             "range_scope": "all_launches_in_configured_cross_thread_start_end_ranges",

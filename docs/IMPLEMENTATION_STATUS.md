@@ -47,11 +47,12 @@
 - v4 Job 1--3 均自然完成 30,000 iteration 并逐项通过 launch binding、SourceCounters 和动态 SASS gate。Job 1 为 `1435/1435`，耗时 `2257.096601009369 s`；Job 2 为 `1634/1634`，耗时 `2068.0485558509827 s`，status 文件 SHA-256 为 `dcc584abb9246aa2deaed2b79b830a72640d61609290d9da8d65b75b08e3528c`；Job 3 为 `964/964`，耗时 `1835.250658750534 s`，status 文件 SHA-256 为 `5767d558789f34055309de867db6e2d326cbc249a2efe402d0a7bf3c8ef5df85`。三项累计覆盖 `2338/5418` 个必测样本，但在完整计划闭合前仍明确 `formal_performance_eligible=false`。
 - v4 Job 4 的同一 direct-copy kernel replay 点连续两次进入 GPU 0%、stdout 和 report 均不更新的停滞状态。两次均只终止精确进程树并保留现场；首次 `watchdog_stop.json` SHA-256 为 `51a0346583fd965bb40202759e8e582639dd8b8faaeab7f6a0528d78397d0181`，第二次在连续 300 秒无推进后以 `watchdog_inactivity_timeout` 退出，`watchdog.json` SHA-256 为 `b86d3d7af321a1c770539fb44fa04ccdc64733a1b2696576d9a798a339a4c8b5`。600-iteration 定向 kernel-replay 诊断用正式 metrics、SourceCounters 和短 ordinal 窗口自然完成 `14/14`，证明 kernel 可采，失败来自 v4 多名称/ordinal 交叉分组产生的额外 replay 压力。
 - v5 将 invocation 作业上限从 6 提到 16，候选计划保持 `5418` 个必测样本不变，把选择量从 `8939` 降至 `5824`、额外 launch 从 `3521` 降至 `406`，并将 direct-copy 独立为 `127/127`、0 extra 的作业。正式 runner 同时加入计划绑定的 300 秒 inactivity watchdog；只有本作业进程组 GPU 活动、stdout 或 report 任一推进才续时，超时后先 SIGTERM、再按冻结 grace 必要时 SIGKILL，并写入正式 status。短门对稀疏组使用一个真实内核名称的全部可用 iteration-1 launch（上限 16），并记录实际数量；v5 正式计划必须在该实现形成 clean Git 提交后重新生成；v4 Job 1--3 仅作为历史证据，未经逐字段等价检查和显式 plan-lineage 重绑定不得并入 v5。
+- 针对第十三组 `CUDAFunctor_add<float>` 的 `239` 个实际启动序号在同一回放组内触发停滞，分组生成器现支持配置化的 `maximum_single_kernel_group_launch_count=128`：只对超过上限的单一内核按真实 invocation ordinal 连续分区，并禁止受保护分区再次合并。正式采集组上限同步调整为 `22`，不会改变 `5418` 个必测样本或覆盖集合；该实现已通过 `136 passed, 1 skipped` 全量测试，新的正式计划尚待 clean 提交后生成。
 - `600:601` 跨迭代真实窗口 trace 已完成 quick validation，结构化记录位于 `GALA-runtime/records/r2_gaussian_chest_trace_window_600_601.json`，SHA-256 为 `b80547658c5fbe4af69ae7864309fd5c97ed6563712a146316ecdba0ca59c947`。捕获包含 `872588146` 个事件、`1430920031` 条依赖、`589824` 个 query、`144911313` 条真实 relation，并覆盖一次 collection、clone/prune、optimizer/no-op optimizer、update begin/end 和后继 query 屏障；全量 validator 修复后 PASS。插桩与两次未插桩 601-iteration 运行的质量差异为 PSNR `-0.000180522587961 dB`、SSIM `-0.000003659142978`、LPIPS `-0.000018147627513`，低于冻结阈值；由于上游 backward CUDA 使用 `atomicAdd`，不宣称 bitwise identical。该窗口明确 `formal_performance_eligible=false`、`quality_eligible=false`，不能作为正式完整 trace、Base ASIC、Oracle、消融或论文结果。
 
 ## 当前入口
 
-R²-Gaussian + Chest 当前处于工作流步骤 2 的正式 GPU/AGX Orin 校准闭合阶段。v4 NCU Job 1--3 已通过，Job 4 的可重复停滞触发 v5 分组修复。当前入口是提交并冻结 v5 plan、对独立 direct-copy 作业执行短门，然后顺序完成或严格重绑定全部 v5 作业；完整 measured evidence 通过前不进入正式 30k trace、Base ASIC 或 Oracle，也不报告正式阶段权重或 Orin 换算结果。
+R²-Gaussian + Chest 当前处于工作流步骤 2 的正式 GPU/AGX Orin 校准闭合阶段。v4 NCU Job 1--3 已通过，v5 的大型单内核分组修复已实现并通过测试，但新计划尚未生成。当前入口是 clean 提交并冻结修订后的 v5 plan、对拆分后的 direct-copy 与 `CUDAFunctor_add<float>` 组执行短门，然后顺序完成或严格重绑定全部正式作业；完整 measured evidence 通过前不进入正式 30k trace、Base ASIC 或 Oracle，也不报告正式阶段权重或 Orin 换算结果。
 
 本轮 v9 stream-only 真实 Chest 1-iteration capture 已生成完整 raw-column manifest：577,268,206 个事件、895,439,361 条依赖；capture audit 记录 294,912 个逻辑 query、690,928 个 CUDA candidate、95,948,757 条有效 relation，实际 D2H transfer 12 次。插桩与未插桩官方运行的 `vol_pred.npy` SHA-256 和逐元素值完全一致，PSNR `20.285214676826495`、SSIM `0.268613299848576`、LPIPS `0.6325289289156596` 完全一致。该证据仍是 1 iteration smoke，不是正式 30k trace。随后 `600:601` 窗口已补齐真实增密、更新和释放事务，但仍只用于 quick validation。
 
@@ -69,7 +70,7 @@ R²-Gaussian 的官方 CUDA 扩展仍没有直接导出完整 CLAMP 事件缓冲
 
 ## 下一步入口条件
 
-1. 在 clean profiling implementation 上冻结正式 v5 plan，先运行独立 direct-copy 作业短门，再逐项完成 v5 invocation/range 作业并补齐 AGX Orin 校准向量。历史 v4 作业只有在 filter、expected launch、原始 report、stage identity 和实现 lineage 全部严格闭合时才能重绑定；其余作业必须让官方 30,000-iteration 训练自然结束。不得使用 `--launch-count`、`--kill` 或以 watchdog 终止结果冒充自然完成证据。
+1. 在 clean profiling implementation 上生成并冻结修订后的正式 v5 plan，验证单内核分区不重复、不遗漏且总必测样本仍为 `5418`；先运行拆分后的 direct-copy 与 `CUDAFunctor_add<float>` 作业短门，再逐项完成 v5 invocation/range 作业并补齐 AGX Orin 校准向量。历史 v4 作业只有在 filter、expected launch、原始 report、stage identity 和实现 lineage 全部严格闭合时才能重绑定；其余作业必须让官方 30,000-iteration 训练自然结束。不得使用 `--launch-count`、`--kill` 或以 watchdog 终止结果冒充自然完成证据。
 2. 冻结 `relation.seed_fifo_entries`、模块时序、trace chunk 容量和 `memory.ramulator_config_sha256` 等 pending hardware/timing/chunk 参数。
 3. 设计并运行正式完整 30k stream-only trace 获取策略；窗口 trace 只能作为 quick validation，不能替代正式 trace。
 4. 在完整真实 trace 上通过依赖、状态、释放和动态事件计数检查，再运行 `0000` Base ASIC 和两个受资源约束 Oracle。

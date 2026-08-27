@@ -330,6 +330,45 @@ def test_ncu_plan_preserves_multiplicity_and_selects_validation_occurrences(
     assert r"\x3a\x3a" in _regex_alternation(["namespace::kernel"])
 
 
+def test_ncu_plan_partitions_large_single_kernel_groups_by_actual_ordinals(
+    tmp_path: Path,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    base = NcuPlanConfig.load(
+        root / "configs/profiling/r2_gaussian_chest_ncu.yaml"
+    )
+    config = replace(
+        base,
+        maximum_capture_job_count=100,
+        maximum_single_kernel_group_launch_count=3,
+    )
+    campaign = GpuProfileCampaign.load(config.campaign)
+    paths = _nsys_plan_profiles(tmp_path, campaign)
+    plan = build_ncu_plan(config, paths, paths)
+    invocation_groups = [
+        group for group in plan["capture_groups"]
+        if group["capture_mode"] == "kernel_invocations"
+    ]
+    assert invocation_groups
+    assert all(
+        group["selected_kernel_launch_count"] <= 3
+        for group in invocation_groups
+        if len(group["kernel_names"]) == 1
+    )
+    assert any(
+        len(group["kernel_names"]) == 1
+        and group["selected_kernel_launch_count"] == 3
+        for group in invocation_groups
+    )
+    planned_ids = [
+        launch["selected_launch_id"]
+        for group in invocation_groups
+        for launch in group["expected_launches"]
+    ]
+    assert len(planned_ids) == len(set(planned_ids))
+    assert plan["ncu"]["maximum_single_kernel_group_launch_count"] == 3
+
+
 def test_ncu_plan_rejects_inexact_nsys_coverage(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[1]
     config = NcuPlanConfig.load(
