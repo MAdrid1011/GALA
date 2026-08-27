@@ -24,7 +24,11 @@ from gala_sim.tools.gpu_ncu_plan import (
     NcuPlanConfig, _regex_alternation, build_ncu_plan, main as ncu_plan_main,
     validate_ncu_measurement,
 )
-from gala_sim.tools.gpu_ncu_runner import _capture_job, _load_plan, _sample_summary
+from gala_sim.tools.gpu_ncu_runner import (
+    _capture_job, _load_plan, _run_and_sample, _sample_has_job_gpu_activity,
+    _sample_summary,
+)
+from gala_sim.tools.preflight import GpuSample
 from gala_sim.adapters.stage_runner import _frozen_profile_identity, _profile_selection
 from gala_sim.tools.gpu_normalization import normalize_stage_profiles
 
@@ -282,7 +286,10 @@ def test_ncu_plan_preserves_multiplicity_and_selects_validation_occurrences(
     assert result["coverage"]["observed_kernel_launch_count"] == 121
     assert result["coverage"]["representative_iteration_signature_count"] == 117
     assert result["ncu"]["preflight_profile_launch_count"] == 16
-    assert 0 < result["coverage"]["invocation_capture_job_count"] <= 6
+    assert (
+        0 < result["coverage"]["invocation_capture_job_count"]
+        <= config.maximum_capture_job_count
+    )
     assert result["coverage"]["range_capture_job_count"] == 1
     assert sum(
         group["required_sample_count"] for group in result["capture_groups"]
@@ -407,6 +414,39 @@ def test_ncu_runner_rejects_early_termination_options() -> None:
     ])
     assert summary["mean_utilization_percent"] == 60
     assert summary["maximum_memory_used_bytes"] == 200
+
+
+def test_ncu_runner_watchdog_terminates_only_the_spawned_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "gala_sim.tools.gpu_ncu_runner.sample_gpustat",
+        lambda: GpuSample(0.0, 0.0, 0, None, None, None, None),
+    )
+    returncode, _, _, watchdog = _run_and_sample(
+        ["/bin/sleep", "10"], tmp_path, {}, tmp_path / "stdout.log",
+        tmp_path / "profile.ncu-rep", 0.01, 0.05, 0.5,
+    )
+    assert returncode != 0
+    assert watchdog["status"] == "terminated"
+    assert watchdog["termination_signal"] == "SIGTERM"
+    assert watchdog["maximum_observed_inactivity_seconds"] >= 0.05
+
+
+def test_ncu_runner_watchdog_ignores_unrelated_gpu_activity(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    sample = {
+        "utilization_percent": 100.0,
+        "compute_processes": [{"pid": 123}, {"pid": 456}],
+    }
+    monkeypatch.setattr(
+        "gala_sim.tools.gpu_ncu_runner.os.getpgid",
+        lambda pid: {123: 10, 456: 20}[pid],
+    )
+    assert _sample_has_job_gpu_activity(sample, 20) is True
+    assert _sample_has_job_gpu_activity(sample, 30) is False
+    assert _sample_has_job_gpu_activity({**sample, "utilization_percent": 0.0}, 20) is False
 
 
 def test_ncu_runner_requires_clean_matching_implementation(

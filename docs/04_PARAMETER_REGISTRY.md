@@ -121,6 +121,8 @@ FMA、EXP、LOG、RCP、SQRT、SRAM、CAM、互连和寄存器流水延迟不写
 | `preflight.long_run_threshold_seconds` | 3600 | second | 触发小时级任务预检 |
 | `preflight.gpu_utilization_floor_percent` | 60 | percent | 触发工程效率审计 |
 | `preflight.gpustat_interval_seconds` | 1 | second | GPU 利用率采样周期 |
+| `ncu.watchdog_inactivity_seconds` | 300 | second | GPU、stdout 和分析器报告均无推进时的终止门限 |
+| `ncu.watchdog_termination_grace_seconds` | 10 | second | watchdog 发出 SIGTERM 后等待精确进程组退出的时间 |
 | `preflight.warmup_iterations` | 10 | iteration | 排除首次编译和缓存建立 |
 | `preflight.measure_iterations` | 50 | iteration | 预测总运行时间 |
 | `trace.chunk_events` | 自动调优后冻结 | event | 设备 trace chunk 容量 |

@@ -426,7 +426,7 @@ def bind_ncu_profile_to_plan(
         str(key): value for key, value in plan.items() if key != "content_sha256"
     }
     if (
-        plan.get("schema_version") != "gala-ncu-launch-signature-plan-v4"
+        plan.get("schema_version") != "gala-ncu-launch-signature-plan-v5"
         or not isinstance(plan_hash, str)
         or sha256_bytes(canonical_json(plan_payload)) != plan_hash
     ):

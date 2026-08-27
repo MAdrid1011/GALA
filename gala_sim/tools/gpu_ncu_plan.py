@@ -17,8 +17,8 @@ from gala_sim.identity import canonical_json, sha256_bytes, sha256_file
 from gala_sim.tools.gpu_profile_campaign import GpuProfileCampaign
 
 
-CONFIG_SCHEMA_VERSION = "gala-ncu-launch-signature-config-v4"
-PLAN_SCHEMA_VERSION = "gala-ncu-launch-signature-plan-v4"
+CONFIG_SCHEMA_VERSION = "gala-ncu-launch-signature-config-v5"
+PLAN_SCHEMA_VERSION = "gala-ncu-launch-signature-plan-v5"
 _SUPPORTED_SIGNATURE_FIELDS = ("stage", "kernel_name", "grid", "block")
 _SUPPORTED_OCCURRENCES = ("first", "middle", "last")
 _SUPPORTED_NCU_OPTIONS = {
@@ -56,6 +56,8 @@ class NcuPlanConfig:
     maximum_capture_job_count: int
     range_capture_stages: tuple[str, ...]
     preflight_profile_launch_count: int
+    watchdog_inactivity_seconds: float
+    watchdog_termination_grace_seconds: float
     metrics: tuple[str, ...]
     sections: tuple[str, ...]
     ncu_options: Mapping[str, str]
@@ -86,6 +88,12 @@ class NcuPlanConfig:
             preflight_profile_launch_count=int(
                 document.get("preflight_profile_launch_count", 0)
             ),
+            watchdog_inactivity_seconds=float(
+                document.get("watchdog_inactivity_seconds", 0.0)
+            ),
+            watchdog_termination_grace_seconds=float(
+                document.get("watchdog_termination_grace_seconds", 0.0)
+            ),
             metrics=tuple(str(value) for value in document.get("metrics", ())),
             sections=tuple(str(value) for value in document.get("sections", ())),
             ncu_options={str(name): str(value) for name, value in options.items()},
@@ -115,6 +123,11 @@ class NcuPlanConfig:
             raise ValueError("NCU range-capture stages are invalid")
         if self.preflight_profile_launch_count <= 0:
             raise ValueError("NCU preflight profile launch count must be positive")
+        if (
+            self.watchdog_inactivity_seconds <= 0
+            or self.watchdog_termination_grace_seconds <= 0
+        ):
+            raise ValueError("NCU watchdog timing must be positive")
         if not self.metrics or len(set(self.metrics)) != len(self.metrics):
             raise ValueError("NCU metrics must be nonempty and unique")
         if (
@@ -846,6 +859,10 @@ def build_ncu_plan(
             "invocation_scope": "representative_windows_after_nvtx_range_exclusion",
             "range_scope": "all_launches_in_configured_cross_thread_start_end_ranges",
             "preflight_profile_launch_count": config.preflight_profile_launch_count,
+            "watchdog_inactivity_seconds": config.watchdog_inactivity_seconds,
+            "watchdog_termination_grace_seconds": (
+                config.watchdog_termination_grace_seconds
+            ),
         },
         "coverage": {
             "status": "complete",

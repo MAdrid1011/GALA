@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 import json
 import os
 from pathlib import Path
+import signal
 import shutil
 import statistics
 import subprocess
@@ -25,8 +26,8 @@ from gala_sim.tools.gpu_ncu_plan import _implementation_hashes, _kernel_id_filte
 from gala_sim.tools.preflight import sample_gpustat
 
 
-RUN_SCHEMA_VERSION = "gala-ncu-capture-run-v2"
-PLAN_SCHEMA_VERSION = "gala-ncu-launch-signature-plan-v4"
+RUN_SCHEMA_VERSION = "gala-ncu-capture-run-v3"
+PLAN_SCHEMA_VERSION = "gala-ncu-launch-signature-plan-v5"
 
 
 def _read_json(path: Path) -> dict[str, Any]:
@@ -192,24 +193,92 @@ def _write_status(path: Path, document: Mapping[str, Any]) -> None:
     path.write_text(json.dumps(payload, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
 
+def _file_progress(path: Path) -> tuple[int, int]:
+    try:
+        status = path.stat()
+    except FileNotFoundError:
+        return 0, 0
+    return status.st_size, status.st_mtime_ns
+
+
+def _terminate_process_group(process: subprocess.Popen[str], grace_seconds: float) -> str:
+    os.killpg(process.pid, signal.SIGTERM)
+    try:
+        process.wait(timeout=grace_seconds)
+        return "SIGTERM"
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGKILL)
+        process.wait()
+        return "SIGKILL"
+
+
+def _sample_has_job_gpu_activity(
+    sample: Mapping[str, Any], process_group_id: int,
+) -> bool:
+    if float(sample.get("utilization_percent", 0.0)) <= 0.0:
+        return False
+    for process in sample.get("compute_processes", ()):
+        if not isinstance(process, Mapping):
+            continue
+        try:
+            if os.getpgid(int(process["pid"])) == process_group_id:
+                return True
+        except (KeyError, OSError, TypeError, ValueError):
+            continue
+    return False
+
+
 def _run_and_sample(
     command: list[str], working_directory: Path, environment: Mapping[str, str],
-    log_path: Path, interval_seconds: float,
-) -> tuple[int, float, list[dict[str, Any]]]:
+    log_path: Path, report_path: Path, interval_seconds: float,
+    inactivity_seconds: float, termination_grace_seconds: float,
+) -> tuple[int, float, list[dict[str, Any]], dict[str, Any]]:
     start = time.time()
+    monotonic_start = time.monotonic()
+    last_progress = monotonic_start
+    maximum_inactivity = 0.0
     samples = []
+    previous_files = (_file_progress(log_path), _file_progress(report_path))
+    termination_signal = None
     with log_path.open("w", encoding="utf-8") as log:
         process = subprocess.Popen(
             command, cwd=working_directory, env=dict(environment), stdout=log,
-            stderr=subprocess.STDOUT, text=True,
+            stderr=subprocess.STDOUT, text=True, start_new_session=True,
         )
         while process.poll() is None:
+            sample: dict[str, Any]
             try:
-                samples.append(asdict(sample_gpustat()))
+                sample = asdict(sample_gpustat())
             except RuntimeError as error:
-                samples.append({"timestamp": time.time(), "error": str(error)})
-            time.sleep(interval_seconds)
-        return int(process.returncode), time.time() - start, samples
+                sample = {"timestamp": time.time(), "error": str(error)}
+            samples.append(sample)
+            current_files = (_file_progress(log_path), _file_progress(report_path))
+            gpu_active = _sample_has_job_gpu_activity(sample, process.pid)
+            if gpu_active or current_files != previous_files:
+                last_progress = time.monotonic()
+            previous_files = current_files
+            inactivity = time.monotonic() - last_progress
+            maximum_inactivity = max(maximum_inactivity, inactivity)
+            if inactivity >= inactivity_seconds:
+                termination_signal = _terminate_process_group(
+                    process, termination_grace_seconds,
+                )
+                break
+            try:
+                process.wait(timeout=interval_seconds)
+            except subprocess.TimeoutExpired:
+                pass
+        returncode = int(process.wait())
+    watchdog = {
+        "status": "terminated" if termination_signal else "passed",
+        "inactivity_limit_seconds": inactivity_seconds,
+        "termination_grace_seconds": termination_grace_seconds,
+        "maximum_observed_inactivity_seconds": maximum_inactivity,
+        "termination_signal": termination_signal,
+        "final_log_size_bytes": _file_progress(log_path)[0],
+        "final_report_size_bytes": _file_progress(report_path)[0],
+    }
+    return returncode, time.time() - start, samples, watchdog
 
 
 def _sample_summary(samples: list[Mapping[str, Any]]) -> dict[str, Any]:
@@ -244,6 +313,12 @@ def _run(args: argparse.Namespace) -> int:
     interval = float(config.value("preflight.gpustat_interval_seconds"))
     threshold = float(config.value("preflight.long_run_threshold_seconds"))
     floor = float(config.value("preflight.gpu_utilization_floor_percent"))
+    inactivity = float(plan.get("ncu", {}).get("watchdog_inactivity_seconds", 0.0))
+    termination_grace = float(
+        plan.get("ncu", {}).get("watchdog_termination_grace_seconds", 0.0)
+    )
+    if inactivity <= 0 or termination_grace <= 0:
+        raise ValueError("NCU watchdog timing must be positive")
     preflight_iterations = None
     if args.mode == "preflight":
         preflight_iterations = int(config.value("preflight.warmup_iterations")) + int(
@@ -271,8 +346,9 @@ def _run(args: argparse.Namespace) -> int:
         "preflight_iterations": preflight_iterations,
     }
     _write_status(output / "status.json", running)
-    returncode, duration, samples = _run_and_sample(
-        command, working_directory, environment, output / "stdout.log", interval,
+    returncode, duration, samples, watchdog = _run_and_sample(
+        command, working_directory, environment, output / "stdout.log",
+        output / "profile.ncu-rep", interval, inactivity, termination_grace,
     )
     report = output / "profile.ncu-rep"
     details = output / "profile.details.csv"
@@ -281,7 +357,9 @@ def _run(args: argparse.Namespace) -> int:
     prediction = None
     failure = None
     try:
-        if returncode != 0 or not report.is_file():
+        if watchdog["status"] == "terminated":
+            failure = "watchdog_inactivity_timeout"
+        elif returncode != 0 or not report.is_file():
             failure = "ncu_command_failed"
         else:
             _export_report(report, "details", details)
@@ -358,6 +436,7 @@ def _run(args: argparse.Namespace) -> int:
         "duration_seconds": duration, "returncode": returncode,
         "long_run_threshold_seconds": threshold,
         "gpu_utilization_floor_percent": floor,
+        "watchdog": watchdog,
         "gpu_sampling": summary, "gpu_samples": samples,
         "prediction": prediction, "artifacts": artifacts, "failure": failure,
     }
