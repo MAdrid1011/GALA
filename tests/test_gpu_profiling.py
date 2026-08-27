@@ -259,13 +259,18 @@ def _nsys_plan_profiles(tmp_path: Path, campaign: GpuProfileCampaign) -> list[Pa
     return paths
 
 
+def _test_ncu_config(root: Path) -> NcuPlanConfig:
+    return replace(
+        NcuPlanConfig.load(root / "configs/profiling/r2_gaussian_chest_ncu.yaml"),
+        isolated_invocation_ordinals={},
+    )
+
+
 def test_ncu_plan_preserves_multiplicity_and_selects_validation_occurrences(
     tmp_path: Path,
 ) -> None:
     root = Path(__file__).resolve().parents[1]
-    config = NcuPlanConfig.load(
-        root / "configs/profiling/r2_gaussian_chest_ncu.yaml"
-    )
+    config = _test_ncu_config(root)
     campaign = GpuProfileCampaign.load(config.campaign)
     paths = _nsys_plan_profiles(tmp_path, campaign)
     result = build_ncu_plan(config, paths, paths)
@@ -334,13 +339,12 @@ def test_ncu_plan_partitions_large_single_kernel_groups_by_actual_ordinals(
     tmp_path: Path,
 ) -> None:
     root = Path(__file__).resolve().parents[1]
-    base = NcuPlanConfig.load(
-        root / "configs/profiling/r2_gaussian_chest_ncu.yaml"
-    )
+    base = _test_ncu_config(root)
     config = replace(
         base,
         maximum_capture_job_count=100,
         maximum_single_kernel_group_launch_count=3,
+        isolated_invocation_ordinals={"backward_kernel": (1,)},
     )
     campaign = GpuProfileCampaign.load(config.campaign)
     paths = _nsys_plan_profiles(tmp_path, campaign)
@@ -367,13 +371,18 @@ def test_ncu_plan_partitions_large_single_kernel_groups_by_actual_ordinals(
     ]
     assert len(planned_ids) == len(set(planned_ids))
     assert plan["ncu"]["maximum_single_kernel_group_launch_count"] == 3
+    isolated = [
+        group for group in invocation_groups
+        if group["kernel_names"] == ["backward_kernel"]
+        and group["invocation_ordinals"] == [1]
+    ]
+    assert len(isolated) == 1
+    assert plan["isolated_invocation_ordinals"] == {"backward_kernel": [1]}
 
 
 def test_ncu_plan_rejects_inexact_nsys_coverage(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[1]
-    config = NcuPlanConfig.load(
-        root / "configs/profiling/r2_gaussian_chest_ncu.yaml"
-    )
+    config = _test_ncu_config(root)
     campaign = GpuProfileCampaign.load(config.campaign)
     paths = _nsys_plan_profiles(tmp_path, campaign)
     profile = json.loads(paths[0].read_text(encoding="utf-8"))
@@ -387,7 +396,7 @@ def test_ncu_plan_requires_repeat_stability_outside_range_stages(
     tmp_path: Path,
 ) -> None:
     root = Path(__file__).resolve().parents[1]
-    base = NcuPlanConfig.load(root / "configs/profiling/r2_gaussian_chest_ncu.yaml")
+    base = _test_ncu_config(root)
     config = replace(base, range_capture_stages=("projection_forward",))
     campaign = GpuProfileCampaign.load(config.campaign)
     primary_root = tmp_path / "primary"
@@ -492,7 +501,7 @@ def test_ncu_runner_preflight_uses_all_available_launches_for_sparse_job(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = Path(__file__).resolve().parents[1]
-    config = NcuPlanConfig.load(root / "configs/profiling/r2_gaussian_chest_ncu.yaml")
+    config = _test_ncu_config(root)
     campaign = GpuProfileCampaign.load(config.campaign)
     plan = build_ncu_plan(config, _nsys_plan_profiles(tmp_path, campaign))
     job = next(
@@ -583,7 +592,7 @@ def test_ncu_runner_requires_clean_matching_implementation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     root = Path(__file__).resolve().parents[1]
-    config = NcuPlanConfig.load(root / "configs/profiling/r2_gaussian_chest_ncu.yaml")
+    config = _test_ncu_config(root)
     campaign = GpuProfileCampaign.load(config.campaign)
     paths = _nsys_plan_profiles(tmp_path, campaign)
     plan = build_ncu_plan(config, paths, paths)
@@ -606,7 +615,7 @@ def test_ncu_job_binding_restores_exact_planned_launch_identity(
     tmp_path: Path,
 ) -> None:
     root = Path(__file__).resolve().parents[1]
-    config = NcuPlanConfig.load(root / "configs/profiling/r2_gaussian_chest_ncu.yaml")
+    config = _test_ncu_config(root)
     campaign = GpuProfileCampaign.load(config.campaign)
     paths = _nsys_plan_profiles(tmp_path, campaign)
     plan = build_ncu_plan(config, paths, paths)
@@ -677,7 +686,7 @@ def test_ncu_range_job_binds_every_dynamic_launch_without_cross_run_shape_assump
     tmp_path: Path,
 ) -> None:
     root = Path(__file__).resolve().parents[1]
-    base = NcuPlanConfig.load(root / "configs/profiling/r2_gaussian_chest_ncu.yaml")
+    base = _test_ncu_config(root)
     config = replace(base, range_capture_stages=("projection_forward",))
     campaign = GpuProfileCampaign.load(config.campaign)
     paths = _nsys_plan_profiles(tmp_path, campaign)
@@ -785,7 +794,7 @@ def test_ncu_range_job_binds_every_dynamic_launch_without_cross_run_shape_assump
 
 def test_ncu_measurement_validator_requires_exact_call_sequences(tmp_path: Path) -> None:
     root = Path(__file__).resolve().parents[1]
-    config = NcuPlanConfig.load(root / "configs/profiling/r2_gaussian_chest_ncu.yaml")
+    config = _test_ncu_config(root)
     campaign = GpuProfileCampaign.load(config.campaign)
     paths = _nsys_plan_profiles(tmp_path, campaign)
     plan = build_ncu_plan(config, paths, paths)

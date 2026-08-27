@@ -55,6 +55,7 @@ class NcuPlanConfig:
     validation_occurrences: tuple[str, ...]
     maximum_capture_job_count: int
     maximum_single_kernel_group_launch_count: int
+    isolated_invocation_ordinals: Mapping[str, tuple[int, ...]]
     range_capture_stages: tuple[str, ...]
     preflight_profile_launch_count: int
     watchdog_inactivity_seconds: float
@@ -86,6 +87,15 @@ class NcuPlanConfig:
             maximum_single_kernel_group_launch_count=int(
                 document.get("maximum_single_kernel_group_launch_count", 0)
             ),
+            isolated_invocation_ordinals={
+                str(name): tuple(
+                    int(ordinal) for ordinal in ordinals
+                )
+                for name, ordinals in (
+                    document.get("isolated_invocation_ordinals", {}) or {}
+                ).items()
+            } if isinstance(document.get("isolated_invocation_ordinals", {}) or {}, Mapping)
+            else {},
             range_capture_stages=tuple(
                 str(value) for value in document.get("range_capture_stages", ())
             ),
@@ -124,6 +134,15 @@ class NcuPlanConfig:
             raise ValueError(
                 "NCU maximum single-kernel group launch count must be positive"
             )
+        for name, ordinals in self.isolated_invocation_ordinals.items():
+            if (
+                not name or not ordinals or len(set(ordinals)) != len(ordinals)
+                or any(
+                    isinstance(ordinal, bool) or ordinal <= 0
+                    for ordinal in ordinals
+                )
+            ):
+                raise ValueError("NCU isolated invocation ordinals are invalid")
         if len(set(self.range_capture_stages)) != len(self.range_capture_stages) or any(
             not value or not re.fullmatch(r"[a-z_]+", value)
             for value in self.range_capture_stages
@@ -651,27 +670,64 @@ def build_ncu_plan(
     # NCU replays every selected ordinal, so this bound controls replay pressure
     # without changing the required launch set or inventing a sampling subset.
     groups: list[tuple[set[str], set[int], bool]] = []
-    for ordinals, names in grouped_names.items():
+    applied_isolated_ordinals: set[tuple[str, int]] = set()
+
+    def append_single_kernel_group(
+        name: str, ordinals: set[int], *, force_partition: bool = False,
+    ) -> None:
         ordered_ordinals = sorted(ordinals)
-        is_single_kernel = len(names) == 1
-        if (
-            is_single_kernel
-            and len(ordered_ordinals)
-            > config.maximum_single_kernel_group_launch_count
+        should_partition = (
+            force_partition
+            or len(ordered_ordinals) > config.maximum_single_kernel_group_launch_count
+        )
+        if not should_partition:
+            groups.append(({name}, set(ordinals), False))
+            return
+        for start in range(
+            0, len(ordered_ordinals),
+            config.maximum_single_kernel_group_launch_count,
         ):
-            for start in range(
-                0, len(ordered_ordinals),
-                config.maximum_single_kernel_group_launch_count,
-            ):
-                groups.append((
-                    set(names),
-                    set(ordered_ordinals[
-                        start:start + config.maximum_single_kernel_group_launch_count
-                    ]),
-                    True,
-                ))
+            groups.append((
+                {name},
+                set(ordered_ordinals[
+                    start:start + config.maximum_single_kernel_group_launch_count
+                ]),
+                True,
+            ))
+
+    for ordinals, names in grouped_names.items():
+        ordinal_set = set(ordinals)
+        remaining_names = set(names)
+        # Isolation is allowed to split a configured kernel out of a shared
+        # ordinal group; its other ordinals remain fully represented separately.
+        for name in sorted(names):
+            isolated = (
+                set(config.isolated_invocation_ordinals.get(name, ()))
+                & ordinal_set
+            )
+            if not isolated:
+                continue
+            for ordinal in sorted(isolated):
+                groups.append(({name}, {ordinal}, True))
+                applied_isolated_ordinals.add((name, ordinal))
+            remainder = ordinal_set - isolated
+            if remainder:
+                append_single_kernel_group(name, remainder)
+            remaining_names.discard(name)
+        if not remaining_names:
+            continue
+        if len(remaining_names) == 1:
+            append_single_kernel_group(next(iter(remaining_names)), ordinal_set)
         else:
-            groups.append((set(names), set(ordinals), False))
+            groups.append((remaining_names, ordinal_set, False))
+    configured_isolated_ordinals = {
+        (name, ordinal)
+        for name, ordinals in config.isolated_invocation_ordinals.items()
+        for ordinal in ordinals
+    }
+    if configured_isolated_ordinals - applied_isolated_ordinals:
+        missing = sorted(configured_isolated_ordinals - applied_isolated_ordinals)
+        raise ValueError(f"NCU isolated invocation ordinals are not selectable: {missing}")
     while len(groups) > config.maximum_capture_job_count:
         best: tuple[int, int, int, int, tuple[set[str], set[int], bool]] | None = None
         for left in range(len(groups)):
@@ -867,6 +923,10 @@ def build_ncu_plan(
         "maximum_single_kernel_group_launch_count": (
             config.maximum_single_kernel_group_launch_count
         ),
+        "isolated_invocation_ordinals": {
+            name: list(ordinals)
+            for name, ordinals in sorted(config.isolated_invocation_ordinals.items())
+        },
         "stability_validation": stability,
         "counter_reuse_gate": {
             "policy": (
@@ -899,6 +959,10 @@ def build_ncu_plan(
             "maximum_single_kernel_group_launch_count": (
                 config.maximum_single_kernel_group_launch_count
             ),
+            "isolated_invocation_ordinals": {
+                name: list(ordinals)
+                for name, ordinals in sorted(config.isolated_invocation_ordinals.items())
+            },
             "capture_mode": "cuda_profiler_api",
             "invocation_scope": "representative_windows_after_nvtx_range_exclusion",
             "range_scope": "all_launches_in_configured_cross_thread_start_end_ranges",
