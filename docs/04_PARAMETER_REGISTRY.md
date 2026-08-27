@@ -123,8 +123,8 @@ FMA、EXP、LOG、RCP、SQRT、SRAM、CAM、互连和寄存器流水延迟不写
 | `preflight.gpustat_interval_seconds` | 1 | second | GPU 利用率采样周期 |
 | `ncu.watchdog_inactivity_seconds` | 300 | second | GPU、stdout 和分析器报告均无推进时的终止门限 |
 | `ncu.watchdog_termination_grace_seconds` | 10 | second | watchdog 发出 SIGTERM 后等待精确进程组退出的时间 |
-| `ncu.maximum_capture_job_count` | 36 | job | 非 NVTX range 的 Nsight Compute invocation 采集组上限；range 组单独计入 |
-| `ncu.maximum_single_kernel_group_launch_count` | 128 | launch | 单一内核采集组的实际启动序号上限；超过后按序号分区 |
+| `ncu.maximum_capture_job_count` | 60 | job | 非 NVTX range 的 Nsight Compute invocation 采集组上限；range 组单独计入 |
+| `ncu.maximum_single_kernel_group_launch_count` | 64 | launch | 单一内核采集组的实际启动序号上限；超过后按序号分区 |
 | `preflight.warmup_iterations` | 10 | iteration | 排除首次编译和缓存建立 |
 | `preflight.measure_iterations` | 50 | iteration | 预测总运行时间 |
 | `trace.chunk_events` | 自动调优后冻结 | event | 设备 trace chunk 容量 |
