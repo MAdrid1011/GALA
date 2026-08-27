@@ -527,6 +527,58 @@ def test_ncu_runner_preflight_uses_all_available_launches_for_sparse_job(
     assert "--launch-count" not in command
 
 
+def test_ncu_runner_preflight_reuses_iteration_one_kernel_for_later_shard(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = Path(__file__).resolve().parents[1]
+    kernel = "vectorized_kernel"
+    source_job = {
+        "job_index": 1,
+        "capture_mode": "kernel_invocations",
+        "kernel_names": [kernel],
+        "ncu_arguments": ["--profile-from-start", "off", "--kernel-id", "old"],
+        "expected_launches": [{
+            "iteration": 1, "kernel_name": kernel,
+            "kernel_name_ordinal_in_invocation_capture": 1,
+        }],
+    }
+    later_shard = {
+        "job_index": 2,
+        "capture_mode": "kernel_invocations",
+        "kernel_names": [kernel],
+        "ncu_arguments": ["--profile-from-start", "off", "--kernel-id", "old"],
+        "expected_launches": [{
+            "iteration": 10000, "kernel_name": kernel,
+            "kernel_name_ordinal_in_invocation_capture": 10032,
+        }],
+    }
+    plan = {
+        "capture_groups": [source_job, later_shard],
+        "ncu": {"preflight_profile_launch_count": 16},
+    }
+    monkeypatch.setattr(
+        "gala_sim.tools.gpu_ncu_runner.shutil.which", lambda _: "/usr/bin/ncu"
+    )
+    monkeypatch.setattr(
+        "gala_sim.tools.gpu_ncu_runner._freeze_command",
+        lambda *_: (["/usr/bin/python", "train.py", "-s", "data", "-m", "model"], tmp_path),
+    )
+    command, _, _, selection = _runner_command(
+        root, plan, later_shard, tmp_path / "freeze.json", tmp_path / "output",
+        preflight_iterations=60,
+    )
+    assert selection == {
+        "requested_maximum_launch_count": 16,
+        "selected_launch_count": 1,
+        "kernel_name": kernel,
+        "invocation_ordinals": [1],
+        "source_capture_job_index": 1,
+        "source_iteration": 1,
+    }
+    assert "--profile-iteration-range" in command
+    assert "1:1" in command
+
+
 def test_ncu_runner_requires_clean_matching_implementation(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:

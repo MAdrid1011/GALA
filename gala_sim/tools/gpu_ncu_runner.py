@@ -140,13 +140,43 @@ def _runner_command(
         ncu_arguments = [str(value) for value in job["ncu_arguments"]]
         if job.get("capture_mode") != "kernel_invocations":
             raise ValueError("NCU preflight requires an invocation capture job")
+        job_index = int(job.get("job_index", -1))
+        job_names = {
+            str(name) for name in job.get("kernel_names", ())
+            if isinstance(name, str) and name
+        }
         by_name: dict[str, list[int]] = {}
-        for launch in job.get("expected_launches", ()):
-            if not isinstance(launch, Mapping) or int(launch.get("iteration", -1)) != 1:
-                continue
-            by_name.setdefault(str(launch["kernel_name"]), []).append(
+        source_job_by_name: dict[str, int] = {}
+
+        def add_iteration_one_launch(launch: Mapping[str, Any], source_job: int) -> None:
+            if int(launch.get("iteration", -1)) != 1:
+                return
+            name = str(launch["kernel_name"])
+            if job_names and name not in job_names:
+                return
+            by_name.setdefault(name, []).append(
                 int(launch["kernel_name_ordinal_in_invocation_capture"])
             )
+            source_job_by_name[name] = source_job
+
+        # Prefer this job's own iteration-1 launches.  A later ordinal shard
+        # may have none, so fall back to the same kernel in another job; that
+        # still measures the real kernel and keeps the preflight short.
+        for launch in job.get("expected_launches", ()):
+            if isinstance(launch, Mapping):
+                add_iteration_one_launch(launch, job_index)
+        if not by_name:
+            for candidate in plan.get("capture_groups", ()):
+                if (
+                    not isinstance(candidate, Mapping)
+                    or candidate.get("capture_mode") != "kernel_invocations"
+                    or int(candidate.get("job_index", -1)) == job_index
+                ):
+                    continue
+                source_job = int(candidate.get("job_index", -1))
+                for launch in candidate.get("expected_launches", ()):
+                    if isinstance(launch, Mapping):
+                        add_iteration_one_launch(launch, source_job)
         requested = int(plan.get("ncu", {}).get("preflight_profile_launch_count", 0))
         eligible = sorted(
             ((len(ordinals), name, sorted(set(ordinals))) for name, ordinals in by_name.items()),
@@ -163,6 +193,8 @@ def _runner_command(
             "selected_launch_count": len(selected_ordinals),
             "kernel_name": name,
             "invocation_ordinals": selected_ordinals,
+            "source_capture_job_index": source_job_by_name[name],
+            "source_iteration": 1,
         }
     command = [
         ncu, "--force-overwrite", "--export", str(report_base),
