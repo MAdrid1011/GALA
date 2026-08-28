@@ -234,6 +234,28 @@ def test_online_cycle_replay_consumes_packets_without_trace_columns() -> None:
     assert session.resident_completion_markers == 0
 
 
+def test_online_cycle_replay_reports_progress() -> None:
+    masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
+    masks[0, 0] = 1
+    source = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 1),
+        point_ids=np.asarray([0], dtype=np.int64),
+        point_keys=np.asarray([0], dtype=np.uint64), masks=masks,
+        loss_flags=1, backward_confirmed=True,
+    )
+    progress = []
+    session = CycleEngine(_config()).online_session(
+        max_events=4, initial_gaussian_count=1,
+        progress=progress.append, progress_interval_seconds=0.001,
+    )
+    session.accept_query_packet(source)
+    session.close_iteration(1)
+    session.finish()
+    assert progress
+    assert progress[-1].phase == "online_replay"
+    assert progress[-1].completed_events > 0
+
+
 def test_online_cycle_replay_rejects_frontier_overflow_before_advancing_ids() -> None:
     rows = np.empty(2, dtype=event_dtype())
     rows[:] = TraceEvent().as_tuple()

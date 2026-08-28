@@ -125,6 +125,17 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(f"online cycle input does not exist: {required_path}")
         online_sinks: list[BufferedVirtualCycleConsumer] = []
 
+        def online_progress(progress) -> None:
+            elapsed = max(progress.elapsed_seconds, 1e-12)
+            print(json.dumps({
+                "phase": progress.phase,
+                "completed_events": progress.completed_events,
+                "accepted_events": progress.total_events,
+                "simulated_cycles": progress.simulated_cycles,
+                "elapsed_seconds": progress.elapsed_seconds,
+                "completed_events_per_second": progress.completed_events / elapsed,
+            }, ensure_ascii=True, sort_keys=True), file=sys.stderr, flush=True)
+
         def consumer_factory(initial_gaussian_count: int) -> BufferedVirtualCycleConsumer:
             binding = NativeRamulator2Binding.from_build_manifest(
                 args.online_ramulator_build_manifest, args.online_ramulator_config,
@@ -137,6 +148,8 @@ def main(argv: list[str] | None = None) -> int:
                     max_events=chunk_events,
                     max_frontier_events=max_frontier_events,
                     initial_gaussian_count=initial_gaussian_count,
+                    progress=online_progress,
+                    progress_interval_seconds=progress_interval_seconds,
                 )
             )
             online_sinks.append(sink)
