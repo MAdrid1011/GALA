@@ -70,6 +70,12 @@ class MechanismSelection:
     query_oracle: bool = False
     residency_oracle: bool = False
 
+    @property
+    def query_scheduler_enabled(self) -> bool:
+        """Whether the three bounded F/C/A source FIFOs feed the scheduler."""
+
+        return self.query_load_rules or self.overlap_guided_issue
+
 
 @dataclass(frozen=True)
 class OraclePortfolioMember:
@@ -1544,7 +1550,7 @@ class CycleEngine:
             return event_id, event_id
 
         def fusion_kind(event_id: int, stage: int) -> TaskKind | None:
-            if not self.selection.overlap_guided_issue or stage != 0:
+            if not self.selection.query_scheduler_enabled or stage != 0:
                 return None
             kind = PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
             return {
@@ -1920,7 +1926,7 @@ class CycleEngine:
                 last_progress_completed = len(completed)
                 next_progress_event = len(completed) + progress_interval_events
                 next_progress_time = now + progress_interval_seconds
-            if self.selection.overlap_guided_issue:
+            if self.selection.query_scheduler_enabled:
                 self.issue_scheduler.set_clock(cycle)
                 fusion_capacity = (
                     self.config.candidate_fifo_entries
@@ -1974,7 +1980,7 @@ class CycleEngine:
                 ))
                 if not queue:
                     del ready[ready_key]
-            if self.selection.overlap_guided_issue:
+            if self.selection.query_scheduler_enabled:
                 if self.selection.query_oracle:
                     assert future_plan is not None
                     selected_ids = set(self._select_query_oracle_candidates(
@@ -2009,7 +2015,7 @@ class CycleEngine:
             ordered = [(event_id, dict(candidates)[event_id]) for event_id in ordered_ids]
             fusion_packets: dict[int, TaskPacket] = {}
             fusion_selected: set[int] = set()
-            if self.selection.overlap_guided_issue:
+            if self.selection.query_scheduler_enabled:
                 for event_id, stage in ordered:
                     kind = PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
                     if stage == 0 and kind in {
@@ -2557,7 +2563,7 @@ class CycleEngine:
                                 )
                         except ValueError as error:
                             raise CycleConfigurationError(str(error)) from error
-                    if self.selection.overlap_guided_issue:
+                    if self.selection.query_scheduler_enabled:
                         self.issue_scheduler.commit_issued((fusion_packets[event_id],))
                     if fusion_port_name is not None:
                         fusion_port_issued[fusion_port_name] = (
@@ -3840,7 +3846,7 @@ class CycleReplaySession:
             self._fusion_inputs[task_kind].appendleft(event_id)
 
     def _fusion_kind(self, event_id: int, stage: int) -> TaskKind | None:
-        if not self.engine.selection.overlap_guided_issue or stage != 0:
+        if not self.engine.selection.query_scheduler_enabled or stage != 0:
             return None
         kind = self._kinds[event_id]
         return {
@@ -3916,7 +3922,14 @@ class CycleReplaySession:
 
     def _drain(self) -> None:
         async_memory = callable(getattr(self.engine.config.memory, "submit_async", None))
-        while self._ready or self._in_flight or self._memory_waiters or self._lane_outputs:
+        while (
+            self._ready
+            or self._in_flight
+            or self._memory_waiters
+            or self._lane_outputs
+            or self._fusion_pending
+            or any(self._fusion_inputs.values())
+        ):
             # Bank reservations are scoped to one cycle.  Drop old entries so
             # long packet streams do not retain one dictionary item per cycle.
             self._bank_busy = {
@@ -3958,7 +3971,7 @@ class CycleReplaySession:
                 else:
                     self._push_ready(event_id, next_stage)
                 progressed = True
-            if self.engine.selection.overlap_guided_issue:
+            if self.engine.selection.query_scheduler_enabled:
                 self.engine.issue_scheduler.set_clock(self._cycle)
                 capacity = (
                     self.engine.config.candidate_fifo_entries
@@ -3989,7 +4002,7 @@ class CycleReplaySession:
                 ))
                 if not queue:
                     del self._ready[ready_key]
-            if self.engine.selection.overlap_guided_issue:
+            if self.engine.selection.query_scheduler_enabled:
                 for task_kind in (TaskKind.FORWARD, TaskKind.CONSUMER, TaskKind.ADJOINT):
                     if self._fusion_inputs[task_kind]:
                         candidates.append((self._fusion_inputs[task_kind].popleft(), 0))
@@ -3998,7 +4011,7 @@ class CycleReplaySession:
                 fusion_packets = {
                     event_id: self._task_packet(event_id)
                     for event_id, stage in ordered
-                    if self.engine.selection.overlap_guided_issue and stage == 0
+                    if self.engine.selection.query_scheduler_enabled and stage == 0
                     and PrimitiveKind(int(self._events[event_id]["primitive_kind"]))
                     in {PrimitiveKind.FORWARD, PrimitiveKind.CONSUMER, PrimitiveKind.ADJOINT}
                 }
@@ -4403,7 +4416,7 @@ class CycleReplaySession:
                         )
                 except ValueError as error:
                     raise CycleConfigurationError(str(error)) from error
-            if self.engine.selection.overlap_guided_issue:
+            if self.engine.selection.query_scheduler_enabled:
                 self.engine.issue_scheduler.commit_issued((self._task_packet(event_id),))
             if port_name:
                 self._cycle_fusion_ports[port_name] = self._cycle_fusion_ports.get(port_name, 0) + 1

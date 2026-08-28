@@ -4,6 +4,8 @@
 
 ## 已通过
 
+- 2026-08-29 查询负载规则的独立接线已通过回归：A 单独开启时使用三条有界 F/C/A FIFO 的真实负载排序，同时保持 Base 单发射宽度；在线 `CycleReplaySession` 会排空调度 FIFO 和待融合输入。定向测试 2 项、全套测试 `295 passed, 1 skipped, 2 warnings`。当前没有可用于绝对性能合理性、数量级检查或 ASIC 达标判断的静态锚点；双窗口 `144,550 cycles` 仅是同一真实 trace、同一 Ramulator 后端和同一资源配置下的 Base ASIC 比较分母，不能解释为外部锚点、可达目标或性能上界。`speedup_vs_orin` 继续保持 `unavailable`。
+
 - 查询调度运行时已对齐权威 Fusion Issue 合同：配置显式冻结每条候选源 FIFO 为 32 项；Query State 按八 lane pack 分配真实物理槽并在完整 F/C/A、生成关闭和归约可读后复用；候选冲突同时检查查询状态、归约键和目标资源；年龄由实际入队周期计算。离线与在线 consumer 均在最后一个查询归约依赖完成时选择真实完成时间最晚的 credit owner，支持一个归约被多个消费者共享。新增容量、槽复用、目标冲突、年龄和 owner 生命周期回归；编译与全量测试为 `293 passed, 1 skipped`。该实现尚未形成正式周期结果，下一入口仍是同一双窗口真实 trace 的同后端 Base/Oracle/实际机制对照。
 
 - 固定的 R²-Gaussian 提交 `f2579bfddd9aac009cb797c8503bef8119bbd022` 可核验，官方 Chest 数据清单包含 153 个文件、元数据哈希和文件级 SHA-256。

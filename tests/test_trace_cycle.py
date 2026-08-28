@@ -1089,6 +1089,81 @@ def test_fusion_issue_uses_independent_forward_consumer_and_adjoint_ports() -> N
     )
 
 
+def test_query_load_rules_order_three_fifo_heads_without_enabling_fusion() -> None:
+    builder = TraceBuilder()
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.FORWARD), query_id=9,
+        gaussian_id=9, relation_id=9, reduction_key=9, address_token=9,
+        state_version=0, resource_class=int(ResourceClass.ISSUE),
+    ))
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CONSUMER), query_id=1,
+        gaussian_id=1, consumer_id=1, reduction_key=1, address_token=1,
+        state_version=0, resource_class=int(ResourceClass.ISSUE),
+    ))
+    timing = ModuleTiming(
+        latency=1, initiation_interval=1, queue_capacity=8, ports=3, banks=16,
+    )
+    config = CycleConfig(
+        modules={name: timing for name in (
+            "relation_constructor", "fusion_issue", "semantic_cache", "compute_pod",
+            "bidirectional_query", "reconstruction_update", "shared_sram",
+        )},
+        memory=_Memory(), clock_frequency_hz=500_000_000,
+        relation_seed_fifo_entries=8, candidate_lanes=3,
+        fusion_forward_ports=1, fusion_consumer_ports=1, fusion_adjoint_ports=1,
+    )
+    engine = CycleEngine(config, policy="variant:1000")
+    committed: list[int] = []
+    original_commit = engine.issue_scheduler.commit_issued
+
+    def record_commit(tasks) -> None:
+        packets = tuple(tasks)
+        committed.extend(packet.event_id for packet in packets)
+        original_commit(packets)
+
+    engine.issue_scheduler.commit_issued = record_commit  # type: ignore[method-assign]
+    result = engine.run(builder.finish())
+
+    assert committed == [1, 0]
+    assert any(
+        stall.module == "fusion_issue" and stall.reason == "base_single_issue"
+        for stall in result.stalls
+    )
+    assert set(result.completion_cycles) == {0, 1}
+
+
+def test_online_query_load_rules_drain_pending_fifo_heads() -> None:
+    masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
+    masks[0, 0] = 1
+    source = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 1),
+        point_ids=np.asarray([0], dtype=np.int64),
+        point_keys=np.asarray([0], dtype=np.uint64), masks=masks,
+        loss_flags=1, backward_confirmed=True,
+    )
+    engine = CycleEngine(_config(), policy="variant:1000")
+    committed: list[int] = []
+    original_commit = engine.issue_scheduler.commit_issued
+
+    def record_commit(tasks) -> None:
+        packets = tuple(tasks)
+        committed.extend(item.event_id for item in packets)
+        original_commit(packets)
+
+    engine.issue_scheduler.commit_issued = record_commit  # type: ignore[method-assign]
+    session = engine.online_session(max_events=4, initial_gaussian_count=1)
+    session.accept_query_packet(source)
+    session.close_iteration(1)
+    result = session.finish()
+
+    assert committed
+    assert result.event_counts["FORWARD"] == 1
+    assert result.event_counts["CONSUMER"] == 1
+    assert result.event_counts["ADJOINT"] == 1
+    assert session.quiescent
+
+
 def test_fusion_issue_applies_each_task_class_port_limit() -> None:
     builder = TraceBuilder()
     for event_id in range(2):
