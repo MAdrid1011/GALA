@@ -507,6 +507,16 @@ def test_cycle_bounds_report_physical_packets_and_lane_utilization() -> None:
     query = next(item for item in report.scenarios if item.scenario == "query")
     assert query.memory_request_lower_bound == 1
     assert query.memory_byte_lower_bound == 128
+    assert report.capacity_diagnostics["relation_windows"]["declared_windows"] == 1
+    assert report.capacity_diagnostics["query_replay"]["capacity_entries"] == 256
+    volume_components = {
+        item.name: item.cycles for item in query.components
+        if item.name.startswith("bidirectional_query.volume_")
+    }
+    assert volume_components == {
+        "bidirectional_query.volume_read_banks": 5,
+        "bidirectional_query.volume_write_banks": 5,
+    }
 
 
 def test_base_and_oracles_share_identical_physical_packet_work() -> None:
