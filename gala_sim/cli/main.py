@@ -292,6 +292,10 @@ def main(argv: list[str] | None = None) -> int:
                 args.throughput_progress or args.stop_when_throughput_stable
             ):
                 raise ValueError("--orin-anchor requires cycle throughput diagnostics")
+            if orin_anchor is not None and orin_anchor[1].get("workload_iterations") is None:
+                raise ValueError(
+                    "--orin-anchor must declare workload_iterations for comparable speedup"
+                )
             if args.stop_when_throughput_stable:
                 require_empty_diagnostic_output(args.output)
             monitor: ThroughputMonitor | None = None
@@ -314,6 +318,10 @@ def main(argv: list[str] | None = None) -> int:
                         if orin_anchor is not None
                         and isinstance(orin_anchor[1].get("interval_ms"), dict)
                         else None
+                    ),
+                    orin_anchor_iterations=(
+                        int(orin_anchor[1]["workload_iterations"])
+                        if orin_anchor is not None else None
                     ),
                 )
 

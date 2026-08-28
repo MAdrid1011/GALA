@@ -104,6 +104,7 @@ class ThroughputMonitor:
         clock_frequency_hz: int | None = None,
         orin_anchor_seconds: float | None = None,
         orin_anchor_interval_seconds: tuple[float, float] | None = None,
+        orin_anchor_iterations: int | None = None,
     ) -> None:
         self.config = config
         self.stop_when_stable = stop_when_stable
@@ -117,6 +118,9 @@ class ThroughputMonitor:
             raise ValueError("Orin anchor seconds must be positive")
         self.clock_frequency_hz = clock_frequency_hz
         self.orin_anchor_seconds = orin_anchor_seconds
+        if orin_anchor_iterations is not None and orin_anchor_iterations <= 0:
+            raise ValueError("Orin anchor iterations must be positive")
+        self.orin_anchor_iterations = orin_anchor_iterations
         if orin_anchor_interval_seconds is not None:
             low, high = orin_anchor_interval_seconds
             if (
@@ -208,16 +212,28 @@ class ThroughputMonitor:
             projected_total_cycles / self.clock_frequency_hz
             if self.clock_frequency_hz is not None else None
         )
+        anchor_scale = (
+            progress.total_iterations / self.orin_anchor_iterations
+            if self.orin_anchor_iterations is not None else 1.0
+        )
+        comparable_orin_seconds = (
+            self.orin_anchor_seconds * anchor_scale
+            if self.orin_anchor_seconds is not None else None
+        )
+        comparable_orin_interval = (
+            tuple(value * anchor_scale for value in self.orin_anchor_interval_seconds)
+            if self.orin_anchor_interval_seconds is not None else None
+        )
         static_speedup = (
-            self.orin_anchor_seconds / projected_asic_seconds
+            comparable_orin_seconds / projected_asic_seconds
             if self.orin_anchor_seconds is not None
             and projected_asic_seconds is not None else None
         )
         static_speedup_interval = None
-        if self.orin_anchor_interval_seconds is not None and projected_asic_seconds is not None:
+        if comparable_orin_interval is not None and projected_asic_seconds is not None:
             static_speedup_interval = {
-                "low": self.orin_anchor_interval_seconds[0] / projected_asic_seconds,
-                "high": self.orin_anchor_interval_seconds[1] / projected_asic_seconds,
+                "low": comparable_orin_interval[0] / projected_asic_seconds,
+                "high": comparable_orin_interval[1] / projected_asic_seconds,
             }
         sample = ThroughputSample(
             completed_events=boundary_events,
@@ -308,6 +324,7 @@ class ThroughputMonitor:
                 self.samples and self.samples[-1].completed_events == self.samples[-1].total_events
             ),
             "configuration": asdict(self.config),
+            "orin_anchor_iterations": self.orin_anchor_iterations,
             "runtime_samples": [asdict(sample) for sample in self.runtime_samples],
             "samples": [asdict(sample) for sample in self.samples],
             "stability": {

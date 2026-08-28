@@ -104,6 +104,23 @@ def test_monitor_reports_orin_speedup_interval() -> None:
     })
 
 
+def test_monitor_scales_full_run_orin_anchor_to_replayed_iterations() -> None:
+    monitor = ThroughputMonitor(
+        _config(), clock_frequency_hz=100, orin_anchor_seconds=200,
+        orin_anchor_iterations=10,
+    )
+    one_iteration = CycleProgress(
+        phase="replay", completed_events=10, total_events=10,
+        completed_iterations=1, total_iterations=1,
+        last_completed_iteration=1, simulated_cycles=1000,
+        elapsed_seconds=1.0,
+    )
+    sample = monitor.observe(one_iteration)["samples"][-1]
+    # The 200-second anchor represents ten iterations, so one replayed
+    # iteration must compare against 20 seconds rather than 200 seconds.
+    assert sample["static_anchor_speedup_vs_orin"] == pytest.approx(2)
+
+
 @pytest.mark.parametrize("field,value", [
     ("completed_events", 101),
     ("completed_iterations", 11),

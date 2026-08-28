@@ -14,7 +14,7 @@
 
 其余入口为 `config-check`、`cycle-preflight`、`trace-validate`、`cycle-replay` 和 `ablation`。query sample 和显式迭代窗口 trace 默认均被周期入口拒绝；调用者必须显式传入 `--quick-validation`，输出 manifest 会固定 `formal_performance_eligible=false`。`ablation --parallel-workers N` 可并行运行独立变体；父进程按固定 `0000..1111` 顺序收集并验证结果。正式范围的 `ablation --orin-anchor <json>` 会在每个变体完成时输出相对于 Base ASIC 和静态 Orin 锚点的加速比，并写出非正式比较 sidecar；快速验证 trace 禁止使用该选项。
 
-`cycle-replay --throughput-progress` 按完整迭代输出运行健康状态、墙钟事件吞吐、每事件模拟周期和总周期投影。只有显式增加 `--stop-when-throughput-stable` 才允许稳定窗口提前结束；该路径要求输出目录不存在或为空，只写 `throughput.json`、非正式 manifest 和标明非正式资格的状态记录，不写 `cycles.json`。不带早停选项时始终保留完整重放语义。`--orin-anchor <json>` 只把非正式静态锚点及其不确定区间加入实时工程诊断。
+`cycle-replay --throughput-progress` 按完整迭代输出运行健康状态、墙钟事件吞吐、每事件模拟周期和总周期投影。只有显式增加 `--stop-when-throughput-stable` 才允许稳定窗口提前结束；该路径要求输出目录不存在或为空，只写 `throughput.json`、非正式 manifest 和标明非正式资格的状态记录，不写 `cycles.json`。不带早停选项时始终保留完整重放语义。`--orin-anchor <json>` 只把非正式静态锚点及其不确定区间加入实时工程诊断；anchor 必须包含 `workload_iterations`，周期入口会按当前重放迭代数缩放 Orin 时间，拒绝工作量不明确的旧 anchor。
 
 ## Internal Helpers
 

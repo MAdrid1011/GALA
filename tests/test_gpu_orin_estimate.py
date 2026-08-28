@@ -85,3 +85,16 @@ def test_proxy_anchor_loader_preserves_valid_interval(tmp_path) -> None:
     assert loaded is not None
     assert loaded[0] == pytest.approx(2)
     assert loaded[1]["interval_ms"] == {"low": 1500, "high": 2500}
+
+
+def test_proxy_anchor_loader_preserves_workload_iterations(tmp_path) -> None:
+    path = tmp_path / "anchor.json"
+    path.write_text(
+        '{"status":"proxy_estimate", "formal_performance_eligible":false,'
+        ' "workload_iterations":30000,'
+        ' "total":{"estimated_orin_ms":2000}}',
+        encoding="utf-8",
+    )
+    loaded = load_proxy_anchor(path)
+    assert loaded is not None
+    assert loaded[1]["workload_iterations"] == 30000

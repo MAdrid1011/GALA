@@ -106,7 +106,10 @@ def _ratios(reference: Mapping[str, Any]) -> dict[str, float]:
 
 def estimate_normalized(
     normalization: Mapping[str, Any], reference: Mapping[str, Any],
+    *, workload_iterations: int | None = None,
 ) -> dict[str, Any]:
+    if workload_iterations is not None and workload_iterations <= 0:
+        raise OrinEstimateError("workload_iterations must be positive")
     stages = normalization.get("stages")
     if not isinstance(stages, Mapping) or not stages:
         raise OrinEstimateError("normalization has no stages")
@@ -192,17 +195,21 @@ def estimate_normalized(
         "uncertainty_status": "category_intervals_with_explicit_proxy_assumptions",
         "reference_devices": {"local": reference["local"], "target": reference["target"]},
         "reference_uncertainty": uncertainty,
+        "workload_iterations": workload_iterations,
     }
 
 
 def estimate_files(
     normalization_path: Path, reference_path: Path, output_path: Path,
+    *, workload_iterations: int | None = None,
 ) -> dict[str, Any]:
     normalization = json.loads(normalization_path.read_text(encoding="utf-8"))
     if not isinstance(normalization, Mapping):
         raise OrinEstimateError("normalization must be a JSON object")
     reference = _reference(reference_path)
-    result = estimate_normalized(normalization, reference)
+    result = estimate_normalized(
+        normalization, reference, workload_iterations=workload_iterations,
+    )
     result["sources"] = {
         "normalization": {
             "path": str(normalization_path.resolve()),
@@ -251,12 +258,25 @@ def load_proxy_anchor(path: Path | None) -> tuple[float, dict[str, object]] | No
         if low > milliseconds or milliseconds > high:
             raise OrinEstimateError("Orin anchor estimate must lie inside interval")
         interval = {"low": low, "high": high}
+    workload_iterations = document.get("workload_iterations")
+    if workload_iterations is not None:
+        try:
+            workload_iterations = int(workload_iterations)
+        except (TypeError, ValueError) as error:
+            raise OrinEstimateError(
+                "Orin anchor workload_iterations must be an integer"
+            ) from error
+        if workload_iterations <= 0:
+            raise OrinEstimateError(
+                "Orin anchor workload_iterations must be positive"
+            )
     return milliseconds / 1000.0, {
         "path": str(path.resolve()),
         "status": document["status"],
         "result_scope": document.get("result_scope"),
         "estimated_orin_ms": milliseconds,
         "interval_ms": interval,
+        "workload_iterations": workload_iterations,
         "formal_performance_eligible": False,
     }
 
@@ -266,8 +286,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--normalization", type=Path, required=True)
     parser.add_argument("--reference", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
+    parser.add_argument(
+        "--workload-iterations", type=int, default=None,
+        help="number of training iterations represented by the proxy total",
+    )
     args = parser.parse_args(argv)
-    result = estimate_files(args.normalization, args.reference, args.output)
+    result = estimate_files(
+        args.normalization, args.reference, args.output,
+        workload_iterations=args.workload_iterations,
+    )
     print(json.dumps({
         "output": str(args.output.resolve()),
         "status": result["status"],
