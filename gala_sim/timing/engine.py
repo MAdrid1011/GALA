@@ -1460,6 +1460,15 @@ class CycleReplaySession:
             # event sub-packets must enter the frontier before the scheduler
             # advances, otherwise each sub-packet edge introduces artificial
             # serialization that is absent from the equivalent trace replay.
+            if (
+                self.max_frontier_events is not None
+                and self.pending_event_count + event_packet.event_count
+                > self.max_frontier_events
+            ):
+                # Keep the online stream bounded.  This is a frontier
+                # backpressure point, not a semantic packet boundary.
+                self._drain()
+                self._compact_completed_prefix()
             self.accept_event_packet(event_packet, _drain_after=False)
         self._backward_frontier = (*self._backward_frontier, *terminal_ids)
 

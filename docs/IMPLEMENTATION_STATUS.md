@@ -99,10 +99,10 @@
 
 在线周期入口已修正同一 CUDA work-buffer packet 的事件子包调度边界：
 `CycleReplaySession.accept_query_packet()` 现在先将该 packet 展开的候选、关系、缓存、
-前向、归约、消费者、伴随和梯度事件全部登记到有界 frontier，再推进一次调度器。
-因此不会在同一 packet 的子包之间提前 drain 并人为串行化。新增回归在代表性单 packet 上
-与离线展开回放保持完全相同的事件计数，周期差为最多 1 cycle；多个独立 source packet
-之间仍保留真实到达边界的调度影响，不能未经对照直接当作离线周期等价。
+前向、归约、消费者、伴随和梯度事件登记到有界 frontier，再推进调度器；达到 frontier
+容量时才因真实反压 drain。这样不会在同一 packet 的子包之间提前 drain 并人为串行化，
+同时保持有界内存。新增回归在代表性单 packet 上与离线展开回放保持完全相同的事件计数，
+周期差为最多 1 cycle；frontier 受限时的额外周期明确归因于容量边界。
 使用仓库外真实 capture 原始记录重建的栅格 tile 0（9 个候选、816 条关系、256 个 query）
 已接入同一 LPDDR5-6400 Ramulator：离线 `5806 cycles`、在线 `5807 cycles`，事件计数逐项
 一致，周期差 `0.0172%`，在线结束 `pending=0` 且 `quiescent=true`。该短门仍是
