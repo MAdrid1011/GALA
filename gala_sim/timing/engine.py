@@ -93,6 +93,15 @@ class CycleProgress:
 
 
 @dataclass
+class _StallAccumulator:
+    cycle: int
+    module: str
+    reason: str
+    event_ids: list[int]
+    count: int = 1
+
+
+@dataclass
 class _InFlight:
     completion_cycle: int
     event_id: int
@@ -194,7 +203,7 @@ class CycleEngine:
             "reconstruction_update": ReconstructionUpdateUnit("reconstruction_update", config.modules["reconstruction_update"], counters["reconstruction_update"]),
             "shared_sram": SharedSram("shared_sram", config.modules["shared_sram"], counters["shared_sram"]),
         }
-        self.stalls: list[StallRecord] = []
+        self._stalls: list[_StallAccumulator] = []
         self._stall_index: dict[tuple[int, str, str], int] = {}
         self._stall_cycle: int | None = None
 
@@ -205,15 +214,19 @@ class CycleEngine:
         key = (cycle, module, reason)
         index = self._stall_index.get(key)
         if index is None:
-            self._stall_index[key] = len(self.stalls)
-            self.stalls.append(StallRecord(cycle, module, reason, (event_id,)))
+            self._stall_index[key] = len(self._stalls)
+            self._stalls.append(_StallAccumulator(cycle, module, reason, [event_id]))
             return
-        previous = self.stalls[index]
-        event_ids = previous.event_ids
-        if len(event_ids) < self.config.candidate_lanes:
-            event_ids = (*event_ids, event_id)
-        self.stalls[index] = StallRecord(
-            cycle, module, reason, event_ids, previous.count + 1
+        previous = self._stalls[index]
+        if len(previous.event_ids) < self.config.candidate_lanes:
+            previous.event_ids.append(event_id)
+        previous.count += 1
+
+    def _stall_records(self) -> tuple[StallRecord, ...]:
+        return tuple(
+            StallRecord(item.cycle, item.module, item.reason,
+                        tuple(item.event_ids), item.count)
+            for item in self._stalls
         )
 
     @staticmethod
@@ -1005,7 +1018,7 @@ class CycleEngine:
         return CycleResult(
             total_cycles=max(completed.values(), default=0),
             module_counters=module_counters,
-            stalls=tuple(self.stalls),
+            stalls=self._stall_records(),
             completion_cycles=completed,
             event_counts={kind.name: int((trace.events["primitive_kind"] == int(kind)).sum())
                           for kind in PrimitiveKind},
@@ -1590,7 +1603,7 @@ class CycleReplaySession:
         return CycleResult(
             total_cycles=self._cycle,
             module_counters=counters,
-            stalls=tuple(self.engine.stalls),
+            stalls=self.engine._stall_records(),
             completion_cycles=(dict(self._completion_cycles)
                                if self.retain_completion_cycles else {}),
             event_counts=dict(self._event_counts),
