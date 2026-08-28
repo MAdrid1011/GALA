@@ -4,6 +4,8 @@
 
 ## 已通过
 
+- 2026-08-29 在线虚拟生命周期事务依赖已修正：`UPDATE_BEGIN` 只连接 backward/state frontier；同一事务内各个 `UPDATE_COMMIT` 共享 begin 依赖，不再通过前一个 commit 或修改事件链式串行化；`UPDATE_END` 汇合本事务全部 commit/修改事件。新增依赖图回归，定向生命周期测试 4 项通过，全套测试 `296 passed, 1 skipped, 2 warnings`。该修复只消除模拟器人为串行化，不构成绝对性能锚点或硬件加速承诺。
+
 - 2026-08-29 查询负载规则的独立接线已通过回归：A 单独开启时使用三条有界 F/C/A FIFO 的真实负载排序，同时保持 Base 单发射宽度；在线 `CycleReplaySession` 会排空调度 FIFO 和待融合输入。定向测试 2 项、全套测试 `295 passed, 1 skipped, 2 warnings`。当前没有可用于绝对性能合理性、数量级检查或 ASIC 达标判断的静态锚点；双窗口 `144,550 cycles` 仅是同一真实 trace、同一 Ramulator 后端和同一资源配置下的 Base ASIC 比较分母，不能解释为外部锚点、可达目标或性能上界。`speedup_vs_orin` 继续保持 `unavailable`。
 
 - 2026-08-29 在同一 `r2_gaussian_chest_median_packets_v1` 双窗口真实物理包 trace、同一 LPDDR5-6400 Ramulator 和冻结资源包络上完成 Base、两类 Oracle、两类实际机制与联合入口对照。Base `0000` 为 `144,550 cycles`；实际 Query `143,663 cycles`（`1.006174x`），Query future-visible Oracle `144,177 cycles`，portfolio 胜者为实际 Query；实际 Residency `144,549 cycles`（`1.0000069x`），Residency Oracle `144,550 cycles`；完整 `full` 为 `143,662 cycles`，与十六项矩阵 `1111` 完全一致。所有事件均完成且结果目录状态为 `passed`，但 trace 仍是 `quick_cycle_validation`，不具备正式 30,000 iteration 性能资格。Base 的主要停顿为双向查询 `reduction_bank=15,212,818`、`query_datapath=587,748`，以及 ComputePod `compute_resource=473,396`；实际 Query 将前者降至 `15,199,619`，但端到端只减少 `887 cycles`。实际 Residency 的语义缓存请求由 `19,777` 降至 `547`，却只减少 `1 cycle`。这组分解说明当前不是千倍级可达提升，资源必要下界也不能充当目标或锚点。

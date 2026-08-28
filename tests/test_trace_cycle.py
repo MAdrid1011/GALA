@@ -429,6 +429,51 @@ def test_online_cycle_replay_keeps_lifecycle_events_in_same_frontier() -> None:
     assert result.event_counts["UPDATE_END"] == 1
 
 
+def test_online_lifecycle_commits_share_transaction_begin_dependency() -> None:
+    masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
+    masks[0, 0] = 1
+    source = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 1),
+        point_ids=np.asarray([0], dtype=np.int64),
+        point_keys=np.asarray([0], dtype=np.uint64), masks=masks,
+        loss_flags=1, backward_confirmed=True,
+    )
+    session = CycleEngine(_config()).online_session(
+        max_events=16, initial_gaussian_count=3,
+    )
+    # Keep the frontier resident while inspecting the dependency graph.  The
+    # normal online path drains after each packet and retires completed rows.
+    accept_event_packet = session.accept_event_packet
+    session.accept_event_packet = lambda packet, **kwargs: accept_event_packet(
+        packet, _drain_after=False
+    )
+    session.accept_query_packet(source)
+    session.accept_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_BEGIN, 0,
+        field_mask=1, transaction_kind=2, active_ids=(0, 1, 2),
+    ))
+    session.accept_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_COMMIT, 0,
+        field_mask=1, transaction_kind=2, all_active=True,
+        active_ids=(0, 1, 2),
+    ))
+    session.accept_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_END, 0,
+        field_mask=1, transaction_kind=2,
+    ))
+    begin = next(event_id for event_id, kind in session._kinds.items()
+                 if kind is PrimitiveKind.UPDATE_BEGIN)
+    commits = [event_id for event_id, kind in session._kinds.items()
+               if kind is PrimitiveKind.UPDATE_COMMIT]
+    end = next(event_id for event_id, kind in session._kinds.items()
+               if kind is PrimitiveKind.UPDATE_END)
+    assert len(commits) == 3
+    assert all(session._dependencies[event_id] == (begin,) for event_id in commits)
+    assert set(session._dependencies[end]) == set(commits)
+    session.close_iteration(1)
+    session.finish()
+
+
 def test_online_cycle_replay_consumes_exact_semantic_workset_sidecar() -> None:
     masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
     masks[0, 0] = 0b11
