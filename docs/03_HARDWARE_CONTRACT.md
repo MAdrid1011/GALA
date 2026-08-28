@@ -57,6 +57,8 @@ FMA 被组织为四个四路算术组。三个边界选择器在前一组输出�
 
 微上下文保存尚未完成关系的操作数、中间值、模板位置和目标键。上下文满时向上游反压。模板切换、反馈依赖、超越函数占用和归约树冲突均进入周期模型。
 
+每个 owner cluster 包含两个 owner-gradient 槽。槽以完整 Gaussian epoch 身份区分，但只保存已经发射且尚未由 gradient-completion 接收的物理伴随 relation packet；同一 packet 经过查询重放和 Pod 两个阶段时只预约一次。配对的物理梯度归约 packet 完成后递减在途 relation 引用，最后一个在途引用完成即释放槽。尚未发射的未来 relation 不得预占或延长槽生命周期，同一 Gaussian epoch 后续可以重新预约已释放的槽。释放语义对应 GALA 设计实现 `5c5f6631:src/gaussian_pod.cpp` 的 owner partial acknowledgement。
+
 ## 6. 双向查询执行单元
 
 前向路径接收四个 Pod 的贡献并按查询编号写入六十四个查询归约 Bank。每个 Bank 交错四组部分和以覆盖 FP32 累加反馈。归约完成后将 `Y(q)` 置位并把结果写入查询 SRAM。

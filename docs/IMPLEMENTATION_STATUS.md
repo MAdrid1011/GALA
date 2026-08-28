@@ -235,7 +235,9 @@ Orin 时间相除。可选 ComputePod 遥测同步保存 `177,603` 条事件时�
 周期比，不外推到完整训练。资源必要下界为 `8,616 cycles`，即只从必要条件看最多仍有 `8.19x`
 未排除空间；该下界假设其余冲突全部消失，不是可达性能、静态锚点或机制上界。当前真实 Oracle
 仅约 `1.0007x`，说明下一技术任务是解释并缩小必要下界与受约束可达调度之间的差距，而不是用
-Orin 外推构造达标数字。
+Orin 外推构造达标数字。后续双窗口验证发现该阶段把 owner-gradient 槽错误持有到同一 Gaussian
+在整次 trace 的全部梯度归约完成，因此上述 `70,596` Base、两类实际机制和 Oracle 周期均已由
+在途 packet 生命周期修正取代，不能继续作为当前性能结果。
 
 owner-gradient 等待集合的全扫描已替换为语义等价的增量就绪索引。索引分别维护普通候选、
 单 owner-key 候选和多 key packet；cluster 有空 epoch 槽时取该 cluster 最早候选，槽满时只从
@@ -244,9 +246,22 @@ owner-gradient 等待集合的全扫描已替换为语义等价的增量就绪�
 同一最小真实 trace 从 `251.00 s` 降至 `82.14 s`，软件墙钟提速 `3.06x`，Base 仍精确为
 `70,596 cycles`；最终回归记录位于仓库外
 `GALA-runtime/records/r2_gaussian_chest_raster_ready_index_telemetry_v2/`。运行期间最大进展报告间隔
-约 `30.0 s`，未触发五分钟无进展门控。下一入口是运行同时包含 raster 和 volumetric packet 的
-中位双窗口 trace，并在相同 trace 上闭合 Base、实际机制、两类同资源 Oracle 和必要下界。
+约 `30.0 s`，未触发五分钟无进展门控。该 `3.06x` 只说明软件选择器提速；其 `70,596 cycles`
+随后因上述硬件生命周期错误失效。
 
-完整测试当前为 `282 passed, 1 skipped, 2 warnings`。`3341x`、`3495x` 和所有公开规格
+同时包含 raster 和 volumetric packet 的中位双窗口 trace 含 `846,012` 个事件、`1,289,964`
+条依赖和 `19,777` 个物理 relation packet。首次重放在 replay queue 的 256 个 query 项与每个 owner
+cluster 的两个错误常驻 Gaussian 槽之间形成循环等待。权威 C++ 实现证明 owner 槽在 partial 被
+gradient-completion 接收后立即释放，未来 relation 不占槽；两个真实 trace 中全部 adjoint 与
+gradient-reduction packet 均按 relation-ID 一一配对，且所有 `140,520` 个 logical gradient event
+都直接依赖配对 adjoint。周期模型现按已预约 relation 维护在途引用，同一 packet 穿过查询和 Pod
+阶段只计一次，配对 gradient packet 完成后释放。修正后最小 raster Base 为 `64,682 cycles`，双窗口
+Base 首次完整闭合为 `144,550 cycles`（500 MHz 下 `0.289100 ms`），墙钟 `283.41 s`，峰值主机
+内存约 `1.07 GiB`，最大进展间隔约 `30.01 s`。双窗口记录位于仓库外
+`GALA-runtime/records/r2_gaussian_chest_median_packets_owner_inflight_fix_v1_base/`。两者仍是
+`quick_cycle_validation`，不外推到正式 30K；下一入口是在同一双窗口 trace 上重跑实际机制、两类
+同资源 Oracle 和必要下界。
+
+完整测试当前为 `284 passed, 1 skipped, 2 warnings`。`3341x`、`3495x` 和所有公开规格
 Orin extrapolation 已彻底退出性能判断，不能作为正式结果、静态锚点、数量级检查、方向判断或
 ASIC 达标门槛。Orin 平台结果保持 `unavailable`，直到取得同套件实测向量。

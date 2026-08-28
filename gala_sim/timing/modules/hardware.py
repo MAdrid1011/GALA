@@ -670,6 +670,14 @@ class QueryReplayTracker:
             and len(self.active_queries) >= self.capacity
         )
 
+    def requires_consumer_slot(self, event_id: int) -> bool:
+        query_key = self.consumer_query_by_event.get(event_id)
+        return bool(
+            query_key is not None
+            and self.remaining_adjoint_by_query.get(query_key, 0) > 0
+            and query_key not in self.active_queries
+        )
+
     def reserve_consumer(self, event_id: int) -> None:
         query_key = self.consumer_query_by_event.get(event_id)
         if query_key is None or self.remaining_adjoint_by_query.get(query_key, 0) == 0:
@@ -717,11 +725,15 @@ class OwnerGradientTracker:
     clusters_per_pod: int
     slots_per_cluster: int
     remaining_gradient_by_key: dict[tuple[int, int, int], int] = field(default_factory=dict)
-    gradient_events_by_key: dict[tuple[int, int, int], list[int]] = field(
+    active_relations_by_key: dict[tuple[int, int, int], set[int]] = field(
         default_factory=dict
     )
     key_by_adjoint_event: dict[int, tuple[int, int, int]] = field(default_factory=dict)
     key_by_gradient_event: dict[int, tuple[int, int, int]] = field(default_factory=dict)
+    relation_by_adjoint_event: dict[int, int] = field(default_factory=dict)
+    relation_by_gradient_event: dict[int, int] = field(default_factory=dict)
+    gradient_event_by_relation: dict[int, int] = field(default_factory=dict)
+    key_by_relation: dict[int, tuple[int, int, int]] = field(default_factory=dict)
     active_by_cluster: dict[int, set[tuple[int, int, int]]] = field(
         default_factory=dict
     )
@@ -758,18 +770,25 @@ class OwnerGradientTracker:
                 continue
             event_id = int(row["event_id"])
             key = self._key(row)
+            relation_id = int(row["relation_id"])
+            if relation_id < 0:
+                raise ValueError("owner-gradient event has no relation identity")
+            existing_key = self.key_by_relation.setdefault(relation_id, key)
+            if existing_key != key:
+                raise ValueError("owner-gradient relation changes Gaussian epoch")
             if kind is PrimitiveKind.ADJOINT:
                 if event_id in self.key_by_adjoint_event:
                     raise ValueError("owner-gradient adjoint event is registered twice")
                 self.key_by_adjoint_event[event_id] = key
+                self.relation_by_adjoint_event[event_id] = relation_id
             else:
                 if event_id in self.key_by_gradient_event:
                     raise ValueError("owner-gradient reduction event is registered twice")
+                if relation_id in self.gradient_event_by_relation:
+                    raise ValueError("owner-gradient relation has duplicate reductions")
                 self.key_by_gradient_event[event_id] = key
-                self.gradient_events_by_key.setdefault(key, []).append(event_id)
-                self.remaining_gradient_by_key[key] = (
-                    self.remaining_gradient_by_key.get(key, 0) + 1
-                )
+                self.relation_by_gradient_event[event_id] = relation_id
+                self.gradient_event_by_relation[relation_id] = event_id
 
     def key_for_adjoint(self, event_id: int) -> tuple[int, int, int]:
         try:
@@ -805,7 +824,11 @@ class OwnerGradientTracker:
         reductions: list[dict[str, object]] = []
         for cluster, keys in active.items():
             for key in keys:
-                events = self.gradient_events_by_key.get(key, ())
+                events = tuple(
+                    self.gradient_event_by_relation[relation_id]
+                    for relation_id in sorted(self.active_relations_by_key[key])
+                    if relation_id in self.gradient_event_by_relation
+                )
                 ready_count = sum(
                     int(remaining_dependencies[event_id]) == 0
                     for event_id in events
@@ -847,6 +870,7 @@ class OwnerGradientTracker:
             raise ValueError("adjoint commits without an owner-gradient epoch slot")
         for event_id in event_ids:
             key = self.key_by_adjoint_event[event_id]
+            relation_id = self.relation_by_adjoint_event[event_id]
             cluster = self._cluster(key)
             active = self.active_by_cluster.setdefault(cluster, set())
             if key not in active:
@@ -855,6 +879,9 @@ class OwnerGradientTracker:
                 self.peak_slots_per_cluster = max(
                     self.peak_slots_per_cluster, len(active)
                 )
+            relations = self.active_relations_by_key.setdefault(key, set())
+            relations.add(relation_id)
+            self.remaining_gradient_by_key[key] = len(relations)
 
     def complete_gradient(self, event_ids: tuple[int, ...]) -> None:
         completed: set[tuple[int, tuple[int, int, int]]] = set()
@@ -865,13 +892,17 @@ class OwnerGradientTracker:
             cluster = self._cluster(key)
             if key not in self.active_by_cluster.get(cluster, set()):
                 raise ValueError("gradient reduction has no reserved owner-gradient slot")
-            remaining = self.remaining_gradient_by_key[key] - 1
-            if remaining < 0:
-                raise ValueError("owner-gradient reduction count underflows")
-            self.remaining_gradient_by_key[key] = remaining
-            if remaining == 0:
+            relation_id = self.relation_by_gradient_event[event_id]
+            relations = self.active_relations_by_key[key]
+            if relation_id not in relations:
+                raise ValueError("gradient reduction has no in-flight adjoint relation")
+            relations.remove(relation_id)
+            self.remaining_gradient_by_key[key] = len(relations)
+            if not relations:
                 completed.add((cluster, key))
         for cluster, key in completed:
+            del self.active_relations_by_key[key]
+            del self.remaining_gradient_by_key[key]
             self.active_by_cluster[cluster].remove(key)
             if not self.active_by_cluster[cluster]:
                 del self.active_by_cluster[cluster]

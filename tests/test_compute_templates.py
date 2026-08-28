@@ -18,7 +18,9 @@ from gala_sim.timing import (
     ModuleTiming,
 )
 from gala_sim.timing.engine import _ReadyCandidateQueue
-from gala_sim.timing.modules import ComputePod, CounterBlock, OwnerGradientTracker
+from gala_sim.timing.modules import (
+    ComputePod, CounterBlock, OwnerGradientTracker, QueryReplayTracker,
+)
 from gala_sim.timing.packets import PhysicalPacketStage
 
 
@@ -214,6 +216,7 @@ def test_ready_selection_finds_reusable_owner_epoch_beyond_fifo_head() -> None:
     rows["iteration_id"] = 1
     rows["primitive_kind"] = int(PrimitiveKind.ADJOINT)
     rows["state_version"] = 0
+    rows["relation_id"] = np.arange(258)
     # All keys target owner cluster zero. The final event reuses the first
     # active epoch after 255 blocked keys.
     rows["gaussian_id"] = np.arange(258) * 20
@@ -232,6 +235,7 @@ def test_ready_selection_finds_reusable_owner_epoch_beyond_fifo_head() -> None:
         queue, "compute_pod", row_for=rows.__getitem__,
         physical_stage_for=lambda _event_id: None,
         owner_gradients=tracker,
+        query_replay=None,
     )
 
     assert selected == [(257, 2)]
@@ -245,6 +249,7 @@ def test_ready_index_matches_full_scan_across_owner_state_changes() -> None:
     rows["iteration_id"] = 1
     rows["primitive_kind"] = int(PrimitiveKind.ADJOINT)
     rows["state_version"] = 0
+    rows["relation_id"] = np.arange(14)
     rows["gaussian_id"] = np.arange(14) * 20
     rows[12]["gaussian_id"] = rows[0]["gaussian_id"]
     rows[13]["primitive_kind"] = int(PrimitiveKind.FORWARD)
@@ -280,6 +285,7 @@ def test_ready_index_matches_full_scan_across_owner_state_changes() -> None:
             3, "compute_pod", row_for=rows.__getitem__,
             physical_stage_for=lambda _event_id: None,
             owner_gradients=tracker,
+            query_replay=None,
         )
         assert selected == expected
         for candidate in selected:
@@ -294,6 +300,7 @@ def test_ready_index_checks_multi_owner_packet_with_original_capacity_rule() -> 
     rows["iteration_id"] = 1
     rows["primitive_kind"] = int(PrimitiveKind.ADJOINT)
     rows["state_version"] = 0
+    rows["relation_id"] = np.arange(5)
     rows["gaussian_id"] = np.arange(5) * 20
     tracker = OwnerGradientTracker(
         pods=4, clusters_per_pod=5, slots_per_cluster=2,
@@ -312,10 +319,46 @@ def test_ready_index_checks_multi_owner_packet_with_original_capacity_rule() -> 
         3, "compute_pod", row_for=rows.__getitem__,
         physical_stage_for=lambda event_id: packet if event_id in (1, 2) else None,
         owner_gradients=tracker,
+        query_replay=None,
     )
 
     assert selected == [(3, 2)]
     assert list(queue) == [(1, 2)]
+
+
+def test_ready_index_reaches_adjoint_behind_full_replay_queue() -> None:
+    rows = np.empty(4, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = np.arange(4)
+    rows["iteration_id"] = 1
+    rows["query_id"] = [0, 1, 0, 1]
+    rows["primitive_kind"] = [
+        int(PrimitiveKind.CONSUMER),
+        int(PrimitiveKind.CONSUMER),
+        int(PrimitiveKind.ADJOINT),
+        int(PrimitiveKind.ADJOINT),
+    ]
+    replay = QueryReplayTracker(capacity=1)
+    replay.register_rows(rows)
+    replay.reserve_consumer(0)
+    queue = _ReadyCandidateQueue()
+    queue.push((1, 1))
+    queue.push((2, 1))
+
+    selected = queue.pop_acceptable(
+        1, "bidirectional_query", row_for=rows.__getitem__,
+        physical_stage_for=lambda _event_id: None,
+        owner_gradients=None, query_replay=replay,
+    )
+    assert selected == [(2, 1)]
+
+    replay.dispatch_adjoint((2,))
+    selected = queue.pop_acceptable(
+        1, "bidirectional_query", row_for=rows.__getitem__,
+        physical_stage_for=lambda _event_id: None,
+        owner_gradients=None, query_replay=replay,
+    )
+    assert selected == [(1, 1)]
 
 
 def test_compute_telemetry_is_exact_and_does_not_change_cycles() -> None:

@@ -146,6 +146,7 @@ class _ReadyCandidateQueue:
         self._next_token = 0
         self._candidate_by_token: dict[int, tuple[int, int]] = {}
         self._general: list[tuple[tuple[int, int], int]] = []
+        self._replay_consumers: list[tuple[tuple[int, int], int]] = []
         self._simple_by_cluster: dict[
             int, list[tuple[tuple[int, int], int]]
         ] = defaultdict(list)
@@ -162,6 +163,7 @@ class _ReadyCandidateQueue:
         self._row_for: Callable[[int], np.void] | None = None
         self._physical_stage_for: Callable[[int], PhysicalPacketStage | None] | None = None
         self._owner_gradients: OwnerGradientTracker | None = None
+        self._query_replay: QueryReplayTracker | None = None
 
     def __bool__(self) -> bool:
         return bool(self._candidate_by_token)
@@ -186,12 +188,22 @@ class _ReadyCandidateQueue:
         assert self._row_for is not None
         assert self._physical_stage_for is not None
         owner_gradients = self._owner_gradients
+        query_replay = self._query_replay
         event_id, _stage = candidate
         row = self._row_for(event_id)
+        kind = PrimitiveKind(int(row["primitive_kind"]))
+        if (
+            query_replay is not None
+            and self._module_name == "bidirectional_query"
+            and kind is PrimitiveKind.CONSUMER
+            and query_replay.requires_consumer_slot(event_id)
+        ):
+            heapq.heappush(self._replay_consumers, (candidate, token))
+            return
         if (
             owner_gradients is None
             or self._module_name not in {"bidirectional_query", "compute_pod"}
-            or PrimitiveKind(int(row["primitive_kind"])) is not PrimitiveKind.ADJOINT
+            or kind is not PrimitiveKind.ADJOINT
         ):
             heapq.heappush(self._general, (candidate, token))
             return
@@ -220,6 +232,7 @@ class _ReadyCandidateQueue:
         row_for: Callable[[int], np.void],
         physical_stage_for: Callable[[int], PhysicalPacketStage | None],
         owner_gradients: OwnerGradientTracker | None,
+        query_replay: QueryReplayTracker | None,
     ) -> None:
         if self._configured:
             if module_name != self._module_name:
@@ -232,6 +245,7 @@ class _ReadyCandidateQueue:
         self._row_for = row_for
         self._physical_stage_for = physical_stage_for
         self._owner_gradients = owner_gradients
+        self._query_replay = query_replay
         for token, candidate in self._candidate_by_token.items():
             self._index(token, candidate)
 
@@ -262,6 +276,14 @@ class _ReadyCandidateQueue:
         general = self._peek(self._general)
         if general is not None:
             choices.append(general)
+        query_replay = self._query_replay
+        if (
+            query_replay is not None
+            and len(query_replay.active_queries) < query_replay.capacity
+        ):
+            consumer = self._peek(self._replay_consumers)
+            if consumer is not None:
+                choices.append(consumer)
         owner_gradients = self._owner_gradients
         if owner_gradients is not None:
             for cluster, heap in self._simple_by_cluster.items():
@@ -299,6 +321,8 @@ class _ReadyCandidateQueue:
                 del self._simple_by_cluster[cluster]
         elif self._peek(self._general) == entry:
             heapq.heappop(self._general)
+        elif self._peek(self._replay_consumers) == entry:
+            heapq.heappop(self._replay_consumers)
         self._complex_event_ids.pop(token, None)
         del self._candidate_by_token[token]
 
@@ -310,11 +334,13 @@ class _ReadyCandidateQueue:
         row_for: Callable[[int], np.void],
         physical_stage_for: Callable[[int], PhysicalPacketStage | None],
         owner_gradients: OwnerGradientTracker | None,
+        query_replay: QueryReplayTracker | None,
     ) -> list[tuple[int, int]]:
         self._configure(
             module_name, row_for=row_for,
             physical_stage_for=physical_stage_for,
             owner_gradients=owner_gradients,
+            query_replay=query_replay,
         )
         selected: list[tuple[int, int]] = []
         for _ in range(min(width, len(self))):
@@ -980,6 +1006,7 @@ class CycleEngine:
         row_for,
         physical_stage_for,
         owner_gradients: OwnerGradientTracker | None,
+        query_replay: QueryReplayTracker | None,
     ) -> list[tuple[int, int]]:
         """Pop the earliest work whose owner-gradient epoch is acceptable."""
 
@@ -988,6 +1015,7 @@ class CycleEngine:
             width, module_name, row_for=row_for,
             physical_stage_for=physical_stage_for,
             owner_gradients=owner_gradients,
+            query_replay=query_replay,
         )
 
     def _uses_generic_module_limits(self, module_name: str) -> bool:
@@ -1760,6 +1788,7 @@ class CycleEngine:
                     row_for=lambda event_id: trace.events[event_id],
                     physical_stage_for=packet_plan.stage_for_event,
                     owner_gradients=owner_gradients,
+                    query_replay=query_replay,
                 ))
                 if not queue:
                     del ready[ready_key]
@@ -3602,6 +3631,7 @@ class CycleReplaySession:
                     row_for=self._events.__getitem__,
                     physical_stage_for=self._packet_stage_by_event.get,
                     owner_gradients=self._owner_gradients,
+                    query_replay=self._query_replay,
                 ))
                 if not queue:
                     del self._ready[ready_key]

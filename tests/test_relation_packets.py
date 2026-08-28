@@ -210,17 +210,67 @@ def test_query_replay_queue_releases_only_after_last_adjoint_dispatch() -> None:
 
 
 def test_owner_gradient_slots_are_partitioned_by_pod_and_owner_cluster() -> None:
-    rows = np.empty(6, dtype=TraceBuilder().finish().events.dtype)
+    rows = np.empty(4, dtype=TraceBuilder().finish().events.dtype)
     rows[:] = TraceEvent().as_tuple()
-    rows["event_id"] = np.arange(6)
-    rows["iteration_id"] = [1, 1, 1, 2, 2, 2]
+    rows["event_id"] = np.arange(4)
+    rows["iteration_id"] = [1, 1, 2, 2]
     # Gaussian 1 maps to Pod 1, local owner cluster 1 in both epochs.
     rows["gaussian_id"] = 1
-    rows["state_version"] = [0, 0, 0, 1, 1, 1]
+    rows["state_version"] = [0, 0, 1, 1]
+    rows["relation_id"] = [10, 10, 20, 20]
     rows["primitive_kind"] = [
         int(PrimitiveKind.ADJOINT),
         int(PrimitiveKind.GRADIENT_REDUCTION),
+        int(PrimitiveKind.ADJOINT),
         int(PrimitiveKind.GRADIENT_REDUCTION),
+    ]
+    tracker = OwnerGradientTracker(
+        pods=4, clusters_per_pod=5, slots_per_cluster=2,
+    )
+    tracker.register_rows(rows)
+
+    tracker.reserve_adjoint((0,))
+    tracker.reserve_adjoint((2,))
+    assert tracker.snapshot()["owner_gradient_peak_slots_per_cluster"] == 2
+    deadlock = tracker.deadlock_snapshot(
+        pending_adjoint_event_ids=(0, 2),
+        remaining_dependencies=np.asarray([0, 2, 0, 0]),
+    )
+    assert deadlock["active_by_cluster"] == {
+        6: ((1, 1, 0), (2, 1, 1)),
+    }
+    assert deadlock["pending_adjoint_count"] == 2
+    assert deadlock["active_gradient_reductions"] == (
+        {
+            "key": (1, 1, 0), "cluster": 6, "event_count": 1,
+            "ready_count": 0, "event_sample": ((1, 2),),
+        },
+        {
+            "key": (2, 1, 1), "cluster": 6, "event_count": 1,
+            "ready_count": 1, "event_sample": ((3, 0),),
+        },
+    )
+    tracker.complete_gradient((1,))
+    assert tracker.snapshot()["owner_gradient_live_slots"] == 1
+    tracker.complete_gradient((3,))
+    assert tracker.snapshot() == {
+        "owner_gradient_slot_reservations": 2,
+        "owner_gradient_slot_releases": 2,
+        "owner_gradient_peak_slots_per_cluster": 2,
+        "owner_gradient_live_slots": 0,
+    }
+
+
+def test_owner_gradient_slot_tracks_only_in_flight_adjoint_relations() -> None:
+    rows = np.empty(4, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = np.arange(4)
+    rows["iteration_id"] = 1
+    rows["gaussian_id"] = 7
+    rows["state_version"] = 0
+    rows["relation_id"] = [10, 11, 10, 11]
+    rows["primitive_kind"] = [
+        int(PrimitiveKind.ADJOINT),
         int(PrimitiveKind.ADJOINT),
         int(PrimitiveKind.GRADIENT_REDUCTION),
         int(PrimitiveKind.GRADIENT_REDUCTION),
@@ -230,36 +280,13 @@ def test_owner_gradient_slots_are_partitioned_by_pod_and_owner_cluster() -> None
     )
     tracker.register_rows(rows)
 
-    tracker.reserve_adjoint((0,))
-    tracker.reserve_adjoint((3,))
-    assert tracker.snapshot()["owner_gradient_peak_slots_per_cluster"] == 2
-    deadlock = tracker.deadlock_snapshot(
-        pending_adjoint_event_ids=(0, 3),
-        remaining_dependencies=np.asarray([0, 2, 1, 0, 3, 0]),
-    )
-    assert deadlock["active_by_cluster"] == {
-        6: ((1, 1, 0), (2, 1, 1)),
-    }
-    assert deadlock["pending_adjoint_count"] == 2
-    assert deadlock["active_gradient_reductions"] == (
-        {
-            "key": (1, 1, 0), "cluster": 6, "event_count": 2,
-            "ready_count": 0, "event_sample": ((1, 2), (2, 1)),
-        },
-        {
-            "key": (2, 1, 1), "cluster": 6, "event_count": 2,
-            "ready_count": 1, "event_sample": ((4, 3), (5, 0)),
-        },
-    )
-    tracker.complete_gradient((1, 2))
+    tracker.reserve_adjoint((0, 1))
+    tracker.reserve_adjoint((0, 1))
+    assert tracker.remaining_gradient_by_key[(1, 7, 0)] == 2
+    tracker.complete_gradient((2,))
     assert tracker.snapshot()["owner_gradient_live_slots"] == 1
-    tracker.complete_gradient((4, 5))
-    assert tracker.snapshot() == {
-        "owner_gradient_slot_reservations": 2,
-        "owner_gradient_slot_releases": 2,
-        "owner_gradient_peak_slots_per_cluster": 2,
-        "owner_gradient_live_slots": 0,
-    }
+    tracker.complete_gradient((3,))
+    assert tracker.snapshot()["owner_gradient_live_slots"] == 0
 
 
 def test_query_close_packets_follow_rows_and_partial_width() -> None:
