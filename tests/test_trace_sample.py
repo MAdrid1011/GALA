@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from gala_sim.clamp import PrimitiveKind, ResourceClass, TraceBuilder, TraceEvent
@@ -9,6 +10,7 @@ from gala_sim.trace import (
     QueryRange, TraceSampleConfig, TraceWriter, dependency_closed_query_sample,
     validate_trace,
 )
+from gala_sim.trace.sample import _gather_value_batches
 from gala_sim.cli import main
 
 
@@ -118,6 +120,16 @@ def test_query_sample_enforces_dependency_and_id_limits() -> None:
                 scan_events=10, scan_backend="cpu",
             ),
         )
+
+
+def test_dependency_value_batches_split_duplicate_frontier_edges() -> None:
+    source = np.asarray([0, 1, 0, 1], dtype=np.uint64)
+    begins = np.asarray([0, 2], dtype=np.uint64)
+    counts = np.asarray([2, 2], dtype=np.uint64)
+
+    batches = list(_gather_value_batches(source, begins, counts, max_values=3))
+
+    assert [batch.tolist() for batch in batches] == [[0, 1], [0, 1]]
 
 
 def test_cli_writes_sample_and_cycle_cli_rejects_implicit_formal_use(

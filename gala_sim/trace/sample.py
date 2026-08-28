@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import mmap
-from typing import Callable
+from typing import Callable, Iterator
 
 import numpy as np
 
@@ -103,22 +103,22 @@ def dependency_closed_query_sample(
         next_ids: list[int] = []
         for start in range(0, frontier.size, config.scan_events):
             rows = trace.events[frontier[start:start + config.scan_events]]
-            dependencies = np.unique(_gather_values(
+            for dependency_batch in _gather_value_batches(
                 trace.dependencies,
                 np.asarray(rows["dependency_begin"], dtype=np.uint64),
                 np.asarray(rows["dependency_count"], dtype=np.uint64),
                 max_values=config.max_dependencies,
-            ))
-            for raw_dependency in dependencies:
-                dependency = int(raw_dependency)
-                if dependency not in selected_ids:
-                    selected_ids.add(dependency)
-                    next_ids.append(dependency)
-                    if len(selected_ids) > config.max_events:
-                        raise ValueError(
-                            "dependency closure exceeds max_events; reduce the query "
-                            "ranges or raise the explicit quick-validation limit"
-                        )
+            ):
+                for raw_dependency in np.unique(dependency_batch):
+                    dependency = int(raw_dependency)
+                    if dependency not in selected_ids:
+                        selected_ids.add(dependency)
+                        next_ids.append(dependency)
+                        if len(selected_ids) > config.max_events:
+                            raise ValueError(
+                                "dependency closure exceeds max_events; reduce the query "
+                                "ranges or raise the explicit quick-validation limit"
+                            )
         if len(selected_ids) > config.max_events:
             raise ValueError(
                 "dependency closure exceeds max_events; reduce the query ranges "
@@ -209,6 +209,33 @@ def _gather_values(
     offsets = np.arange(total, dtype=np.uint64) - np.repeat(prefixes, repeat_counts)
     indices = np.repeat(begins, repeat_counts) + offsets
     return np.asarray(source[indices], dtype=source.dtype)
+
+
+def _gather_value_batches(
+    source: np.ndarray, begins: np.ndarray, counts: np.ndarray,
+    *, max_values: int,
+) -> Iterator[np.ndarray]:
+    """Yield dependency values without treating duplicate frontier edges as output."""
+
+    if max_values <= 0:
+        raise ValueError("sample dependency batch limit must be positive")
+    start = 0
+    while start < counts.size:
+        first_count = int(counts[start])
+        if first_count > max_values:
+            raise ValueError("sample dependency frontier exceeds max_dependencies")
+        end = start + 1
+        total = first_count
+        while end < counts.size:
+            count = int(counts[end])
+            if count > max_values:
+                raise ValueError("sample dependency frontier exceeds max_dependencies")
+            if total + count > max_values:
+                break
+            total += count
+            end += 1
+        yield _gather_values(source, begins[start:end], counts[start:end])
+        start = end
 
 
 def _exclusive_prefix(counts: np.ndarray) -> np.ndarray:
