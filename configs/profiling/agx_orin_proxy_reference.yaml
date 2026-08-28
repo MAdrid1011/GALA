@@ -1,0 +1,25 @@
+schema_version: gala-gpu-proxy-reference-v1
+method: same-generation-public-specification-proxy
+formal_performance_eligible: false
+local:
+  name: NVIDIA GeForce RTX 3060
+  fp32_cores: 3584
+  sm_clock_hz: 1777000000
+  memory_bandwidth_bytes_per_second: 360000000000
+  source: NVIDIA GeForce RTX 3060 public specifications
+target:
+  name: NVIDIA Jetson AGX Orin 64GB
+  fp32_cores: 2048
+  sm_clock_hz: 1300000000
+  memory_bandwidth_bytes_per_second: 204800000000
+  source: docs/01_REPRODUCTION_TARGETS.md:agx-orin-reference
+uncertainty:
+  fp32_fma: 0.25
+  exp: 0.50
+  log: 0.50
+  rcp: 0.50
+  sqrt: 0.50
+  memory_bandwidth: 0.15
+  atomic: 0.75
+  kernel_launch: 1.00
+  synchronization: 1.00

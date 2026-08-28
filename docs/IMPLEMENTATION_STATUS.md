@@ -75,6 +75,8 @@
 - 修订后的正式计划位于 `GALA-runtime/records/r2_gaussian_chest_ncu_signature_plan_v5_revision6.json`，内容 SHA-256 为 `1609031dde955a9cd5d4ef0351913f159ce430638b8ffe26e28256fc14bee188`，文件 SHA-256 为 `3a4580eb64de7002cee10e173a8c1a8d94d25ec6e2584d3aa1a6a61b0df9ce6f`，绑定提交 `b35134f`。计划稳定性为 `passed`，共 36 个 invocation 组和 1 个 collection range 组，必测样本 `5418`、选择启动 `5418`、额外启动 `0`。第 17 组与第 36 组的同名 `CUDAFunctor_add<float>` 短门均通过，状态文件 SHA-256 分别为 `86fc74b7c9070adcd2aa5d89a71082d35fe091612374fcce6c38e2a7881aa32d` 和 `f8a2b78efcbda35d9055006f611fb15dc2a0747726ca36bea4bbdf214fe3b990`；完整作业预测时间分别为 `1312.0653946399689 s` 和 `1311.1520919799805 s`。这些短门只证明采集入口和开销预检通过，不是正式计数证据。该计划第 17 组于完整运行中在序号 `4862` 触发 `watchdog_inactivity_timeout`，状态文件保留在 `GALA-runtime/profiles/r2_gaussian_chest_ncu_v5r4_job17/status.json`，不能作为通过证据。
 - revision9 第 16 组已自然完成完整 30,000 iteration，状态为 `passed`，实际捕获 `64/64` 个计划启动；GPU 利用率中位数 `94%`、采样数 `1400`，watchdog 最大无进展 `2.38716679206118 s`。性能采样在此终止，不再启动第 17--54 组。代表采样汇总位于 `GALA-runtime/records/r2_gaussian_chest_ncu_sampled16_performance_v1.json`：按迭代、阶段、调用位置、启动序号和内核名称匹配，不校验计划、提交或产物哈希；精确内容命中 `3238/4094`，覆盖率 `79.09135319980459%`，按真实 signature 出现次数加权覆盖率 `85.88074894423358%`，collection 保留 `1532` 个实测启动，其余缺口按同阶段同内核、同内核或同阶段的最近工作规模外推并逐阶段报告离散度。本地归一化报告 `r2_gaussian_chest_gpu_normalization_sampled16_v1.json` 的 13 个阶段权重和均为 `1.0`，`local_sampling_status=passed`；AGX Orin 校准向量不可用，因此 Orin 换算保持 provisional，不影响本地性能采样继续用于模拟器参数化。
 - `600:601` 跨迭代真实窗口 trace 已完成 quick validation，结构化记录位于 `GALA-runtime/records/r2_gaussian_chest_trace_window_600_601.json`，SHA-256 为 `b80547658c5fbe4af69ae7864309fd5c97ed6563712a146316ecdba0ca59c947`。捕获包含 `872588146` 个事件、`1430920031` 条依赖、`589824` 个 query、`144911313` 条真实 relation，并覆盖一次 collection、clone/prune、optimizer/no-op optimizer、update begin/end 和后继 query 屏障；全量 validator 修复后 PASS。插桩与两次未插桩 601-iteration 运行的质量差异为 PSNR `-0.000180522587961 dB`、SSIM `-0.000003659142978`、LPIPS `-0.000018147627513`，低于冻结阈值；由于上游 backward CUDA 使用 `atomicAdd`，不宣称 bitwise identical。该窗口明确 `formal_performance_eligible=false`、`quality_eligible=false`，不能作为正式完整 trace、Base ASIC、Oracle、消融或论文结果。
+- 2026-08-28 曾在 GPU 空闲时启动一次完整 30,000 iteration `stream_only` trace 补采，5 分钟门点仍停在首轮 CPU 序列化，GPU 利用率为 `0%`、无训练日志或 manifest 推进，`events.raw` 已达约 `45.8 GB`、进程 RSS 约 `9.8 GB`，遂按门控停止并保留现场 `GALA-runtime/trace-smoke/r2_gaussian_chest_trace_v11_full30k/`。该目录没有完成 manifest，不能进入 validator 或周期；结合已通过的一迭代 `577,268,206` events 证据，继续到 30,000 iteration 会产生不可用规模，因此不再重复该补采。
+- canonical Ramulator preflight 与中心 raster/voxel 真实依赖闭包 quick 周期已重新执行：`0000` Base ASIC 为 `415477` cycles，`query_oracle` 为 `415554`，`residency_oracle` 为 `406180`，联合 `1111` 为 `406208`。十六项消融在同一配置上全部通过，`1111` 与联合入口一致、事件集合一致；新增 `--parallel-workers 4` 后 16 个独立变体约 2 分钟完成，逐项进度写入 stderr。上述结果固定为 `quick_cycle_validation`，不升级为完整 30k 正式周期。
 
 ## 当前入口
 
@@ -97,6 +99,13 @@ R²-Gaussian 的官方 CUDA 扩展仍没有直接导出完整 CLAMP 事件缓冲
 关系记录 decoder 输出现按迭代边界合并，每个非空 flush 最多执行一次 D2H；flush 在最后一个 query 的 backward 到达、下一迭代、optimizer step、Gaussian 集合修改和最终写出之前发生，并要求每个捕获 query 恰有一次类型匹配且已关联 loss 的 backward。v9 decoder 的 raw terminal CUDA scanner 已通过 CPU 逐索引对照；完整一迭代和 `600:601` 跨迭代窗口的质量与结构+生命周期 validator 均已通过，下一项 trace 工作是正式完整训练 capture，而不是重复 smoke。
 
 ## 下一步入口条件
+
+在没有 AGX Orin 实机的条件下，已用 16 组本地归一化报告和显式公开规格参考生成工程静态锚点
+`GALA-runtime/records/r2_gaussian_chest_agx_orin_proxy_v1.json`：总估算为 `3817.435 s`，
+区间为 `2856.733--4778.137 s`。该记录按阶段和类别保存权重、换算比与不确定性，
+状态为 `proxy_estimate` 且 `formal_performance_eligible=false`；可用于论文中无实机条件下的
+数量级/加速比合理性检查，但不改变正式归一化的 `agx_orin_estimate.status=unavailable`，
+也不填充正式 `speedup_vs_orin`。
 
 1. 对 canonical 30k stream-only trace 执行一次质量与完整性验证，并保存机器可读的结构、生命周期和资源记录。
 2. 在真实 trace 上通过依赖、状态、释放和动态事件计数检查，再运行 `0000` Base ASIC 和两个受资源约束 Oracle；性能采样继续固定使用 16 组结果。
