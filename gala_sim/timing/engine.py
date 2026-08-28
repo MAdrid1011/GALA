@@ -235,25 +235,7 @@ class CycleEngine:
                 int(trace.events[event_id]["query_id"]),
                 int(trace.events[event_id]["relation_id"]), event_id,
             ))
-        if self.selection.overlap_guided_issue:
-            base_order = self._schedule_fusion(trace, base_order)
         return base_order
-
-    def _schedule_fusion(self, trace: Trace, base_order: list[int]) -> list[int]:
-        fusion_ids = [event_id for event_id in base_order if PrimitiveKind(
-            int(trace.events[event_id]["primitive_kind"])
-        ) in {
-            PrimitiveKind.FORWARD, PrimitiveKind.CONSUMER, PrimitiveKind.ADJOINT,
-        }]
-        packets = [self._task_packet(trace, event_id) for event_id in fusion_ids]
-        self.issue_scheduler.observe_arrival(packets)
-        scheduled = [packet.event_id for packet in self.issue_scheduler.forecast(packets)]
-        scheduled_iter = iter(scheduled)
-        scheduled_set = set(fusion_ids)
-        return [
-            next(scheduled_iter) if event_id in scheduled_set else event_id
-            for event_id in base_order
-        ]
 
     @staticmethod
     def _task_packet(trace: Trace, event_id: int) -> TaskPacket:
@@ -456,16 +438,48 @@ class CycleEngine:
         )
 
         def build_ready() -> list[tuple[int, int]]:
-            ready_events = [
+            return [
                 (int(event_id), 0)
                 for event_id in np.flatnonzero(dependency_index.remaining == 0)
             ]
-            heapq.heapify(ready_events)
-            return ready_events
 
-        ready = run_phase(
+        initial_ready = run_phase(
             "ready_queue", build_ready, total_iterations=int(iteration_ids.size)
         )
+        ready: list[tuple[int, int]] = []
+        fusion_pending: list[tuple[int, TaskKind]] = []
+        fusion_inputs: dict[TaskKind, list[int]] = {
+            TaskKind.FORWARD: [],
+            TaskKind.CONSUMER: [],
+            TaskKind.ADJOINT: [],
+        }
+
+        def fusion_kind(event_id: int, stage: int) -> TaskKind | None:
+            if not self.selection.overlap_guided_issue or stage != 0:
+                return None
+            kind = PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
+            return {
+                PrimitiveKind.FORWARD: TaskKind.FORWARD,
+                PrimitiveKind.CONSUMER: TaskKind.CONSUMER,
+                PrimitiveKind.ADJOINT: TaskKind.ADJOINT,
+            }.get(kind)
+
+        def push_ready(event_id: int, stage: int) -> None:
+            task_kind = fusion_kind(event_id, stage)
+            if task_kind is None:
+                heapq.heappush(ready, (event_id, stage))
+            else:
+                heapq.heappush(fusion_pending, (event_id, task_kind))
+
+        def requeue_candidate(event_id: int, stage: int) -> None:
+            task_kind = fusion_kind(event_id, stage)
+            if task_kind is None:
+                heapq.heappush(ready, (event_id, stage))
+            else:
+                heapq.heappush(fusion_inputs[task_kind], event_id)
+
+        for event_id, stage in initial_ready:
+            push_ready(event_id, stage)
         remaining_events = len(trace.events)
         in_flight: list[tuple[int, int, int, str]] = []
         module_busy_until = {name: 0 for name in self.modules}
@@ -553,7 +567,7 @@ class CycleEngine:
                         for state, key in cache_keys_by_version.get(state_version, []):
                             state.close(key)
                 if stage + 1 < len(stages):
-                    heapq.heappush(ready, (event_id, stage + 1))
+                    push_ready(event_id, stage + 1)
                 else:
                     completed[event_id] = finish
                     remaining_events -= 1
@@ -592,7 +606,7 @@ class CycleEngine:
                             )
                         dependency_index.remaining[dependent] = remaining - 1
                         if remaining == 1:
-                            heapq.heappush(ready, (dependent, 0))
+                            push_ready(dependent, 0)
                 if (PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
                         is PrimitiveKind.RELATION_CANDIDATE):
                     relation_seed_inflight -= 1
@@ -627,11 +641,33 @@ class CycleEngine:
                 last_progress_completed = len(completed)
                 next_progress_event = len(completed) + progress_interval_events
                 next_progress_time = now + progress_interval_seconds
+            if self.selection.overlap_guided_issue:
+                fusion_capacity = self.modules["fusion_issue"].timing.queue_capacity
+                fusion_occupancy = sum(len(queue) for queue in fusion_inputs.values())
+                while fusion_pending and fusion_occupancy < fusion_capacity:
+                    event_id, task_kind = heapq.heappop(fusion_pending)
+                    heapq.heappush(fusion_inputs[task_kind], event_id)
+                    self.issue_scheduler.observe_arrival((
+                        self._task_packet(trace, event_id),
+                    ))
+                    fusion_occupancy += 1
+                if fusion_pending:
+                    self.modules["fusion_issue"].counters.queue_stalls += 1
+                    self._record_stall(
+                        cycle, "fusion_issue", "input_queue_capacity",
+                        fusion_pending[0][0],
+                    )
             candidates: list[tuple[int, int]] = []
             for _ in range(ready_scan_window):
                 if not ready:
                     break
                 candidates.append(heapq.heappop(ready))
+            if self.selection.overlap_guided_issue:
+                for task_kind in (
+                    TaskKind.FORWARD, TaskKind.CONSUMER, TaskKind.ADJOINT,
+                ):
+                    if fusion_inputs[task_kind]:
+                        candidates.append((heapq.heappop(fusion_inputs[task_kind]), 0))
             fusion_issued = 0
             fusion_port_issued: dict[str, int] = {}
             issued_modules: dict[str, int] = {}
@@ -650,6 +686,14 @@ class CycleEngine:
                         fusion_packets[event_id] = self._task_packet(trace, event_id)
                 decision = self.issue_scheduler.select(fusion_packets.values())
                 fusion_selected = {task.event_id for task in decision.accepted}
+                fusion_order = iter(
+                    task.event_id for task in (*decision.accepted, *decision.rejected)
+                )
+                ordered = [
+                    (next(fusion_order), stage)
+                    if event_id in fusion_packets else (event_id, stage)
+                    for event_id, stage in ordered
+                ]
             for event_id, stage in ordered:
                 row = trace.events[event_id]
                 kind = PrimitiveKind(int(row["primitive_kind"]))
@@ -666,7 +710,7 @@ class CycleEngine:
                     self._record_stall(
                         cycle, module_name, "scheduler_conflict_or_port", event_id
                     )
-                    heapq.heappush(ready, (event_id, stage))
+                    requeue_candidate(event_id, stage)
                     continue
                 if module_name == "fusion_issue" and stage == 0:
                     issue_limit = (
@@ -681,7 +725,7 @@ class CycleEngine:
                             else "base_single_issue"
                         )
                         self._record_stall(cycle, module_name, reason, event_id)
-                        heapq.heappush(ready, (event_id, stage))
+                        requeue_candidate(event_id, stage)
                         continue
                 if not module.accepts_kind(kind):
                     raise CycleConfigurationError(f"{module_name} does not accept {kind.name}")
@@ -694,12 +738,12 @@ class CycleEngine:
                     if fusion_port_issued.get(fusion_port_name, 0) >= fusion_port_limit:
                         module.counters.port_stalls += 1
                         self._record_stall(cycle, module_name, "port", event_id)
-                        heapq.heappush(ready, (event_id, stage))
+                        requeue_candidate(event_id, stage)
                         continue
                 elif issued_modules.get(module_name, 0) >= timing.ports:
                     module.counters.port_stalls += 1
                     self._record_stall(cycle, module_name, "port", event_id)
-                    heapq.heappush(ready, (event_id, stage))
+                    requeue_candidate(event_id, stage)
                     continue
                 busy_until = (
                     fusion_busy_until[fusion_port_name]
@@ -709,18 +753,18 @@ class CycleEngine:
                 if busy_until > cycle:
                     module.counters.queue_stalls += 1
                     self._record_stall(cycle, module_name, "initiation_interval", event_id)
-                    heapq.heappush(ready, (event_id, stage))
+                    requeue_candidate(event_id, stage)
                     continue
                 if module_inflight[module_name] >= timing.queue_capacity:
                     module.counters.queue_stalls += 1
                     self._record_stall(cycle, module_name, "queue_capacity", event_id)
-                    heapq.heappush(ready, (event_id, stage))
+                    requeue_candidate(event_id, stage)
                     continue
                 if (kind is PrimitiveKind.RELATION_CANDIDATE
                         and relation_seed_inflight >= self.config.relation_seed_fifo_entries):
                     module.counters.queue_stalls += 1
                     self._record_stall(cycle, module_name, "seed_fifo", event_id)
-                    heapq.heappush(ready, (event_id, stage))
+                    requeue_candidate(event_id, stage)
                     continue
                 bank_key = (module_name, cycle, module.bank(int(row["address_token"])))
                 if bank_key in bank_busy:
@@ -744,7 +788,7 @@ class CycleEngine:
                         except CacheBackpressure:
                             module.counters.queue_stalls += 1
                             self._record_stall(cycle, module_name, "cache_capacity", event_id)
-                            heapq.heappush(ready, (event_id, stage))
+                            requeue_candidate(event_id, stage)
                             continue
                         cache_event_state[event_id] = (state, key, lookup)
                         state_version = int(row["state_version"])

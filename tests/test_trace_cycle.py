@@ -11,6 +11,7 @@ from gala_sim.clamp import (
     PrimitiveKind,
     ReductionDomain,
     ResourceClass,
+    TaskKind,
     TraceBuilder,
     TraceEvent,
     UpdateBeginKind,
@@ -570,11 +571,8 @@ def test_fusion_issue_applies_each_task_class_port_limit() -> None:
         fusion_forward_ports=1, fusion_consumer_ports=1, fusion_adjoint_ports=1,
     )
     result = CycleEngine(config, policy="variant:0010").run(builder.finish())
-    assert any(
-        stall.module == "fusion_issue"
-        and stall.reason == "scheduler_conflict_or_port"
-        for stall in result.stalls
-    )
+    assert result.module_counters["fusion_issue"]["accepted"] == 2
+    assert result.completion_cycles[0] < result.completion_cycles[1]
 
 
 @pytest.mark.parametrize("policy,expected", [
@@ -650,6 +648,52 @@ def test_overlap_issue_rejects_same_query_reduction_in_one_cycle() -> None:
     assert any(
         stall.reason == "scheduler_conflict_or_port" for stall in result.stalls
     )
+
+
+def test_overlap_scheduler_observes_three_real_input_heads() -> None:
+    builder = TraceBuilder()
+    for event_id in range(8):
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.FORWARD), query_id=event_id,
+            gaussian_id=event_id, relation_id=event_id, reduction_key=event_id,
+            address_token=event_id, resource_class=int(ResourceClass.ISSUE),
+        ))
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CONSUMER), query_id=20,
+        gaussian_id=20, consumer_id=20, reduction_key=20, address_token=20,
+        resource_class=int(ResourceClass.ISSUE),
+    ))
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.ADJOINT), query_id=21,
+        gaussian_id=21, relation_id=21, reduction_key=21, address_token=21,
+        resource_class=int(ResourceClass.ISSUE),
+    ))
+    timing = ModuleTiming(
+        latency=1, initiation_interval=1, queue_capacity=16, ports=3, banks=32,
+    )
+    config = CycleConfig(
+        modules={name: timing for name in (
+            "relation_constructor", "fusion_issue", "semantic_cache", "compute_pod",
+            "bidirectional_query", "reconstruction_update", "shared_sram",
+        )},
+        memory=_Memory(), clock_frequency_hz=500_000_000,
+        relation_seed_fifo_entries=8, candidate_lanes=3,
+        fusion_forward_ports=1, fusion_consumer_ports=1, fusion_adjoint_ports=1,
+    )
+    engine = CycleEngine(config, policy="variant:0010")
+    observed: list[tuple[TaskKind, ...]] = []
+    original_select = engine.issue_scheduler.select
+
+    def recording_select(candidates, **kwargs):
+        packets = tuple(candidates)
+        observed.append(tuple(packet.task_kind for packet in packets))
+        return original_select(packets, **kwargs)
+
+    engine.issue_scheduler.select = recording_select  # type: ignore[method-assign]
+    engine.run(builder.finish(), validate_input=False)
+    assert set(observed[0]) == {
+        TaskKind.FORWARD, TaskKind.CONSUMER, TaskKind.ADJOINT,
+    }
 
 
 def test_event_driven_engine_replays_large_dependency_chain() -> None:

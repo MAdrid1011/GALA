@@ -79,6 +79,7 @@
 - canonical Ramulator preflight 与中心 raster/voxel 真实依赖闭包 quick 周期已重新执行：`0000` Base ASIC 为 `415477` cycles，`query_oracle` 为 `415554`，`residency_oracle` 为 `406180`，联合 `1111` 为 `406208`。十六项消融在同一配置上全部通过，`1111` 与联合入口一致、事件集合一致；新增 `--parallel-workers 4` 后 16 个独立变体约 2 分钟完成，逐项进度写入 stderr。上述结果固定为 `quick_cycle_validation`，不升级为完整 30k 正式周期。
 - 长周期重放已加入显式开发诊断：按完成事件数或 30 秒墙钟间隔输出运行健康状态，并只在完整连续迭代闭合时采样墙钟吞吐、每事件模拟周期、总周期投影和静态 AGX Orin 锚点加速比区间。默认仍完整运行；只有显式 `--stop-when-throughput-stable` 才能在预热、最小完成比例、连续稳定窗口和多指标跨度同时通过后提前结束。提前结束要求独立空目录，固定 `formal_performance_eligible=false`，不写正式 `cycles.json` 或消融结果。
 - A/B/C/D 已由周期引擎独立解析，不再把 A 与 C 合并或丢弃 B；`query`、`residency` 和 `full` 别名分别严格映射到 `1010`、`0101` 和 `1111`。C 关闭时融合发射使用全局单发射合同；C 打开时调度器以带查询/高斯目标域的真实归约键执行冲突选择，并只在周期引擎确认端口、Bank 和队列接纳后提交发射状态。中心 raster/voxel 闭包的修复后十六项 quick 矩阵位于 `GALA-runtime/records/r2_gaussian_chest_ablation_mechanism_fix_v1.csv`：Base `0000=415477` cycles，`1000=415558`，`0100=415477`，`0010=415704`，`0001=406180`，`1111=406364`，完整 GALA 相对 Base 为 `1.02243x`。A、B、C 单独位尚未形成目标收益：A 仍缺冻结的真实查询负载计划，B 尚未生成语义工作集，C 尚未使用三个真实有界队首和跨轮历史，因此该矩阵只验证独立开关与冲突合同，不是机制闭环或正式性能结果。
+- C 的三输入队首和成功提交路径已完成并通过反例测试：融合前向、消费者、伴随分别进入有界输入队列，每周期只将三个实际队首交给调度器；被冲突、端口、Bank 或队列拒绝的任务留在原队列，只有真正进入在途状态的任务才更新调度器历史。第二次中心闭包十六项 quick 矩阵位于 `GALA-runtime/records/r2_gaussian_chest_ablation_three_heads_v1.csv`，`0000=415477`、`0010=415458`、`1111=406186` cycles，`1111` 与完整入口一致；该结果仍是 quick validation，C 的跨迭代重叠状态和 A 的真实查询负载规则尚未完成。
 
 ## 当前入口
 
