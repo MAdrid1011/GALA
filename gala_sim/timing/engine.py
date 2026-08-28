@@ -3580,18 +3580,28 @@ class CycleReplaySession:
                     else (self._backward_frontier or tuple(self._events))
                 )
             )
-        gaussian_ids = (
-            tuple(record.active_ids)
-            if record.kind is VirtualLifecycleKind.UPDATE_COMMIT
-            and record.all_active and record.active_ids
-            else ((record.parent_id, *record.child_ids)
-                  if record.kind in {
-                      VirtualLifecycleKind.CLONE, VirtualLifecycleKind.SPLIT,
-                  } and record.child_ids else (record.gaussian_id,))
-        )
+        if (
+            record.kind is VirtualLifecycleKind.UPDATE_COMMIT
+            and record.all_active
+            and record.active_ids
+        ):
+            gaussian_ids = tuple(record.active_ids)
+        elif record.kind is VirtualLifecycleKind.CLONE and record.child_ids:
+            gaussian_ids = (record.parent_id, *record.child_ids)
+        elif record.kind is VirtualLifecycleKind.SPLIT and record.child_ids:
+            # Raw capture emits split children first and the parent update
+            # after all child records have completed.
+            gaussian_ids = (*record.child_ids, record.parent_id)
+        else:
+            gaussian_ids = (record.gaussian_id,)
+        lineage_event_ids: list[int] = []
         for gaussian_id in gaussian_ids:
             event_id = self._stream_validator.next_event_id
             dependency_ids = base_dependencies
+            if record.kind is VirtualLifecycleKind.CLONE and lineage_event_ids:
+                dependency_ids = (*dependency_ids, lineage_event_ids[0])
+            elif record.kind is VirtualLifecycleKind.SPLIT and gaussian_id == record.parent_id:
+                dependency_ids = (*dependency_ids, *lineage_event_ids)
             if record.kind is VirtualLifecycleKind.UPDATE_BEGIN:
                 self._open_lifecycle_events = []
             row = np.empty(1, dtype=event_dtype())
@@ -3626,6 +3636,10 @@ class CycleReplaySession:
                 self._open_lifecycle_begin = event_id
             elif record.kind is not VirtualLifecycleKind.UPDATE_END:
                 self._open_lifecycle_events.append(event_id)
+            if record.kind in {
+                VirtualLifecycleKind.CLONE, VirtualLifecycleKind.SPLIT,
+            }:
+                lineage_event_ids.append(event_id)
             self.accept_event_packet(event_packet)
         if record.kind is VirtualLifecycleKind.UPDATE_END:
             self._state_barrier_event = self._last_lifecycle_event

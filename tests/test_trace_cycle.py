@@ -474,6 +474,53 @@ def test_online_lifecycle_commits_share_transaction_begin_dependency() -> None:
     session.finish()
 
 
+def test_online_lifecycle_lineage_preserves_clone_and_split_order() -> None:
+    masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
+    masks[0, 0] = 1
+    source = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 1),
+        point_ids=np.asarray([0], dtype=np.int64),
+        point_keys=np.asarray([0], dtype=np.uint64), masks=masks,
+        loss_flags=1, backward_confirmed=True,
+    )
+    session = CycleEngine(_config()).online_session(
+        max_events=16, initial_gaussian_count=2,
+    )
+    accept_event_packet = session.accept_event_packet
+    session.accept_event_packet = lambda packet, **kwargs: accept_event_packet(
+        packet, _drain_after=False
+    )
+    session.accept_query_packet(source)
+    session.accept_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_BEGIN, 0,
+        field_mask=1, transaction_kind=1, active_ids=(0, 1),
+    ))
+    session.accept_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.CLONE, 0, parent_id=0, child_ids=(2, 3),
+        transaction_kind=1,
+    ))
+    session.accept_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.SPLIT, 0, parent_id=1, child_ids=(4, 5),
+        transaction_kind=1,
+    ))
+    session.accept_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_END, 0,
+        field_mask=1, transaction_kind=1,
+    ))
+
+    modifications = [
+        event_id for event_id, kind in session._kinds.items()
+        if kind is PrimitiveKind.SET_MODIFICATION
+    ]
+    assert len(modifications) == 6
+    clone_parent, clone_child_a, clone_child_b, split_child_a, split_child_b, split_parent = modifications
+    assert session._dependencies[clone_child_a][-1] == clone_parent
+    assert session._dependencies[clone_child_b][-1] == clone_parent
+    assert session._dependencies[split_parent][-2:] == (split_child_a, split_child_b)
+    session.close_iteration(1)
+    session.finish()
+
+
 def test_online_cycle_replay_consumes_exact_semantic_workset_sidecar() -> None:
     masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
     masks[0, 0] = 0b11
