@@ -8,7 +8,7 @@ from dataclasses import dataclass
 import heapq
 from pathlib import Path
 import time
-from typing import Callable, Iterable
+from typing import Callable, Iterable, Mapping
 
 import numpy as np
 
@@ -1007,6 +1007,7 @@ class CycleEngine:
         *,
         max_events: int,
         initial_gaussian_count: int = 0,
+        semantic_workset_totals: Mapping[tuple[int, int], int] | None = None,
         retain_completion_cycles: bool = False,
         progress: Callable[[CycleProgress], None] | None = None,
         progress_interval_seconds: float | None = None,
@@ -1017,6 +1018,7 @@ class CycleEngine:
             self,
             max_events=max_events,
             initial_gaussian_count=initial_gaussian_count,
+            semantic_workset_totals=semantic_workset_totals,
             retain_completion_cycles=retain_completion_cycles,
             progress=progress,
             progress_interval_seconds=progress_interval_seconds,
@@ -1165,6 +1167,7 @@ class CycleReplaySession:
         *,
         max_events: int,
         initial_gaussian_count: int = 0,
+        semantic_workset_totals: Mapping[tuple[int, int], int] | None = None,
         retain_completion_cycles: bool = False,
         progress: Callable[[CycleProgress], None] | None = None,
         progress_interval_seconds: float | None = None,
@@ -1178,6 +1181,10 @@ class CycleReplaySession:
         self.engine = engine
         self.max_events = max_events
         self.retain_completion_cycles = retain_completion_cycles
+        self.semantic_workset_totals = dict(semantic_workset_totals or {})
+        if any(key[0] < 0 or key[1] < 0 or value <= 0
+               for key, value in self.semantic_workset_totals.items()):
+            raise ValueError("semantic workset totals must use positive keyed counts")
         self.progress = progress
         self.progress_interval_seconds = progress_interval_seconds
         self._expander = VirtualQueryEventExpander(max_events=max_events)
@@ -1208,6 +1215,8 @@ class CycleReplaySession:
         self._cache_fill_request: dict[tuple[int, tuple[int, int]], int] = {}
         self._memory_waiters: dict[int, list[tuple[int, int, str, int]]] = {}
         self._cache_event_state: dict[int, tuple[SemanticCacheState, tuple[int, int], CacheLookup]] = {}
+        self._workset_seen: dict[tuple[int, int], int] = defaultdict(int)
+        self._workset_by_request: dict[int, tuple[int, int, int, bool]] = {}
         self._cache_keys_by_version: dict[int, list[tuple[SemanticCacheState, tuple[int, int]]] ] = {}
         self._closed_versions: set[int] = set()
         self._memory_requests = 0
@@ -1258,6 +1267,22 @@ class CycleReplaySession:
             self._dependencies[event_id] = dependencies
             self._remaining[event_id] = unresolved
             kind = PrimitiveKind(int(row["primitive_kind"]))
+            if kind is PrimitiveKind.CACHE_REQUEST and self.semantic_workset_totals:
+                key = (int(row["gaussian_id"]), int(row["state_version"]))
+                total = self.semantic_workset_totals.get(key)
+                if total is None:
+                    raise CycleConfigurationError(
+                        f"semantic workset is missing cache key {key}"
+                    )
+                ordinal = self._workset_seen[key]
+                if ordinal >= total:
+                    raise CycleConfigurationError(
+                        f"semantic workset has too many uses for key {key}"
+                    )
+                self._workset_by_request[event_id] = (
+                    ordinal, total, total - ordinal, ordinal + 1 == total
+                )
+                self._workset_seen[key] = ordinal + 1
             self._event_counts[kind.name] += 1
             self._accepted_events += 1
             if unresolved == 0:
@@ -1349,6 +1374,12 @@ class CycleReplaySession:
             raise CycleConfigurationError(
                 "online replay requires at least one closed query iteration"
             )
+        if self.semantic_workset_totals:
+            observed = dict(self._workset_seen)
+            if observed != self.semantic_workset_totals:
+                raise CycleConfigurationError(
+                    "online semantic workset totals do not match cache requests"
+                )
         self._finalized = True
         self._report_progress(force=True)
         counters = {
@@ -1363,6 +1394,12 @@ class CycleReplaySession:
                     cache_totals[key] += value
             counters["semantic_cache"].update(cache_totals)
         counters["semantic_cache"]["memory_requests"] = self._memory_requests
+        counters["semantic_cache"]["workset_keys"] = len(self.semantic_workset_totals)
+        counters["semantic_cache"]["workset_uses"] = sum(self._workset_seen.values())
+        counters["semantic_cache"]["workset_releases"] = sum(
+            1 for _ordinal, _total, _remaining, last_use in self._workset_by_request.values()
+            if last_use
+        )
         audit_records = getattr(self.engine.config.memory, "audit_records", None)
         memory_records = tuple(audit_records()) if callable(audit_records) else ()
         return CycleResult(
@@ -1644,7 +1681,12 @@ class CycleReplaySession:
         instance = self.engine._cache_instance(int(row["gaussian_id"]))
         key = (int(row["gaussian_id"]), int(row["state_version"]))
         state = self._cache_states[instance]
-        lookup = state.request(key, remaining_uses=1)
+        workset = self._workset_by_request.get(event_id)
+        lookup = state.request(
+            key,
+            remaining_uses=workset[2] if workset is not None else 1,
+            workset_total_uses=workset[1] if workset is not None else None,
+        )
         self._cache_event_state[event_id] = (state, key, lookup)
         self._cache_keys_by_version.setdefault(key[1], []).append((state, key))
         if lookup is CacheLookup.HIT:
@@ -1699,7 +1741,9 @@ class CycleReplaySession:
                 raise CycleConfigurationError(f"cache return {event_id} has no unique request")
             state, key, _lookup = self._cache_event_state[request_ids[0]]
             state.complete_read(key)
-            state.close(key)
+            workset = self._workset_by_request.get(request_ids[0])
+            if workset is None or workset[3]:
+                state.close(key)
         if kind is PrimitiveKind.UPDATE_END and stage == len(stages) - 1:
             version = int(row["state_version"])
             if int(row["field_mask"]) != 0:
