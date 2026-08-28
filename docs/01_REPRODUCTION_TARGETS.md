@@ -54,8 +54,8 @@ Base ASIC 关闭四项核心优化，保留完整通用硬件和正确的数值�
 `gala_sim.tools.gpu_orin_estimate` 工程代理：它把已测的本地阶段权重与显式公开规格参考向量结合，
 并为每个类别给出不确定区间。生成代理时必须通过 `--workload-iterations` 声明总时间对应的训练迭代数；
 周期诊断会先按当前重放迭代数缩放该时间，再计算加速比。该代理输出固定为 `status=proxy_estimate`、
-`formal_performance_eligible=false`，只能作为工程锚点和异常检查；它不改变正式归一化状态，
-不生成 `speedup_vs_orin`，也不能替代同一校准套件、数据类型和批量范围下的 AGX Orin 实测向量。
+`formal_performance_eligible=false`，只能作为带明确假设的非正式规格代理和异常检查；它不改变正式归一化状态，
+不生成 `speedup_vs_orin`，不能作为 ASIC 达标或加速比门槛，也不能替代同一校准套件、数据类型和批量范围下的 AGX Orin 实测向量。
 
 软件参考在实现者实际使用的 NVIDIA GPU 上测量，并保存原始设备时间。到 AGX Orin 的换算按执行阶段进行，每个阶段分别使用可移植校准程序测得 FP32 FMA、EXP、LOG、RCP、SQRT、有效显存带宽、原子操作、kernel 发射和同步开销。换算使用同版本 CUDA、相同数据类型和相同批量区间，不使用峰值算力比或单一全局系数。
 

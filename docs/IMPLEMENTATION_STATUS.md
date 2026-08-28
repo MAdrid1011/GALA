@@ -177,12 +177,12 @@ R²-Gaussian 的官方 CUDA 扩展仍没有直接导出完整 CLAMP 事件缓冲
 
 ## 下一步入口条件
 
-在没有 AGX Orin 实机的条件下，已用 16 组本地归一化报告和显式公开规格参考生成工程静态锚点
+在没有 AGX Orin 实机的条件下，已用 16 组本地归一化报告和显式公开规格参考生成非正式规格代理
 `GALA-runtime/records/r2_gaussian_chest_agx_orin_proxy_v1.json`：总估算为 `3817.435 s`，
 区间为 `2856.733--4778.137 s`。该记录按阶段和类别保存权重、换算比与不确定性，
-状态为 `proxy_estimate` 且 `formal_performance_eligible=false`；可用于论文中无实机条件下的
-数量级/加速比合理性检查，但不改变正式归一化的 `agx_orin_estimate.status=unavailable`，
-也不填充正式 `speedup_vs_orin`。
+状态为 `proxy_estimate` 且 `formal_performance_eligible=false`；只能用于开发阶段的数量级对照，
+不能证明加速比合理，更不能作为 ASIC 达标门槛。不改变正式归一化的
+`agx_orin_estimate.status=unavailable`，也不填充正式 `speedup_vs_orin`。
 
 1. 将有界虚拟数据包直接接入跨包 CycleEngine，并在一迭代和 `600:601` 窗口逐字段对照旧完整 trace；通过后运行一次 canonical 30k 虚拟包流的质量、结构、生命周期和资源门。
 2. 在真实 trace 上通过依赖、状态、释放和动态事件计数检查，再运行 `0000` Base ASIC 和两个受资源约束 Oracle；性能采样继续固定使用 16 组结果。
