@@ -17,6 +17,12 @@ from .virtual import (
     VirtualRelationEventExpander,
     VirtualEventStreamValidator,
     VirtualQueryEventExpander,
+    VirtualLifecycleKind,
+    VirtualLifecycleRecord,
+    VirtualIterationLedger,
+    VirtualTraceLifecycleValidator,
+    TRANSACTION_COLLECTION,
+    TRANSACTION_OPTIMIZER,
 )
 
 __all__ = [
@@ -42,4 +48,10 @@ __all__ = [
     "VirtualRelationEventExpander",
     "VirtualEventStreamValidator",
     "VirtualQueryEventExpander",
+    "VirtualLifecycleKind",
+    "VirtualLifecycleRecord",
+    "VirtualIterationLedger",
+    "VirtualTraceLifecycleValidator",
+    "TRANSACTION_COLLECTION",
+    "TRANSACTION_OPTIMIZER",
 ]

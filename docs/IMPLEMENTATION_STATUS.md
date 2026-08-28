@@ -88,7 +88,9 @@
 `VirtualTracePacket` 保留官方 raster/voxel 的 point list、point key 和完整 valid mask，
 并以稳定的全局 query 顺序惰性枚举真实 relation。`VirtualQueryEventExpander` 现在能
 在全局连续 ID 下生成候选、关系、缓存请求/返回、前向、查询归约、消费者、伴随和梯度
-归约事件；`VirtualEventStreamValidator` 检查包号、事件连续性、外部依赖和前向依赖。
+归约事件；`VirtualEventStreamValidator` 检查包号、事件连续性、外部依赖和前向依赖；
+`VirtualTraceLifecycleValidator` 维护活动 Gaussian、状态版本、更新事务和每迭代计数
+ledger。
 `VirtualTraceStream` 使用有界生产/消费队列、物理包字节和峰值驻留统计，并在配置的不活动
 期限内停止无进展运行。当前原型仍缺少跨包语义工作集 sidecar、Ramulator 未完成请求、
 UPDATE_BEGIN/COMMIT/END、Clone/Split/Prune lineage 和迭代级状态屏障，尚未接入正式

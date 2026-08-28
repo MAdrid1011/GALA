@@ -9,6 +9,9 @@ import pytest
 from gala_sim.trace import (
     VirtualEventStreamValidator,
     VirtualQueryEventExpander,
+    VirtualLifecycleKind,
+    VirtualLifecycleRecord,
+    VirtualTraceLifecycleValidator,
     Trace,
     VirtualRelationEventExpander,
     VirtualTracePacket,
@@ -190,6 +193,67 @@ def test_query_expander_builds_a_valid_full_query_chain() -> None:
     )
     report = validate_trace(trace)
     assert report.event_count == 26
+
+
+def test_lifecycle_validator_tracks_updates_lineage_and_iteration_ledger() -> None:
+    validator = VirtualTraceLifecycleValidator(initial_gaussian_count=2)
+    masks = _mask(2, 8)
+    masks[:, 0] = np.uint32(1)
+    packet = VirtualTracePacket(
+        iteration_id=600, template_id=1, query_base=0, query_shape=(1, 1),
+        point_ids=np.asarray([0, 1], dtype=np.int64),
+        point_keys=np.asarray([0, 0], dtype=np.uint64), masks=masks,
+        loss_flags=1,
+    )
+    validator.accept_packet(packet)
+    validator.accept_lifecycle(VirtualLifecycleRecord(
+        600, VirtualLifecycleKind.UPDATE_BEGIN, 0,
+        field_mask=15, transaction_kind=2,
+    ))
+    for gaussian_id in (0, 1):
+        validator.accept_lifecycle(VirtualLifecycleRecord(
+            600, VirtualLifecycleKind.UPDATE_COMMIT, 0,
+            field_mask=15, gaussian_id=gaussian_id, transaction_kind=2,
+        ))
+    validator.accept_lifecycle(VirtualLifecycleRecord(
+        600, VirtualLifecycleKind.UPDATE_END, 0,
+        field_mask=15, transaction_kind=2,
+    ))
+    validator.accept_lifecycle(VirtualLifecycleRecord(
+        600, VirtualLifecycleKind.UPDATE_BEGIN, 1,
+        field_mask=15, transaction_kind=1,
+    ))
+    validator.accept_lifecycle(VirtualLifecycleRecord(
+        600, VirtualLifecycleKind.CLONE, 1,
+        parent_id=0, child_ids=(2,), transaction_kind=1,
+    ))
+    validator.accept_lifecycle(VirtualLifecycleRecord(
+        600, VirtualLifecycleKind.PRUNE, 1,
+        gaussian_id=1, transaction_kind=1,
+    ))
+    validator.accept_lifecycle(VirtualLifecycleRecord(
+        600, VirtualLifecycleKind.UPDATE_END, 1,
+        field_mask=15, transaction_kind=1,
+    ))
+    ledger = validator.close_iteration(600)
+
+    assert ledger.relation_count == ledger.backward_relation_count == 2
+    assert ledger.optimizer_commits == 2
+    assert ledger.collection_transactions == 1
+    assert ledger.state_version_start == 0
+    assert ledger.state_version_end == 2
+    assert ledger.active_gaussian_count_start == ledger.active_gaussian_count_end == 2
+    assert validator.finalize() == (ledger,)
+
+
+def test_lifecycle_validator_rejects_cross_iteration_open_transaction() -> None:
+    validator = VirtualTraceLifecycleValidator(initial_gaussian_count=1)
+    validator.accept_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_BEGIN, 0,
+        field_mask=15, transaction_kind=2,
+    ))
+    with pytest.raises(ValueError, match="open update"):
+        validator.close_iteration(1)
 
 
 def test_stream_bounds_inflight_packets_and_accounts_physical_bytes() -> None:

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
 from dataclasses import dataclass
+from enum import IntEnum
 from functools import lru_cache
 import queue
 import threading
@@ -37,6 +38,225 @@ RASTER_BLOCK = (16, 16)
 VOXEL_BLOCK = (8, 8, 8)
 LOSS_SSIM = 1 << 1
 LOSS_TV = 1 << 2
+TRANSACTION_COLLECTION = 1
+TRANSACTION_OPTIMIZER = 2
+
+
+class VirtualLifecycleKind(IntEnum):
+    """Compact lifecycle records that are not represented by query masks."""
+
+    UPDATE_BEGIN = 1
+    UPDATE_COMMIT = 2
+    UPDATE_END = 3
+    PRUNE = 4
+    CLONE = 5
+    SPLIT = 6
+
+
+@dataclass(frozen=True)
+class VirtualLifecycleRecord:
+    """One exact optimizer or Gaussian-set transition."""
+
+    iteration_id: int
+    kind: VirtualLifecycleKind
+    state_version: int
+    field_mask: int = 0
+    gaussian_id: int = -1
+    parent_id: int = -1
+    child_ids: tuple[int, ...] = ()
+    transaction_kind: int = 0
+
+    def __post_init__(self) -> None:
+        if self.iteration_id < 0 or self.state_version < 0 or self.field_mask < 0:
+            raise ValueError("virtual lifecycle fields must be non-negative")
+        if not isinstance(self.kind, VirtualLifecycleKind):
+            raise ValueError("virtual lifecycle kind is invalid")
+        if any(child < 0 for child in self.child_ids):
+            raise ValueError("virtual lifecycle child IDs must be non-negative")
+        if self.transaction_kind not in {0, TRANSACTION_COLLECTION, TRANSACTION_OPTIMIZER}:
+            raise ValueError("virtual lifecycle transaction kind is invalid")
+
+
+@dataclass(frozen=True)
+class VirtualIterationLedger:
+    """Audit counters retained after an iteration's packets are released."""
+
+    iteration_id: int
+    packet_count: int
+    query_count: int
+    candidate_count: int
+    relation_count: int
+    backward_relation_count: int
+    optimizer_commits: int
+    collection_transactions: int
+    state_version_start: int
+    state_version_end: int
+    active_gaussian_count_start: int
+    active_gaussian_count_end: int
+    physical_stream_bytes: int
+
+
+@dataclass
+class VirtualTraceLifecycleValidator:
+    """Validate packet counts and lifecycle transitions with bounded state."""
+
+    initial_gaussian_count: int
+    active_gaussians: set[int] | None = None
+    state_version: int = 0
+    current_iteration: int | None = None
+    current_packets: int = 0
+    current_queries: int = 0
+    current_candidates: int = 0
+    current_relations: int = 0
+    current_backward_relations: int = 0
+    current_optimizer_commits: int = 0
+    current_collection_transactions: int = 0
+    current_physical_bytes: int = 0
+    _iteration_start_version: int = 0
+    _iteration_start_gaussians: int = 0
+    _open_update: tuple[int, int, int] | None = None
+    _ledgers: list[VirtualIterationLedger] | None = None
+
+    def __post_init__(self) -> None:
+        if self.initial_gaussian_count < 0:
+            raise ValueError("initial Gaussian count must be non-negative")
+        if self.active_gaussians is None:
+            self.active_gaussians = set(range(self.initial_gaussian_count))
+        if self._ledgers is None:
+            self._ledgers = []
+
+    @property
+    def ledgers(self) -> tuple[VirtualIterationLedger, ...]:
+        return tuple(self._ledgers or ())
+
+    def accept_packet(self, packet: VirtualTracePacket) -> None:
+        self._select_iteration(packet.iteration_id)
+        if packet.state_version != self.state_version:
+            raise ValueError("virtual packet state version does not match lifecycle state")
+        if self._open_update is not None:
+            raise ValueError("virtual query packet arrived inside an update transaction")
+        point_ids = np.asarray(packet.point_ids, dtype=np.int64)
+        if point_ids.size and not set(int(value) for value in np.unique(point_ids)).issubset(
+            self.active_gaussians or set()
+        ):
+            raise ValueError("virtual packet refers to an inactive Gaussian")
+        relations = packet.logical_relation_count
+        self.current_packets += 1
+        self.current_queries += packet.query_count
+        self.current_candidates += packet.candidate_count
+        self.current_relations += relations
+        self.current_backward_relations += relations
+        self.current_physical_bytes += packet.physical_bytes
+
+    def accept_lifecycle(self, record: VirtualLifecycleRecord) -> None:
+        self._select_iteration(record.iteration_id)
+        if record.state_version != self.state_version:
+            raise ValueError("virtual lifecycle state version is not current")
+        if record.kind is VirtualLifecycleKind.UPDATE_BEGIN:
+            if self._open_update is not None:
+                raise ValueError("virtual update transactions cannot overlap")
+            if record.transaction_kind not in {TRANSACTION_COLLECTION, TRANSACTION_OPTIMIZER}:
+                raise ValueError("virtual update begin requires a transaction kind")
+            self._open_update = (
+                record.transaction_kind, record.field_mask, record.iteration_id
+            )
+            return
+        if record.kind is VirtualLifecycleKind.UPDATE_COMMIT:
+            if self._open_update is None:
+                raise ValueError("virtual update commit has no begin")
+            if record.gaussian_id not in (self.active_gaussians or set()):
+                raise ValueError("virtual update commit refers to an inactive Gaussian")
+            self.current_optimizer_commits += 1
+            return
+        if record.kind is VirtualLifecycleKind.PRUNE:
+            self._require_collection()
+            if record.gaussian_id not in (self.active_gaussians or set()):
+                raise ValueError("virtual prune refers to an inactive Gaussian")
+            self.active_gaussians.remove(record.gaussian_id)  # type: ignore[union-attr]
+            return
+        if record.kind in {VirtualLifecycleKind.CLONE, VirtualLifecycleKind.SPLIT}:
+            self._require_collection()
+            if record.parent_id not in (self.active_gaussians or set()):
+                raise ValueError("virtual lineage parent is inactive")
+            if not record.child_ids:
+                raise ValueError("virtual lineage transition has no children")
+            for child in record.child_ids:
+                if child in (self.active_gaussians or set()):
+                    raise ValueError("virtual lineage child is already active")
+                self.active_gaussians.add(child)  # type: ignore[union-attr]
+            if record.kind is VirtualLifecycleKind.SPLIT:
+                self.active_gaussians.remove(record.parent_id)  # type: ignore[union-attr]
+            return
+        if record.kind is VirtualLifecycleKind.UPDATE_END:
+            if self._open_update is None:
+                raise ValueError("virtual update end has no begin")
+            transaction_kind, begin_mask, _ = self._open_update
+            if record.field_mask != begin_mask:
+                raise ValueError("virtual update masks do not match")
+            if begin_mask:
+                self.state_version += 1
+            if transaction_kind == TRANSACTION_COLLECTION:
+                self.current_collection_transactions += 1
+            self._open_update = None
+            return
+        raise ValueError("unsupported virtual lifecycle record")
+
+    def close_iteration(self, iteration_id: int) -> VirtualIterationLedger:
+        if self.current_iteration != iteration_id:
+            raise ValueError("virtual iteration close does not match the active iteration")
+        if self._open_update is not None:
+            raise ValueError("virtual iteration ended with an open update transaction")
+        if self.current_relations != self.current_backward_relations:
+            raise ValueError("virtual forward/backward relation counts differ")
+        ledger = VirtualIterationLedger(
+            iteration_id=iteration_id,
+            packet_count=self.current_packets,
+            query_count=self.current_queries,
+            candidate_count=self.current_candidates,
+            relation_count=self.current_relations,
+            backward_relation_count=self.current_backward_relations,
+            optimizer_commits=self.current_optimizer_commits,
+            collection_transactions=self.current_collection_transactions,
+            state_version_start=self._iteration_start_version,
+            state_version_end=self.state_version,
+            active_gaussian_count_start=self._iteration_start_gaussians,
+            active_gaussian_count_end=len(self.active_gaussians or ()),
+            physical_stream_bytes=self.current_physical_bytes,
+        )
+        self._ledgers.append(ledger)  # type: ignore[union-attr]
+        self.current_iteration = None
+        self._reset_iteration_counters()
+        return ledger
+
+    def finalize(self) -> tuple[VirtualIterationLedger, ...]:
+        if self.current_iteration is not None:
+            raise ValueError("virtual trace ended before its active iteration closed")
+        if self._open_update is not None:
+            raise ValueError("virtual trace ended with an open update transaction")
+        return self.ledgers
+
+    def _select_iteration(self, iteration_id: int) -> None:
+        if self.current_iteration is None:
+            self.current_iteration = iteration_id
+            self._iteration_start_version = self.state_version
+            self._iteration_start_gaussians = len(self.active_gaussians or ())
+            return
+        if iteration_id != self.current_iteration:
+            raise ValueError("virtual iteration changed without an explicit close")
+
+    def _require_collection(self) -> None:
+        if self._open_update is None or self._open_update[0] != TRANSACTION_COLLECTION:
+            raise ValueError("Gaussian set modification requires a collection transaction")
+
+    def _reset_iteration_counters(self) -> None:
+        self.current_packets = 0
+        self.current_queries = 0
+        self.current_candidates = 0
+        self.current_relations = 0
+        self.current_backward_relations = 0
+        self.current_optimizer_commits = 0
+        self.current_collection_transactions = 0
+        self.current_physical_bytes = 0
 
 
 @dataclass(frozen=True)
