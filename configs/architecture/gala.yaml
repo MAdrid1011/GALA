@@ -143,6 +143,12 @@ parameters:
       source: docs/03_HARDWARE_CONTRACT.md:fusion-issue
       scope: hardware
       status: frozen
+    candidate_fifo_entries:
+      value: 32
+      unit: entry_per_source_fifo
+      source: GALA design config:query_fusion.issue_candidate_fifo_entries
+      scope: hardware
+      status: frozen
     forward_ports:
       value: 1
       unit: port

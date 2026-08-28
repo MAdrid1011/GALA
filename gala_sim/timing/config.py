@@ -166,6 +166,8 @@ class CycleConfig:
     relation_seed_fifo_entries: int
     candidate_lanes: int
     relation_query_lanes: int = 1
+    query_state_entries: int | None = None
+    candidate_fifo_entries: int | None = None
     cache_instances: int | None = None
     cache_capacity_per_instance: int | None = None
     cache_directory_banks: int | None = None
@@ -217,6 +219,10 @@ class CycleConfig:
         )
         if any(value is not None and value <= 0 for value in optional_fusion_values):
             raise ValueError("optional fusion port values must be positive")
+        if self.query_state_entries is not None and self.query_state_entries <= 0:
+            raise ValueError("query-state table capacity must be positive")
+        if self.candidate_fifo_entries is not None and self.candidate_fifo_entries <= 0:
+            raise ValueError("candidate FIFO capacity must be positive")
         if (self.resource_envelope is None) != (self.resource_usage is None):
             raise ValueError("resource envelope and usage must be provided together")
         if self.resource_envelope is not None and self.resource_usage is not None:
@@ -324,6 +330,10 @@ class CycleConfig:
                    candidate_lanes=int(config.value("issue.candidate_lanes")),
                    relation_query_lanes=int(
                        config.value("compute.relations_per_microcontext")
+                   ),
+                   query_state_entries=int(config.value("issue.query_state_entries")),
+                   candidate_fifo_entries=int(
+                       config.value("issue.candidate_fifo_entries")
                    ),
                    cache_instances=int(config.value("cache.instances")),
                    cache_capacity_per_instance=int(config.value("cache.active_records_per_instance")),

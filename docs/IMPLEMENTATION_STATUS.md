@@ -4,6 +4,8 @@
 
 ## 已通过
 
+- 查询调度运行时已对齐权威 Fusion Issue 合同：配置显式冻结每条候选源 FIFO 为 32 项；Query State 按八 lane pack 分配真实物理槽并在完整 F/C/A、生成关闭和归约可读后复用；候选冲突同时检查查询状态、归约键和目标资源；年龄由实际入队周期计算。离线与在线 consumer 均在最后一个查询归约依赖完成时选择真实完成时间最晚的 credit owner，支持一个归约被多个消费者共享。新增容量、槽复用、目标冲突、年龄和 owner 生命周期回归；编译与全量测试为 `293 passed, 1 skipped`。该实现尚未形成正式周期结果，下一入口仍是同一双窗口真实 trace 的同后端 Base/Oracle/实际机制对照。
+
 - 固定的 R²-Gaussian 提交 `f2579bfddd9aac009cb797c8503bef8119bbd022` 可核验，官方 Chest 数据清单包含 153 个文件、元数据哈希和文件级 SHA-256。
 - 官方 CUDA 扩展在 `gaussian-slam-official` 环境中使用 CUDA 12.1 工具链和 GCC 11 编译并通过最小 GPU kernel 调用。
 - 官方 Chest 1/2 迭代真实 smoke 已在仓库外保存；1 迭代评估输出了官方路径的 PSNR、SSIM 和体重建文件。

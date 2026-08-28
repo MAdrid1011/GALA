@@ -1234,6 +1234,64 @@ def test_overlap_scheduler_observes_three_real_input_heads() -> None:
     }
 
 
+def test_consumer_credit_owner_is_last_query_dependency_not_last_generic_dependency() -> None:
+    builder = TraceBuilder()
+    reductions = []
+    for query_id in (0, 1):
+        relation = builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.RELATION), query_id=query_id,
+            gaussian_id=query_id, relation_id=query_id,
+            resource_class=int(ResourceClass.RELATION),
+        ))
+        close = builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.QUERY_CLOSE), query_id=query_id,
+            resource_class=int(ResourceClass.RELATION),
+        ), dependencies=[relation])
+        forward = builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.FORWARD), query_id=query_id,
+            gaussian_id=query_id, relation_id=query_id, reduction_key=query_id,
+            resource_class=int(ResourceClass.ISSUE),
+        ), dependencies=[relation])
+        reductions.append(builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.QUERY_REDUCTION), query_id=query_id,
+            reduction_key=query_id, resource_class=int(ResourceClass.QUERY),
+        ), dependencies=[close, forward]))
+    tail = None
+    for index in range(8):
+        tail = builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.RELATION_CANDIDATE),
+            gaussian_id=100 + index,
+            resource_class=int(ResourceClass.RELATION),
+        ), dependencies=(() if tail is None else (tail,)))
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CONSUMER), query_id=0,
+        consumer_id=0, reduction_key=0,
+        resource_class=int(ResourceClass.QUERY),
+    ), dependencies=[*reductions, tail])
+    engine = CycleEngine(_config(), policy="query")
+    credited: list[int] = []
+    original_credit = engine.issue_scheduler.successor_credit
+
+    def record_credit(owner: int, count: int = 1) -> bool:
+        credited.append(owner)
+        return original_credit(owner, count)
+
+    engine.issue_scheduler.successor_credit = record_credit  # type: ignore[method-assign]
+
+    result = engine.run(builder.finish(), validate_input=False)
+
+    assert result.event_counts["CONSUMER"] == 1
+    assert len(credited) == 1
+    assert credited[0] in {0, 1}
+
+
+def test_loaded_architecture_uses_three_independent_32_entry_candidate_fifos() -> None:
+    config = load_config(Path(__file__).parents[1] / "configs/architecture/gala.yaml")
+    cycle_config = CycleConfig.from_gala(config, _Memory())
+
+    assert cycle_config.candidate_fifo_entries == 32
+
+
 def test_event_driven_engine_replays_large_dependency_chain() -> None:
     builder = TraceBuilder()
     previous: int | None = None

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
-from collections import defaultdict
+from collections import defaultdict, deque
 from dataclasses import dataclass, replace
 from functools import lru_cache
 import heapq
@@ -485,6 +485,8 @@ class CycleEngine:
             forward_ports=config.fusion_forward_ports or config.modules["fusion_issue"].ports,
             consumer_ports=config.fusion_consumer_ports or config.modules["fusion_issue"].ports,
             adjoint_ports=config.fusion_adjoint_ports or config.modules["fusion_issue"].ports,
+            query_state_entries=config.query_state_entries,
+            query_state_lanes=config.relation_query_lanes,
         )
         counters = {name: CounterBlock() for name in config.modules}
         self.modules = {
@@ -644,11 +646,6 @@ class CycleEngine:
                 cache_positions, ordered_cache, strict=True,
             ):
                 base_order[position] = event_id
-        if self.selection.query_load_rules:
-            base_order = sorted(base_order, key=lambda event_id: (
-                int(trace.events[event_id]["query_id"]),
-                int(trace.events[event_id]["relation_id"]), event_id,
-            ))
         return base_order
 
     @staticmethod
@@ -656,6 +653,10 @@ class CycleEngine:
         trace: Trace,
         event_id: int,
         packet_stage: PhysicalPacketStage | None = None,
+        *,
+        consumer_owner_ids: tuple[int, ...] = (),
+        workset_hit: bool = False,
+        age: int = 0,
     ) -> TaskPacket:
         row = trace.events[event_id]
         kind = PrimitiveKind(int(row["primitive_kind"]))
@@ -677,6 +678,8 @@ class CycleEngine:
             raise CycleConfigurationError(
                 f"{kind.name} event {event_id} lacks a semantic reduction key"
             )
+        if kind is PrimitiveKind.CONSUMER and not consumer_owner_ids:
+            consumer_owner_ids = CycleEngine._consumer_owner_ids(trace, event_id)
         return TaskPacket(
             event_id=event_id,
             query_id=max(query_id, 0),
@@ -688,15 +691,85 @@ class CycleEngine:
             template_id=int(row["template_id"]),
             address_token=int(row["address_token"]),
             task_kind=task_kind,
+            target_resource=(
+                (int(row["resource_class"]) << 56)
+                | int(row["address_token"])
+            ),
+            consumer_owner_ids=consumer_owner_ids,
+            workset_hit=workset_hit,
+            age=age,
             conflict_query_ids=(
                 tuple(
                     int(trace.events[member]["query_id"])
                     for member in packet_stage.event_ids
                 )
-                if task_kind is TaskKind.FORWARD and packet_stage is not None
+                if task_kind in {TaskKind.FORWARD, TaskKind.ADJOINT}
+                and packet_stage is not None
                 else ()
             ),
         )
+
+    @staticmethod
+    def _consumer_owner_ids(trace: Trace, event_id: int) -> tuple[int, ...]:
+        """Return the real query results whose last arrival releases a consumer."""
+
+        row = trace.events[event_id]
+        owners = {
+            int(trace.events[int(dependency)]["query_id"])
+            for dependency in trace.dependency_ids(row)
+            if PrimitiveKind(
+                int(trace.events[int(dependency)]["primitive_kind"])
+            ) is PrimitiveKind.QUERY_REDUCTION
+            and int(trace.events[int(dependency)]["query_id"]) >= 0
+        }
+        return tuple(sorted(owners))
+
+    @staticmethod
+    def _workset_hit(
+        cache_states: Mapping[int, SemanticCacheState], row: np.void,
+    ) -> bool:
+        """Report a hit only when the keyed active record is actually resident."""
+
+        if not cache_states or int(row["gaussian_id"]) < 0:
+            return False
+        key = (int(row["gaussian_id"]), int(row["state_version"]))
+        return any(key in state.active for state in cache_states.values())
+
+    def _update_query_state_for_completion(
+        self,
+        row: np.void,
+        kind: PrimitiveKind,
+        adjoint_relation_ids: set[int],
+    ) -> None:
+        """Commit one logical relation/query lifecycle event to live F/C/A."""
+
+        if not self.issue_scheduler.strict_lifecycle:
+            return
+        query_id = int(row["query_id"])
+        if query_id < 0:
+            return
+        try:
+            if kind is PrimitiveKind.RELATION:
+                relation_id = int(row["relation_id"])
+                self.issue_scheduler.relation_accept(
+                    (query_id,),
+                    adjoint_query_ids=(
+                        (query_id,) if relation_id in adjoint_relation_ids else ()
+                    ),
+                )
+            elif kind is PrimitiveKind.QUERY_CLOSE:
+                self.issue_scheduler.producer_close((query_id,))
+            elif kind is PrimitiveKind.FORWARD:
+                self.issue_scheduler.forward_retire((query_id,))
+            elif kind is PrimitiveKind.QUERY_REDUCTION:
+                self.issue_scheduler.reduction_writeback((query_id,))
+            elif kind is PrimitiveKind.ADJOINT:
+                self.issue_scheduler.adjoint_retire((query_id,))
+        except ValueError as error:
+            raise CycleConfigurationError(
+                f"invalid query lifecycle at {kind.name} event "
+                f"{int(row['event_id'])}: {error}"
+            ) from error
 
     @staticmethod
     def _selection_for_policy(policy: str) -> MechanismSelection:
@@ -1251,6 +1324,28 @@ class CycleEngine:
                 trace, query_lanes=self.config.relation_query_lanes,
             ),
         )
+        self.issue_scheduler.reset()
+        trace_kinds = set(
+            np.unique(trace.events["primitive_kind"]).astype(int).tolist()
+        )
+        complete_query_lifecycle = all(
+            int(kind) in trace_kinds
+            for kind in (
+                PrimitiveKind.RELATION,
+                PrimitiveKind.QUERY_CLOSE,
+                PrimitiveKind.FORWARD,
+                PrimitiveKind.QUERY_REDUCTION,
+            )
+        )
+        self.issue_scheduler.set_strict_lifecycle(complete_query_lifecycle)
+        self.issue_scheduler.enable_exact_readiness(complete_query_lifecycle)
+        adjoint_relation_ids = {
+            int(row["relation_id"])
+            for row in trace.events[
+                trace.events["primitive_kind"] == int(PrimitiveKind.ADJOINT)
+            ]
+            if int(row["relation_id"]) >= 0
+        }
         window_plan = run_phase(
             "relation_window_plan",
             lambda: RelationWindowPlan.from_trace(trace, packet_plan),
@@ -1386,16 +1481,61 @@ class CycleEngine:
         ready: dict[tuple[str, int], _ReadyCandidateQueue] = defaultdict(
             _ReadyCandidateQueue
         )
-        fusion_pending: list[tuple[tuple[int, int], int, TaskKind]] = []
-        fusion_inputs: dict[TaskKind, list[int]] = {
-            TaskKind.FORWARD: [],
-            TaskKind.CONSUMER: [],
-            TaskKind.ADJOINT: [],
+        fusion_pending: deque[tuple[int, TaskKind]] = deque()
+        fusion_inputs: dict[TaskKind, deque[int]] = {
+            TaskKind.FORWARD: deque(),
+            TaskKind.CONSUMER: deque(),
+            TaskKind.ADJOINT: deque(),
         }
         fusion_oracle_inputs: list[tuple[tuple[int, int], int, TaskKind]] = []
         packet_ready_members: dict[int, set[int]] = defaultdict(set)
         packet_ready_stages: set[tuple[int, int]] = set()
+        consumer_credit_owner: dict[int, int] = {}
+        consumer_reduction_remaining: dict[int, int] = {}
+        consumer_last_reduction: dict[int, tuple[int, int, int]] = {}
         cycle = 0
+
+        def observe_consumer_reduction(
+            consumer_id: int, reduction_id: int, finish: int, owner: int,
+        ) -> None:
+            if consumer_id in consumer_credit_owner:
+                return
+            remaining = consumer_reduction_remaining.get(consumer_id)
+            if remaining is None:
+                reduction_dependencies = tuple(
+                    int(dependency)
+                    for dependency in trace.dependency_ids(trace.events[consumer_id])
+                    if PrimitiveKind(
+                        int(trace.events[int(dependency)]["primitive_kind"])
+                    ) is PrimitiveKind.QUERY_REDUCTION
+                )
+                if not reduction_dependencies:
+                    raise CycleConfigurationError(
+                        f"consumer {consumer_id} has no query reduction dependency"
+                    )
+                remaining = len(reduction_dependencies)
+            remaining -= 1
+            if remaining < 0:
+                raise CycleConfigurationError(
+                    f"consumer {consumer_id} query dependency count underflow"
+                )
+            consumer_reduction_remaining[consumer_id] = remaining
+            completed = (finish, reduction_id, owner)
+            if completed > consumer_last_reduction.get(
+                consumer_id, (-1, -1, -1),
+            ):
+                consumer_last_reduction[consumer_id] = completed
+            if remaining != 0:
+                return
+            credit_owner = consumer_last_reduction[consumer_id][2]
+            consumer_credit_owner[consumer_id] = credit_owner
+            try:
+                if not self.issue_scheduler.successor_credit(credit_owner):
+                    raise CycleConfigurationError(
+                        f"consumer {consumer_id} credit owner {credit_owner} is not live"
+                    )
+            except ValueError as error:
+                raise CycleConfigurationError(str(error)) from error
 
         def fusion_priority(event_id: int) -> tuple[int, int]:
             if self.selection.query_oracle:
@@ -1446,10 +1586,7 @@ class CycleEngine:
                 )
                 ready[(module_name, partition)].push((event_id, stage))
             else:
-                heapq.heappush(
-                    fusion_pending,
-                    (fusion_priority(event_id), event_id, task_kind),
-                )
+                fusion_pending.append((event_id, task_kind))
 
         def requeue_candidate(event_id: int, stage: int) -> None:
             physical_stage = packet_plan.stage_for_event(event_id)
@@ -1469,7 +1606,7 @@ class CycleEngine:
                     (fusion_priority(event_id), event_id, task_kind),
                 )
             else:
-                heapq.heappush(fusion_inputs[task_kind], event_id)
+                fusion_inputs[task_kind].appendleft(event_id)
 
         for event_id, stage in initial_ready:
             push_ready(event_id, stage)
@@ -1531,6 +1668,11 @@ class CycleEngine:
             if event_id in completed:
                 raise CycleConfigurationError(f"event {event_id} completed twice")
             completed[event_id] = finish
+            row = trace.events[event_id]
+            kind = PrimitiveKind(int(row["primitive_kind"]))
+            self._update_query_state_for_completion(
+                row, kind, adjoint_relation_ids,
+            )
             if compute_telemetry is not None:
                 compute_telemetry.mark_finish(event_id, finish)
             if relation_windows is not None and event_id in relation_windows.event_to_window:
@@ -1570,6 +1712,22 @@ class CycleEngine:
                         f"dependency count underflow at event {dependent}"
                     )
                 dependency_index.remaining[dependent] = remaining - 1
+                dependent_kind = PrimitiveKind(
+                    int(trace.events[dependent]["primitive_kind"])
+                )
+                if (
+                    kind is PrimitiveKind.QUERY_REDUCTION
+                    and dependent_kind is PrimitiveKind.CONSUMER
+                    and self.issue_scheduler.strict_lifecycle
+                ):
+                    owner = int(row["query_id"])
+                    if owner < 0:
+                        raise CycleConfigurationError(
+                            f"consumer {dependent} has an invalid credit owner"
+                        )
+                    observe_consumer_reduction(
+                        dependent, event_id, finish, owner,
+                    )
                 if remaining == 1:
                     push_ready(dependent, 0)
 
@@ -1763,33 +1921,45 @@ class CycleEngine:
                 next_progress_event = len(completed) + progress_interval_events
                 next_progress_time = now + progress_interval_seconds
             if self.selection.overlap_guided_issue:
-                fusion_capacity = self.modules["fusion_issue"].timing.queue_capacity
-                fusion_occupancy = (
-                    len(fusion_oracle_inputs)
-                    if self.selection.query_oracle
-                    else sum(len(queue) for queue in fusion_inputs.values())
+                self.issue_scheduler.set_clock(cycle)
+                fusion_capacity = (
+                    self.config.candidate_fifo_entries
+                    or self.modules["fusion_issue"].timing.queue_capacity
                 )
-                while fusion_pending and fusion_occupancy < fusion_capacity:
-                    priority, event_id, task_kind = heapq.heappop(fusion_pending)
+                blocked_pending: list[tuple[int, TaskKind]] = []
+                pending_count = len(fusion_pending)
+                for _ in range(pending_count):
+                    event_id, task_kind = fusion_pending.popleft()
                     if self.selection.query_oracle:
+                        if len(fusion_oracle_inputs) >= fusion_capacity:
+                            blocked_pending.append((event_id, task_kind))
+                            continue
                         heapq.heappush(
                             fusion_oracle_inputs,
-                            (priority, event_id, task_kind),
+                            (fusion_priority(event_id), event_id, task_kind),
                         )
                     else:
-                        heapq.heappush(fusion_inputs[task_kind], event_id)
+                        if len(fusion_inputs[task_kind]) >= fusion_capacity:
+                            blocked_pending.append((event_id, task_kind))
+                            continue
+                        fusion_inputs[task_kind].append(event_id)
                         self.issue_scheduler.observe_arrival((
                             self._task_packet(
                                 trace, event_id,
                                 packet_plan.stage_for_event(event_id),
+                                consumer_owner_ids=(
+                                    (consumer_credit_owner[event_id],)
+                                    if task_kind is TaskKind.CONSUMER
+                                    and event_id in consumer_credit_owner else ()
+                                ),
                             ),
-                        ))
-                    fusion_occupancy += 1
+                        ), arrival_cycle=cycle)
+                fusion_pending.extend(blocked_pending)
                 if fusion_pending:
                     self.modules["fusion_issue"].counters.queue_stalls += 1
                     self._record_stall(
                         cycle, "fusion_issue", "input_queue_capacity",
-                        fusion_pending[0][1],
+                        fusion_pending[0][0],
                     )
             candidates: list[tuple[int, int]] = []
             for ready_key in tuple(ready):
@@ -1827,7 +1997,7 @@ class CycleEngine:
                         TaskKind.FORWARD, TaskKind.CONSUMER, TaskKind.ADJOINT,
                     ):
                         if fusion_inputs[task_kind]:
-                            candidates.append((heapq.heappop(fusion_inputs[task_kind]), 0))
+                            candidates.append((fusion_inputs[task_kind].popleft(), 0))
             fusion_issued = 0
             fusion_port_issued: dict[str, int] = {}
             issued_modules: dict[tuple[str, int], int] = {}
@@ -1850,11 +2020,22 @@ class CycleEngine:
                         fusion_packets[event_id] = self._task_packet(
                             trace, event_id,
                             packet_plan.stage_for_event(event_id),
+                            consumer_owner_ids=(
+                                (consumer_credit_owner[event_id],)
+                                if kind is PrimitiveKind.CONSUMER
+                                and event_id in consumer_credit_owner else ()
+                            ),
+                            workset_hit=self._workset_hit(
+                                cache_states, trace.events[event_id],
+                            ),
                         )
                 decision = (
                     self.issue_scheduler.select_in_order(fusion_packets.values())
                     if self.selection.query_oracle
-                    else self.issue_scheduler.select(fusion_packets.values())
+                    else self.issue_scheduler.select(
+                        fusion_packets.values(),
+                        use_load_rules=self.selection.query_load_rules,
+                    )
                 )
                 fusion_selected = {task.event_id for task in decision.accepted}
                 fusion_order = iter(
@@ -2367,6 +2548,15 @@ class CycleEngine:
                 )
                 if module_name == "fusion_issue" and stage == 0:
                     fusion_issued += 1
+                    if kind is PrimitiveKind.CONSUMER and self.issue_scheduler.strict_lifecycle:
+                        try:
+                            owner = consumer_credit_owner.get(event_id)
+                            if owner is None or not self.issue_scheduler.successor_dispatch(owner):
+                                raise CycleConfigurationError(
+                                    f"consumer {event_id} has no committed credit owner"
+                                )
+                        except ValueError as error:
+                            raise CycleConfigurationError(str(error)) from error
                     if self.selection.overlap_guided_issue:
                         self.issue_scheduler.commit_issued((fusion_packets[event_id],))
                     if fusion_port_name is not None:
@@ -2543,6 +2733,19 @@ class CycleEngine:
                     "cycle replay ended with live owner-gradient epoch slots"
                 )
             module_counters["compute_pod"].update(owner_gradients.snapshot())
+        if self.issue_scheduler.enforce_exact_readiness:
+            try:
+                self.issue_scheduler.require_drained()
+            except ValueError as error:
+                raise CycleConfigurationError(str(error)) from error
+        self.issue_scheduler.release_completed()
+        f_count, c_count, a_count = self.issue_scheduler.live_counter_totals()
+        module_counters["fusion_issue"].update({
+            **self.issue_scheduler.state_table_snapshot(),
+            "live_forward_count": f_count,
+            "live_consumer_count": c_count,
+            "live_adjoint_count": a_count,
+        })
         audit_records = getattr(self.config.memory, "audit_records", None)
         memory_request_records = tuple(audit_records()) if callable(audit_records) else ()
         total_cycles = max(completed.values(), default=0)
@@ -2901,6 +3104,7 @@ class CycleReplaySession:
         if progress_interval_seconds is not None and progress_interval_seconds <= 0:
             raise ValueError("online progress interval must be positive")
         self.engine = engine
+        self.engine.issue_scheduler.reset()
         self.max_events = max_events
         self.max_frontier_events = max_frontier_events
         self.retain_completion_cycles = retain_completion_cycles
@@ -2927,9 +3131,11 @@ class CycleReplaySession:
         self._ready: dict[
             tuple[str, int], _ReadyCandidateQueue
         ] = defaultdict(_ReadyCandidateQueue)
-        self._fusion_pending: list[tuple[int, TaskKind]] = []
-        self._fusion_inputs: dict[TaskKind, list[int]] = {
-            TaskKind.FORWARD: [], TaskKind.CONSUMER: [], TaskKind.ADJOINT: [],
+        self._fusion_pending: deque[tuple[int, TaskKind]] = deque()
+        self._fusion_inputs: dict[TaskKind, deque[int]] = {
+            TaskKind.FORWARD: deque(),
+            TaskKind.CONSUMER: deque(),
+            TaskKind.ADJOINT: deque(),
         }
         self._in_flight: list[tuple[int, int, int, str]] = []
         self._lane_outputs: list[tuple[int, int, int | None]] = []
@@ -2937,6 +3143,11 @@ class CycleReplaySession:
         self._packet_stage_by_event: dict[int, PhysicalPacketStage] = {}
         self._packet_ready_members: dict[int, set[int]] = defaultdict(set)
         self._packet_ready_stages: set[tuple[int, int]] = set()
+        self._adjoint_relation_ids: set[int] = set()
+        self._consumer_credit_owner: dict[int, int] = {}
+        self._completed_reduction_owner: dict[int, tuple[int, int]] = {}
+        self._consumer_reduction_remaining: dict[int, int] = {}
+        self._consumer_last_reduction: dict[int, tuple[int, int, int]] = {}
         self._relation_windows = engine._new_relation_window_tracker()
         self._query_replay = engine._new_query_replay_tracker()
         self._owner_gradients = engine._new_owner_gradient_tracker()
@@ -3125,6 +3336,28 @@ class CycleReplaySession:
             )
             self._dependencies[event_id] = dependencies
             self._remaining[event_id] = unresolved
+            if (
+                kind is PrimitiveKind.CONSUMER
+                and self.engine.issue_scheduler.strict_lifecycle
+            ):
+                reduction_dependencies = tuple(
+                    dependency for dependency in dependencies
+                    if self._kinds.get(dependency) is PrimitiveKind.QUERY_REDUCTION
+                    or dependency in self._completed_reduction_owner
+                )
+                if not reduction_dependencies:
+                    raise CycleConfigurationError(
+                        f"consumer {event_id} has no query reduction dependency"
+                    )
+                self._consumer_reduction_remaining[event_id] = len(
+                    reduction_dependencies
+                )
+                for dependency in reduction_dependencies:
+                    completed = self._completed_reduction_owner.get(dependency)
+                    if completed is not None:
+                        self._record_reduction_for_consumer(
+                            event_id, dependency, completed[0], completed[1],
+                        )
             physical_stage = self._packet_stage_by_event.get(event_id)
             physical_reader = (
                 physical_stage is None
@@ -3191,6 +3424,28 @@ class CycleReplaySession:
         event_packets = tuple(self._expander.expand(
             packet, external_dependencies=external_dependencies
         ))
+        expanded_rows = np.concatenate([item.events for item in event_packets])
+        expanded_kinds = set(
+            np.unique(expanded_rows["primitive_kind"]).astype(int).tolist()
+        )
+        if all(
+            int(kind) in expanded_kinds
+            for kind in (
+                PrimitiveKind.RELATION,
+                PrimitiveKind.QUERY_CLOSE,
+                PrimitiveKind.FORWARD,
+                PrimitiveKind.QUERY_REDUCTION,
+            )
+        ):
+            self.engine.issue_scheduler.set_strict_lifecycle()
+            self.engine.issue_scheduler.enable_exact_readiness()
+        self._adjoint_relation_ids.update(
+            int(row["relation_id"])
+            for row in expanded_rows[
+                expanded_rows["primitive_kind"] == int(PrimitiveKind.ADJOINT)
+            ]
+            if int(row["relation_id"]) >= 0
+        )
         packet_plan = RelationPacketPlan.from_event_packets(
             event_packets,
             query_lanes=self.engine.config.relation_query_lanes,
@@ -3198,14 +3453,14 @@ class CycleReplaySession:
         if self._query_replay is not None:
             try:
                 self._query_replay.register_rows(
-                    np.concatenate([item.events for item in event_packets])
+                    expanded_rows
                 )
             except ValueError as error:
                 raise CycleConfigurationError(str(error)) from error
         if self._owner_gradients is not None:
             try:
                 self._owner_gradients.register_rows(
-                    np.concatenate([item.events for item in event_packets])
+                    expanded_rows
                 )
             except ValueError as error:
                 raise CycleConfigurationError(str(error)) from error
@@ -3352,6 +3607,7 @@ class CycleReplaySession:
         self._lifecycle.close_iteration(iteration_id)
         self._closed_iterations += 1
         self._drain()
+        self._completed_reduction_owner.clear()
 
     def retire_semantic_workset_totals(
         self, keys: Iterable[tuple[int, int]]
@@ -3402,6 +3658,21 @@ class CycleReplaySession:
         counters = {
             name: module.counters.as_dict() for name, module in self.engine.modules.items()
         }
+        if self.engine.issue_scheduler.enforce_exact_readiness:
+            try:
+                self.engine.issue_scheduler.require_drained()
+            except ValueError as error:
+                raise CycleConfigurationError(str(error)) from error
+        self.engine.issue_scheduler.release_completed()
+        f_count, c_count, a_count = (
+            self.engine.issue_scheduler.live_counter_totals()
+        )
+        counters["fusion_issue"].update({
+            **self.engine.issue_scheduler.state_table_snapshot(),
+            "live_forward_count": f_count,
+            "live_consumer_count": c_count,
+            "live_adjoint_count": a_count,
+        })
         if self._relation_windows is not None:
             counters["bidirectional_query"].update(
                 self._relation_windows.snapshot()
@@ -3467,6 +3738,52 @@ class CycleReplaySession:
         self._completed_ids.clear()
         self._completed_through = expected_end
 
+    def _assign_consumer_credit(self, event_id: int, owner: int) -> None:
+        existing = self._consumer_credit_owner.get(event_id)
+        if existing is not None:
+            if existing != owner:
+                raise CycleConfigurationError(
+                    f"consumer {event_id} changed credit owner"
+                )
+            return
+        try:
+            if not self.engine.issue_scheduler.successor_credit(owner):
+                raise CycleConfigurationError(
+                    f"consumer {event_id} credit owner {owner} is not live"
+                )
+        except ValueError as error:
+            raise CycleConfigurationError(str(error)) from error
+        self._consumer_credit_owner[event_id] = owner
+
+    def _record_reduction_for_consumer(
+        self, consumer_id: int, reduction_id: int, finish: int, owner: int,
+    ) -> None:
+        """Credit a consumer after its final query reduction completes."""
+
+        if consumer_id in self._consumer_credit_owner:
+            return
+        remaining = self._consumer_reduction_remaining.get(consumer_id)
+        if remaining is None:
+            raise CycleConfigurationError(
+                f"consumer {consumer_id} has no reduction dependency ledger"
+            )
+        remaining -= 1
+        if remaining < 0:
+            raise CycleConfigurationError(
+                f"consumer {consumer_id} query dependency count underflow"
+            )
+        self._consumer_reduction_remaining[consumer_id] = remaining
+        completed = (int(finish), int(reduction_id), int(owner))
+        previous = self._consumer_last_reduction.get(
+            consumer_id, (-1, -1, -1),
+        )
+        if completed > previous:
+            self._consumer_last_reduction[consumer_id] = completed
+        if remaining == 0:
+            self._assign_consumer_credit(
+                consumer_id, self._consumer_last_reduction[consumer_id][2],
+            )
+
     def _push_ready(self, event_id: int, stage: int) -> None:
         physical_stage = self._packet_stage_by_event.get(event_id)
         kind = self._kinds[event_id]
@@ -3503,7 +3820,7 @@ class CycleReplaySession:
             )
             self._ready[(module_name, partition)].push((event_id, stage))
         else:
-            heapq.heappush(self._fusion_pending, (event_id, task_kind))
+            self._fusion_pending.append((event_id, task_kind))
 
     def _requeue(self, event_id: int, stage: int) -> None:
         physical_stage = self._packet_stage_by_event.get(event_id)
@@ -3520,7 +3837,7 @@ class CycleReplaySession:
             )
             self._ready[(module_name, partition)].push((event_id, stage))
         else:
-            heapq.heappush(self._fusion_inputs[task_kind], event_id)
+            self._fusion_inputs[task_kind].appendleft(event_id)
 
     def _fusion_kind(self, event_id: int, stage: int) -> TaskKind | None:
         if not self.engine.selection.overlap_guided_issue or stage != 0:
@@ -3555,12 +3872,22 @@ class CycleReplaySession:
             reduction_domain=domain, state_version=int(row["state_version"]),
             template_id=int(row["template_id"]), address_token=int(row["address_token"]),
             task_kind=task_kind,
+            target_resource=(
+                (int(row["resource_class"]) << 56)
+                | int(row["address_token"])
+            ),
+            consumer_owner_ids=(
+                ((self._consumer_credit_owner[event_id],)
+                 if event_id in self._consumer_credit_owner else ())
+                if kind is PrimitiveKind.CONSUMER else ()
+            ),
+            workset_hit=self.engine._workset_hit(self._cache_states, row),
             conflict_query_ids=(
                 tuple(
                     int(self._events[member]["query_id"])
                     for member in physical_stage.event_ids
                 )
-                if task_kind is TaskKind.FORWARD
+                if task_kind in {TaskKind.FORWARD, TaskKind.ADJOINT}
                 and (physical_stage := self._packet_stage_by_event.get(event_id))
                 is not None
                 else ()
@@ -3568,18 +3895,23 @@ class CycleReplaySession:
         )
 
     def _ordered(self, candidates: list[tuple[int, int]]) -> list[tuple[int, int]]:
-        def key(item: tuple[int, int]) -> tuple[int, int, int]:
-            event_id, _stage = item
-            row = self._events[event_id]
-            return int(row["query_id"]), int(row["relation_id"]), event_id
-        if self.engine.selection.query_load_rules:
-            return sorted(candidates, key=key)
         if self.engine.selection.semantic_residency:
-            return sorted(candidates, key=lambda item: (
-                0 if PrimitiveKind(int(self._events[item[0]]["primitive_kind"]))
-                in {PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN} else 1,
-                int(self._events[item[0]]["gaussian_id"]), item[0],
-            ))
+            cache_kinds = {PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN}
+            cache_positions = [
+                position for position, item in enumerate(candidates)
+                if self._kinds[item[0]] in cache_kinds
+            ]
+            ordered_cache = sorted(
+                (candidates[position] for position in cache_positions),
+                key=lambda item: (
+                    int(self._events[item[0]]["gaussian_id"]), item[0],
+                ),
+            )
+            candidates = list(candidates)
+            for position, item in zip(
+                cache_positions, ordered_cache, strict=True,
+            ):
+                candidates[position] = item
         return candidates
 
     def _drain(self) -> None:
@@ -3627,13 +3959,23 @@ class CycleReplaySession:
                     self._push_ready(event_id, next_stage)
                 progressed = True
             if self.engine.selection.overlap_guided_issue:
-                capacity = self.engine.modules["fusion_issue"].timing.queue_capacity
-                occupancy = sum(len(queue) for queue in self._fusion_inputs.values())
-                while self._fusion_pending and occupancy < capacity:
-                    event_id, task_kind = heapq.heappop(self._fusion_pending)
-                    heapq.heappush(self._fusion_inputs[task_kind], event_id)
-                    self.engine.issue_scheduler.observe_arrival((self._task_packet(event_id),))
-                    occupancy += 1
+                self.engine.issue_scheduler.set_clock(self._cycle)
+                capacity = (
+                    self.engine.config.candidate_fifo_entries
+                    or self.engine.modules["fusion_issue"].timing.queue_capacity
+                )
+                blocked_pending: list[tuple[int, TaskKind]] = []
+                while self._fusion_pending:
+                    event_id, task_kind = self._fusion_pending.popleft()
+                    if len(self._fusion_inputs[task_kind]) >= capacity:
+                        blocked_pending.append((event_id, task_kind))
+                        continue
+                    self._fusion_inputs[task_kind].append(event_id)
+                    self.engine.issue_scheduler.observe_arrival(
+                        (self._task_packet(event_id),), arrival_cycle=self._cycle,
+                    )
+                for pending_entry in blocked_pending:
+                    self._fusion_pending.append(pending_entry)
             candidates: list[tuple[int, int]] = []
             for ready_key in tuple(self._ready):
                 queue = self._ready[ready_key]
@@ -3650,7 +3992,7 @@ class CycleReplaySession:
             if self.engine.selection.overlap_guided_issue:
                 for task_kind in (TaskKind.FORWARD, TaskKind.CONSUMER, TaskKind.ADJOINT):
                     if self._fusion_inputs[task_kind]:
-                        candidates.append((heapq.heappop(self._fusion_inputs[task_kind]), 0))
+                        candidates.append((self._fusion_inputs[task_kind].popleft(), 0))
             if candidates:
                 ordered = self._ordered(candidates)
                 fusion_packets = {
@@ -3662,7 +4004,10 @@ class CycleReplaySession:
                 }
                 selected: set[int] = set()
                 if fusion_packets:
-                    decision = self.engine.issue_scheduler.select(fusion_packets.values())
+                    decision = self.engine.issue_scheduler.select(
+                        fusion_packets.values(),
+                        use_load_rules=self.engine.selection.query_load_rules,
+                    )
                     selected = {task.event_id for task in decision.accepted}
                     order = iter(task.event_id for task in (*decision.accepted, *decision.rejected))
                     ordered = [
@@ -4045,6 +4390,19 @@ class CycleReplaySession:
         )
         if module_name == "fusion_issue" and stage == 0:
             self._cycle_fusion_issued = getattr(self, "_cycle_fusion_issued", 0) + 1
+            if kind is PrimitiveKind.CONSUMER and self.engine.issue_scheduler.strict_lifecycle:
+                try:
+                    owner = self._consumer_credit_owner.get(event_id)
+                    dispatched = (
+                        owner is not None
+                        and self.engine.issue_scheduler.successor_dispatch(owner)
+                    )
+                    if not dispatched:
+                        raise CycleConfigurationError(
+                            f"consumer {event_id} has no query-state owner"
+                        )
+                except ValueError as error:
+                    raise CycleConfigurationError(str(error)) from error
             if self.engine.selection.overlap_guided_issue:
                 self.engine.issue_scheduler.commit_issued((self._task_packet(event_id),))
             if port_name:
@@ -4254,6 +4612,15 @@ class CycleReplaySession:
         if event_id in self._completed_ids or event_id <= self._completed_through:
             raise CycleConfigurationError(f"online event {event_id} completed twice")
         self._completed_ids.add(event_id)
+        row = self._events[event_id]
+        kind = self._kinds[event_id]
+        self.engine._update_query_state_for_completion(
+            row, kind, self._adjoint_relation_ids,
+        )
+        if kind is PrimitiveKind.QUERY_REDUCTION:
+            self._completed_reduction_owner[event_id] = (
+                finish, int(row["query_id"]),
+            )
         if self._compute_telemetry is not None:
             self._compute_telemetry.mark_finish(event_id, finish)
         if (
@@ -4273,12 +4640,23 @@ class CycleReplaySession:
             if remaining < 0:
                 raise CycleConfigurationError(f"dependency count underflow at event {dependent}")
             self._remaining[dependent] = remaining
+            if (
+                kind is PrimitiveKind.QUERY_REDUCTION
+                and self._kinds[dependent] is PrimitiveKind.CONSUMER
+                and self.engine.issue_scheduler.strict_lifecycle
+            ):
+                self._record_reduction_for_consumer(
+                    dependent, event_id, finish, int(row["query_id"]),
+                )
             if remaining == 0:
                 self._push_ready(dependent, 0)
         if not retain:
             self._drop_event(event_id)
 
     def _drop_event(self, event_id: int) -> None:
+        self._consumer_credit_owner.pop(event_id, None)
+        self._consumer_reduction_remaining.pop(event_id, None)
+        self._consumer_last_reduction.pop(event_id, None)
         self._events.pop(event_id, None)
         self._kinds.pop(event_id, None)
         self._dependencies.pop(event_id, None)

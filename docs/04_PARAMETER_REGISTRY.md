@@ -22,6 +22,7 @@
 | `relation.seed_fifo_entries` | 必须由设计配置给出 | entry | 关系构造器实现参数 |
 | `issue.query_state_entries` | 2048 | entry | 查询状态 SRAM |
 | `issue.candidate_lanes` | 3 | lane | Forecast、Conflict、Issue 三级结构 |
+| `issue.candidate_fifo_entries` | 32 | entry_per_source_fifo | 前向、消费者、伴随三条候选 FIFO 的独立容量 |
 | `issue.forward_ports` | 1 | port | 三输出交叉开关 |
 | `issue.consumer_ports` | 1 | port | 三输出交叉开关 |
 | `issue.adjoint_ports` | 1 | port | 三输出交叉开关 |
