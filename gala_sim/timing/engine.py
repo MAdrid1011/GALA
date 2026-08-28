@@ -955,11 +955,13 @@ class CycleEngine:
             )
         if module_name == "bidirectional_query" and self._has_query_resources():
             assert self.config.query_reduction_banks is not None
+            assert self.config.query_partial_sum_groups_per_bank is not None
             assert self.config.query_loss_queries_per_cycle is not None
             assert self.config.query_adjoint_replay_lanes is not None
             assert self.config.query_volume_banks is not None
             return (
                 self.config.query_reduction_banks
+                * self.config.query_partial_sum_groups_per_bank
                 + self.config.query_loss_queries_per_cycle
                 + self.config.query_adjoint_replay_lanes
                 + 2 * self.config.query_volume_banks
@@ -982,16 +984,19 @@ class CycleEngine:
         if not self._has_query_resources():
             raise CycleConfigurationError("query resource allocation is unavailable")
         banks = self.config.query_reduction_banks
+        groups = self.config.query_partial_sum_groups_per_bank
         loss_slots = self.config.query_loss_queries_per_cycle
         replay_lanes = self.config.query_adjoint_replay_lanes
         volume_banks = self.config.query_volume_banks
         assert (
             banks is not None
+            and groups is not None
             and loss_slots is not None
             and replay_lanes is not None
             and volume_banks is not None
         )
-        loss_base = banks
+        reduction_slots = banks * groups
+        loss_base = reduction_slots
         replay_base = loss_base + loss_slots
         volume_read_base = replay_base + replay_lanes
         volume_write_base = volume_read_base + volume_banks
@@ -1007,12 +1012,18 @@ class CycleEngine:
             tuple(physical_stage.query_base + lane for lane in physical_stage.lanes)
             if physical_stage is not None else (int(row["query_id"]),)
         )
+
+        def reduction_slot(query_id: int) -> int:
+            bank = query_id % banks
+            group = (query_id // banks) % groups
+            return bank * groups + group
+
         if kind is PrimitiveKind.FORWARD:
-            allocation = tuple({query_id % banks for query_id in query_ids})
+            allocation = tuple({reduction_slot(query_id) for query_id in query_ids})
         elif kind is PrimitiveKind.QUERY_REDUCTION:
             query_id = int(row["query_id"])
             allocation = (
-                query_id % banks,
+                reduction_slot(query_id),
                 volume_write_base + query_id % volume_banks,
             )
         elif kind is PrimitiveKind.CONSUMER:
@@ -2230,6 +2241,24 @@ class CycleEngine:
                         )
                         requeue_candidate(event_id, stage)
                         continue
+                    if (
+                        not self.selection.query_load_rules
+                        and not self.selection.query_oracle
+                    ):
+                        try:
+                            stage_reason = relation_windows.full_stage_blocking_reason(
+                                event_id, kind,
+                            )
+                        except ValueError as error:
+                            raise CycleConfigurationError(str(error)) from error
+                        if stage_reason is not None:
+                            query_module = self.modules["bidirectional_query"]
+                            query_module.counters.queue_stalls += 1
+                            self._record_stall(
+                                cycle, "bidirectional_query", stage_reason, event_id,
+                            )
+                            requeue_candidate(event_id, stage)
+                            continue
                 if (kind is PrimitiveKind.RELATION_CANDIDATE
                         and relation_seed_inflight >= self.config.relation_seed_fifo_entries):
                     module.counters.queue_stalls += 1
@@ -3525,6 +3554,10 @@ class CycleReplaySession:
         """Register exact totals before their cache-request events arrive."""
 
         self._ensure_open()
+        if totals and not self.engine.selection.semantic_residency:
+            raise CycleConfigurationError(
+                "semantic workset totals require semantic residency"
+            )
         for key, value in totals.items():
             normalized_key = (int(key[0]), int(key[1]))
             normalized_value = int(value)
@@ -4311,6 +4344,26 @@ class CycleReplaySession:
                 )
                 self._requeue(event_id, stage)
                 return False
+            if (
+                not self.engine.selection.query_load_rules
+                and not self.engine.selection.query_oracle
+            ):
+                try:
+                    stage_reason = (
+                        self._relation_windows.full_stage_blocking_reason(
+                            event_id, kind,
+                        )
+                    )
+                except ValueError as error:
+                    raise CycleConfigurationError(str(error)) from error
+                if stage_reason is not None:
+                    query_module = self.engine.modules["bidirectional_query"]
+                    query_module.counters.queue_stalls += 1
+                    self.engine._record_stall(
+                        self._cycle, "bidirectional_query", stage_reason, event_id,
+                    )
+                    self._requeue(event_id, stage)
+                    return False
         bank_partition, bank = self.engine._module_bank_partition(module_name, row)
         bank_key = (module_name, self._cycle, bank_partition, bank)
         if (self.engine._uses_generic_module_limits(module_name)
@@ -4792,6 +4845,11 @@ class BufferedVirtualCycleConsumer:
 
     def _flush_packets(self) -> None:
         if not self._packets:
+            return
+        if not self.session.engine.selection.semantic_residency:
+            packets = tuple(self._packets)
+            self._packets.clear()
+            self.session.accept_query_packets(packets)
             return
         totals: dict[tuple[int, int], int] = defaultdict(int)
         for packet in self._packets:

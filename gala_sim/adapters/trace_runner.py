@@ -44,6 +44,14 @@ def _parser() -> argparse.ArgumentParser:
         help="capture and validate virtual packet ledgers without online cycle replay",
     )
     parser.add_argument(
+        "--packet-archive-root", type=Path, default=None,
+        help="persist compact virtual packets for independent later replays",
+    )
+    parser.add_argument(
+        "--capture-config", type=Path, default=None,
+        help="Gala config providing compact capture software parameters",
+    )
+    parser.add_argument(
         "--capture-iteration-range", type=_iteration_range, default=None,
         metavar="START:END",
         help="capture an inclusive validation window while executing all training iterations",
@@ -90,6 +98,10 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("GALA_TRACE_PROGRESS_INTERVAL_SECONDS must be positive")
     if args.virtual_capture and args.stream_only:
         raise ValueError("--virtual-capture and --stream-only are mutually exclusive")
+    if args.packet_archive_root is not None and not args.virtual_capture:
+        raise ValueError("--packet-archive-root requires --virtual-capture")
+    if args.capture_config is not None and not args.virtual_capture:
+        raise ValueError("--capture-config requires --virtual-capture")
     online_options = (
         args.online_cycle_config,
         args.online_ramulator_build_manifest,
@@ -157,12 +169,28 @@ def main(argv: list[str] | None = None) -> int:
     else:
         consumer_factory = None
         online_sinks = []
+    archive_chunk_bytes = None
+    if args.packet_archive_root is not None:
+        config_path = args.capture_config or args.online_cycle_config
+        if config_path is None:
+            raise ValueError(
+                "--packet-archive-root requires --capture-config or --online-cycle-config"
+            )
+        from gala_sim.config import load_config
+
+        capture_config = load_config(config_path)
+        capture_config.require_ready()
+        archive_chunk_bytes = int(capture_config.value("trace.archive_chunk_bytes"))
+        if archive_chunk_bytes <= 0:
+            raise ValueError("trace.archive_chunk_bytes must be positive")
     session = TraceSession(
         args.trace_output, state_record_bytes=state_record_bytes,
         chunk_events=chunk_events, stream_only=args.stream_only,
         capture_iteration_range=args.capture_iteration_range,
         virtual_capture=args.virtual_capture,
         virtual_packet_consumer_factory=consumer_factory,
+        virtual_packet_archive_root=args.packet_archive_root,
+        virtual_packet_archive_chunk_bytes=archive_chunk_bytes,
         inactivity_timeout_seconds=inactivity_timeout_seconds,
         progress_interval_seconds=progress_interval_seconds,
     )

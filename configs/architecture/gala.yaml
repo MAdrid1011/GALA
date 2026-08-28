@@ -604,6 +604,13 @@ parameters:
       scope: workflow
       status: frozen
   trace:
+    archive_chunk_bytes:
+      value: 67108864
+      unit: byte
+      source: docs/IMPLEMENTATION_STATUS.md:compact-packet-archive
+      scope: software
+      status: frozen
+      allowed_range: [1048576, 268435456]
     chunk_events:
       value: 4000000
       unit: event

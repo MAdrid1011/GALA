@@ -97,6 +97,10 @@ class TraceSession:
     virtual_capture: bool = False
     virtual_packet_consumer: Any | None = None
     virtual_packet_consumer_factory: Callable[[int], Any] | None = None
+    virtual_packet_archive_root: Path | None = None
+    virtual_packet_archive_chunk_bytes: int | None = None
+    virtual_capture_complete_30k: bool = False
+    virtual_capture_validation_passed: bool = False
     inactivity_timeout_seconds: float = 300.0
     progress_interval_seconds: float = 30.0
     _builder: ChunkedTraceBuilder = field(init=False)
@@ -160,6 +164,8 @@ class TraceSession:
                 inactivity_timeout_seconds=self.inactivity_timeout_seconds,
                 progress_interval_seconds=self.progress_interval_seconds,
                 packet_consumer=self.virtual_packet_consumer,
+                packet_archive_root=self.virtual_packet_archive_root,
+                packet_archive_chunk_bytes=self.virtual_packet_archive_chunk_bytes,
             )
 
     def install(self) -> None:
@@ -215,7 +221,11 @@ class TraceSession:
             self._close_virtual_iteration()
             if self._virtual_consumer is None:
                 raise RuntimeError("virtual capture consumer is not initialized")
-            return self._virtual_consumer.finish(capture_audit=self._audit)
+            return self._virtual_consumer.finish(
+                capture_audit=self._audit,
+                complete_30k=self.virtual_capture_complete_30k,
+                validation_passed=self.virtual_capture_validation_passed,
+            )
         audit = dict(self._audit)
         audit.setdefault("relation_record_device_batches", 0)
         audit.setdefault("relation_record_d2h_batches", 0)

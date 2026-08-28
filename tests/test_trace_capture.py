@@ -409,6 +409,19 @@ def test_trace_runner_virtual_capture_requires_explicit_online_or_audit_scope(
             "--online-cycle-config", "configs/architecture/gala.yaml",
             "train.py",
         ])
+    with pytest.raises(ValueError, match="packet-archive-root requires"):
+        main([
+            "--trace-output", str(tmp_path / "trace"),
+            "--packet-archive-root", str(tmp_path / "archive"),
+            "train.py",
+        ])
+    with pytest.raises(ValueError, match="requires --capture-config"):
+        main([
+            "--trace-output", str(tmp_path / "trace"),
+            "--virtual-capture", "--virtual-capture-audit-only",
+            "--packet-archive-root", str(tmp_path / "archive"),
+            "train.py",
+        ])
 
 
 def test_query_and_backward_batches_preserve_capture_order_across_chunk_sizes(

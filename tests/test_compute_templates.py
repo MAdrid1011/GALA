@@ -61,7 +61,7 @@ def test_production_compute_profiles_have_audited_path_latencies() -> None:
     assert config.query_relation_store_records == 16_384
     assert config.query_volume_banks == 16
     assert config.owner_gradient_slots_per_cluster == 2
-    assert CycleEngine(config)._module_issue_ports("bidirectional_query") == 120
+    assert CycleEngine(config)._module_issue_ports("bidirectional_query") == 312
     assert config.compute_templates[1].latency_for("forward") == 17
     assert config.compute_templates[1].latency_for("adjoint") == 27
     assert config.compute_templates[2].latency_for("forward") == 27
@@ -123,7 +123,9 @@ def test_query_reduction_banks_issue_independently_and_serialize_aliases() -> No
         return CycleEngine(config).run(builder.finish(), validate_input=False)
 
     independent = run((0, 1))
-    aliased = run((0, 64))
+    # Four interleaved partial groups share a bank; query 256 wraps to the
+    # same bank/group slot as query 0.
+    aliased = run((0, 256))
 
     assert independent.completion_cycles[0] == independent.completion_cycles[1]
     assert aliased.completion_cycles[1] == aliased.completion_cycles[0] + 1
@@ -144,30 +146,30 @@ def test_query_datapaths_allocate_loss_replay_and_query_volume_ports() -> None:
     consumer = engine._query_resource_allocation(
         lanes, row(PrimitiveKind.CONSUMER, 3), PrimitiveKind.CONSUMER, None, 0,
     )
-    assert consumer == (64, 91, 107)
+    assert consumer == (256, 283, 299)
     for lane in consumer:
         lanes[lane] = 1
 
     # A second query can use another loss slot and another SRAM bank.
     assert engine._query_resource_allocation(
         lanes, row(PrimitiveKind.CONSUMER, 4), PrimitiveKind.CONSUMER, None, 0,
-    ) == (65, 92, 108)
+    ) == (257, 284, 300)
     # An adjoint read to query 3 conflicts with the consumer read port, while
     # the independent write port remains legal in the same cycle.
     assert engine._query_resource_allocation(
         lanes, row(PrimitiveKind.ADJOINT, 3), PrimitiveKind.ADJOINT, None, 0,
     ) is None
     read_busy_only = [0] * len(lanes)
-    read_busy_only[91] = 1
+    read_busy_only[283] = 1
     assert engine._query_resource_allocation(
         read_busy_only, row(PrimitiveKind.QUERY_REDUCTION, 3),
         PrimitiveKind.QUERY_REDUCTION, None, 0,
-    ) == (3, 107)
+    ) == (12, 299)
 
     # A full replay packet waits when any of the eight lanes are busy; that is
     # backpressure, not an invalid packet-width error.
     replay_busy = [0] * len(lanes)
-    replay_busy[80] = 1
+    replay_busy[272] = 1
     packet = type("Packet", (), {"query_base": 0, "lanes": tuple(range(8))})()
     assert engine._query_resource_allocation(
         replay_busy, row(PrimitiveKind.ADJOINT, 0),

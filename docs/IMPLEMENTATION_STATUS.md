@@ -2,6 +2,18 @@
 
 本文件记录 `docs/10_IMPLEMENTATION_WORKFLOW.md` 的当前入口和证据，不替代正式实验结果。
 
+当前 R²-Gaussian + Chest 的静态锚点已按 2026-08-29 外部规范更新：匹配硬件端点
+`ASIC_A0B0=2.430x`、`ASIC_A1B0=3.513x`、`ASIC_A0B1=3.507x`、`ASIC_A1B1=6.436x`
+（均相对 CUDA_OPT）。相对 Base ASIC 的派生参考约为 `1.446x`、`1.443x` 和 `2.649x`；
+它们是 `anchor_not_measurement`，不替代同套件实测，也不构成理论上限。
+
+- 2026-08-29 阶段门控修复后的同一双窗口 quick trace 四点对照已闭合：Base `125,214 cycles`，
+  编译侧 A（`variant:1000`）`124,878 cycles`，架构侧 C（`variant:0010`）`124,938 cycles`，
+  联合 AC（`variant:1010`）`124,633 cycles`，事件集合均为 `846,012/846,012`。相对 Base
+  的实际加速依次为 `1.002691x`、`1.002209x` 和 `1.004662x`。停顿计数的主要项仍是
+  ComputePod `compute_resource`、查询 `reduction_bank` 和关系存储 `relation_store_capacity`；
+  因此当前只证明门控语义和周期闭合，尚未达到新锚点，也不具备正式 30,000 iteration 资格。
+
 ## 已通过
 
 - 2026-08-29 生命周期与 lineage 修复后的最小真实双窗口 Base 回放已重新完成：`846,012/846,012` 个事件、`1,289,964` 条依赖，原生 LPDDR5-6400 Ramulator 2 返回 `144,550 cycles`（500 MHz 下 `0.289100 ms`），记录位于仓库外 `GALA-runtime/records/r2_gaussian_chest_median_packets_base_post_lineage_v1/`。该结果只证明最新依赖实现仍能闭合同一 quick trace，不是正式 30,000 iteration 周期，也不是绝对性能锚点。

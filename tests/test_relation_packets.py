@@ -143,6 +143,46 @@ def test_relation_window_keeps_four_reference_classes_until_final_adjoint() -> N
     }
 
 
+def test_relation_window_full_stage_barrier_waits_for_all_prior_work() -> None:
+    descriptor = RelationWindowDescriptor(
+        window_id=0,
+        relation_stage_heads=frozenset({1}),
+        producer_event_ids=frozenset({0, 1}),
+        forward_stage_heads=frozenset({2, 3}),
+        consumer_event_ids=frozenset({4, 5}),
+        adjoint_event_ids=frozenset({6}),
+    )
+    tracker = RelationWindowTracker(
+        window_capacity=1, relation_capacity=1, relation_banks=1,
+    )
+    tracker.register(descriptor)
+    assert tracker.full_stage_blocking_reason(
+        0, PrimitiveKind.RELATION_CANDIDATE,
+    ) is None
+    tracker.issue(0, PrimitiveKind.RELATION_CANDIDATE,
+                  physical_stage_head=True, cycle=0)
+
+    assert tracker.full_stage_blocking_reason(
+        4, PrimitiveKind.CONSUMER,
+    ) == "base_forward_stage"
+    tracker.complete_event(2)
+    assert tracker.full_stage_blocking_reason(
+        4, PrimitiveKind.CONSUMER,
+    ) == "base_forward_stage"
+    tracker.complete_event(3)
+    assert tracker.full_stage_blocking_reason(4, PrimitiveKind.CONSUMER) is None
+
+    # Once the complete forward stage retires, adjoint replay can drain behind
+    # each consumer; waiting for every consumer would exceed a bounded replay
+    # queue for larger windows.
+    assert tracker.full_stage_blocking_reason(
+        6, PrimitiveKind.ADJOINT,
+    ) is None
+    tracker.complete_event(4)
+    tracker.complete_event(5)
+    assert tracker.full_stage_blocking_reason(6, PrimitiveKind.ADJOINT) is None
+
+
 def test_relation_window_and_record_store_have_independent_backpressure() -> None:
     def descriptor(window_id: int, base: int) -> RelationWindowDescriptor:
         return RelationWindowDescriptor(

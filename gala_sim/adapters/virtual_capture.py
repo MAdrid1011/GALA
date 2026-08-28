@@ -17,6 +17,7 @@ from gala_sim.trace import (
     VirtualQueryEventExpander,
     VirtualTraceLifecycleValidator,
     VirtualTracePacket,
+    VirtualPacketArchiveWriter,
 )
 from gala_sim.trace.virtual import VirtualLifecycleRecord
 
@@ -50,6 +51,8 @@ class VirtualCaptureConsumer:
     expand_for_validation: bool = False
     packet_consumer: Any | None = None
     lifecycle_consumer: Any | None = None
+    packet_archive_root: Path | None = None
+    packet_archive_chunk_bytes: int | None = None
     _expander: VirtualQueryEventExpander = field(init=False)
     _event_validator: VirtualEventStreamValidator = field(
         default_factory=VirtualEventStreamValidator, init=False
@@ -66,6 +69,7 @@ class VirtualCaptureConsumer:
     _last_progress: float = field(default_factory=time.monotonic, init=False)
     _started_at: float = field(default_factory=time.monotonic, init=False)
     _last_report: float = field(default_factory=time.monotonic, init=False)
+    _packet_archive: VirtualPacketArchiveWriter | None = field(default=None, init=False)
 
     def __post_init__(self) -> None:
         if (
@@ -85,6 +89,13 @@ class VirtualCaptureConsumer:
             relation_candidate_bytes=self.relation_candidate_bytes,
             relation_query_lanes=self.relation_query_lanes,
         )
+        if self.packet_archive_root is not None:
+            if self.packet_archive_chunk_bytes is None or self.packet_archive_chunk_bytes <= 0:
+                raise ValueError("packet archive chunk byte capacity must be positive")
+            self._packet_archive = VirtualPacketArchiveWriter(
+                self.packet_archive_root,
+                max_chunk_bytes=self.packet_archive_chunk_bytes,
+            )
 
     def initialize_gaussians(self, count: int) -> None:
         if count < 0:
@@ -93,6 +104,8 @@ class VirtualCaptureConsumer:
             self._lifecycle = VirtualTraceLifecycleValidator(count)
         elif self._lifecycle.initial_gaussian_count != count:
             raise ValueError("virtual capture Gaussian count changed during initialization")
+        if self._packet_archive is not None:
+            self._packet_archive.initialize_gaussians(count)
 
     @property
     def current_iteration(self) -> int | None:
@@ -110,6 +123,8 @@ class VirtualCaptureConsumer:
         if packet.iteration_id != self._current_iteration:
             raise ValueError("virtual query packet changed iteration without a close")
         self._lifecycle.accept_packet(packet)  # type: ignore[union-attr]
+        if self._packet_archive is not None:
+            self._packet_archive.append_packet(packet)
         self._packet_count += 1
         self._query_count += packet.query_count
         self._candidate_count += packet.candidate_count
@@ -140,6 +155,8 @@ class VirtualCaptureConsumer:
         if record.iteration_id != self._current_iteration:
             raise ValueError("virtual lifecycle record changed iteration without a close")
         self._lifecycle.accept_lifecycle(record)  # type: ignore[union-attr]
+        if self._packet_archive is not None:
+            self._packet_archive.append_lifecycle(record)
         self._dispatch_lifecycle(record)
         self._last_progress = time.monotonic()
 
@@ -148,12 +165,17 @@ class VirtualCaptureConsumer:
         if self._current_iteration != iteration_id:
             raise ValueError("virtual iteration close does not match the active iteration")
         self._lifecycle.close_iteration(iteration_id)  # type: ignore[union-attr]
+        if self._packet_archive is not None:
+            self._packet_archive.close_iteration(iteration_id)
         self._dispatch_iteration_close(iteration_id)
         self._current_iteration = None
         self._last_progress = time.monotonic()
         self._report_progress(force=True)
 
-    def finish(self, *, capture_audit: dict[str, int] | None = None) -> dict[str, Any]:
+    def finish(
+        self, *, capture_audit: dict[str, int] | None = None,
+        complete_30k: bool = False, validation_passed: bool = False,
+    ) -> dict[str, Any]:
         self._ensure_lifecycle()
         if self._current_iteration is not None:
             self.close_iteration(self._current_iteration)
@@ -175,11 +197,25 @@ class VirtualCaptureConsumer:
             self._event_validator.finalize()
         ledgers = self._lifecycle.finalize()  # type: ignore[union-attr]
         self._finish_packet_consumer()
+        archive_manifest = None
+        if self._packet_archive is not None:
+            archive_manifest = self._packet_archive.finish(
+                complete_30k=complete_30k, validation_passed=validation_passed,
+            )
         elapsed = time.monotonic() - self._started_at
+        archive_eligible = bool(
+            archive_manifest is not None
+            and archive_manifest.get("formal_performance_eligible", False)
+        )
+        archive_complete_30k = bool(
+            archive_manifest is not None and archive_manifest.get("complete_30k", False)
+        )
         result: dict[str, Any] = {
             "schema_version": "gala-virtual-trace-capture-v1",
             "status": "passed",
-            "formal_performance_eligible": False,
+            "formal_performance_eligible": bool(archive_eligible),
+            "complete_30k": archive_complete_30k,
+            "validation_passed": bool(validation_passed),
             "packet_count": self._packet_count,
             "query_count": self._query_count,
             "candidate_count": self._candidate_count,
@@ -202,6 +238,8 @@ class VirtualCaptureConsumer:
             "iterations": [ledger.__dict__ for ledger in ledgers],
             "capture_audit": dict(sorted((capture_audit or {}).items())),
         }
+        if archive_manifest is not None:
+            result["packet_archive"] = archive_manifest
         self.output_root.mkdir(parents=True, exist_ok=True)
         (self.output_root / "virtual_trace_manifest.json").write_text(
             json.dumps(result, ensure_ascii=True, sort_keys=True, indent=2) + "\n",

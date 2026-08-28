@@ -2,12 +2,14 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-
 import numpy as np
+import pytest
 
 from gala_sim.adapters.trace_capture import LOSS_L1, STATE_FIELD_MASK, TraceSession
 from gala_sim.adapters.virtual_capture import VirtualCaptureConsumer
 from gala_sim.trace import (
+    VirtualPacketArchiveReader,
+    VirtualPacketArchiveWriter,
     VirtualLifecycleKind,
     VirtualLifecycleRecord,
     VirtualTracePacket,
@@ -38,6 +40,100 @@ def _packet(*, iteration: int = 1, point_id: int = 0) -> VirtualTracePacket:
         loss_flags=LOSS_L1,
         backward_confirmed=True,
     )
+
+
+def test_virtual_packet_archive_roundtrip_preserves_payload_and_order(tmp_path: Path) -> None:
+    archive_root = tmp_path / "archive"
+    writer = VirtualPacketArchiveWriter(archive_root, max_chunk_bytes=1024)
+    writer.initialize_gaussians(2)
+    packet = _packet(point_id=0)
+    begin = VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_BEGIN, 0,
+        field_mask=STATE_FIELD_MASK, transaction_kind=2,
+    )
+    end = VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_END, 0,
+        field_mask=STATE_FIELD_MASK, transaction_kind=2,
+    )
+    writer.append_packet(packet)
+    writer.append_lifecycle(begin)
+    writer.append_lifecycle(end)
+    writer.close_iteration(1)
+    manifest = writer.finish()
+
+    assert manifest["formal_performance_eligible"] is False
+    assert manifest["chunk_count"] == 1
+    assert not (archive_root / "events.raw").exists()
+    records = list(VirtualPacketArchiveReader(archive_root).records())
+    assert [kind for kind, _ in records] == [
+        "packet", "lifecycle", "lifecycle", "close_iteration",
+    ]
+    restored = records[0][1]
+    assert np.array_equal(restored.point_ids, packet.point_ids)
+    assert np.array_equal(restored.point_keys, packet.point_keys)
+    assert np.array_equal(restored.masks, packet.masks)
+    assert restored.backward_confirmed is True
+    assert records[1][1] == begin
+    assert records[2][1] == end
+    assert records[3][1] == 1
+
+
+def test_virtual_packet_archive_readers_have_independent_packet_objects(tmp_path: Path) -> None:
+    archive_root = tmp_path / "archive"
+    writer = VirtualPacketArchiveWriter(archive_root, max_chunk_bytes=1024)
+    writer.initialize_gaussians(1)
+    writer.append_packet(_packet())
+    writer.close_iteration(1)
+    writer.finish()
+
+    first = list(VirtualPacketArchiveReader(archive_root).records())
+    second = list(VirtualPacketArchiveReader(archive_root).records())
+    first_packet = first[0][1]
+    second_packet = second[0][1]
+    first_packet.point_ids[0] = 99
+    assert second_packet.point_ids[0] == 0
+
+
+def test_virtual_packet_archive_rejects_cross_chunk_iteration_regression(tmp_path: Path) -> None:
+    writer = VirtualPacketArchiveWriter(tmp_path / "archive", max_chunk_bytes=1)
+    writer.initialize_gaussians(1)
+    writer.append_packet(_packet(iteration=2))
+    with pytest.raises(ValueError, match="iteration order"):
+        writer.append_packet(_packet(iteration=1))
+
+
+def test_virtual_packet_archive_reader_retains_only_current_chunk(tmp_path: Path) -> None:
+    archive_root = tmp_path / "archive"
+    writer = VirtualPacketArchiveWriter(archive_root, max_chunk_bytes=1)
+    writer.initialize_gaussians(2)
+    writer.append_packet(_packet(point_id=0))
+    writer.append_packet(_packet(point_id=1))
+    writer.close_iteration(1)
+    manifest = writer.finish()
+    assert manifest["chunk_count"] == 2
+
+    reader = VirtualPacketArchiveReader(archive_root)
+    records = reader.records()
+    assert next(records)[1].point_ids.tolist() == [0]
+    first_chunk = reader._chunk
+    assert reader._chunk_index == 0
+    assert next(records)[1].point_ids.tolist() == [1]
+    assert reader._chunk_index == 1
+    assert reader._chunk is not first_chunk
+    assert set(vars(reader)).intersection({"_chunks", "_chunk_cache"}) == set()
+
+
+def test_virtual_packet_archive_failed_formal_gate_keeps_writer_open(tmp_path: Path) -> None:
+    writer = VirtualPacketArchiveWriter(tmp_path / "archive", max_chunk_bytes=1024)
+    writer.initialize_gaussians(1)
+    writer.append_packet(_packet())
+    writer.close_iteration(1)
+    with pytest.raises(ValueError, match="iterations 1 through 30000"):
+        writer.finish(complete_30k=True, validation_passed=True)
+
+    manifest = writer.finish()
+    assert manifest["complete_30k"] is False
+    assert manifest["formal_performance_eligible"] is False
 
 
 def test_virtual_consumer_closes_event_and_lifecycle_frontiers(tmp_path: Path) -> None:

@@ -31,6 +31,8 @@ from gala_sim.timing.memory import Ramulator2Backend, RecordedMemoryBackend
 from gala_sim.config import load_config
 from gala_sim.trace import NumpyChunkSink, TraceReader, TraceWriter, TraceValidationError, validate_trace
 from gala_sim.trace import (
+    VirtualPacketArchiveReader,
+    VirtualPacketArchiveWriter,
     VirtualEventPacket,
     VirtualLifecycleKind,
     VirtualLifecycleRecord,
@@ -263,6 +265,45 @@ def test_online_cycle_replay_consumes_packets_without_trace_columns() -> None:
     assert session.closed_iteration_count == 1
 
 
+@pytest.mark.parametrize("policy", ["base", "variant:0001", "full"])
+def test_archived_packet_replay_matches_live_buffered_cycle(
+    tmp_path: Path, policy: str,
+) -> None:
+    masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
+    masks[0, 0] = 0b11
+    source = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 2),
+        point_ids=np.asarray([0], dtype=np.int64),
+        point_keys=np.asarray([0], dtype=np.uint64), masks=masks,
+        loss_flags=1, backward_confirmed=True,
+    )
+    writer = VirtualPacketArchiveWriter(tmp_path / "archive", max_chunk_bytes=64)
+    writer.initialize_gaussians(1)
+    writer.append_packet(source)
+    writer.close_iteration(1)
+    writer.finish()
+
+    config_path = Path(__file__).parents[1] / "configs/architecture/gala.yaml"
+    live_config = CycleConfig.from_gala(load_config(config_path), _Memory())
+    archive_config = CycleConfig.from_gala(load_config(config_path), _Memory())
+    live = BufferedVirtualCycleConsumer(
+        CycleEngine(live_config, policy=policy).online_session(
+            max_events=4, initial_gaussian_count=1,
+        )
+    )
+    live.accept_query_packet(source)
+    live.close_iteration(1)
+    live_result = live.finish()
+    archive_result = VirtualPacketArchiveReader(tmp_path / "archive").replay_session(
+        CycleEngine(archive_config, policy=policy), max_events=4,
+    )
+
+    assert archive_result.total_cycles == live_result.total_cycles
+    assert archive_result.event_counts == live_result.event_counts
+    assert archive_result.module_counters == live_result.module_counters
+    assert archive_result.stalls == live_result.stalls
+
+
 def test_online_cycle_replay_reports_progress() -> None:
     masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
     masks[0, 0] = 1
@@ -350,6 +391,41 @@ def test_online_query_packet_batch_respects_frontier_bound() -> None:
     assert result.event_counts["RELATION"] == 256
     assert session.peak_frontier_events <= 128
     assert session.quiescent
+
+
+def test_query_reduction_banks_interleave_configured_partial_sum_groups() -> None:
+    config_path = Path(__file__).parents[1] / "configs/architecture/gala.yaml"
+    engine = CycleEngine(CycleConfig.from_gala(
+        load_config(config_path), _Memory(),
+    ))
+    rows = np.empty(3, dtype=event_dtype())
+    rows[:] = TraceEvent(
+        primitive_kind=int(PrimitiveKind.FORWARD), query_id=0,
+    ).as_tuple()
+    rows[1]["query_id"] = 64
+    rows[2]["query_id"] = 256
+    lanes = [0] * engine._module_issue_ports("bidirectional_query")
+
+    first = engine._query_resource_allocation(
+        lanes, rows[0], PrimitiveKind.FORWARD, None, 0,
+    )
+    second = engine._query_resource_allocation(
+        lanes, rows[1], PrimitiveKind.FORWARD, None, 0,
+    )
+    repeated = engine._query_resource_allocation(
+        lanes, rows[2], PrimitiveKind.FORWARD, None, 0,
+    )
+
+    assert first == (0,)
+    assert second == (1,)
+    assert repeated == first
+    lanes[first[0]] = engine.modules["bidirectional_query"].timing.latency
+    assert engine._query_resource_allocation(
+        lanes, rows[1], PrimitiveKind.FORWARD, None, 1,
+    ) == second
+    assert engine._query_resource_allocation(
+        lanes, rows[2], PrimitiveKind.FORWARD, None, 1,
+    ) is None
 
 
 def test_online_cycle_replay_rejects_frontier_overflow_before_advancing_ids() -> None:

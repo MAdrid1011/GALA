@@ -534,6 +534,29 @@ class RelationWindowTracker:
             return "relation_store_bank"
         return None
 
+    def full_stage_blocking_reason(
+        self, event_id: int, kind: PrimitiveKind,
+    ) -> str | None:
+        """Apply the A-disabled window barriers without changing dependencies."""
+
+        window_id = self.event_to_window.get(event_id)
+        if window_id is None:
+            return None
+        if kind not in {PrimitiveKind.CONSUMER, PrimitiveKind.ADJOINT}:
+            return None
+        state = self.live.get(window_id)
+        if state is None:
+            raise ValueError("relation-window task became ready without a live window")
+        if kind is PrimitiveKind.CONSUMER and state.forward_events:
+            return "base_forward_stage"
+        if kind is PrimitiveKind.ADJOINT and state.forward_events:
+            # Base still waits for the complete forward stage, but adjoints
+            # may drain behind each completed consumer.  Requiring every
+            # consumer first can deadlock when a window has more consumers
+            # than replay-queue entries.
+            return "base_forward_stage"
+        return None
+
     def issue(
         self,
         event_id: int,

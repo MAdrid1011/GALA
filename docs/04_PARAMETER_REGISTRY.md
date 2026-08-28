@@ -152,6 +152,7 @@ FMA、EXP、LOG、RCP、SQRT、SRAM、CAM、互连和寄存器流水延迟不写
 | `preflight.measure_iterations` | 50 | iteration | 预测总运行时间 |
 | `preflight.inactivity_timeout_seconds` | 300 | second | 官方长任务无 GPU、日志或进程 CPU 推进时的终止门限 |
 | `trace.chunk_events` | 自动调优后冻结 | event | 设备 trace chunk 容量 |
+| `trace.archive_chunk_bytes` | 67108864 | byte | 紧凑 packet 归档单个压缩块的未压缩数组字节上限；单个超大 packet 可独占一块并超过该值 |
 | `trace.inactivity_timeout_seconds` | 300 | second | 虚拟 trace 数据包或日志无推进时的终止门限 |
 | `trace.progress_interval_seconds` | 30 | second | 虚拟 trace 结构化吞吐日志的最长间隔 |
 | `diagnostic.throughput_report_interval_events` | 100000 | completed_event | 周期开发模式的事件采样间隔 |

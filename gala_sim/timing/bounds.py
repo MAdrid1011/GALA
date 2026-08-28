@@ -311,16 +311,15 @@ def _query_components(
     reduction_ids = np.flatnonzero(np.isin(kinds, [
         int(PrimitiveKind.FORWARD), int(PrimitiveKind.QUERY_REDUCTION),
     ]))
-    bank_counts = np.bincount(
-        np.asarray(trace.events["query_id"][reduction_ids] % banks, dtype=np.int64),
-        minlength=banks,
-    )
-    busiest_bank = int(np.max(bank_counts, initial=0))
+    query_ids = np.asarray(trace.events["query_id"][reduction_ids], dtype=np.int64)
+    reduction_slots = (query_ids % banks) * groups + (query_ids // banks) % groups
+    slot_counts = np.bincount(reduction_slots, minlength=banks * groups)
+    busiest_slot = int(np.max(slot_counts, initial=0))
     components = [CycleBoundComponent(
         name="bidirectional_query.reduction_banks",
         category="query_reduction",
         cycles=_issue_completion_bound(
-            busiest_bank,
+            busiest_slot,
             ports=1,
             initiation_interval=timing.initiation_interval,
             minimum_service=timing.latency,
@@ -334,9 +333,10 @@ def _query_components(
             )),
             "reduction_banks": banks,
             "partial_sum_groups_per_bank": groups,
-            "busiest_bank_events": busiest_bank,
+            "reduction_slots": banks * groups,
+            "busiest_bank_group_events": busiest_slot,
         },
-        limitation="Assumes all banks are independently fed and every contribution is ready.",
+        limitation="Assumes all interleaved bank groups are independently fed and every contribution is ready.",
     )]
 
     consumers = int(np.count_nonzero(kinds == int(PrimitiveKind.CONSUMER)))
