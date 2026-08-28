@@ -133,6 +133,7 @@ class TraceSession:
     _capture_window_started: bool = field(default=False, init=False)
     _virtual_consumer: VirtualCaptureConsumer | None = field(default=None, init=False)
     _virtual_collection_begin: bool = field(default=False, init=False)
+    _iteration_event_counts: dict[int, int] = field(default_factory=dict, init=False)
 
     def __post_init__(self) -> None:
         if self.capture_iteration_range is not None:
@@ -230,6 +231,10 @@ class TraceSession:
             "capture_audit_schema_version": "gala-r2-capture-audit-v4",
             "initial_gaussian_count": self._initial_gaussian_count,
             "capture_audit": dict(sorted(audit.items())),
+            "iteration_event_counts": {
+                str(iteration): count
+                for iteration, count in sorted(self._iteration_event_counts.items())
+            },
         }
         if self.capture_iteration_range is not None:
             start, end = self.capture_iteration_range
@@ -1054,6 +1059,7 @@ class TraceSession:
             dependencies=reduction_dependencies,
             dependency_counts=reduction_counts,
         )
+        self._record_iteration_events(rendered + 4 * relation_count + 2 * query_count)
         context = _QueryContext(
             query_base, query_shape, relation_offsets, stable_gaussian_ids,
             relation_ids, reduction_events, binning_pointer, output_pointer,
@@ -1072,12 +1078,14 @@ class TraceSession:
         self, query_id: int, dependencies: Any,
         *, template_id: int, field_mask: int,
     ) -> int:
-        return self._builder.emit(TraceEvent(
+        event = self._builder.emit(TraceEvent(
             iteration_id=self._iteration,
             primitive_kind=int(PrimitiveKind.QUERY_CLOSE), query_id=query_id,
             state_version=self._state_version, resource_class=int(ResourceClass.RELATION),
             template_id=template_id, field_mask=field_mask,
         ), dependencies=dependencies)
+        self._record_iteration_events(1)
+        return event
 
     def _capture_backward(self, buffer_pointer: int, *, voxel: bool) -> None:
         if not self._iteration_capture_enabled():
@@ -1191,6 +1199,7 @@ class TraceSession:
             self._pending_backward_events.append(
                 np.asarray(gradient_events, dtype=dependency_dtype())
             )
+        self._record_iteration_events(query_count + 2 * relation_count)
         self._output_contexts.pop(context.output_pointer, None)
         self._contexts.pop(buffer_pointer, None)
         self._completed_backward_buffers.add(buffer_pointer)
@@ -1380,6 +1389,7 @@ class TraceSession:
                 event, dependencies=dependencies,
                 dependency_counts=np.asarray([dependencies.size], dtype=np.int64),
             )[0]))
+            self._record_iteration_events(1)
         self._state_ready_event = self._emit_update_end(
             flags=UPDATE_BEGIN_OPTIMIZER, begin=begin,
             dependencies=commits or [begin], field_mask=field_mask,
@@ -1402,6 +1412,7 @@ class TraceSession:
             event_batch, dependencies=dependency_array,
             dependency_counts=np.asarray([dependency_array.size], dtype=np.int64),
         )[0])
+        self._record_iteration_events(1)
         self._audit_increment("update_begin_events")
         return event
 
@@ -1428,6 +1439,7 @@ class TraceSession:
             template_id=UPDATE_TEMPLATE_ID,
             flags=int(flags), reduction_key=int(begin), field_mask=int(field_mask),
         ), dependencies=dependencies)
+        self._record_iteration_events(1)
         self._audit_increment("update_end_events")
         return event
 
@@ -1509,6 +1521,7 @@ class TraceSession:
             template_id=MODIFICATION_TEMPLATE_ID, field_mask=STATE_FIELD_MASK,
             flags=int(flags), reduction_key=int(reduction_key),
         ), dependencies=(begin, *(int(value) for value in dependencies)))
+        self._record_iteration_events(1)
         self._collection_events.append(event)
         self._audit_increment("collection_modification_events")
         self._audit_increment(
@@ -1610,3 +1623,11 @@ class TraceSession:
         if amount < 0:
             raise ValueError("capture audit increments must be non-negative")
         self._audit[name] = self._audit.get(name, 0) + int(amount)
+
+    def _record_iteration_events(self, count: int) -> None:
+        if count < 0:
+            raise ValueError("iteration event count increments must be non-negative")
+        if count:
+            self._iteration_event_counts[self._iteration] = (
+                self._iteration_event_counts.get(self._iteration, 0) + int(count)
+            )

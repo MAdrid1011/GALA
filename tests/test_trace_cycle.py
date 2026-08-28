@@ -23,6 +23,7 @@ from gala_sim.timing import (
     CycleConfig,
     CycleConfigurationError,
     CycleEngine,
+    CycleProgress,
     ModuleTiming,
 )
 from gala_sim.timing.engine import _DependencyIndex
@@ -89,6 +90,29 @@ def test_trace_round_trip_and_cycle_result(tmp_path: Path) -> None:
     assert result.total_cycles > 0
     assert result.completion_cycles[3] <= result.total_cycles
     assert result.module_counters["relation_constructor"]["completed"] == 2
+
+
+def test_cycle_progress_uses_capture_iteration_totals_metadata() -> None:
+    trace = _trace()
+    trace = replace(
+        trace,
+        metadata={**trace.metadata, "iteration_event_counts": {"0": trace.event_count}},
+    )
+    progress: list[CycleProgress] = []
+
+    result = CycleEngine(_config()).run(
+        trace,
+        progress=progress.append,
+        progress_interval_events=2,
+        progress_interval_seconds=0.001,
+    )
+
+    assert result.total_cycles > 0
+    replay = [item for item in progress if item.phase == "replay"]
+    assert replay
+    assert replay[-1].total_iterations == 1
+    assert replay[-1].completed_iterations == 1
+    assert any(item.phase == "dependency_index_dependency_fill" for item in progress)
 
 
 def test_virtual_cycle_replay_preserves_global_packet_state(tmp_path: Path) -> None:

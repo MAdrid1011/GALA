@@ -177,6 +177,47 @@ class _DependencyIndex:
         return self.dependents[begin:end]
 
 
+def _iteration_index_from_metadata(
+    trace: Trace,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray] | None:
+    """Use capture-provided exact iteration totals when available."""
+
+    raw_counts = trace.metadata.get("iteration_event_counts")
+    if raw_counts is None:
+        return None
+    if not isinstance(raw_counts, Mapping) or not raw_counts:
+        raise CycleConfigurationError("iteration_event_counts metadata is malformed")
+    pairs: list[tuple[int, int]] = []
+    for raw_iteration, raw_count in raw_counts.items():
+        try:
+            iteration = int(raw_iteration)
+            count = int(raw_count)
+        except (TypeError, ValueError) as error:
+            raise CycleConfigurationError(
+                "iteration_event_counts metadata is malformed"
+            ) from error
+        if iteration < 0 or count <= 0:
+            raise CycleConfigurationError("iteration_event_counts metadata is malformed")
+        pairs.append((iteration, count))
+    pairs.sort()
+    if len({iteration for iteration, _ in pairs}) != len(pairs):
+        raise CycleConfigurationError("iteration_event_counts metadata has duplicate IDs")
+    if sum(count for _, count in pairs) != trace.event_count:
+        raise CycleConfigurationError(
+            "iteration_event_counts metadata does not cover the trace"
+        )
+    iteration_ids = np.asarray([iteration for iteration, _ in pairs], dtype=np.uint32)
+    iteration_totals = np.asarray([count for _, count in pairs], dtype=np.uint64)
+    iteration_positions = np.full(int(iteration_ids[-1]) + 1, -1, dtype=np.int64)
+    iteration_positions[iteration_ids] = np.arange(iteration_ids.size)
+    iteration_completed = np.zeros(iteration_ids.size, dtype=np.uint64)
+    iteration_done = np.zeros(iteration_ids.size, dtype=np.bool_)
+    return (
+        iteration_ids, iteration_totals, iteration_positions,
+        iteration_completed, iteration_done,
+    )
+
+
 class CycleEngine:
     """Run the same trace for Base, Oracle, or mechanism-specific policies."""
 
@@ -431,7 +472,13 @@ class CycleEngine:
         last_completed_iteration_events: int | None = None
         last_completed_iteration_cycles: int | None = None
         last_completed_iteration_elapsed_seconds: float | None = None
-        if progress is not None:
+        metadata_iteration_index = _iteration_index_from_metadata(trace)
+        if metadata_iteration_index is not None:
+            (
+                iteration_ids, iteration_totals, iteration_positions,
+                iteration_completed, iteration_done,
+            ) = metadata_iteration_index
+        elif progress is not None:
             iteration_values = np.asarray(trace.events["iteration_id"])
             max_iteration = int(iteration_values.max()) if iteration_values.size else 0
             iteration_totals = np.zeros(max_iteration + 1, dtype=np.uint64)
@@ -462,9 +509,28 @@ class CycleEngine:
             iteration_completed = np.zeros(iteration_ids.size, dtype=np.uint64)
             iteration_done = np.zeros(iteration_ids.size, dtype=np.bool_)
 
+        def dependency_index_progress(stage: str, current: int, total: int) -> None:
+            if progress is None:
+                return
+            progress(CycleProgress(
+                phase=f"dependency_index_{stage}",
+                completed_events=0,
+                total_events=trace.event_count,
+                completed_iterations=0,
+                total_iterations=int(iteration_ids.size),
+                last_completed_iteration=None,
+                simulated_cycles=0,
+                elapsed_seconds=time.monotonic() - started_at,
+            ))
+
         dependency_index = run_phase(
             "dependency_index",
-            lambda: _DependencyIndex.from_trace(trace),
+            lambda: _DependencyIndex.from_trace(
+                trace,
+                progress=dependency_index_progress if progress is not None else None,
+                progress_interval_events=progress_interval_events,
+                progress_interval_seconds=progress_interval_seconds,
+            ),
             total_iterations=int(iteration_ids.size),
         )
 
