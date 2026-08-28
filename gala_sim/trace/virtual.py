@@ -19,7 +19,13 @@ from typing import Any
 
 import numpy as np
 
-from gala_sim.clamp.events import dependency_dtype, event_dtype
+from gala_sim.clamp.events import (
+    PrimitiveKind,
+    ResourceClass,
+    TraceEvent,
+    dependency_dtype,
+    event_dtype,
+)
 
 
 MASK_WORD_BITS = 32
@@ -319,6 +325,229 @@ class VirtualTracePacket:
             count=relation_count * 4,
         )
         return rows.reshape((-1, 4))
+
+
+@dataclass(frozen=True)
+class VirtualEventPacket:
+    """A bounded event batch with IDs valid in one global event stream.
+
+    Dependency offsets are local to ``dependencies`` while dependency values
+    themselves are global dense event IDs.  The explicit packet boundary is
+    therefore transport-only: it cannot silently rebase or drop a dependency
+    belonging to an earlier packet.
+    """
+
+    packet_id: int
+    global_event_start: int
+    events: np.ndarray
+    dependencies: np.ndarray
+    final_packet: bool = False
+    frontier_complete: bool = False
+
+    def __post_init__(self) -> None:
+        if self.packet_id < 0 or self.global_event_start < 0:
+            raise ValueError("virtual event packet identifiers must be non-negative")
+        if self.events.dtype != event_dtype() or self.events.ndim != 1:
+            raise ValueError("virtual event packet events do not use the frozen schema")
+        if self.dependencies.dtype != dependency_dtype() or self.dependencies.ndim != 1:
+            raise ValueError("virtual event packet dependencies use an invalid schema")
+        expected_ids = np.arange(
+            self.global_event_start,
+            self.global_event_start + self.events.size,
+            dtype=np.uint64,
+        )
+        if not np.array_equal(self.events["event_id"], expected_ids):
+            raise ValueError("virtual event packet event IDs are not globally contiguous")
+        if self.events.size:
+            for row in self.events:
+                begin = int(row["dependency_begin"])
+                end = begin + int(row["dependency_count"])
+                if begin < 0 or end > self.dependencies.size:
+                    raise ValueError("virtual event packet dependency range is invalid")
+                if end > begin and np.any(self.dependencies[begin:end] >= row["event_id"]):
+                    raise ValueError("virtual event packet has a forward dependency")
+        if self.final_packet and not self.frontier_complete:
+            raise ValueError("final virtual event packet must close its dependency frontier")
+
+    @property
+    def event_count(self) -> int:
+        return int(self.events.size)
+
+    @property
+    def global_event_end(self) -> int:
+        return self.global_event_start + self.event_count
+
+    @property
+    def external_dependencies(self) -> np.ndarray:
+        """Return dependencies outside this packet's global event range."""
+
+        if self.dependencies.size == 0:
+            return np.empty(0, dtype=dependency_dtype())
+        external = self.dependencies[self.dependencies < self.global_event_start]
+        return np.unique(external).astype(dependency_dtype(), copy=False)
+
+    def dependency_ids(self, event_index: int) -> np.ndarray:
+        if event_index < 0 or event_index >= self.event_count:
+            raise IndexError("virtual event packet event index is out of range")
+        row = self.events[event_index]
+        begin = int(row["dependency_begin"])
+        end = begin + int(row["dependency_count"])
+        return self.dependencies[begin:end]
+
+
+@dataclass
+class VirtualRelationEventExpander:
+    """Expand one work-buffer packet into bounded global-ID event packets.
+
+    This deliberately emits only the relation-construction prefix.  Later
+    CLAMP stages must consume the same global IDs and carry their state across
+    packet boundaries; pretending that this prefix is a complete trace would
+    make cache and update lifetimes unverifiable.
+    """
+
+    max_events: int
+    state_record_bytes: int = 128
+    relation_candidate_bytes: int = 0
+    next_event_id: int = 0
+    next_relation_id: int = 0
+    next_packet_id: int = 0
+
+    def __post_init__(self) -> None:
+        if self.max_events <= 0 or self.state_record_bytes <= 0:
+            raise ValueError("virtual event expander limits must be positive")
+        if self.relation_candidate_bytes < 0:
+            raise ValueError("relation candidate bytes must be non-negative")
+
+    def expand(self, packet: VirtualTracePacket) -> Iterator[VirtualEventPacket]:
+        candidate_start = self.next_event_id
+        relation_start = candidate_start + packet.candidate_count
+        relation_count = packet.logical_relation_count
+        self.next_event_id = relation_start + relation_count
+        relation_base = self.next_relation_id
+        self.next_relation_id += relation_count
+
+        candidate_ids = np.arange(
+            candidate_start, relation_start, dtype=np.uint64
+        )
+        for start in range(0, packet.candidate_count, self.max_events):
+            end = min(start + self.max_events, packet.candidate_count)
+            rows = np.empty(end - start, dtype=event_dtype())
+            rows[:] = TraceEvent().as_tuple()
+            rows["event_id"] = candidate_ids[start:end]
+            rows["iteration_id"] = packet.iteration_id
+            rows["primitive_kind"] = int(PrimitiveKind.RELATION_CANDIDATE)
+            rows["gaussian_id"] = packet.point_ids[start:end]
+            rows["state_version"] = packet.state_version
+            rows["resource_class"] = int(ResourceClass.RELATION)
+            rows["address_token"] = packet.point_keys[start:end]
+            rows["data_bytes"] = self.relation_candidate_bytes
+            rows["template_id"] = packet.template_id
+            rows["field_mask"] = packet.field_mask
+            rows["flags"] = np.any(packet.masks[start:end], axis=1)
+            yield self._make_event_packet(rows, np.empty(0, dtype=dependency_dtype()))
+
+        relation_rows: list[tuple[int, int, int, int]] = []
+        emitted_relations = 0
+        for candidate, query_id, gaussian_id, point_key in packet.iter_relations():
+            relation_rows.append((candidate, query_id, gaussian_id, point_key))
+            if len(relation_rows) == self.max_events:
+                yield self._relation_packet(
+                    relation_rows, packet, candidate_start, relation_start,
+                    relation_base, emitted_relations,
+                )
+                emitted_relations += len(relation_rows)
+                relation_rows = []
+        if relation_rows:
+            yield self._relation_packet(
+                relation_rows, packet, candidate_start, relation_start,
+                relation_base, emitted_relations,
+            )
+
+    def _relation_packet(
+        self,
+        relations: list[tuple[int, int, int, int]],
+        source: VirtualTracePacket,
+        candidate_start: int,
+        relation_start: int,
+        relation_base: int,
+        emitted_before: int,
+    ) -> VirtualEventPacket:
+        rows = np.empty(len(relations), dtype=event_dtype())
+        rows[:] = TraceEvent().as_tuple()
+        rows["event_id"] = np.arange(
+            relation_start + emitted_before,
+            relation_start + emitted_before + len(relations),
+            dtype=np.uint64,
+        )
+        rows["iteration_id"] = source.iteration_id
+        rows["primitive_kind"] = int(PrimitiveKind.RELATION)
+        rows["query_id"] = np.asarray([item[1] for item in relations], dtype=np.int64)
+        rows["gaussian_id"] = np.asarray([item[2] for item in relations], dtype=np.int64)
+        rows["state_version"] = source.state_version
+        rows["relation_id"] = np.arange(
+            relation_base + emitted_before,
+            relation_base + emitted_before + len(relations),
+            dtype=np.int64,
+        )
+        rows["resource_class"] = int(ResourceClass.RELATION)
+        rows["template_id"] = source.template_id
+        rows["field_mask"] = source.field_mask
+        rows["address_token"] = np.asarray(
+            [item[2] * self.state_record_bytes for item in relations], dtype=np.uint64
+        )
+        dependencies = np.asarray(
+            [candidate_start + item[0] for item in relations], dtype=dependency_dtype()
+        )
+        return self._make_event_packet(rows, dependencies)
+
+    def _make_event_packet(
+        self, rows: np.ndarray, dependencies: np.ndarray
+    ) -> VirtualEventPacket:
+        rows = np.asarray(rows, dtype=event_dtype())
+        if dependencies.size:
+            rows["dependency_begin"] = np.arange(
+                dependencies.size, dtype=np.uint64
+            )
+            rows["dependency_count"] = 1
+        packet = VirtualEventPacket(
+            packet_id=self.next_packet_id,
+            global_event_start=int(rows["event_id"][0]) if rows.size else self.next_event_id,
+            events=rows,
+            dependencies=np.asarray(dependencies, dtype=dependency_dtype()),
+        )
+        self.next_packet_id += 1
+        return packet
+
+
+@dataclass
+class VirtualEventStreamValidator:
+    """Validate global-ID continuity while event packets cross a boundary."""
+
+    next_packet_id: int = 0
+    next_event_id: int = 0
+    accepted_packets: int = 0
+    accepted_events: int = 0
+    final_seen: bool = False
+
+    def accept(self, packet: VirtualEventPacket) -> None:
+        if self.final_seen:
+            raise ValueError("virtual event packet arrived after the final packet")
+        if packet.packet_id != self.next_packet_id:
+            raise ValueError("virtual event packet IDs are not contiguous")
+        if packet.global_event_start != self.next_event_id:
+            raise ValueError("virtual event packet event IDs were rebased or skipped")
+        if packet.external_dependencies.size and int(packet.external_dependencies.max()) >= packet.global_event_start:
+            raise ValueError("virtual event packet external dependency is not from an earlier packet")
+        self.next_packet_id += 1
+        self.next_event_id = packet.global_event_end
+        self.accepted_packets += 1
+        self.accepted_events += packet.event_count
+        if packet.final_packet:
+            self.final_seen = True
+
+    def finalize(self) -> None:
+        if not self.final_seen:
+            raise ValueError("virtual event stream ended without a final packet")
 
 
 @dataclass(frozen=True)

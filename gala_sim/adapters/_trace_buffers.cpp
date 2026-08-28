@@ -59,14 +59,11 @@ torch::Tensor copy_voxel_point_list(const torch::Tensor& buffer, int64_t count) 
         throw std::invalid_argument("voxel point-list count must be non-negative");
     }
     std::size_t offset = align128(buffer, 0);
-    offset = align128(buffer, offset + static_cast<std::size_t>(count) * sizeof(std::uint32_t));
-    offset = align128(buffer, offset + static_cast<std::size_t>(count) * sizeof(std::uint32_t));
-    offset = align128(buffer, offset + static_cast<std::size_t>(count) * sizeof(std::uint64_t));
-    auto needed = offset + static_cast<std::size_t>(count) * sizeof(std::uint64_t);
+    auto needed = offset + static_cast<std::size_t>(count) * sizeof(std::uint32_t);
     if (needed > static_cast<std::size_t>(buffer.numel())) {
         throw std::invalid_argument("voxel binning buffer is smaller than its declared layout");
     }
-    return copy_int32(buffer, aligned_pointer(buffer, 0), {count});
+    return copy_int32(buffer, aligned_pointer(buffer, offset), {count});
 }
 
 torch::Tensor copy_raster_point_keys(const torch::Tensor& buffer, int64_t count) {

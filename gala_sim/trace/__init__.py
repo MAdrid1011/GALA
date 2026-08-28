@@ -13,6 +13,9 @@ from .virtual import (
     VirtualTraceProgress,
     VirtualTraceRun,
     VirtualTraceStream,
+    VirtualEventPacket,
+    VirtualRelationEventExpander,
+    VirtualEventStreamValidator,
 )
 
 __all__ = [
@@ -34,4 +37,7 @@ __all__ = [
     "VirtualTraceProgress",
     "VirtualTraceRun",
     "VirtualTraceStream",
+    "VirtualEventPacket",
+    "VirtualRelationEventExpander",
+    "VirtualEventStreamValidator",
 ]

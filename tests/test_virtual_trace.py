@@ -6,7 +6,12 @@ import time
 import numpy as np
 import pytest
 
-from gala_sim.trace import VirtualTracePacket, VirtualTraceStream
+from gala_sim.trace import (
+    VirtualEventStreamValidator,
+    VirtualRelationEventExpander,
+    VirtualTracePacket,
+    VirtualTraceStream,
+)
 
 
 def _mask(candidate_count: int, words: int) -> np.ndarray:
@@ -98,6 +103,54 @@ def test_relation_batches_are_bounded_and_exact() -> None:
     assert [len(batch) for batch in packet.iter_relation_batches(2)] == [2, 1]
     with pytest.raises(ValueError, match="exceeds"):
         packet.materialize_relations(max_relations=2)
+
+
+def test_relation_event_expander_preserves_global_ids_and_external_dependencies() -> None:
+    masks = _mask(2, 8)
+    masks[0, 0] = np.uint32(1)
+    masks[1, 0] = np.uint32((1 << 0) | (1 << 1))
+    source = VirtualTracePacket(
+        iteration_id=1,
+        template_id=1,
+        query_base=0,
+        query_shape=(1, 2),
+        point_ids=np.asarray([0, 1], dtype=np.int64),
+        point_keys=np.asarray([0, 0], dtype=np.uint64),
+        masks=masks,
+    )
+    expander = VirtualRelationEventExpander(max_events=2)
+    output = list(expander.expand(source))
+
+    assert [packet.global_event_start for packet in output] == [0, 2, 4]
+    assert [packet.event_count for packet in output] == [2, 2, 1]
+    assert output[1].external_dependencies.tolist() == [0, 1]
+    assert output[2].external_dependencies.tolist() == [1]
+    assert output[1].events["query_id"].tolist() == [0, 0]
+    assert output[2].events["query_id"].tolist() == [1]
+    assert expander.next_event_id == 5
+    assert expander.next_relation_id == 3
+
+
+def test_event_stream_validator_rejects_rebased_or_unclosed_packets() -> None:
+    masks = _mask(1, 8)
+    masks[0, 0] = np.uint32(1)
+    source = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 1),
+        point_ids=np.asarray([0], dtype=np.int64),
+        point_keys=np.asarray([0], dtype=np.uint64), masks=masks,
+    )
+    packets = list(VirtualRelationEventExpander(max_events=1).expand(source))
+    validator = VirtualEventStreamValidator()
+    validator.accept(packets[0])
+    rebased_events = packets[1].events.copy()
+    rebased_events["event_id"] = 99
+    with pytest.raises(ValueError, match="rebased"):
+        validator.accept(type(packets[1])(
+            packet_id=1, global_event_start=99,
+            events=rebased_events, dependencies=packets[1].dependencies,
+        ))
+    with pytest.raises(ValueError, match="final"):
+        validator.finalize()
 
 
 def test_stream_bounds_inflight_packets_and_accounts_physical_bytes() -> None:
