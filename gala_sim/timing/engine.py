@@ -1017,12 +1017,11 @@ class CycleEngine:
         so cache state, dependency readiness, fusion history, memory waiters,
         and the configured Ramulator backend are never reset at packet edges.
 
-        This is intentionally a quick-validation API. ``max_total_events`` is
-        mandatory in spirit (and has a conservative default) so a full
-        30,000-iteration capture cannot accidentally expand into a multi-GB
-        staging trace. Formal performance runs must use a prevalidated canonical
-        trace and :meth:`run` directly. ``trace_root`` is an explicit durable
-        staging directory and is not removed after a run.
+        This is intentionally a quick-validation API. Both event bounds are
+        mandatory so a full 30,000-iteration capture cannot accidentally
+        expand into a multi-GB staging trace. Formal performance runs must use
+        a prevalidated canonical trace and :meth:`run` directly. ``trace_root``
+        is an explicit durable staging directory and is not removed after a run.
         """
         if max_events <= 0:
             raise ValueError("virtual cycle event batch size must be positive")

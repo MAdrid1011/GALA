@@ -23,7 +23,7 @@ from gala_sim.timing.engine import _DependencyIndex
 from gala_sim.timing.memory import Ramulator2Backend, RecordedMemoryBackend
 from gala_sim.config import load_config
 from gala_sim.trace import NumpyChunkSink, TraceReader, TraceWriter, TraceValidationError, validate_trace
-from gala_sim.trace import VirtualTracePacket
+from gala_sim.trace import VirtualQueryEventExpander, VirtualTracePacket
 from gala_sim.adapters.r2_gaussian import _push_trace_chunks
 from gala_sim.clamp.events import dependency_dtype, event_dtype
 
@@ -156,6 +156,43 @@ def test_virtual_cycle_replay_rejects_reused_output_directory(tmp_path: Path) ->
             [source], trace_root=root, max_events=2, max_total_events=64
         )
     assert (root / "chunk_manifest.json").read_text(encoding="utf-8") == "stale\n"
+
+
+def test_virtual_forward_dependencies_preserve_relation_pairing() -> None:
+    masks = np.zeros((3, 8), dtype=np.dtype("<u4"))
+    masks[:, 0] = 1
+    source = VirtualTracePacket(
+        iteration_id=1,
+        template_id=1,
+        query_base=0,
+        query_shape=(1, 3),
+        point_ids=np.asarray([0, 1, 2], dtype=np.int64),
+        point_keys=np.asarray([0, 0, 0], dtype=np.uint64),
+        masks=masks,
+        loss_flags=1,
+    )
+    packets = tuple(VirtualQueryEventExpander(max_events=8).expand(source))
+    events = np.concatenate([packet.events for packet in packets])
+    relation = events[events["primitive_kind"] == int(PrimitiveKind.RELATION)]
+    returns = events[events["primitive_kind"] == int(PrimitiveKind.CACHE_RETURN)]
+    forwards = events[events["primitive_kind"] == int(PrimitiveKind.FORWARD)]
+    assert relation.size == returns.size == forwards.size == 3
+    for packet in packets:
+        for forward in packet.events[
+            packet.events["primitive_kind"] == int(PrimitiveKind.FORWARD)
+        ]:
+            begin = int(forward["dependency_begin"])
+            deps = packet.dependencies[
+                begin:begin + int(forward["dependency_count"])
+            ]
+            relation_row = relation[relation["event_id"] == deps[0]][0]
+            return_row = returns[returns["event_id"] == deps[1]][0]
+            assert int(relation_row["relation_id"]) == int(forward["relation_id"])
+            assert int(return_row["relation_id"]) == int(forward["relation_id"])
+            assert int(relation_row["query_id"]) == int(forward["query_id"])
+            assert int(return_row["query_id"]) == int(forward["query_id"])
+            assert int(relation_row["gaussian_id"]) == int(forward["gaussian_id"])
+            assert int(return_row["gaussian_id"]) == int(forward["gaussian_id"])
 
 
 def test_formal_cycle_records_but_does_not_gate_on_configuration_hash() -> None:

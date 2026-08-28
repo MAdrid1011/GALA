@@ -1029,9 +1029,13 @@ class VirtualQueryEventExpander:
             rows["template_id"] = source.template_id
             rows["field_mask"] = source.field_mask
             dependencies = np.empty(count * 2, dtype=dependency_dtype())
-            relation_ids = relation_start + emitted
+            relation_ids = relation_start + emitted + np.arange(
+                count, dtype=dependency_dtype()
+            )
             dependencies[0::2] = relation_ids
-            dependencies[1::2] = return_start + emitted
+            dependencies[1::2] = return_start + emitted + np.arange(
+                count, dtype=dependency_dtype()
+            )
             rows["dependency_begin"] = np.arange(0, count * 2, 2, dtype=np.uint64)
             rows["dependency_count"] = 2
             emitted += count
