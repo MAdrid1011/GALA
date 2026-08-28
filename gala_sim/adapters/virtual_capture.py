@@ -47,7 +47,8 @@ class VirtualCaptureConsumer:
     inactivity_timeout_seconds: float = 300.0
     progress_interval_seconds: float = 30.0
     expand_for_validation: bool = False
-    packet_consumer: Callable[[VirtualTracePacket], None] | None = None
+    packet_consumer: Any | None = None
+    lifecycle_consumer: Any | None = None
     _expander: VirtualQueryEventExpander = field(init=False)
     _event_validator: VirtualEventStreamValidator = field(
         default_factory=VirtualEventStreamValidator, init=False
@@ -121,7 +122,7 @@ class VirtualCaptureConsumer:
                 self._last_progress = time.monotonic()
                 self._report_progress()
         if self.packet_consumer is not None:
-            self.packet_consumer(packet)
+            self._dispatch_query(packet)
         self._last_progress = time.monotonic()
         self._report_progress()
 
@@ -133,6 +134,7 @@ class VirtualCaptureConsumer:
         if record.iteration_id != self._current_iteration:
             raise ValueError("virtual lifecycle record changed iteration without a close")
         self._lifecycle.accept_lifecycle(record)  # type: ignore[union-attr]
+        self._dispatch_lifecycle(record)
         self._last_progress = time.monotonic()
 
     def close_iteration(self, iteration_id: int) -> None:
@@ -140,6 +142,7 @@ class VirtualCaptureConsumer:
         if self._current_iteration != iteration_id:
             raise ValueError("virtual iteration close does not match the active iteration")
         self._lifecycle.close_iteration(iteration_id)  # type: ignore[union-attr]
+        self._dispatch_iteration_close(iteration_id)
         self._current_iteration = None
         self._last_progress = time.monotonic()
         self._report_progress(force=True)
@@ -165,6 +168,7 @@ class VirtualCaptureConsumer:
             self._event_validator.accept(terminal)
             self._event_validator.finalize()
         ledgers = self._lifecycle.finalize()  # type: ignore[union-attr]
+        self._finish_packet_consumer()
         elapsed = time.monotonic() - self._started_at
         result: dict[str, Any] = {
             "schema_version": "gala-virtual-trace-capture-v1",
@@ -202,6 +206,38 @@ class VirtualCaptureConsumer:
     def _ensure_lifecycle(self) -> None:
         if self._lifecycle is None:
             raise RuntimeError("virtual capture consumer has no Gaussian initialization")
+
+    def _dispatch_query(self, packet: VirtualTracePacket) -> None:
+        consumer = self.packet_consumer
+        if hasattr(consumer, "accept_query_packet"):
+            consumer.accept_query_packet(packet)
+        elif callable(consumer):
+            consumer(packet)
+        else:
+            raise TypeError("virtual packet consumer must be callable or expose accept_query_packet")
+
+    def _dispatch_lifecycle(self, record: VirtualLifecycleRecord) -> None:
+        consumer = self.lifecycle_consumer or self.packet_consumer
+        if consumer is None:
+            return
+        if hasattr(consumer, "accept_lifecycle"):
+            consumer.accept_lifecycle(record)
+        elif self.lifecycle_consumer is not None:
+            raise TypeError("virtual lifecycle consumer must expose accept_lifecycle")
+
+    def _dispatch_iteration_close(self, iteration_id: int) -> None:
+        consumer = self.lifecycle_consumer or self.packet_consumer
+        if consumer is None:
+            return
+        if hasattr(consumer, "close_iteration"):
+            consumer.close_iteration(iteration_id)
+        elif self.lifecycle_consumer is not None:
+            raise TypeError("virtual lifecycle consumer must expose close_iteration")
+
+    def _finish_packet_consumer(self) -> None:
+        consumer = self.lifecycle_consumer or self.packet_consumer
+        if consumer is not None and hasattr(consumer, "finish"):
+            consumer.finish()
 
     def _check_progress(self) -> None:
         now = time.monotonic()

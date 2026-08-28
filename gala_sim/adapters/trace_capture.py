@@ -95,6 +95,7 @@ class TraceSession:
     stream_only: bool = False
     capture_iteration_range: tuple[int, int] | None = None
     virtual_capture: bool = False
+    virtual_packet_consumer: Any | None = None
     inactivity_timeout_seconds: float = 300.0
     progress_interval_seconds: float = 30.0
     _builder: ChunkedTraceBuilder = field(init=False)
@@ -152,6 +153,7 @@ class TraceSession:
                 relation_candidate_bytes=self.relation_candidate_bytes,
                 inactivity_timeout_seconds=self.inactivity_timeout_seconds,
                 progress_interval_seconds=self.progress_interval_seconds,
+                packet_consumer=self.virtual_packet_consumer,
             )
 
     def install(self) -> None:

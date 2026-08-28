@@ -68,6 +68,51 @@ def test_virtual_consumer_closes_event_and_lifecycle_frontiers(tmp_path: Path) -
     assert json.loads((tmp_path / "virtual_trace_manifest.json").read_text()) == result
 
 
+class _PacketLifecycleSink:
+    def __init__(self) -> None:
+        self.queries = 0
+        self.lifecycle = []
+        self.closed = []
+        self.finished = False
+
+    def accept_query_packet(self, packet: VirtualTracePacket) -> None:
+        self.queries += 1
+
+    def accept_lifecycle(self, record: VirtualLifecycleRecord) -> None:
+        self.lifecycle.append(record.kind)
+
+    def close_iteration(self, iteration_id: int) -> None:
+        self.closed.append(iteration_id)
+
+    def finish(self) -> None:
+        self.finished = True
+
+
+def test_virtual_consumer_dispatches_query_and_lifecycle_to_online_sink(tmp_path: Path) -> None:
+    sink = _PacketLifecycleSink()
+    consumer = VirtualCaptureConsumer(tmp_path, packet_consumer=sink)
+    consumer.initialize_gaussians(1)
+    consumer.accept_query(_packet())
+    consumer.accept_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_BEGIN, 0,
+        field_mask=STATE_FIELD_MASK, transaction_kind=2,
+    ))
+    consumer.accept_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_COMMIT, 0,
+        field_mask=STATE_FIELD_MASK, transaction_kind=2, all_active=True,
+    ))
+    consumer.accept_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_END, 0,
+        field_mask=STATE_FIELD_MASK, transaction_kind=2,
+    ))
+    consumer.close_iteration(1)
+    consumer.finish()
+    assert sink.queries == 1
+    assert len(sink.lifecycle) == 3
+    assert sink.closed == [1]
+    assert sink.finished is True
+
+
 def test_trace_session_virtual_path_skips_relation_record_decoder(tmp_path: Path) -> None:
     session = TraceSession(tmp_path, chunk_events=2, virtual_capture=True)
     session._iteration = 1
