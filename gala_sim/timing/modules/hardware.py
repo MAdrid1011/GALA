@@ -85,7 +85,7 @@ class SemanticCacheState:
     directory_banks: int
     sector_bytes: int
     active: dict[tuple[int, int], dict[str, int | bool]]
-    pending: dict[tuple[int, int], int]
+    pending: dict[tuple[int, int], dict[str, int | bool]]
     closing_pending: set[tuple[int, int]]
     counters: dict[str, int]
 
@@ -98,33 +98,63 @@ class SemanticCacheState:
             "multicast_reads": 0, "fills": 0, "releases": 0,
         })
 
-    def request(self, key: tuple[int, int], *, remaining_uses: int) -> CacheLookup:
+    def request(
+        self,
+        key: tuple[int, int],
+        *,
+        remaining_uses: int,
+        workset_total_uses: int | None = None,
+    ) -> CacheLookup:
         if remaining_uses <= 0:
             raise ValueError("remaining use count must be positive")
+        if workset_total_uses is not None and workset_total_uses < remaining_uses:
+            raise ValueError("workset total uses cannot be below remaining uses")
         if key in self.active:
             record = self.active[key]
             record["active_reads"] = int(record["active_reads"]) + 1
-            record["remaining_uses"] = int(record["remaining_uses"]) + 1
+            if workset_total_uses is None:
+                record["remaining_uses"] = int(record["remaining_uses"]) + 1
+            elif int(record["remaining_uses"]) != remaining_uses:
+                raise ValueError("semantic workset remaining-use count diverged")
             self.counters["directory_hits"] += 1
             return CacheLookup.HIT
         if key in self.pending:
-            self.pending[key] += 1
+            pending = self.pending[key]
+            pending["waiters"] = int(pending["waiters"]) + 1
+            if workset_total_uses is None:
+                pending["remaining_uses"] = int(pending["remaining_uses"]) + 1
             self.counters["miss_merges"] += 1
             return CacheLookup.MERGED
         if len(self.active) + len(self.pending) >= self.capacity:
             raise CacheBackpressure("semantic cache has no free slot or miss-merge entry")
-        self.pending[key] = 1
+        self.pending[key] = {
+            "waiters": 1,
+            "remaining_uses": workset_total_uses or 1,
+            "predeclared": workset_total_uses is not None,
+        }
         self.counters["directory_misses"] += 1
         return CacheLookup.MISS
 
-    def fill_complete(self, key: tuple[int, int], *, remaining_uses: int) -> None:
-        waiters = self.pending.pop(key, None)
-        if waiters is None:
+    def fill_complete(
+        self,
+        key: tuple[int, int],
+        *,
+        remaining_uses: int,
+        active_reads: int | None = None,
+    ) -> None:
+        pending = self.pending.pop(key, None)
+        if pending is None:
             raise ValueError("cache fill has no pending miss")
+        pending_uses = int(pending["remaining_uses"])
+        if remaining_uses != pending_uses:
+            raise ValueError("cache fill remaining uses diverged from pending workset")
         self.active[key] = {
-            "remaining_uses": waiters,
-            "active_reads": waiters,
+            "remaining_uses": pending_uses,
+            "active_reads": (
+                active_reads if active_reads is not None else int(pending["waiters"])
+            ),
             "closing": key in self.closing_pending,
+            "predeclared": bool(pending["predeclared"]),
         }
         self.closing_pending.discard(key)
         self.counters["fills"] += 1
@@ -133,7 +163,10 @@ class SemanticCacheState:
         if destinations <= 0 or key not in self.active:
             raise ValueError("multicast requires an active key and destinations")
         self.active[key]["active_reads"] = int(self.active[key]["active_reads"]) + destinations
-        self.active[key]["remaining_uses"] = int(self.active[key]["remaining_uses"]) + destinations
+        if not bool(self.active[key].get("predeclared", False)):
+            self.active[key]["remaining_uses"] = (
+                int(self.active[key]["remaining_uses"]) + destinations
+            )
         self.counters["multicast_reads"] += 1
 
     def complete_read(self, key: tuple[int, int]) -> None:

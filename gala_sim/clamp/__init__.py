@@ -13,6 +13,7 @@ from .tasks import (
     FusionIssueScheduler, IssueDecision, QueryState, ReductionDomain, TaskKind,
     TaskPacket,
 )
+from .worksets import SemanticWorksets, WORKSET_DTYPE
 
 __all__ = [
     "EVENT_SCHEMA_VERSION",
@@ -24,4 +25,5 @@ __all__ = [
     "TraceBuilder", "ChunkedTraceBuilder", "TraceChunkManifest",
     "FusionIssueScheduler", "IssueDecision", "QueryState", "ReductionDomain",
     "TaskKind", "TaskPacket",
+    "SemanticWorksets", "WORKSET_DTYPE",
 ]

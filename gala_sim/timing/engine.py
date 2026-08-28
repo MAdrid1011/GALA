@@ -11,7 +11,7 @@ from typing import Callable
 import numpy as np
 
 from gala_sim.clamp import (
-    FusionIssueScheduler, ReductionDomain, TaskKind, TaskPacket,
+    FusionIssueScheduler, ReductionDomain, SemanticWorksets, TaskKind, TaskPacket,
 )
 from gala_sim.clamp.events import PrimitiveKind
 from gala_sim.trace.model import Trace
@@ -501,6 +501,10 @@ class CycleEngine:
         cache_keys_by_version: dict[
             int, list[tuple[SemanticCacheState, tuple[int, int]]]
         ] = {}
+        semantic_worksets = (
+            SemanticWorksets.from_trace(trace)
+            if self.selection.semantic_worksets else None
+        )
         closed_versions: set[int] = set()
         memory_requests = 0
         cycle = 0
@@ -547,7 +551,17 @@ class CycleEngine:
                 if kind is PrimitiveKind.CACHE_REQUEST and stage == 0 and event_id in cache_event_state:
                     state, key, lookup = cache_event_state[event_id]
                     if lookup is CacheLookup.MISS:
-                        state.fill_complete(key, remaining_uses=1)
+                        workset = (
+                            semantic_worksets.for_event(event_id)
+                            if semantic_worksets is not None else None
+                        )
+                        state.fill_complete(
+                            key,
+                            remaining_uses=(
+                                int(workset["remaining_uses"])
+                                if workset is not None else 1
+                            ),
+                        )
                         if int(trace.events[event_id]["state_version"]) in closed_versions:
                             state.close(key)
                 if cache_states and kind is PrimitiveKind.CACHE_RETURN and stage == len(stages) - 1:
@@ -558,6 +572,10 @@ class CycleEngine:
                         )
                     state, key, _ = cache_event_state[int(request_ids[0])]
                     state.complete_read(key)
+                    if semantic_worksets is not None:
+                        request_event_id = int(request_ids[0])
+                        if bool(semantic_worksets.for_event(request_event_id)["last_use"]):
+                            state.close(key)
                     if int(trace.events[event_id]["state_version"]) in closed_versions:
                         state.close(key)
                 if kind is PrimitiveKind.UPDATE_END and stage == len(stages) - 1:
@@ -784,7 +802,21 @@ class CycleEngine:
                         state = cache_states[instance]
                         key = (int(row["gaussian_id"]), int(row["state_version"]))
                         try:
-                            lookup = state.request(key, remaining_uses=1)
+                            workset = (
+                                semantic_worksets.for_event(event_id)
+                                if semantic_worksets is not None else None
+                            )
+                            lookup = state.request(
+                                key,
+                                remaining_uses=(
+                                    int(workset["remaining_uses"])
+                                    if workset is not None else 1
+                                ),
+                                workset_total_uses=(
+                                    int(workset["total_uses"])
+                                    if workset is not None else None
+                                ),
+                            )
                         except CacheBackpressure:
                             module.counters.queue_stalls += 1
                             self._record_stall(cycle, module_name, "cache_capacity", event_id)
@@ -933,6 +965,14 @@ class CycleEngine:
                     cache_totals[key] += value
             module_counters["semantic_cache"].update(cache_totals)
         module_counters["semantic_cache"]["memory_requests"] = memory_requests
+        module_counters["semantic_cache"].update({
+            "workset_keys": semantic_worksets.key_count if semantic_worksets else 0,
+            "workset_uses": int(semantic_worksets.requests.size) if semantic_worksets else 0,
+            "workset_releases": (
+                int(semantic_worksets.requests["last_use"].sum())
+                if semantic_worksets else 0
+            ),
+        })
         audit_records = getattr(self.config.memory, "audit_records", None)
         memory_request_records = tuple(audit_records()) if callable(audit_records) else ()
         return CycleResult(

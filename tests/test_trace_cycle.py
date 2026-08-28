@@ -359,11 +359,20 @@ def test_semantic_residency_variant_merges_repeated_state_reads() -> None:
         cache_multicast_destinations=1,
     )
     base = CycleEngine(config, policy="variant:0000").run(trace)
+    worksets = CycleEngine(config, policy="variant:0100").run(trace)
     residency = CycleEngine(config, policy="variant:0001").run(trace)
+    combined = CycleEngine(config, policy="variant:0101").run(trace)
     assert base.module_counters["semantic_cache"]["memory_requests"] == 2
+    assert worksets.module_counters["semantic_cache"]["memory_requests"] == 2
+    assert worksets.module_counters["semantic_cache"]["workset_keys"] == 1
+    assert worksets.module_counters["semantic_cache"]["workset_uses"] == 2
     assert residency.module_counters["semantic_cache"]["memory_requests"] == 1
     assert residency.module_counters["semantic_cache"]["directory_misses"] == 1
     assert residency.module_counters["semantic_cache"]["directory_hits"] == 1
+    assert residency.module_counters["semantic_cache"]["workset_uses"] == 0
+    assert combined.module_counters["semantic_cache"]["memory_requests"] == 1
+    assert combined.module_counters["semantic_cache"]["workset_releases"] == 1
+    assert combined.module_counters["semantic_cache"]["releases"] == 1
 
 
 def test_query_close_keeps_state_resident_until_update_end() -> None:
