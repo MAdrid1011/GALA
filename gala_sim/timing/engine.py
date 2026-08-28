@@ -139,6 +139,194 @@ class _InFlight:
     module: str
 
 
+class _ReadyCandidateQueue:
+    """Heap-index ready work without changing candidate ordering semantics."""
+
+    def __init__(self) -> None:
+        self._next_token = 0
+        self._candidate_by_token: dict[int, tuple[int, int]] = {}
+        self._general: list[tuple[tuple[int, int], int]] = []
+        self._simple_by_cluster: dict[
+            int, list[tuple[tuple[int, int], int]]
+        ] = defaultdict(list)
+        self._simple_by_key: dict[
+            tuple[int, int, int], list[tuple[tuple[int, int], int]]
+        ] = defaultdict(list)
+        self._simple_location_by_token: dict[
+            int, tuple[int, tuple[int, int, int]]
+        ] = {}
+        self._complex: list[tuple[tuple[int, int], int]] = []
+        self._complex_event_ids: dict[int, tuple[int, ...]] = {}
+        self._configured = False
+        self._module_name = ""
+        self._row_for: Callable[[int], np.void] | None = None
+        self._physical_stage_for: Callable[[int], PhysicalPacketStage | None] | None = None
+        self._owner_gradients: OwnerGradientTracker | None = None
+
+    def __bool__(self) -> bool:
+        return bool(self._candidate_by_token)
+
+    def __len__(self) -> int:
+        return len(self._candidate_by_token)
+
+    def __iter__(self):
+        return iter(sorted(self._candidate_by_token.values()))
+
+    def __getitem__(self, index):
+        return sorted(self._candidate_by_token.values())[index]
+
+    def push(self, candidate: tuple[int, int]) -> None:
+        token = self._next_token
+        self._next_token += 1
+        self._candidate_by_token[token] = candidate
+        if self._configured:
+            self._index(token, candidate)
+
+    def _index(self, token: int, candidate: tuple[int, int]) -> None:
+        assert self._row_for is not None
+        assert self._physical_stage_for is not None
+        owner_gradients = self._owner_gradients
+        event_id, _stage = candidate
+        row = self._row_for(event_id)
+        if (
+            owner_gradients is None
+            or self._module_name not in {"bidirectional_query", "compute_pod"}
+            or PrimitiveKind(int(row["primitive_kind"])) is not PrimitiveKind.ADJOINT
+        ):
+            heapq.heappush(self._general, (candidate, token))
+            return
+        physical_stage = self._physical_stage_for(event_id)
+        event_ids = (
+            physical_stage.event_ids
+            if physical_stage is not None else (event_id,)
+        )
+        keys = tuple(dict.fromkeys(
+            owner_gradients.key_for_adjoint(member) for member in event_ids
+        ))
+        if len(keys) == 1:
+            key = keys[0]
+            cluster = owner_gradients.cluster_for_key(key)
+            heapq.heappush(self._simple_by_cluster[cluster], (candidate, token))
+            heapq.heappush(self._simple_by_key[key], (candidate, token))
+            self._simple_location_by_token[token] = (cluster, key)
+            return
+        heapq.heappush(self._complex, (candidate, token))
+        self._complex_event_ids[token] = event_ids
+
+    def _configure(
+        self,
+        module_name: str,
+        *,
+        row_for: Callable[[int], np.void],
+        physical_stage_for: Callable[[int], PhysicalPacketStage | None],
+        owner_gradients: OwnerGradientTracker | None,
+    ) -> None:
+        if self._configured:
+            if module_name != self._module_name:
+                raise CycleConfigurationError("ready queue changed module ownership")
+            self._row_for = row_for
+            self._physical_stage_for = physical_stage_for
+            return
+        self._configured = True
+        self._module_name = module_name
+        self._row_for = row_for
+        self._physical_stage_for = physical_stage_for
+        self._owner_gradients = owner_gradients
+        for token, candidate in self._candidate_by_token.items():
+            self._index(token, candidate)
+
+    def _peek(
+        self, heap: list[tuple[tuple[int, int], int]],
+    ) -> tuple[tuple[int, int], int] | None:
+        while heap and heap[0][1] not in self._candidate_by_token:
+            heapq.heappop(heap)
+        return heap[0] if heap else None
+
+    def _complex_candidate(self) -> tuple[tuple[int, int], int] | None:
+        owner_gradients = self._owner_gradients
+        if owner_gradients is None:
+            return self._peek(self._complex)
+        best: tuple[tuple[int, int], int] | None = None
+        for entry in self._complex:
+            candidate, token = entry
+            if token not in self._candidate_by_token:
+                continue
+            if owner_gradients.blocks_adjoint(self._complex_event_ids[token]):
+                continue
+            if best is None or candidate < best[0]:
+                best = entry
+        return best
+
+    def _earliest_acceptable(self) -> tuple[tuple[int, int], int] | None:
+        choices: list[tuple[tuple[int, int], int]] = []
+        general = self._peek(self._general)
+        if general is not None:
+            choices.append(general)
+        owner_gradients = self._owner_gradients
+        if owner_gradients is not None:
+            for cluster, heap in self._simple_by_cluster.items():
+                active = owner_gradients.active_by_cluster.get(cluster, set())
+                if len(active) < owner_gradients.slots_per_cluster:
+                    entry = self._peek(heap)
+                    if entry is not None:
+                        choices.append(entry)
+                    continue
+                for key in active:
+                    entry = self._peek(self._simple_by_key[key])
+                    if entry is not None:
+                        choices.append(entry)
+        complex_entry = self._complex_candidate()
+        if complex_entry is not None:
+            choices.append(complex_entry)
+        return min(choices, default=None)
+
+    def _remove(self, entry: tuple[tuple[int, int], int]) -> None:
+        _candidate, token = entry
+        location = self._simple_location_by_token.pop(token, None)
+        if location is not None:
+            cluster, key = location
+            key_heap = self._simple_by_key[key]
+            if self._peek(key_heap) == entry:
+                heapq.heappop(key_heap)
+            self._peek(key_heap)
+            if not key_heap:
+                del self._simple_by_key[key]
+            cluster_heap = self._simple_by_cluster[cluster]
+            if self._peek(cluster_heap) == entry:
+                heapq.heappop(cluster_heap)
+            self._peek(cluster_heap)
+            if not cluster_heap:
+                del self._simple_by_cluster[cluster]
+        elif self._peek(self._general) == entry:
+            heapq.heappop(self._general)
+        self._complex_event_ids.pop(token, None)
+        del self._candidate_by_token[token]
+
+    def pop_acceptable(
+        self,
+        width: int,
+        module_name: str,
+        *,
+        row_for: Callable[[int], np.void],
+        physical_stage_for: Callable[[int], PhysicalPacketStage | None],
+        owner_gradients: OwnerGradientTracker | None,
+    ) -> list[tuple[int, int]]:
+        self._configure(
+            module_name, row_for=row_for,
+            physical_stage_for=physical_stage_for,
+            owner_gradients=owner_gradients,
+        )
+        selected: list[tuple[int, int]] = []
+        for _ in range(min(width, len(self))):
+            entry = self._earliest_acceptable()
+            if entry is None:
+                break
+            candidate, _token = entry
+            self._remove(entry)
+            selected.append(candidate)
+        return selected
+
+
 @dataclass
 class _DependencyIndex:
     """Compressed reverse edges and mutable unsatisfied counts for one trace."""
@@ -786,7 +974,7 @@ class CycleEngine:
 
     def _pop_ready_candidates(
         self,
-        queue: list[tuple[int, int]],
+        queue: _ReadyCandidateQueue,
         module_name: str,
         *,
         row_for,
@@ -796,47 +984,11 @@ class CycleEngine:
         """Pop the earliest work whose owner-gradient epoch is acceptable."""
 
         width = self._ready_scan_window(module_name)
-        if (
-            owner_gradients is None
-            or module_name not in {"bidirectional_query", "compute_pod"}
-        ):
-            return [heapq.heappop(queue) for _ in range(min(width, len(queue)))]
-
-        def acceptable(candidate: tuple[int, int]) -> bool:
-            event_id, _stage = candidate
-            row = row_for(event_id)
-            if (
-                PrimitiveKind(int(row["primitive_kind"]))
-                is not PrimitiveKind.ADJOINT
-            ):
-                return True
-            physical_stage = physical_stage_for(event_id)
-            event_ids = (
-                physical_stage.event_ids
-                if physical_stage is not None else (event_id,)
-            )
-            return not owner_gradients.blocks_adjoint(event_ids)
-
-        heads = [heapq.heappop(queue) for _ in range(min(width, len(queue)))]
-        selected = [candidate for candidate in heads if acceptable(candidate)]
-        blocked = [candidate for candidate in heads if candidate not in selected]
-        for candidate in blocked:
-            heapq.heappush(queue, candidate)
-        needed = width - len(selected)
-        if needed <= 0 or not queue:
-            return selected
-        replacements = heapq.nsmallest(
-            needed, (candidate for candidate in queue if acceptable(candidate))
+        return queue.pop_acceptable(
+            width, module_name, row_for=row_for,
+            physical_stage_for=physical_stage_for,
+            owner_gradients=owner_gradients,
         )
-        if replacements:
-            replacement_set = set(replacements)
-            queue[:] = [
-                candidate for candidate in queue
-                if candidate not in replacement_set
-            ]
-            heapq.heapify(queue)
-            selected.extend(replacements)
-        return selected
 
     def _uses_generic_module_limits(self, module_name: str) -> bool:
         return not (
@@ -1191,7 +1343,9 @@ class CycleEngine:
         initial_ready = run_phase(
             "ready_queue", build_ready, total_iterations=int(iteration_ids.size)
         )
-        ready: dict[tuple[str, int], list[tuple[int, int]]] = defaultdict(list)
+        ready: dict[tuple[str, int], _ReadyCandidateQueue] = defaultdict(
+            _ReadyCandidateQueue
+        )
         fusion_pending: list[tuple[tuple[int, int], int, TaskKind]] = []
         fusion_inputs: dict[TaskKind, list[int]] = {
             TaskKind.FORWARD: [],
@@ -1250,9 +1404,7 @@ class CycleEngine:
                 partition = self._module_partition(
                     module_name, trace.events[event_id]
                 )
-                heapq.heappush(
-                    ready[(module_name, partition)], (event_id, stage)
-                )
+                ready[(module_name, partition)].push((event_id, stage))
             else:
                 heapq.heappush(
                     fusion_pending,
@@ -1270,9 +1422,7 @@ class CycleEngine:
                 partition = self._module_partition(
                     module_name, trace.events[event_id]
                 )
-                heapq.heappush(
-                    ready[(module_name, partition)], (event_id, stage)
-                )
+                ready[(module_name, partition)].push((event_id, stage))
             elif self.selection.query_oracle:
                 heapq.heappush(
                     fusion_oracle_inputs,
@@ -2734,8 +2884,8 @@ class CycleReplaySession:
         self._completed_through = -1
         self._completion_cycles: dict[int, int] = {}
         self._ready: dict[
-            tuple[str, int], list[tuple[int, int]]
-        ] = defaultdict(list)
+            tuple[str, int], _ReadyCandidateQueue
+        ] = defaultdict(_ReadyCandidateQueue)
         self._fusion_pending: list[tuple[int, TaskKind]] = []
         self._fusion_inputs: dict[TaskKind, list[int]] = {
             TaskKind.FORWARD: [], TaskKind.CONSUMER: [], TaskKind.ADJOINT: [],
@@ -3310,9 +3460,7 @@ class CycleReplaySession:
             partition = self.engine._module_partition(
                 module_name, self._events[event_id]
             )
-            heapq.heappush(
-                self._ready[(module_name, partition)], (event_id, stage)
-            )
+            self._ready[(module_name, partition)].push((event_id, stage))
         else:
             heapq.heappush(self._fusion_pending, (event_id, task_kind))
 
@@ -3329,9 +3477,7 @@ class CycleReplaySession:
             partition = self.engine._module_partition(
                 module_name, self._events[event_id]
             )
-            heapq.heappush(
-                self._ready[(module_name, partition)], (event_id, stage)
-            )
+            self._ready[(module_name, partition)].push((event_id, stage))
         else:
             heapq.heappush(self._fusion_inputs[task_kind], event_id)
 

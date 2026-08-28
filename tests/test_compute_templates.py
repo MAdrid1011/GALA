@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import heapq
 from dataclasses import replace
 from pathlib import Path
 
@@ -18,7 +17,9 @@ from gala_sim.timing import (
     CycleEngine,
     ModuleTiming,
 )
+from gala_sim.timing.engine import _ReadyCandidateQueue
 from gala_sim.timing.modules import ComputePod, CounterBlock, OwnerGradientTracker
+from gala_sim.timing.packets import PhysicalPacketStage
 
 
 class _Memory:
@@ -223,8 +224,9 @@ def test_ready_selection_finds_reusable_owner_epoch_beyond_fifo_head() -> None:
     tracker.register_rows(rows)
     tracker.reserve_adjoint((0,))
     tracker.reserve_adjoint((1,))
-    queue = [(event_id, 2) for event_id in range(2, 258)]
-    heapq.heapify(queue)
+    queue = _ReadyCandidateQueue()
+    for event_id in range(2, 258):
+        queue.push((event_id, 2))
 
     selected = engine._pop_ready_candidates(
         queue, "compute_pod", row_for=rows.__getitem__,
@@ -234,6 +236,86 @@ def test_ready_selection_finds_reusable_owner_epoch_beyond_fifo_head() -> None:
 
     assert selected == [(257, 2)]
     assert len(queue) == 255
+
+
+def test_ready_index_matches_full_scan_across_owner_state_changes() -> None:
+    rows = np.empty(14, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = np.arange(14)
+    rows["iteration_id"] = 1
+    rows["primitive_kind"] = int(PrimitiveKind.ADJOINT)
+    rows["state_version"] = 0
+    rows["gaussian_id"] = np.arange(14) * 20
+    rows[12]["gaussian_id"] = rows[0]["gaussian_id"]
+    rows[13]["primitive_kind"] = int(PrimitiveKind.FORWARD)
+    tracker = OwnerGradientTracker(
+        pods=4, clusters_per_pod=5, slots_per_cluster=2,
+    )
+    tracker.register_rows(rows)
+    first_key = tracker.key_for_adjoint(0)
+    second_key = tracker.key_for_adjoint(1)
+    tracker.active_by_cluster[0] = {first_key, second_key}
+    queue = _ReadyCandidateQueue()
+    remaining = [(event_id, 2) for event_id in range(2, 14)]
+    for candidate in remaining:
+        queue.push(candidate)
+
+    def acceptable(candidate: tuple[int, int]) -> bool:
+        event_id, _stage = candidate
+        if PrimitiveKind(int(rows[event_id]["primitive_kind"])) is not PrimitiveKind.ADJOINT:
+            return True
+        return not tracker.blocks_adjoint((event_id,))
+
+    for active in (
+        {first_key, second_key},
+        {tracker.key_for_adjoint(3)},
+        set(),
+    ):
+        if active:
+            tracker.active_by_cluster[0] = active
+        else:
+            tracker.active_by_cluster.clear()
+        expected = [candidate for candidate in sorted(remaining) if acceptable(candidate)][:3]
+        selected = queue.pop_acceptable(
+            3, "compute_pod", row_for=rows.__getitem__,
+            physical_stage_for=lambda _event_id: None,
+            owner_gradients=tracker,
+        )
+        assert selected == expected
+        for candidate in selected:
+            remaining.remove(candidate)
+    assert list(queue) == sorted(remaining)
+
+
+def test_ready_index_checks_multi_owner_packet_with_original_capacity_rule() -> None:
+    rows = np.empty(5, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = np.arange(5)
+    rows["iteration_id"] = 1
+    rows["primitive_kind"] = int(PrimitiveKind.ADJOINT)
+    rows["state_version"] = 0
+    rows["gaussian_id"] = np.arange(5) * 20
+    tracker = OwnerGradientTracker(
+        pods=4, clusters_per_pod=5, slots_per_cluster=2,
+    )
+    tracker.register_rows(rows)
+    tracker.reserve_adjoint((0,))
+    packet = PhysicalPacketStage(
+        stage_id=0, kind=PrimitiveKind.ADJOINT, event_ids=(1, 2),
+        lanes=(0, 1), lane_mask=0b11, query_base=0, relation_packet_id=0,
+    )
+    queue = _ReadyCandidateQueue()
+    queue.push((1, 2))
+    queue.push((3, 2))
+
+    selected = queue.pop_acceptable(
+        3, "compute_pod", row_for=rows.__getitem__,
+        physical_stage_for=lambda event_id: packet if event_id in (1, 2) else None,
+        owner_gradients=tracker,
+    )
+
+    assert selected == [(3, 2)]
+    assert list(queue) == [(1, 2)]
 
 
 def test_compute_telemetry_is_exact_and_does_not_change_cycles() -> None:

@@ -237,6 +237,16 @@ Orin 时间相除。可选 ComputePod 遥测同步保存 `177,603` 条事件时�
 仅约 `1.0007x`，说明下一技术任务是解释并缩小必要下界与受约束可达调度之间的差距，而不是用
 Orin 外推构造达标数字。
 
-完整测试当前为 `280 passed, 1 skipped, 2 warnings`。`3341x`、`3495x` 和所有公开规格
+owner-gradient 等待集合的全扫描已替换为语义等价的增量就绪索引。索引分别维护普通候选、
+单 owner-key 候选和多 key packet；cluster 有空 epoch 槽时取该 cluster 最早候选，槽满时只从
+活动 key 中取最早候选，并在所有类别之间保持原有 `(event_id, stage)` 全局顺序。该结构只优化
+模拟器软件路径，offline 和 online replay 共用，不增加被模拟硬件资源。带 ComputePod 精确遥测的
+同一最小真实 trace 从 `251.00 s` 降至 `82.14 s`，软件墙钟提速 `3.06x`，Base 仍精确为
+`70,596 cycles`；最终回归记录位于仓库外
+`GALA-runtime/records/r2_gaussian_chest_raster_ready_index_telemetry_v2/`。运行期间最大进展报告间隔
+约 `30.0 s`，未触发五分钟无进展门控。下一入口是运行同时包含 raster 和 volumetric packet 的
+中位双窗口 trace，并在相同 trace 上闭合 Base、实际机制、两类同资源 Oracle 和必要下界。
+
+完整测试当前为 `282 passed, 1 skipped, 2 warnings`。`3341x`、`3495x` 和所有公开规格
 Orin extrapolation 已彻底退出性能判断，不能作为正式结果、静态锚点、数量级检查、方向判断或
 ASIC 达标门槛。Orin 平台结果保持 `unavailable`，直到取得同套件实测向量。
