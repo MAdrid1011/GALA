@@ -534,6 +534,12 @@ class CycleEngine:
             sum(module.timing.ports for module in self.modules.values()),
         )
         while remaining_events or in_flight:
+            # Bank reservations are scoped to one cycle.  Drop old entries so
+            # long traces do not retain one dictionary item per cycle.
+            bank_busy = {
+                key: value for key, value in bank_busy.items()
+                if key[1] >= cycle
+            }
             progressed = False
             if async_memory:
                 self.config.memory.advance(cycle)  # type: ignore[attr-defined]
@@ -947,6 +953,9 @@ class CycleEngine:
                                                    memory_wakeup)
                                if point is not None and point > cycle]
                 if not next_points:
+                    if ready and any(key[1] == cycle for key in bank_busy):
+                        cycle += 1
+                        continue
                     blocked = tuple(event_id for event_id, _ in ready[:8])
                     raise CycleConfigurationError(f"deadlock at cycle {cycle}, pending={blocked}")
                 cycle = min(next_points)
@@ -1626,6 +1635,12 @@ class CycleReplaySession:
             sum(module.timing.ports for module in self.engine.modules.values()),
         )
         while self._ready or self._in_flight or self._memory_waiters:
+            # Bank reservations are scoped to one cycle.  Drop old entries so
+            # long packet streams do not retain one dictionary item per cycle.
+            self._bank_busy = {
+                key: value for key, value in self._bank_busy.items()
+                if key[1] >= self._cycle
+            }
             self._cycle_fusion_issued = 0
             self._cycle_fusion_ports: dict[str, int] = {}
             self._cycle_module_issued: dict[str, int] = {}
@@ -1697,6 +1712,11 @@ class CycleReplaySession:
                     memory_wakeup,
                 ) if point is not None and point > self._cycle]
                 if not next_points:
+                    if self._ready and any(
+                        key[1] == self._cycle for key in self._bank_busy
+                    ):
+                        self._cycle += 1
+                        continue
                     if self._ready or self._memory_waiters:
                         raise CycleConfigurationError("deadlock in online cycle replay")
                     break
@@ -1858,6 +1878,15 @@ class CycleReplaySession:
         row = self._events[event_id]
         kind = PrimitiveKind(int(row["primitive_kind"]))
         stages = self.engine._stages_for(kind)
+        if (
+            kind is PrimitiveKind.RELATION_CANDIDATE
+            and stage == len(stages) - 1
+        ):
+            self._relation_seed_inflight -= 1
+            if self._relation_seed_inflight < 0:
+                raise CycleConfigurationError(
+                    "negative relation seed FIFO occupancy"
+                )
         if kind is PrimitiveKind.CACHE_REQUEST and stage == 0 and event_id in self._cache_event_state:
             state, key, lookup = self._cache_event_state[event_id]
             if lookup is CacheLookup.MISS:

@@ -256,6 +256,26 @@ def test_online_cycle_replay_rejects_frontier_overflow_before_advancing_ids() ->
     assert session.peak_frontier_events == 0
 
 
+def test_online_cycle_releases_relation_seed_fifo_slots() -> None:
+    masks = np.zeros((2, 8), dtype=np.dtype("<u4"))
+    masks[:, 0] = 1
+    source = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 1),
+        point_ids=np.asarray([0, 1], dtype=np.int64),
+        point_keys=np.asarray([0, 0], dtype=np.uint64), masks=masks,
+        loss_flags=1, backward_confirmed=True,
+    )
+    config = replace(_config(), relation_seed_fifo_entries=1)
+    session = CycleEngine(config).online_session(
+        max_events=4, initial_gaussian_count=2,
+    )
+    session.accept_query_packet(source)
+    session.close_iteration(1)
+    result = session.finish()
+    assert result.event_counts["RELATION_CANDIDATE"] == 2
+    assert session.pending_event_count == 0
+
+
 def test_online_cycle_replay_keeps_lifecycle_events_in_same_frontier() -> None:
     masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
     masks[0, 0] = 1
