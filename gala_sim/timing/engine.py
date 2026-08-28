@@ -1641,6 +1641,7 @@ class CycleReplaySession:
                 key: value for key, value in self._bank_busy.items()
                 if key[1] >= self._cycle
             }
+            self._report_progress()
             self._cycle_fusion_issued = 0
             self._cycle_fusion_ports: dict[str, int] = {}
             self._cycle_module_issued: dict[str, int] = {}
