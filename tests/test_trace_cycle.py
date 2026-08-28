@@ -23,7 +23,12 @@ from gala_sim.timing.engine import _DependencyIndex
 from gala_sim.timing.memory import Ramulator2Backend, RecordedMemoryBackend
 from gala_sim.config import load_config
 from gala_sim.trace import NumpyChunkSink, TraceReader, TraceWriter, TraceValidationError, validate_trace
-from gala_sim.trace import VirtualQueryEventExpander, VirtualTracePacket
+from gala_sim.trace import (
+    VirtualLifecycleKind,
+    VirtualLifecycleRecord,
+    VirtualQueryEventExpander,
+    VirtualTracePacket,
+)
 from gala_sim.adapters.r2_gaussian import _push_trace_chunks
 from gala_sim.clamp.events import dependency_dtype, event_dtype
 
@@ -193,6 +198,67 @@ def test_virtual_forward_dependencies_preserve_relation_pairing() -> None:
             assert int(return_row["query_id"]) == int(forward["query_id"])
             assert int(relation_row["gaussian_id"]) == int(forward["gaussian_id"])
             assert int(return_row["gaussian_id"]) == int(forward["gaussian_id"])
+
+
+def test_online_cycle_replay_consumes_packets_without_trace_columns() -> None:
+    masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
+    masks[0, 0] = 1
+    source = VirtualTracePacket(
+        iteration_id=1,
+        template_id=1,
+        query_base=0,
+        query_shape=(1, 1),
+        point_ids=np.asarray([0], dtype=np.int64),
+        point_keys=np.asarray([0], dtype=np.uint64),
+        masks=masks,
+        loss_flags=1,
+    )
+    engine = CycleEngine(_config())
+    session = engine.online_session(
+        max_events=4, initial_gaussian_count=1, retain_completion_cycles=True
+    )
+    session.accept_query_packet(source)
+    session.close_iteration(1)
+    result = session.finish()
+    assert result.total_cycles > 0
+    assert len(result.completion_cycles) == 10
+    assert result.event_counts["RELATION"] == 1
+    assert session.pending_event_count == 0
+
+
+def test_online_cycle_replay_keeps_lifecycle_events_in_same_frontier() -> None:
+    masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
+    masks[0, 0] = 1
+    source = VirtualTracePacket(
+        iteration_id=1,
+        template_id=1,
+        query_base=0,
+        query_shape=(1, 1),
+        point_ids=np.asarray([0], dtype=np.int64),
+        point_keys=np.asarray([0], dtype=np.uint64),
+        masks=masks,
+        loss_flags=1,
+    )
+    engine = CycleEngine(_config())
+    session = engine.online_session(max_events=4, initial_gaussian_count=1)
+    session.accept_query_packet(source)
+    session.accept_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_BEGIN, 0,
+        field_mask=1, transaction_kind=2,
+    ))
+    session.accept_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_COMMIT, 0,
+        field_mask=1, transaction_kind=2, all_active=True,
+    ))
+    session.accept_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_END, 0,
+        field_mask=1, transaction_kind=2,
+    ))
+    session.close_iteration(1)
+    result = session.finish()
+    assert result.event_counts["UPDATE_BEGIN"] == 1
+    assert result.event_counts["UPDATE_COMMIT"] == 1
+    assert result.event_counts["UPDATE_END"] == 1
 
 
 def test_formal_cycle_records_but_does_not_gate_on_configuration_hash() -> None:

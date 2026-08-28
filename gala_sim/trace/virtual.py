@@ -10,7 +10,7 @@ packet and exposes deterministic lazy relation iterators for consumers.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import IntEnum
 from functools import lru_cache
 import queue
@@ -118,6 +118,11 @@ class VirtualTraceLifecycleValidator:
     _iteration_start_version: int = 0
     _iteration_start_gaussians: int = 0
     _open_update: tuple[int, int, int] | None = None
+    _open_commit_expected: tuple[int, ...] = ()
+    _open_commit_seen: set[int] = field(default_factory=set)
+    _open_commit_all_active: bool = False
+    _next_query_base: int | None = None
+    last_closed_iteration: int | None = None
     _ledgers: list[VirtualIterationLedger] | None = None
 
     def __post_init__(self) -> None:
@@ -138,6 +143,10 @@ class VirtualTraceLifecycleValidator:
             raise ValueError("virtual packet state version does not match lifecycle state")
         if self._open_update is not None:
             raise ValueError("virtual query packet arrived inside an update transaction")
+        expected_query_base = self._next_query_base
+        if expected_query_base is not None and packet.query_base != expected_query_base:
+            raise ValueError("virtual packet query base is not contiguous")
+        self._next_query_base = packet.query_base + packet.query_count
         point_ids = np.asarray(packet.point_ids, dtype=np.int64)
         if point_ids.size and not set(int(value) for value in np.unique(point_ids)).issubset(
             self.active_gaussians or set()
@@ -163,6 +172,13 @@ class VirtualTraceLifecycleValidator:
             self._open_update = (
                 record.transaction_kind, record.field_mask, record.iteration_id
             )
+            self._open_commit_expected = (
+                tuple(sorted(self.active_gaussians or ()))
+                if record.transaction_kind == TRANSACTION_OPTIMIZER and record.field_mask
+                else ()
+            )
+            self._open_commit_seen.clear()
+            self._open_commit_all_active = False
             return
         if record.kind is VirtualLifecycleKind.UPDATE_COMMIT:
             if self._open_update is None:
@@ -172,11 +188,25 @@ class VirtualTraceLifecycleValidator:
                 raise ValueError("virtual update commit is outside an optimizer transaction")
             if record.transaction_kind != transaction_kind or record.field_mask != begin_mask:
                 raise ValueError("virtual update commit does not match its transaction")
+            if not begin_mask:
+                raise ValueError("no-op update cannot contain a commit")
+            if transaction_kind != TRANSACTION_OPTIMIZER:
+                raise ValueError("collection transaction cannot contain an optimizer commit")
             if record.all_active:
+                if self._open_commit_all_active or self._open_commit_seen:
+                    raise ValueError("virtual optimizer commit is duplicated")
+                if record.gaussian_id >= 0:
+                    raise ValueError("all-active optimizer commit cannot name one Gaussian")
+                self._open_commit_all_active = True
                 self.current_optimizer_commits += len(self.active_gaussians or ())
                 return
             if record.gaussian_id not in (self.active_gaussians or set()):
                 raise ValueError("virtual update commit refers to an inactive Gaussian")
+            if record.gaussian_id in self._open_commit_seen:
+                raise ValueError("virtual optimizer Gaussian commit is duplicated")
+            if record.gaussian_id not in self._open_commit_expected:
+                raise ValueError("virtual optimizer commit is outside its begin snapshot")
+            self._open_commit_seen.add(record.gaussian_id)
             self.current_optimizer_commits += 1
             return
         if record.kind is VirtualLifecycleKind.PRUNE:
@@ -206,11 +236,19 @@ class VirtualTraceLifecycleValidator:
                 raise ValueError("virtual update end does not match its transaction")
             if record.field_mask != begin_mask:
                 raise ValueError("virtual update masks do not match")
+            if transaction_kind == TRANSACTION_OPTIMIZER and begin_mask:
+                if not self._open_commit_all_active and (
+                    self._open_commit_seen != set(self._open_commit_expected)
+                ):
+                    raise ValueError("virtual optimizer transaction has incomplete commits")
             if begin_mask:
                 self.state_version += 1
             if transaction_kind == TRANSACTION_COLLECTION:
                 self.current_collection_transactions += 1
             self._open_update = None
+            self._open_commit_expected = ()
+            self._open_commit_seen.clear()
+            self._open_commit_all_active = False
             return
         raise ValueError("unsupported virtual lifecycle record")
 
@@ -237,6 +275,7 @@ class VirtualTraceLifecycleValidator:
             physical_stream_bytes=self.current_physical_bytes,
         )
         self._ledgers.append(ledger)  # type: ignore[union-attr]
+        self.last_closed_iteration = iteration_id
         self.current_iteration = None
         self._reset_iteration_counters()
         return ledger
@@ -249,6 +288,8 @@ class VirtualTraceLifecycleValidator:
         return self.ledgers
 
     def _select_iteration(self, iteration_id: int) -> None:
+        if self.last_closed_iteration is not None and iteration_id <= self.last_closed_iteration:
+            raise ValueError("virtual iteration is not strictly increasing")
         if self.current_iteration is None:
             self.current_iteration = iteration_id
             self._iteration_start_version = self.state_version
