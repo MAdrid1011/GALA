@@ -189,6 +189,53 @@ class _ReadyCandidateQueue:
         self._candidate_by_token[token] = candidate
         if self._configured:
             self._index(token, candidate)
+        self._maybe_compact()
+
+    def _maybe_compact(self) -> None:
+        """Bound lazy-deletion overhead after repeated resource requeues.
+
+        Rejected ready work is issued again with a fresh token so the indexed
+        heaps preserve their existing ordering contract.  Long traces can
+        otherwise retain many stale entries in each secondary index.  Rebuild
+        only after the stale population is materially larger than the live
+        candidate set; this keeps normal short-queue behavior unchanged.
+        """
+
+        # Counting every secondary heap is itself linear in the number of
+        # indexed keys, so inspect the stale population at a coarse cadence.
+        # The token is monotonic and therefore also covers queues that are
+        # repeatedly drained and refilled.
+        if self._next_token % 256:
+            return
+        live = len(self._candidate_by_token)
+        heap_entries = (
+            len(self._general)
+            + len(self._replay_consumers)
+            + len(self._complex)
+            + sum(len(heap) for heap in self._simple_by_cluster.values())
+            + sum(len(heap) for heap in self._simple_by_key.values())
+        )
+        threshold = max(128, live * 4 + 64)
+        if heap_entries <= threshold:
+            return
+
+        def retain(heap: list[tuple[tuple[int, int], int]]) -> None:
+            heap[:] = [
+                entry for entry in heap if entry[1] in self._candidate_by_token
+            ]
+            heapq.heapify(heap)
+
+        retain(self._general)
+        retain(self._replay_consumers)
+        retain(self._complex)
+        for heaps in (self._simple_by_cluster, self._simple_by_key):
+            empty_keys = []
+            for key, heap in heaps.items():
+                retain(heap)
+                if not heap:
+                    empty_keys.append(key)
+            for key in empty_keys:
+                del heaps[key]
 
     def _index(self, token: int, candidate: tuple[int, int]) -> None:
         assert self._row_for is not None

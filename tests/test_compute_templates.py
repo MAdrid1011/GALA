@@ -363,6 +363,43 @@ def test_ready_index_reaches_adjoint_behind_full_replay_queue() -> None:
     assert selected == [(1, 1)]
 
 
+def test_ready_queue_compacts_stale_requeue_indexes() -> None:
+    rows = np.empty(300, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = np.arange(rows.size)
+    rows["primitive_kind"] = int(PrimitiveKind.FORWARD)
+    queue = _ReadyCandidateQueue()
+    for event_id in range(rows.size):
+        queue.push((event_id, 1))
+    queue._configure(
+        "compute_pod", row_for=rows.__getitem__,
+        physical_stage_for=lambda _event_id: None,
+        owner_gradients=None, query_replay=None,
+    )
+
+    retained = (rows.size - 1, 1)
+    for token, candidate in tuple(queue._candidate_by_token.items()):
+        if candidate != retained:
+            queue._remove((candidate, token))
+    # Requeue the high-ID candidate while lower entries are gone.  Without
+    # compaction this leaves every old token in the general heap.
+    for _ in range(256):
+        token = next(
+            token for token, candidate in queue._candidate_by_token.items()
+            if candidate == retained
+        )
+        queue._remove((retained, token))
+        queue.push(retained)
+
+    assert len(queue) == 1
+    assert len(queue._general) <= 2
+    assert queue.pop_acceptable(
+        1, "compute_pod", row_for=rows.__getitem__,
+        physical_stage_for=lambda _event_id: None,
+        owner_gradients=None, query_replay=None,
+    ) == [retained]
+
+
 def test_compute_telemetry_is_exact_and_does_not_change_cycles() -> None:
     profile = ComputeTemplateProfile(1, {
         "gradient_reduction": ComputePathProfile((
