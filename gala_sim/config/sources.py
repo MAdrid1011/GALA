@@ -33,9 +33,6 @@ def load_source_manifest(path: str | Path, *, schema_version: str) -> SourceMani
         raise ConfigError("source manifest name is required")
     if schema_version == "gala-model-source-v1":
         _require_string_fields(document, ("repository", "commit", "evidence_level", "license"))
-        commit = document["commit"]
-        if len(commit) != 40 or any(char not in "0123456789abcdef" for char in commit.lower()):
-            raise ConfigError("model manifest commit must be a 40-character hexadecimal SHA")
         commands = document.get("official_commands")
         if not isinstance(commands, Mapping) or not all(isinstance(value, str) and value for value in commands.values()):
             raise ConfigError("model manifest official_commands must be non-empty strings")

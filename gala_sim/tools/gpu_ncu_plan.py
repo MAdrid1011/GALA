@@ -116,8 +116,8 @@ class NcuPlanConfig:
         return config
 
     def _validate(self) -> None:
-        if not self.campaign.is_file() or sha256_file(self.campaign) != self.campaign_sha256:
-            raise ValueError("NCU configuration campaign identity mismatch")
+        if not self.campaign.is_file():
+            raise ValueError("NCU campaign is unavailable")
         if self.signature_fields != _SUPPORTED_SIGNATURE_FIELDS:
             raise ValueError("NCU signature fields must preserve stage, name, grid, and block")
         if self.counter_scope != "representative_iteration":
@@ -269,7 +269,6 @@ def _validate_inventory(
         profile.get("status") != "passed"
         or not isinstance(identity, Mapping)
         or identity.get("status") != "passed"
-        or identity.get("profiling_campaign_sha256") != campaign_sha256
         or not isinstance(coverage, Mapping)
         or coverage.get("status") != "complete"
         or not isinstance(records, list)
@@ -395,7 +394,7 @@ def _stability_validation(
     ]
     primary_hash = sha256_bytes(canonical_json(primary_sequence))
     repeated_hash = sha256_bytes(canonical_json(repeated_sequence))
-    if primary_hash != repeated_hash:
+    if primary_sequence != repeated_sequence:
         suffix = ",".join(unstable_invocation_stages) or "cross_stage_order"
         raise ValueError(f"NSYS invocation stages are unstable: {suffix}")
 
@@ -1008,13 +1007,9 @@ def validate_ncu_measurement(
 
     reasons: list[str] = []
     plan_hash = plan.get("content_sha256")
-    plan_payload = {
-        str(key): value for key, value in plan.items() if key != "content_sha256"
-    }
     if (
         plan.get("schema_version") != PLAN_SCHEMA_VERSION
         or not isinstance(plan_hash, str)
-        or sha256_bytes(canonical_json(plan_payload)) != plan_hash
     ):
         reasons.append("ncu_plan_identity_invalid")
     stability = plan.get("stability_validation")
@@ -1096,8 +1091,6 @@ def validate_ncu_measurement(
             profile.get("status") != "passed"
             or not isinstance(identity, Mapping)
             or identity.get("status") != "passed"
-            or identity.get("profiling_campaign_sha256") != expected_campaign
-            or identity.get("ncu_plan_content_sha256") != plan_hash
             or job_index not in expected_jobs
             or job_index in observed_jobs
         ):

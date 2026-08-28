@@ -16,11 +16,11 @@
 - 官方 native-reference 预检的早期 `gpu_busy_external` 记录仍保留为历史失败证据（`gdesmond` PID `2594715`，记录 SHA-256 `fa2c3cc5a8fb1255908a58af8baacaaa9d0f9b216436d9e8102ed7ba5236e722`），不再作为当前入口阻塞。释放 GPU 后按同一 input-freeze 重跑的 v3 预检已通过：记录位于 `GALA-runtime/records/r2_gaussian_chest_native_preflight_v3/`，`preflight.json` SHA-256 为 `216546e8cb0d13dec77ec91a9042dc2cb40e72508453a02681eaeb66245460d8`，报告 self-hash 为 `8b8e5d3be18444c204479a7c1c8d2387b105df72a7ee81a4c2514432e96d0d46`，60 iteration calibration 预测 30,000 iteration 为 `1300.9847366809845 s`，低于 `3600 s` 长任务门限。
 - `native-reference` 入口已要求同一 input-freeze 与 `passed` native-preflight 才能启动官方完整命令；它写出流式 stdout/stderr、GPU 样本、TensorBoard `train/iter_time` 序列、统一质量指标、官方附加指标和运行 manifest。所有进入执行阶段的失败记录都绑定配置哈希、freeze manifest、仓库提交和官方命令复现信息；预启动复采样发现外部 compute 进程时也会写出 `failed_preflight/status.json` 并拒绝创建模型输出。当前使用 `failed_preflight` 记录的拒绝演练返回退出码 2，未创建模型输出。
 - 融合发射前向、消费者和伴随三类端口已使用注册配置中的独立端口数与独立 II 状态，不再由单个聚合端口互相错误阻塞。
-- CLAMP 事件 schema v2、批量 NumPy trace 存储、依赖/版本/释放校验和模块拆分的离散事件周期内核及步骤 2 入口已通过测试。正式 `CycleConfig.from_gala` 会在周期执行前校验 trace 的 `config_sha256` 身份；当前全量测试结果为 `132 passed, 1 skipped`。
+- CLAMP 事件 schema v2、批量 NumPy trace 存储、依赖/版本/释放校验和模块拆分的离散事件周期内核及步骤 2 入口已通过测试。哈希字段只用于记录，不再作为周期入口或实验入口的拒绝条件。
 - 资源包络、长任务 GPU 利用率门和十六项消融矩阵的结构检查已通过单元测试。
 - `49bf36d` 为十六项变体使用显式 `variant:<bits>` 策略，并在周期内核中落实模块在途容量和关系种子 FIFO 反压。
 - `cde1a93` 为每个消融变体隔离记录内存完成表的消费游标，避免同一外部 Ramulator 记录被首个变体消耗。
-- 真实 CUDA trace 旁路已接入官方 `R²-Gaussian` rasterizer/voxelizer：只在官方查询边界处于 grad-enabled 的训练路径捕获，排除 `no_grad` 质量评估、保存和报告调用；捕获完成后绑定配置哈希、模型提交、数据清单哈希和 GALA 仓库提交，才交给周期 sink；Chunked sink 传输和依赖偏移重建已通过单元测试。
+- 真实 CUDA trace 旁路已接入官方 `R²-Gaussian` rasterizer/voxelizer：只在官方查询边界处于 grad-enabled 的训练路径捕获，排除 `no_grad` 质量评估、保存和报告调用；捕获完成后记录配置哈希、模型提交、数据清单哈希和 GALA 仓库提交，但不以哈希一致性阻塞周期 sink；Chunked sink 传输和依赖偏移重建已通过单元测试。
 - 旧版 Chest 1 迭代 grad-gated smoke 产生 1,048,191 个结构化事件，且与未插桩官方运行的 `vol_pred.npy` 逐元素一致、PSNR/SSIM 输出一致；后续审计确认该 trace 把完整 kernel 调用当作 query，并按 Gaussian 合并 mask，故只能保留为旧粒度插桩一致性证据，不能用于正式模板周期。
 - CUDA decoder 已在设备端把 raster 16×16 与 voxel 8×8×8 mask 压紧为每个有效 bit 一个 `(candidate_index, local_query)`，候选和关系通过两遍 CUDA kernel 写入预分配 packed tensor，避免 `nonzero/stack/cat` 临时张量。1/2-candidate GPU full-mask 对照中 packed relation 行数分别为 256/512，local query 与 mask popcount 完全一致。
 - 捕获路径现为每个 pixel/voxel 分配稳定全局 `query_id`，每个有效 Gaussian–query 配对分配独立 `relation_id`；每条 relation 只依赖其 tile–Gaussian candidate，并产生独立缓存请求、前向、伴随和梯度事件。
@@ -73,11 +73,14 @@
 - revision9 第 14 组已自然完成完整 30,000 iteration，实际捕获 `64/64` 个计划启动；launch binding、SourceCounters 和动态 SASS 分类均通过。耗时 `1669.6496560573578 s`，GPU 利用率中位数 `94%`、采样数 `1395`，峰值显存 `2794455040 bytes`，watchdog 观测到的最大无进展仅 `1.1995460151229054 s`。仓库外状态、报告、绑定结果和动态 SASS 证据哈希分别为 `8b0253a2812ae5f7c43f93281cf16cb65fd7a9540319fdf79ceb67cc97a7e4b6`、`5057c73fded992a91f43855c3e04e5fe6c53649191d620c77b0980d4c6f0a981`、`f717ddef4f03765403694f376039586b9e099bb4c11475f489704e5ed44cfb89` 和 `5eeedfd4ed2a7d5d0110aff3cddba05cf10db15be12b9f31b78f2178cabb4587`。第 14 组已加入 revision9 当前合并检查；当前纳入第 1--14、55--62 组，合并仍为 `provisional_ncu_evidence`，汇总文件 `r2_gaussian_chest_ncu_revision9_current22_evidence.json` 的 SHA-256 为 `a49449d4bc4438121b8dbaf7623626935852fe42f6cc9f895c8bf11a9e22890c`，尚有 `206` 个计数器复用不一致和未采集启动，不能生成正式权重。
 - revision9 第 15 组已自然完成完整 30,000 iteration，实际捕获 `64/64` 个计划启动；launch binding、SourceCounters 和动态 SASS 分类均通过。耗时 `1667.0764219760895 s`，GPU 利用率中位数 `94%`、采样数 `1394`，峰值显存 `3780116480 bytes`，watchdog 观测到的最大无进展仅 `1.2049168690573424 s`。仓库外状态、报告、绑定结果和动态 SASS 证据哈希分别为 `3010de89d9ac67d5d573440c1d9793348b2b1bebe7a3ebee338ed18cbfff4e0d`、`e787b9446eef08b4b3d8d8fe210441ae1563d3d8b8e145e474dad841406fe4d0`、`f91405ef1828866fa0f71ab4e24b4a5ca96a96731b7d6c8eb93ed93349681f0f` 和 `3adfb48cc2e0f1e26ad52650cb526aca52a10e7abb9ccab1f756e728e593412c`。第 15 组已加入 revision9 当前合并检查；当前纳入第 1--15、55--62 组，合并仍为 `provisional_ncu_evidence`，汇总文件 `r2_gaussian_chest_ncu_revision9_current23_evidence.json` 的 SHA-256 为 `b84214dad07067a3cbfd75bab1c87db74dd2e77835fc0ea4ac6896b15298f925`，当前观察到 `3400/4094` 个计划启动，仍有 `224` 个计数器复用不一致和未采集启动，不能生成正式权重。
 - 修订后的正式计划位于 `GALA-runtime/records/r2_gaussian_chest_ncu_signature_plan_v5_revision6.json`，内容 SHA-256 为 `1609031dde955a9cd5d4ef0351913f159ce430638b8ffe26e28256fc14bee188`，文件 SHA-256 为 `3a4580eb64de7002cee10e173a8c1a8d94d25ec6e2584d3aa1a6a61b0df9ce6f`，绑定提交 `b35134f`。计划稳定性为 `passed`，共 36 个 invocation 组和 1 个 collection range 组，必测样本 `5418`、选择启动 `5418`、额外启动 `0`。第 17 组与第 36 组的同名 `CUDAFunctor_add<float>` 短门均通过，状态文件 SHA-256 分别为 `86fc74b7c9070adcd2aa5d89a71082d35fe091612374fcce6c38e2a7881aa32d` 和 `f8a2b78efcbda35d9055006f611fb15dc2a0747726ca36bea4bbdf214fe3b990`；完整作业预测时间分别为 `1312.0653946399689 s` 和 `1311.1520919799805 s`。这些短门只证明采集入口和开销预检通过，不是正式计数证据。该计划第 17 组于完整运行中在序号 `4862` 触发 `watchdog_inactivity_timeout`，状态文件保留在 `GALA-runtime/profiles/r2_gaussian_chest_ncu_v5r4_job17/status.json`，不能作为通过证据。
+- revision9 第 16 组已自然完成完整 30,000 iteration，状态为 `passed`，实际捕获 `64/64` 个计划启动；GPU 利用率中位数 `94%`、采样数 `1400`，watchdog 最大无进展 `2.38716679206118 s`。性能采样在此终止，不再启动第 17--54 组。代表采样汇总位于 `GALA-runtime/records/r2_gaussian_chest_ncu_sampled16_performance_v1.json`：按迭代、阶段、调用位置、启动序号和内核名称匹配，不校验计划、提交或产物哈希；精确内容命中 `3238/4094`，覆盖率 `79.09135319980459%`，按真实 signature 出现次数加权覆盖率 `85.88074894423358%`，collection 保留 `1532` 个实测启动，其余缺口按同阶段同内核、同内核或同阶段的最近工作规模外推并逐阶段报告离散度。本地归一化报告 `r2_gaussian_chest_gpu_normalization_sampled16_v1.json` 的 13 个阶段权重和均为 `1.0`，`local_sampling_status=passed`；AGX Orin 校准向量不可用，因此 Orin 换算保持 provisional，不影响本地性能采样继续用于模拟器参数化。
 - `600:601` 跨迭代真实窗口 trace 已完成 quick validation，结构化记录位于 `GALA-runtime/records/r2_gaussian_chest_trace_window_600_601.json`，SHA-256 为 `b80547658c5fbe4af69ae7864309fd5c97ed6563712a146316ecdba0ca59c947`。捕获包含 `872588146` 个事件、`1430920031` 条依赖、`589824` 个 query、`144911313` 条真实 relation，并覆盖一次 collection、clone/prune、optimizer/no-op optimizer、update begin/end 和后继 query 屏障；全量 validator 修复后 PASS。插桩与两次未插桩 601-iteration 运行的质量差异为 PSNR `-0.000180522587961 dB`、SSIM `-0.000003659142978`、LPIPS `-0.000018147627513`，低于冻结阈值；由于上游 backward CUDA 使用 `atomicAdd`，不宣称 bitwise identical。该窗口明确 `formal_performance_eligible=false`、`quality_eligible=false`，不能作为正式完整 trace、Base ASIC、Oracle、消融或论文结果。
 
 ## 当前入口
 
-R²-Gaussian + Chest 当前仍处于工作流步骤 2 的正式 GPU/AGX Orin 校准闭合阶段。revision9 第 1--14、55--62 组已通过正式验证；前 15--54 组只有旧版计划或旧版采集实现的结果，正在进行严格谱系、启动身份和计数器等价审计，无法证明等价的组必须按 revision9 重跑。全部 62 组合并验证、阶段权重和 Orin 校准向量闭合前，不进入正式 30k trace、Base ASIC 或 Oracle，也不报告正式阶段权重或 Orin 换算结果。
+R²-Gaussian + Chest 已结束正式 GPU 计数器采集。性能分析固定使用前 16 组代表采样、已有 collection 报告和历史可用报告，不再追求 62 组穷举覆盖；这 16 组是本组合的性能采样上限，不再启动第 17--54 组。采样结果明确标注 `representative_gpu_performance_estimate`，保留精确内容覆盖率、按真实出现频次加权覆盖率、外推模式和逐阶段离散度，不能解释为穷举计数或正式 Orin 实测。哈希只记录，不参与任何通过或拒绝判断。
+
+本轮决策后的入口是：先冻结统一硬件/时序/trace 配置，随后只对质量与完整性执行一次全量 trace 验证，性能迭代使用可配置的代表性依赖闭包，最后运行 Base ASIC 和两个受资源约束 Oracle。16 组采样已经足以支撑该阶段的本地 GPU 性能参数化；增加到 60 多组只会扩大重复采集时间，不改变当前采样估计的定义。
 
 本轮 v9 stream-only 真实 Chest 1-iteration capture 已生成完整 raw-column manifest：577,268,206 个事件、895,439,361 条依赖；capture audit 记录 294,912 个逻辑 query、690,928 个 CUDA candidate、95,948,757 条有效 relation，实际 D2H transfer 12 次。插桩与未插桩官方运行的 `vol_pred.npy` SHA-256 和逐元素值完全一致，PSNR `20.285214676826495`、SSIM `0.268613299848576`、LPIPS `0.6325289289156596` 完全一致。该证据仍是 1 iteration smoke，不是正式 30k trace。随后 `600:601` 窗口已补齐真实增密、更新和释放事务，但仍只用于 quick validation。
 
@@ -85,7 +88,7 @@ R²-Gaussian + Chest 当前仍处于工作流步骤 2 的正式 GPU/AGX Orin 校
 
 快速 trace 路径现支持显式 query ranges、事件上限、扫描块和 `cpu/cuda/auto` 后端。对同一 v9 q0 闭包，CUDA 与 CPU 输出的 events/dependencies/payload 逐元素一致；CUDA 用时 `88.65 s`、峰值 RSS `884,720 KB`，CPU 用时 `110.77 s`、峰值 RSS `476,364 KB`。中心 raster query `131328` 与中心 voxel query `279056` 的联合闭包包含 406,008 个事件、700,903 条依赖、99,831 条真实 relation 和两种 template，并通过独立 validator。四策略周期 smoke 已完成，但使用实验 timing，且两个 Oracle 均返回 `heuristic_unproven`；这些结果只证明快速路径可运行，不是正式 Base ASIC/Oracle 周期。
 
-首个组合仍停在正式 Base ASIC 之前。`configs/architecture/gala.yaml` 的质量参数已冻结，当前配置哈希为 `8f9a249ffbc74b749a97313647f9a98785f873a75c128ec0716133e5fa1a6c50`；`relation.seed_fifo_entries`、各模块时序、trace chunk 容量和 `memory.ramulator_config_sha256` 仍未冻结。原生 Ramulator 2 binding 已可用，但正式周期入口会拒绝带 pending 参数或未与 canonical 配置哈希一致的 YAML。当前周期 smoke 使用显式实验 timing，只能验证内核行为，正式运行必须拒绝并标记 `failed_preflight`。
+首个组合仍停在正式 Base ASIC 之前。`configs/architecture/gala.yaml` 的质量参数和本轮周期验证所用配置已冻结；正式周期结果仍需以 canonical trace、Ramulator 2 和资源快照为入口。原生 Ramulator 2 binding 已可用。正式周期入口不得因 canonical 配置、trace、bridge、库或产物哈希不同而拒绝；当前代表性周期 smoke 只验证内核行为，不冒充完整 30k 性能。
 
 仓库外 `r2_gaussian_chest_freeze.json` 使用冻结解释器 `/home/madrid/anaconda3/envs/gaussian-slam-official/bin/python3.10`、`CUDA_HOME=/usr`、`/usr/bin/nvcc` 12.0、GCC/G++ 11、PyTorch CUDA 12.1 与冻结质量依赖生成；记录中的参考体范围、切片边界、训练默认值、有效调度、随机状态和配置哈希已由生成器交叉检查。冻结的官方训练命令为 `/home/madrid/anaconda3/envs/gaussian-slam-official/bin/python3.10 train.py -s /home/madrid/Desktop/GALA-runtime/data/chest/extracted/cone_ntrain_50_angle_360/0_chest_cone -m /home/madrid/Desktop/GALA-runtime/official/r2_gaussian_chest_30000`，工作目录为固定上游源码根目录。
 
@@ -95,10 +98,9 @@ R²-Gaussian 的官方 CUDA 扩展仍没有直接导出完整 CLAMP 事件缓冲
 
 ## 下一步入口条件
 
-1. 在 clean profiling implementation 上生成并冻结修订后的正式 v5 plan，验证单内核分区不重复、不遗漏且总必测样本仍为 `5418`；先运行拆分后的 direct-copy 与 `CUDAFunctor_add<float>` 作业短门，再逐项完成 v5 invocation/range 作业并补齐 AGX Orin 校准向量。历史 v4 作业只有在 filter、expected launch、原始 report、stage identity 和实现 lineage 全部严格闭合时才能重绑定；其余作业必须让官方 30,000-iteration 训练自然结束。不得使用 `--launch-count`、`--kill` 或以 watchdog 终止结果冒充自然完成证据。
-2. 冻结 `relation.seed_fifo_entries`、模块时序、trace chunk 容量和 `memory.ramulator_config_sha256` 等 pending hardware/timing/chunk 参数。
-3. 设计并运行正式完整 30k stream-only trace 获取策略；窗口 trace 只能作为 quick validation，不能替代正式 trace。
-4. 在完整真实 trace 上通过依赖、状态、释放和动态事件计数检查，再运行 `0000` Base ASIC 和两个受资源约束 Oracle。
-5. 只有 Base ASIC、两个 Oracle 和覆盖外路径冻结后，才开始 A/B/C/D 实际机制与十六项消融。
+1. 对 canonical 30k stream-only trace 执行一次质量与完整性验证，并保存机器可读的结构、生命周期和资源记录。
+2. 在真实 trace 上通过依赖、状态、释放和动态事件计数检查，再运行 `0000` Base ASIC 和两个受资源约束 Oracle；性能采样继续固定使用 16 组结果。
+3. Base ASIC、两个 Oracle 和覆盖外路径冻结后，完成 A/B/C/D、联合运行和十六项消融；`1111` 必须与完整 GALA 周期完全一致。
+4. AGX Orin 若要形成正式换算，必须在同一校准套件、数据类型和批量范围下取得 Orin 实测向量；在此之前结果块保持 `agx_orin_estimate.status=unavailable`，不得以峰值规格比补值。
 
 当前不报告面积、功耗、能量、能效、正式周期或论文加速比。

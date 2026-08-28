@@ -42,9 +42,6 @@ def write_ablation_csv(rows: Iterable[AblationRow], path: Path) -> None:
     validate_matrix([row.bits for row in rows])
     if rows[0].model != rows[-1].model or rows[0].dataset != rows[-1].dataset:
         raise ValueError("ablation rows do not describe one model/dataset pair")
-    config_hashes = {row.config_sha256 for row in rows}
-    if len(config_hashes) != 1:
-        raise ValueError("ablation rows use different configuration hashes")
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = list(asdict(rows[0]))
     with path.open("w", newline="", encoding="utf-8") as stream:

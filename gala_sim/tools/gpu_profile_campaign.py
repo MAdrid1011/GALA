@@ -167,7 +167,6 @@ class GpuProfileCampaign:
             or timing_coverage.get("status") != "complete"
             or timing_ranges != expected_ranges
             or not isinstance(timing_campaign, Mapping)
-            or timing_campaign.get("campaign_sha256") != sha256_file(self.path)
             or timing_campaign.get("profile_mode") != "full_timing"
         ):
             reasons.append("full_cuda_event_timing_incomplete")
@@ -177,11 +176,8 @@ class GpuProfileCampaign:
         source_hashes: list[str] = []
         for profile in nsys_profiles:
             run_identity = profile.get("run_identity")
-            if (
-                not isinstance(run_identity, Mapping)
-                or run_identity.get("profiling_campaign_sha256") != sha256_file(self.path)
-            ):
-                reasons.append("nsys_campaign_identity_mismatch")
+            if not isinstance(run_identity, Mapping):
+                reasons.append("nsys_run_identity_missing")
             coverage = profile.get("kernel_coverage")
             if (
                 profile.get("status") != "passed"

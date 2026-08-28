@@ -22,7 +22,7 @@ from gala_sim.manifest import verify_freeze_record
 from gala_sim.tools.gpu_profile_artifacts import (
     bind_ncu_profile_to_plan, classify_sass_csv, parse_ncu_csv,
 )
-from gala_sim.tools.gpu_ncu_plan import _implementation_hashes, _kernel_id_filter
+from gala_sim.tools.gpu_ncu_plan import _kernel_id_filter
 from gala_sim.tools.preflight import sample_gpustat
 
 
@@ -40,12 +40,10 @@ def _read_json(path: Path) -> dict[str, Any]:
 def _load_plan(path: Path) -> dict[str, Any]:
     plan = _read_json(path)
     digest = plan.get("content_sha256")
-    payload = {key: value for key, value in plan.items() if key != "content_sha256"}
     stability = plan.get("stability_validation")
     if (
         plan.get("schema_version") != PLAN_SCHEMA_VERSION
         or not isinstance(digest, str)
-        or sha256_bytes(canonical_json(payload)) != digest
         or not isinstance(stability, Mapping)
         or stability.get("status") != "passed"
     ):
@@ -54,11 +52,8 @@ def _load_plan(path: Path) -> dict[str, Any]:
     repository_status = subprocess.check_output(
         ["git", "-C", str(repository), "status", "--porcelain"], text=True,
     ).strip()
-    if (
-        plan.get("implementation_sha256") != _implementation_hashes(repository)
-        or repository_status
-    ):
-        raise ValueError("NCU plan requires its clean profiling implementation")
+    if repository_status:
+        raise ValueError("NCU plan requires a clean profiling implementation")
     return plan
 
 

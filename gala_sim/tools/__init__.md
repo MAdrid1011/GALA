@@ -8,4 +8,4 @@
 
 ## Internal Helpers
 
-无内部实现；具体行为分别位于 `preflight.py`、`cycle_preflight.py`、`gpu_calibration.py`、`gpu_profile_artifacts.py`、`gpu_profile_campaign.py`、`gpu_ncu_plan.py`、`gpu_ncu_runner.py` 和 `gpu_normalization.py`。
+无内部实现；具体行为分别位于 `preflight.py`、`cycle_preflight.py`、`gpu_calibration.py`、`gpu_profile_artifacts.py`、`gpu_profile_campaign.py`、`gpu_ncu_plan.py`、`gpu_ncu_runner.py`、`gpu_ncu_sampling.py` 和 `gpu_normalization.py`。

@@ -37,7 +37,7 @@ def test_quality_config_loads_frozen_chest_protocol() -> None:
     assert quality.lpips_version == "0.1"
     assert quality.lpips_backbone_sha256.startswith("7be5be79")
     assert quality.lpips_calibration_sha256.startswith("df73285e")
-    assert not config.ready
+    assert config.ready
 
 
 def test_quality_config_loads_frozen_orthogonal_slice_lists() -> None:

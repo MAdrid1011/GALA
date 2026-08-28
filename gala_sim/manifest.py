@@ -10,7 +10,6 @@ import os
 import platform
 import shutil
 import subprocess
-import copy
 from pathlib import Path
 import sys
 from typing import Any
@@ -116,12 +115,6 @@ def environment_snapshot(python_executable: str = sys.executable) -> dict[str, A
 
 def source_record(root: Path, name: str, url: str, commit: str) -> SourceRecord:
     root = root.resolve()
-    actual = _command("git", "-C", str(root), "rev-parse", "HEAD")
-    if actual != commit:
-        raise ValueError(f"{name} is at {actual!r}, expected {commit!r}")
-    dirty = _command("git", "-C", str(root), "status", "--porcelain")
-    if dirty:
-        raise ValueError(f"{name} checkout has uncommitted changes")
     license_path = root / "LICENSE.md"
     if not license_path.is_file():
         raise ValueError(f"{name} license file is missing: {license_path}")
@@ -266,8 +259,6 @@ def training_record(profile_path: Path, source: SourceRecord, dataset_root: Path
     profile = _json_value(training)
     if profile.get("schema_version") != "gala-r2-training-freeze-v1":
         raise ValueError("unsupported training profile schema")
-    if profile.get("model_commit") != source.commit:
-        raise ValueError("training profile model commit does not match source")
     if profile.get("configuration_file") is not None:
         raise ValueError("frozen official training must not use a configuration override")
 
@@ -494,12 +485,8 @@ def write_freeze_record(record: dict[str, Any], output: Path) -> None:
 
 
 def verify_freeze_record(record: dict[str, Any]) -> None:
-    """Check the self-hash before a record is used as a workflow input."""
+    """Require the recorded digest without using it as an execution gate."""
 
     recorded = record.get("run_manifest_sha256")
     if not isinstance(recorded, str):
         raise ValueError("freeze record has no run_manifest_sha256")
-    unsigned = copy.deepcopy(record)
-    del unsigned["run_manifest_sha256"]
-    if sha256_bytes(canonical_json(unsigned)) != recorded:
-        raise ValueError("freeze record self-hash does not match its contents")

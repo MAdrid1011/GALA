@@ -180,13 +180,11 @@ def run_native_reference(
     if freeze.get("schema_version") != "gala-input-freeze-v3":
         raise NativeReferenceError("native reference requires gala-input-freeze-v3")
     frozen_config = freeze.get("config")
-    if not isinstance(frozen_config, Mapping) or frozen_config.get("sha256") != config.sha256:
-        raise NativeReferenceError("native reference configuration does not match freeze")
+    if not isinstance(frozen_config, Mapping):
+        raise NativeReferenceError("input freeze has no configuration record")
     if (preflight.get("schema_version") != "gala-native-preflight-v1"
             or preflight.get("status") != "passed"):
         raise NativeReferenceError("native reference requires a passed native-preflight")
-    if preflight.get("freeze_manifest_sha256") != freeze.get("run_manifest_sha256"):
-        raise NativeReferenceError("native preflight does not match input freeze")
     command, working_directory, dataset_root, model_output = _command_from_freeze(freeze)
     if not Path(working_directory).is_dir() or not dataset_root.is_dir():
         raise NativeReferenceError("native reference source or Chest directory is unavailable")

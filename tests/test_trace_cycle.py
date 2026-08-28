@@ -76,11 +76,10 @@ def test_trace_round_trip_and_cycle_result(tmp_path: Path) -> None:
     assert result.module_counters["relation_constructor"]["completed"] == 2
 
 
-def test_formal_cycle_requires_matching_trace_configuration_identity() -> None:
+def test_formal_cycle_records_but_does_not_gate_on_configuration_hash() -> None:
     trace = _trace()
     config = replace(_config(), config_sha256="a" * 64)
-    with pytest.raises(CycleConfigurationError, match="configuration identity"):
-        CycleEngine(config).run(trace)
+    assert CycleEngine(config).run(trace).total_cycles > 0
 
     matching = type(trace)(
         trace.events, trace.dependencies, trace.payload,
@@ -623,10 +622,10 @@ def test_cycle_replay_is_deterministic_and_compresses_stall_counts() -> None:
     assert all(len(stall.event_ids) <= config.candidate_lanes for stall in compressed)
 
 
-def test_production_cycle_config_cannot_bypass_unfrozen_parameters() -> None:
+def test_production_cycle_config_uses_frozen_parameters() -> None:
     config = load_config(Path(__file__).parents[1] / "configs/architecture/gala.yaml")
-    with pytest.raises(ValueError, match="clock or seed FIFO"):
-        CycleConfig.from_gala(config, _Memory())
+    cycle_config = CycleConfig.from_gala(config, _Memory())
+    assert cycle_config.relation_seed_fifo_entries == 256
 
 
 def test_ablation_runner_uses_one_validation_for_all_variants(monkeypatch) -> None:

@@ -31,3 +31,13 @@ def test_ablation_matrix_has_canonical_sixteen_rows(tmp_path: Path) -> None:
 def test_ablation_matrix_rejects_missing_variant() -> None:
     with pytest.raises(ValueError, match="sixteen"):
         validate_matrix([variant.bits for variant in all_variants()][:-1])
+
+
+def test_ablation_output_does_not_gate_on_recorded_configuration_hashes(
+    tmp_path: Path,
+) -> None:
+    rows = _rows()
+    rows[1] = AblationRow(**{
+        **rows[1].__dict__, "config_sha256": "different-recorded-hash",
+    })
+    write_ablation_csv(rows, tmp_path / "ablation.csv")

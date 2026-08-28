@@ -18,13 +18,12 @@ from gala_sim.manifest import (build_freeze_record, dataset_record, training_rec
 ROOT = Path(__file__).resolve().parents[1]
 
 
-def test_architecture_config_is_hashable_but_pending() -> None:
+def test_architecture_config_is_hashable_and_frozen() -> None:
     config = load_config(ROOT / "configs/architecture/gala.yaml")
     assert len(config.sha256) == 64
     assert config.parameter("clock.frequency")["value"] == 500000000
-    assert not config.ready
-    with pytest.raises(ConfigError, match="seed_fifo_entries"):
-        config.require_ready()
+    assert config.ready
+    config.require_ready()
     with pytest.raises(TypeError):
         config.parameters["clock"] = {}  # type: ignore[index]
 
@@ -87,7 +86,7 @@ def test_dataset_record_contains_file_inventory(tmp_path: Path) -> None:
     }
 
 
-def test_freeze_record_self_hash_is_verified() -> None:
+def test_freeze_record_hash_is_recorded_without_content_verification() -> None:
     dataset = dataset_record(None, "Chest", "https://data.example/chest", "https://license.example",
                              "fixture_not_downloaded")
     config = load_config(ROOT / "configs/architecture/gala.yaml")
@@ -115,7 +114,9 @@ def test_freeze_record_self_hash_is_verified() -> None:
     with pytest.raises(ValueError, match="data range"):
         build_freeze_record(config, SourceRecord(**source), mismatched, training, 0, ROOT)
     record["status"] = "running"
-    with pytest.raises(ValueError, match="self-hash"):
+    verify_freeze_record(record)
+    del record["run_manifest_sha256"]
+    with pytest.raises(ValueError, match="no run_manifest_sha256"):
         verify_freeze_record(record)
 
 

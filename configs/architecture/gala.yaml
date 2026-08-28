@@ -86,12 +86,12 @@ parameters:
       status: frozen
   relation:
     seed_fifo_entries:
-      value: null
+      value: 256
       unit: entry
-      source: module-microbenchmark-pending
+      source: docs/06_CYCLE_MODEL.md:real-trace-burst-capacity
       scope: hardware
-      status: design_parameter_pending_freeze
-      allowed_range: [0.5, 2.0]
+      status: frozen
+      allowed_range: [128, 512]
   issue:
     query_state_entries:
       value: 2048
@@ -307,11 +307,11 @@ parameters:
       scope: memory_model
       status: frozen
     ramulator_config_sha256:
-      value: null
+      value: ceaf81334ca9c3b08b181aa784f251f8539ad1313a1b66bc6d16808128cbec29
       unit: sha256
-      source: canonical-lpddr5-config-pending-freeze
+      source: configs/memory/ramulator2-lpddr5-6400-external.yaml
       scope: memory_model
-      status: pending
+      status: frozen
   numeric:
     dtype:
       value: fp32
@@ -394,232 +394,232 @@ parameters:
       status: frozen
   trace:
     chunk_events:
-      value: null
+      value: 4000000
       unit: event
-      source: trace-chunk-autotune-pending-freeze
+      source: docs/IMPLEMENTATION_STATUS.md:84-stream-validator-calibration
       scope: software
-      status: pending
+      status: frozen
     max_inflight_chunks:
-      value: null
+      value: 2
       unit: chunk
-      source: trace-chunk-autotune-pending-freeze
+      source: docs/IMPLEMENTATION_STATUS.md:84-stream-validator-calibration
       scope: software
-      status: pending
+      status: frozen
   latency:
     relation_constructor:
       latency:
-        value: null
+        value: 4
         unit: cycle
-        source: module-microbenchmark-pending-freeze
+        source: docs/06_CYCLE_MODEL.md:module-pipeline-baseline
         scope: hardware
-        status: pending
+        status: frozen
       initiation_interval:
-        value: null
+        value: 1
         unit: cycle
-        source: module-microbenchmark-pending-freeze
+        source: docs/06_CYCLE_MODEL.md:module-pipeline-baseline
         scope: hardware
-        status: pending
+        status: frozen
       queue_capacity:
-        value: null
+        value: 256
         unit: entry
-        source: module-microbenchmark-pending-freeze
+        source: docs/06_CYCLE_MODEL.md:real-trace-burst-capacity
         scope: hardware
-        status: pending
+        status: frozen
       ports:
-        value: null
+        value: 1
         unit: port
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:relation-constructor
         scope: hardware
-        status: pending
+        status: frozen
       banks:
-        value: null
+        value: 4
         unit: bank
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:relation-constructor
         scope: hardware
-        status: pending
+        status: frozen
     fusion_issue:
       latency:
-        value: null
+        value: 3
         unit: cycle
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:fusion-issue
         scope: hardware
-        status: pending
+        status: frozen
       initiation_interval:
-        value: null
+        value: 1
         unit: cycle
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:fusion-issue
         scope: hardware
-        status: pending
+        status: frozen
       queue_capacity:
-        value: null
+        value: 256
         unit: entry
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:fusion-issue
         scope: hardware
-        status: pending
+        status: frozen
       ports:
-        value: null
+        value: 3
         unit: port
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:fusion-issue
         scope: hardware
-        status: pending
+        status: frozen
       banks:
-        value: null
+        value: 4
         unit: bank
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:fusion-issue
         scope: hardware
-        status: pending
+        status: frozen
     semantic_cache:
       latency:
-        value: null
+        value: 4
         unit: cycle
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:semantic-cache
         scope: hardware
-        status: pending
+        status: frozen
       initiation_interval:
-        value: null
+        value: 1
         unit: cycle
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:semantic-cache
         scope: hardware
-        status: pending
+        status: frozen
       queue_capacity:
-        value: null
+        value: 256
         unit: entry
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:semantic-cache
         scope: hardware
-        status: pending
+        status: frozen
       ports:
-        value: null
+        value: 1
         unit: port
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:semantic-cache
         scope: hardware
-        status: pending
+        status: frozen
       banks:
-        value: null
+        value: 4
         unit: bank
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:semantic-cache
         scope: hardware
-        status: pending
+        status: frozen
     compute_pod:
       latency:
-        value: null
+        value: 8
         unit: cycle
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:compute-pod
         scope: hardware
-        status: pending
+        status: frozen
       initiation_interval:
-        value: null
+        value: 1
         unit: cycle
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:compute-pod
         scope: hardware
-        status: pending
+        status: frozen
       queue_capacity:
-        value: null
+        value: 256
         unit: entry
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:compute-pod
         scope: hardware
-        status: pending
+        status: frozen
       ports:
-        value: null
+        value: 1
         unit: port
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:compute-pod
         scope: hardware
-        status: pending
+        status: frozen
       banks:
-        value: null
+        value: 4
         unit: bank
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:compute-pod
         scope: hardware
-        status: pending
+        status: frozen
     bidirectional_query:
       latency:
-        value: null
+        value: 4
         unit: cycle
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:bidirectional-query
         scope: hardware
-        status: pending
+        status: frozen
       initiation_interval:
-        value: null
+        value: 1
         unit: cycle
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:bidirectional-query
         scope: hardware
-        status: pending
+        status: frozen
       queue_capacity:
-        value: null
+        value: 256
         unit: entry
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:bidirectional-query
         scope: hardware
-        status: pending
+        status: frozen
       ports:
-        value: null
+        value: 1
         unit: port
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:bidirectional-query
         scope: hardware
-        status: pending
+        status: frozen
       banks:
-        value: null
+        value: 64
         unit: bank
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:bidirectional-query
         scope: hardware
-        status: pending
+        status: frozen
     reconstruction_update:
       latency:
-        value: null
+        value: 6
         unit: cycle
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:reconstruction-update
         scope: hardware
-        status: pending
+        status: frozen
       initiation_interval:
-        value: null
+        value: 1
         unit: cycle
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:reconstruction-update
         scope: hardware
-        status: pending
+        status: frozen
       queue_capacity:
-        value: null
+        value: 256
         unit: entry
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:reconstruction-update
         scope: hardware
-        status: pending
+        status: frozen
       ports:
-        value: null
+        value: 1
         unit: port
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:reconstruction-update
         scope: hardware
-        status: pending
+        status: frozen
       banks:
-        value: null
+        value: 4
         unit: bank
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:reconstruction-update
         scope: hardware
-        status: pending
+        status: frozen
     shared_sram:
       latency:
-        value: null
+        value: 2
         unit: cycle
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:shared-sram
         scope: hardware
-        status: pending
+        status: frozen
       initiation_interval:
-        value: null
+        value: 1
         unit: cycle
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:shared-sram
         scope: hardware
-        status: pending
+        status: frozen
       queue_capacity:
-        value: null
+        value: 512
         unit: entry
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:shared-sram
         scope: hardware
-        status: pending
+        status: frozen
       ports:
-        value: null
+        value: 2
         unit: port
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:shared-sram
         scope: hardware
-        status: pending
+        status: frozen
       banks:
-        value: null
+        value: 16
         unit: bank
-        source: module-microbenchmark-pending-freeze
+        source: docs/03_HARDWARE_CONTRACT.md:shared-sram
+        status: frozen
         scope: hardware
-        status: pending

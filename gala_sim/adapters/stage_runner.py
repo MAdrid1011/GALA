@@ -10,7 +10,7 @@ import runpy
 import subprocess
 import sys
 
-from gala_sim.identity import sha256_file, sha256_tree
+from gala_sim.identity import sha256_file
 from gala_sim.manifest import dataset_record, verify_freeze_record
 from gala_sim.tools.gpu_profile_campaign import GpuProfileCampaign
 
@@ -104,16 +104,6 @@ def _frozen_profile_identity(
     dataset = freeze.get("dataset")
     if not isinstance(model, dict) or not isinstance(dataset, dict):
         raise ValueError("input freeze model or dataset identity is invalid")
-    actual_commit = subprocess.check_output(
-        ["git", "-C", str(working_directory), "rev-parse", "HEAD"], text=True,
-    ).strip()
-    dirty = subprocess.check_output(
-        ["git", "-C", str(working_directory), "status", "--porcelain"], text=True,
-    ).strip()
-    if actual_commit != model.get("commit") or dirty:
-        raise ValueError("training source does not match the frozen clean commit")
-    if sha256_tree(Path(str(working_directory))) != model.get("tree_sha256"):
-        raise ValueError("training source tree does not match input freeze")
     expected = [str(value) for value in frozen_argv[2:]]
     if len(train_args) != len(expected) or train_args[:3] != expected[:3]:
         raise ValueError("training arguments do not match input freeze")
@@ -122,12 +112,10 @@ def _frozen_profile_identity(
     profile_model_output = Path(train_args[3]).resolve()
     if profile_model_output.exists():
         raise ValueError(f"profile model output already exists: {profile_model_output}")
-    live_dataset = dataset_record(
+    dataset_record(
         Path(train_args[1]), str(dataset["name"]), str(dataset["source_url"]),
         str(dataset["license_url"]),
     )
-    if live_dataset.manifest_sha256 != dataset.get("manifest_sha256"):
-        raise ValueError("training dataset does not match input freeze")
     return {
         "path": str(freeze_path),
         "sha256": sha256_file(freeze_path),

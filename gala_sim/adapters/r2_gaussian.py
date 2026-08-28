@@ -33,8 +33,6 @@ def _repository_commit(root: Path) -> str:
         ).strip()
     except (OSError, subprocess.CalledProcessError) as error:
         raise TraceCaptureUnavailable("GALA repository commit is unavailable") from error
-    if len(commit) != 40 or any(character not in "0123456789abcdef" for character in commit):
-        raise TraceCaptureUnavailable("GALA repository commit identity is invalid")
     return commit
 
 

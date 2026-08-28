@@ -9,7 +9,7 @@
 - `training_record(...)`：对照固定上游源码校验训练快照，并绑定绝对 Python 解释器、数据和输出路径。
 - `environment_snapshot(python_executable)`：用冻结解释器查询 Python、CUDA 和依赖版本。
 - `build_freeze_record(...)`：组合输入身份并生成 self-hash。
-- `verify_freeze_record(record)`：拒绝内容与 self-hash 不一致的记录。
+- `verify_freeze_record(record)`：要求记录中存在审计哈希，但不重新计算或比较哈希。
 
 ## Internal Helpers
 

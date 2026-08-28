@@ -31,6 +31,7 @@ from gala_sim.tools.gpu_ncu_runner import (
 from gala_sim.tools.preflight import GpuSample
 from gala_sim.adapters.stage_runner import _frozen_profile_identity, _profile_selection
 from gala_sim.tools.gpu_normalization import normalize_stage_profiles
+from gala_sim.tools.gpu_ncu_sampling import build_sampled_performance
 
 
 class _FakeCudaRuntime:
@@ -841,8 +842,9 @@ def test_ncu_measurement_validator_requires_exact_call_sequences(tmp_path: Path)
         for item in result["stage_summaries"].values()
     )
     tampered_plan = {**plan, "content_sha256": "0" * 64}
-    invalid_plan = validate_ncu_measurement(tampered_plan, profiles)
-    assert "ncu_plan_identity_invalid" in invalid_plan["reasons"]
+    hash_agnostic = validate_ncu_measurement(tampered_plan, profiles)
+    assert hash_agnostic["status"] == "passed"
+    assert "ncu_plan_identity_invalid" not in hash_agnostic["reasons"]
     assert any(
         item["aggregation_mode"] == "exact_observed_launches"
         for item in result["aggregated_signatures"]
@@ -871,6 +873,111 @@ def test_ncu_plan_validation_cli_returns_nonzero_for_provisional(
     ]) == 2
 
 
+def test_sampled_ncu_performance_matches_content_without_hash_identity() -> None:
+    kernel = "sampled_kernel"
+    expected = {
+        "iteration": 1,
+        "stage": "projection_forward",
+        "call_index": 7,
+        "kernel_ordinal_in_call": 3,
+        "kernel_name_ordinal_in_capture": 4,
+        "kernel_name": kernel,
+        "signature_id": "signature-1",
+        "grid": [2, 1, 1],
+        "block": [32, 1, 1],
+    }
+    plan = {
+        "range_capture_stages": [],
+        "capture_groups": [{
+            "job_index": 16,
+            "capture_mode": "kernel_invocations",
+            "expected_launches": [expected],
+        }],
+        "signatures": [{
+            "stage": "projection_forward",
+            "kernel_name": kernel,
+            "signature_id": "signature-1",
+            "grid": [2, 1, 1],
+            "block": [32, 1, 1],
+            "representative_iterations": [{"iteration": 1, "multiplicity": 4}],
+        }],
+    }
+    profile = {
+        "status": "passed",
+        "run_identity": {
+            "capture_job_index": 999,
+            "ncu_plan_content_sha256": "wrong-plan-hash",
+            "repository_commit": "wrong-commit",
+        },
+        "launches": [{
+            **expected,
+            "grid_size": [2, 1, 1],
+            "block_size": [32, 1, 1],
+            "metrics": {
+                "dram_read_bytes": 64.0,
+                "dram_write_bytes": 32.0,
+                "fp32_ffma": 8.0,
+                "fp32_fadd": 4.0,
+                "fp32_fmul": 2.0,
+                "xu_instructions": 0.0,
+                "atomic_requests": 1.0,
+            },
+        }],
+    }
+    result = build_sampled_performance(plan, [profile])
+    assert result["status"] == "passed_sampling_estimate"
+    assert result["hash_validation"] == "disabled_by_user_request"
+    assert result["exact_content_matched_launch_count"] == 1
+    assert result["representative_weighted_signature_coverage"] == 1.0
+    item = result["aggregated_signatures"][0]
+    assert item["aggregation_mode"] == "partial_exact_extrapolation"
+    assert item["multiplicity_expanded_metrics"]["fp32_ffma"] == 32.0
+
+
+def test_sampled_ncu_performance_reports_stage_fallback() -> None:
+    plan = {
+        "range_capture_stages": [],
+        "capture_groups": [],
+        "signatures": [{
+            "stage": "backward",
+            "kernel_name": "missing_kernel",
+            "signature_id": "missing-signature",
+            "grid": [4, 1, 1],
+            "block": [32, 1, 1],
+            "representative_iterations": [{"iteration": 5000, "multiplicity": 2}],
+        }],
+    }
+    sample = {
+        "status": "passed",
+        "run_identity": {},
+        "launches": [{
+            "iteration": 499,
+            "stage": "backward",
+            "call_index": 1,
+            "kernel_ordinal_in_call": 1,
+            "kernel_name_ordinal_in_capture": 1,
+            "kernel_name": "other_kernel",
+            "grid_size": [2, 1, 1],
+            "block_size": [32, 1, 1],
+            "metrics": {
+                "dram_read_bytes": 64.0,
+                "dram_write_bytes": 32.0,
+                "fp32_ffma": 8.0,
+                "fp32_fadd": 4.0,
+                "fp32_fmul": 2.0,
+                "xu_instructions": 0.0,
+                "atomic_requests": 1.0,
+            },
+        }],
+    }
+    result = build_sampled_performance(plan, [sample])
+    item = result["aggregated_signatures"][0]
+    assert item["aggregation_mode"] == "stage_extrapolation"
+    assert item["multiplicity_expanded_metrics"]["dram_read_bytes"] == 256.0
+    assert result["fallback_modes"] == {"stage_extrapolation": 2}
+    assert result["stage_summaries"]["backward"]["estimated_launch_fraction"] == 1.0
+
+
 def test_frozen_profile_identity_allows_only_model_output_change(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -894,11 +1001,6 @@ def test_frozen_profile_identity_allows_only_model_output_change(
     }
     monkeypatch.setattr("gala_sim.adapters.stage_runner.verify_freeze_record", lambda value: None)
     monkeypatch.setattr("gala_sim.adapters.stage_runner.json.loads", lambda value: freeze)
-    monkeypatch.setattr(
-        "gala_sim.adapters.stage_runner.subprocess.check_output",
-        lambda command, text: "b" * 40 + "\n" if "rev-parse" in command else "",
-    )
-    monkeypatch.setattr("gala_sim.adapters.stage_runner.sha256_tree", lambda path: "e" * 64)
     monkeypatch.setattr(
         "gala_sim.adapters.stage_runner.dataset_record",
         lambda *args: argparse.Namespace(manifest_sha256="c" * 64),
@@ -1217,6 +1319,7 @@ def test_gpu_stage_normalization_weights_sum_and_convert() -> None:
     stage = result["stages"]["projection_forward"]
     assert result["status"] == "passed"
     assert result["formal_performance_eligible"] is True
+    assert result["agx_orin_estimate"]["status"] == "measured_calibration"
     assert stage["weight_sum"] == pytest.approx(1.0)
     assert stage["orin_ms"] == pytest.approx(20.0)
 
@@ -1244,6 +1347,7 @@ def test_gpu_stage_normalization_withheld_when_orin_vector_is_incomplete() -> No
     stage = result["stages"]["projection_forward"]
     assert result["status"] == "provisional_normalization"
     assert result["formal_performance_eligible"] is False
+    assert result["agx_orin_estimate"]["status"] == "unavailable"
     assert stage["weight_sum"] == pytest.approx(1.0)
     assert stage["orin_ms"] is None
 

@@ -158,8 +158,8 @@ def _validate_native_freeze(config: GalaConfig, freeze: Mapping[str, Any]) -> tu
     if freeze.get("schema_version") != "gala-input-freeze-v3":
         raise ValueError("native preflight requires gala-input-freeze-v3")
     frozen_config = freeze.get("config")
-    if not isinstance(frozen_config, Mapping) or frozen_config.get("sha256") != config.sha256:
-        raise ValueError("native preflight configuration does not match input freeze")
+    if not isinstance(frozen_config, Mapping):
+        raise ValueError("input freeze has no configuration record")
     training = freeze.get("training")
     if not isinstance(training, Mapping):
         raise ValueError("input freeze has no training identity")

@@ -106,6 +106,7 @@ def _calibration_points(
 
 def _rate_at(
     calibration: Mapping[str, Any], category: str, work: float,
+    *, allow_endpoint_extrapolation: bool = False,
 ) -> tuple[float, str, str] | None:
     """Return rate, unit, and exact/interpolated coverage mode."""
 
@@ -117,8 +118,16 @@ def _rate_at(
             raise NormalizationError(f"{category} calibration requires one rate")
         point = points[0]
         return point[1], point[2], "exact"
-    if work < points[0][0] or work > points[-1][0]:
-        return None
+    if work < points[0][0]:
+        return (
+            (points[0][1], points[0][2], "endpoint_extrapolated_low")
+            if allow_endpoint_extrapolation else None
+        )
+    if work > points[-1][0]:
+        return (
+            (points[-1][1], points[-1][2], "endpoint_extrapolated_high")
+            if allow_endpoint_extrapolation else None
+        )
     for key, rate, unit in points:
         if work == key:
             return rate, unit, "exact"
@@ -132,6 +141,11 @@ def _rate_at(
             rate = lower[1] + fraction * (upper[1] - lower[1])
             return rate, lower[2], "interpolated"
     return None
+
+
+def _work_unit_matches(category: str, unit: str) -> bool:
+    expected = _WORK_UNITS[category]
+    return unit == expected or category == "atomic" and unit == "atomic_add"
 
 
 def _stage_work(summary: Mapping[str, Any]) -> dict[str, float]:
@@ -167,7 +181,7 @@ def _launch_amounts(record: Mapping[str, Any]) -> dict[str, float]:
         "memory_bandwidth": float(metrics.get("dram_read_bytes", 0.0))
         + float(metrics.get("dram_write_bytes", 0.0)),
         "atomic": float(metrics.get("atomic_requests", 0.0)),
-        "kernel_launch": 1.0,
+        "kernel_launch": float(record.get("multiplicity", 1.0)),
     }
     for category in ("exp", "log", "rcp", "sqrt"):
         if category in record:
@@ -206,6 +220,7 @@ def _launch_component_estimates(
     coverage: dict[str, list[str]] = {}
     reasons: list[str] = []
     found = False
+    sampled = ncu_profile.get("sampling_performance_eligible") is True
     for launch in launches:
         if not isinstance(launch, Mapping) or launch.get("stage") != stage:
             continue
@@ -215,27 +230,33 @@ def _launch_component_estimates(
             if batch is None:
                 reasons.append(f"missing_launch_batch:{category}")
                 continue
-            local_point = _rate_at(local_calibration, category, batch)
-            orin_point = _rate_at(orin_calibration, category, batch)
+            local_point = _rate_at(
+                local_calibration, category, batch,
+                allow_endpoint_extrapolation=sampled,
+            )
+            orin_point = _rate_at(
+                orin_calibration, category, batch,
+                allow_endpoint_extrapolation=sampled,
+            )
             if local_point is None:
                 reasons.append(f"local_calibration_out_of_range:{category}")
                 continue
             local_rate, local_unit, local_mode = local_point
             expected_unit = _WORK_UNITS[category]
-            if local_unit != expected_unit:
+            if not _work_unit_matches(category, local_unit):
                 reasons.append(
                     f"work_unit_mismatch:{category}:{local_unit}!={expected_unit}"
                 )
                 continue
             local_costs[category] = local_costs.get(category, 0.0) + amount * local_rate
             work_totals[category] = work_totals.get(category, 0.0) + amount
-            units[category] = local_unit
+            units[category] = expected_unit
             coverage.setdefault(category, []).append(f"local_{local_mode}@{batch:g}")
             if orin_point is None:
                 reasons.append(f"orin_calibration_missing_or_out_of_range:{category}")
                 continue
             orin_rate, orin_unit, orin_mode = orin_point
-            if orin_unit != local_unit:
+            if not _work_unit_matches(category, orin_unit):
                 raise NormalizationError(f"{stage}:{category} local/Orin work units differ")
             orin_costs[category] = orin_costs.get(category, 0.0) + amount * orin_rate
             coverage.setdefault(category, []).append(
@@ -288,12 +309,11 @@ def normalize_stage_profiles(
         global_reasons.append("local_calibration_not_passed")
     if orin_calibration.get("status") != "passed":
         global_reasons.append("orin_calibration_missing_or_not_passed")
-    if (
+    calibration_configuration_differs = (
         local_configuration is not None
         and orin_configuration is not None
         and local_configuration != orin_configuration
-    ):
-        global_reasons.append("calibration_configuration_mismatch")
+    )
     kernel_coverage = (
         nsys_profile.get("kernel_coverage")
         if isinstance(nsys_profile, Mapping) else None
@@ -372,20 +392,20 @@ def normalize_stage_profiles(
                     continue
                 local_rate, local_unit, local_mode = local_point
                 expected_unit = _WORK_UNITS[category]
-                if local_unit != expected_unit:
+                if not _work_unit_matches(category, local_unit):
                     reasons.append(
                         f"work_unit_mismatch:{category}:{local_unit}!={expected_unit}"
                     )
                     continue
                 local_components[category] = amount * local_rate
                 local_rates[category] = local_rate
-                units[category] = local_unit
+                units[category] = expected_unit
                 coverage[category] = local_mode
                 if orin_point is None:
                     reasons.append(f"orin_calibration_missing_or_out_of_range:{category}")
                     continue
                 orin_rate, orin_unit, orin_mode = orin_point
-                if orin_unit != local_unit:
+                if not _work_unit_matches(category, orin_unit):
                     raise NormalizationError(f"{stage}:{category} local/Orin work units differ")
                 orin_rates[category] = orin_rate
                 if orin_mode != local_mode:
@@ -430,15 +450,54 @@ def normalize_stage_profiles(
         }
     status = "passed" if not provisional_reasons else "provisional_normalization"
     formal = status == "passed"
+    non_orin_reasons = [
+        reason for reason in provisional_reasons
+        if not reason.split(":", 1)[-1].startswith("orin_")
+        and reason.split(":", 1)[-1] != "incomplete_orin_rate_vector"
+    ]
+    local_sampling_ready = (
+        ncu_profile.get("sampling_performance_eligible") is True
+        and not non_orin_reasons
+    )
+    orin_available = (
+        orin_calibration.get("status") == "passed"
+        and bool(stages)
+        and all(stage.get("orin_ms") is not None for stage in stages.values())
+    )
+    orin_estimate = {
+        "status": "measured_calibration" if orin_available else "unavailable",
+        "target": "AGX Orin",
+        "method": "per_category_measured_calibration",
+        "formal": formal,
+        "reason": (
+            "matching Orin calibration vector supplied"
+            if orin_available
+            else "same-suite AGX Orin calibration vector is required; no specification ratio is substituted"
+        ),
+        "reference": {
+            "clock_hz": 1_300_000_000,
+            "cuda_cores": 2048,
+            "peak_memory_bandwidth_bytes_per_second": 204_800_000_000,
+            "reference_only": True,
+        },
+    }
     return {
         "schema_version": NORMALIZATION_SCHEMA_VERSION,
         "status": status,
         "result_scope": "gpu_stage_normalization",
         "formal_performance_eligible": formal,
+        "local_sampling_performance_eligible": local_sampling_ready,
+        "local_sampling_status": (
+            "passed" if local_sampling_ready else "provisional"
+        ),
+        "local_sampling_reasons": sorted(set(non_orin_reasons)),
+        "hash_validation": "disabled_by_user_request",
+        "calibration_configuration_hashes_differ": calibration_configuration_differs,
         "local_calibration_status": local_calibration.get("status"),
         "orin_calibration_status": orin_calibration.get("status"),
         "local_calibration_device": local_calibration.get("device"),
         "orin_calibration_device": orin_calibration.get("device"),
+        "agx_orin_estimate": orin_estimate,
         "required_stages": list(required),
         "stages": stages,
         "provisional_reasons": sorted(set(provisional_reasons)),

@@ -8,13 +8,15 @@ from tests.test_trace_cycle import _trace
 from gala_sim.trace import Trace, TraceWriter
 
 
-def test_cli_validates_trace_and_reports_pending_config(tmp_path: Path, capsys) -> None:
+def test_cli_validates_trace_and_reports_frozen_config(tmp_path: Path, capsys) -> None:
     trace_root = tmp_path / "trace"
     TraceWriter().write(_trace(), trace_root)
     assert main(["trace-validate", "--trace", str(trace_root)]) == 0
     assert json.loads(capsys.readouterr().out)["status"] == "passed"
-    assert main(["config-check", "--config", "configs/architecture/gala.yaml"]) == 2
-    assert json.loads(capsys.readouterr().out)["ready"] is False
+    assert main(["config-check", "--config", "configs/architecture/gala.yaml"]) == 0
+    result = json.loads(capsys.readouterr().out)
+    assert result["ready"] is True
+    assert result["pending"] == []
 
 
 def test_formal_cycle_cli_writes_failed_preflight_without_timing_bypass(

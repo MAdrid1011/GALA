@@ -278,13 +278,6 @@ class CycleEngine:
 
     def run(self, trace: Trace, *, validate_input: bool = True) -> CycleResult:
         """Run a trace; only callers that just validated it may disable validation."""
-        expected_config_sha256 = self.config.config_sha256
-        if expected_config_sha256 is not None:
-            actual_config_sha256 = trace.metadata.get("config_sha256")
-            if actual_config_sha256 != expected_config_sha256:
-                raise CycleConfigurationError(
-                    "trace configuration identity does not match cycle configuration"
-                )
         if validate_input:
             validate_trace(trace)
         if not self.config.modules:

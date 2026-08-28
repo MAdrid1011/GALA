@@ -195,7 +195,7 @@ def test_cycle_preflight_records_all_formal_blockers(tmp_path: Path) -> None:
         config, reproduction="gala-sim cycle-preflight --config configs/architecture/gala.yaml",
     )
     assert report.status == "failed_preflight"
-    assert "relation.seed_fifo_entries" in report.pending
+    assert report.pending == ()
     assert "ramulator2_binding" in report.missing_bindings
     assert "resource_envelope" in report.missing_bindings
     write_cycle_preflight(report, tmp_path / "run")
