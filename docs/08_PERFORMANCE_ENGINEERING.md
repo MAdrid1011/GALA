@@ -45,3 +45,9 @@ GPU 利用率低于 `gpu_utilization_floor_percent` 时，不启动小时级任�
 全量质量和正式 trace 完整性门仍对完整模型执行一次。模块开发和周期吞吐调试可以从真实 trace 的一个或多个 query range 构造依赖闭合样本；选择从 consumer 和 gradient terminal 开始，必须保留其全部候选、关系、缓存、前向、查询归约、伴随和梯度前置事件，不得生成平均关系或合成命中率。
 
 扫描块、事件上限和 CPU/CUDA 后端必须显式记录。CUDA 扫描只优化软件处理时间，不改变 trace 内容。sample manifest 固定 `result_scope=quick_cycle_validation`、`formal_performance_eligible=false` 和 `quality_eligible=false`。周期与消融入口默认拒绝 sample；只有显式 quick-validation 模式可运行，且结果不得进入正式 Base ASIC、Oracle、论文消融或端到端加速比汇总。
+
+## 8. 运行时吞吐诊断
+
+长周期重放可以按固定完成事件数或固定墙钟间隔低频输出墙钟吞吐、已模拟周期、事件完成比例和线性总周期投影。墙钟事件吞吐只用于健康检查；只有完整 `iteration_id` 的全部事件完成后才形成判稳样本和按迭代比例计算的周期投影。稳定判定丢弃配置化预热样本，并要求最近连续窗口的区间吞吐与总周期投影相对跨度同时不超过门限，且迭代完成比例越过主要增密阶段。累计平均或单一原语长段不能单独触发稳定。
+
+默认入口始终处理完整事件集合。只有显式启用开发诊断停止时，稳定窗口才可中止当前重放；该输出固定为 `development_throughput_projection`、`formal_performance_eligible=false`，不得写入正式 `cycles.json`、消融矩阵或论文表格。完整运行选项始终保留。投影可与静态 AGX Orin 工程锚点比较，但必须使用投影 ASIC 秒数并保留代理区间，不能把事件前缀周期当作正式加速比。

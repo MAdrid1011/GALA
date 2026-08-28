@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
-import math
 from pathlib import Path
 import shlex
 import sys
@@ -20,6 +19,11 @@ from gala_sim.timing import CycleConfig, CycleEngine
 from gala_sim.timing.memory import NativeRamulator2Binding, Ramulator2Backend
 from gala_sim.timing.resources import ResourceUsage
 from gala_sim.tools.cycle_preflight import run_cycle_preflight, write_cycle_preflight
+from gala_sim.tools.cycle_throughput import (
+    ThroughputConverged, ThroughputDiagnosticConfig, ThroughputMonitor,
+    require_empty_diagnostic_output,
+)
+from gala_sim.tools.gpu_orin_estimate import load_proxy_anchor
 from gala_sim.tools.preflight import run_native_preflight
 from gala_sim.adapters.native_reference import run_native_reference
 from gala_sim.trace import (
@@ -80,6 +84,12 @@ def _parser() -> argparse.ArgumentParser:
     replay.add_argument("--policy", default="base")
     replay.add_argument("--output", type=Path, required=True)
     replay.add_argument("--quick-validation", action="store_true")
+    replay.add_argument("--throughput-progress", action="store_true")
+    replay.add_argument("--stop-when-throughput-stable", action="store_true")
+    replay.add_argument(
+        "--orin-anchor", type=Path, default=None,
+        help="non-formal static AGX Orin estimate for live speedup diagnostics",
+    )
     ablation = commands.add_parser("ablation")
     ablation.add_argument("--trace", type=Path, required=True)
     ablation.add_argument("--config", type=Path, required=True)
@@ -150,37 +160,6 @@ def _load_resource_usage(path: Path | None) -> ResourceUsage | None:
         external_channels=int(document["external_channels"]),
         regions={str(key): int(value) for key, value in document["regions"].items()},
     )
-
-
-def _load_orin_anchor(path: Path | None) -> tuple[float, dict[str, object]] | None:
-    """Load a static Orin estimate without treating it as measured calibration."""
-
-    if path is None:
-        return None
-    document = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(document, dict):
-        raise ValueError("Orin anchor must be a JSON object")
-    if document.get("status") != "proxy_estimate":
-        raise ValueError("Orin anchor must have status=proxy_estimate")
-    if document.get("formal_performance_eligible") is not False:
-        raise ValueError("Orin anchor must be non-formal")
-    total = document.get("total")
-    if not isinstance(total, dict):
-        raise ValueError("Orin anchor lacks total")
-    try:
-        milliseconds = float(total["estimated_orin_ms"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise ValueError("Orin anchor total lacks estimated_orin_ms") from error
-    if not math.isfinite(milliseconds) or milliseconds <= 0:
-        raise ValueError("Orin anchor estimated_orin_ms must be positive")
-    return milliseconds / 1000.0, {
-        "path": str(path.resolve()),
-        "status": document["status"],
-        "result_scope": document.get("result_scope"),
-        "estimated_orin_ms": milliseconds,
-        "interval_ms": total.get("interval_ms"),
-        "formal_performance_eligible": False,
-    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -288,9 +267,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.quick_validation and not quick_scope:
             raise ValueError("--quick-validation requires a sampled or windowed trace")
-        orin_anchor = _load_orin_anchor(
-            args.orin_anchor if args.command == "ablation" else None
-        )
+        orin_anchor = load_proxy_anchor(args.orin_anchor)
         if orin_anchor is not None and quick_scope:
             raise ValueError("--orin-anchor cannot be used with quick-validation traces")
         gala_config = load_config(args.config)
@@ -311,9 +288,121 @@ def main(argv: list[str] | None = None) -> int:
             raise ValueError("formal cycle run requires a Ramulator 2 binding")
         config = CycleConfig.from_gala(gala_config, binding, resource_usage=usage)
         if args.command == "cycle-replay":
-            result = CycleEngine(config, policy=args.policy).run(trace)
+            if orin_anchor is not None and not (
+                args.throughput_progress or args.stop_when_throughput_stable
+            ):
+                raise ValueError("--orin-anchor requires cycle throughput diagnostics")
+            if args.stop_when_throughput_stable:
+                require_empty_diagnostic_output(args.output)
+            monitor: ThroughputMonitor | None = None
+            if args.throughput_progress or args.stop_when_throughput_stable:
+                monitor_config = ThroughputDiagnosticConfig.from_gala(gala_config)
+                monitor = ThroughputMonitor(
+                    monitor_config,
+                    stop_when_stable=args.stop_when_throughput_stable,
+                    clock_frequency_hz=(
+                        config.clock_frequency_hz if orin_anchor is not None else None
+                    ),
+                    orin_anchor_seconds=(
+                        orin_anchor[0] if orin_anchor is not None else None
+                    ),
+                    orin_anchor_interval_seconds=(
+                        (
+                            float(orin_anchor[1]["interval_ms"]["low"]) / 1000.0,
+                            float(orin_anchor[1]["interval_ms"]["high"]) / 1000.0,
+                        )
+                        if orin_anchor is not None
+                        and isinstance(orin_anchor[1].get("interval_ms"), dict)
+                        else None
+                    ),
+                )
+
+            def cycle_progress(progress) -> None:
+                if monitor is None:
+                    return
+                try:
+                    report = monitor.observe(progress)
+                except ThroughputConverged as converged:
+                    runtime = (
+                        converged.report["runtime_samples"][-1]
+                        if converged.report["runtime_samples"] else {
+                            "completed_events": progress.completed_events,
+                            "total_events": progress.total_events,
+                            "elapsed_seconds": progress.elapsed_seconds,
+                            "interval_events_per_second": None,
+                        }
+                    )
+                    print(json.dumps({
+                        "phase": progress.phase,
+                        "runtime": {"status": "active", **runtime},
+                        "throughput": converged.report["samples"][-1],
+                        "stability": converged.report["stability"],
+                    }, sort_keys=True), file=sys.stderr, flush=True)
+                    raise
+                runtime = (
+                    report["runtime_samples"][-1]
+                    if report["runtime_samples"] else {
+                        "completed_events": progress.completed_events,
+                        "total_events": progress.total_events,
+                        "elapsed_seconds": progress.elapsed_seconds,
+                        "interval_events_per_second": None,
+                    }
+                )
+                print(json.dumps({
+                    "phase": progress.phase,
+                    "runtime": {"status": "active", **runtime},
+                    "throughput": (
+                        report["samples"][-1] if report["samples"] else None
+                    ),
+                    "stability": report["stability"],
+                }, sort_keys=True), file=sys.stderr, flush=True)
+
+            try:
+                result = CycleEngine(config, policy=args.policy).run(
+                    trace,
+                    progress=cycle_progress if monitor is not None else None,
+                    progress_interval_events=(
+                        monitor.config.report_interval_events if monitor is not None else None
+                    ),
+                    progress_interval_seconds=(
+                        monitor.config.report_interval_seconds if monitor is not None else None
+                    ),
+                )
+            except ThroughputConverged as converged:
+                diagnostic = {
+                    **converged.report,
+                    "termination": "stopped_on_stable_throughput",
+                    "policy": args.policy,
+                    "static_anchor": orin_anchor[1] if orin_anchor is not None else None,
+                }
+                write_json(diagnostic, args.output / "throughput.json")
+                write_json({
+                    "result_scope": "development_throughput_projection",
+                    "formal_performance_eligible": False,
+                    "termination": diagnostic["termination"],
+                }, args.output / "manifest.json")
+                write_json({
+                    "status": "passed",
+                    "checks": {
+                        "formal_performance_eligible": False,
+                        "termination": diagnostic["termination"],
+                    },
+                }, args.output / "status.json")
+                print(json.dumps({
+                    "status": "diagnostic_stopped",
+                    "output": str((args.output / "throughput.json").resolve()),
+                    "formal_performance_eligible": False,
+                }, sort_keys=True))
+                return 0
             writer = RunOutputWriter(args.output)
             writer.write_cycles(result)
+            if monitor is not None:
+                write_json({
+                    **monitor.report(),
+                    "termination": "complete_trace_replay",
+                    "policy": args.policy,
+                    "static_anchor": orin_anchor[1] if orin_anchor is not None else None,
+                }, args.output / "throughput.json")
             writer.write_manifest({
                 "result_scope": (
                     "quick_cycle_validation" if quick_scope else "formal_performance"

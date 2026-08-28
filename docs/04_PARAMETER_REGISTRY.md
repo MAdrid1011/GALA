@@ -129,6 +129,13 @@ FMA、EXP、LOG、RCP、SQRT、SRAM、CAM、互连和寄存器流水延迟不写
 | `preflight.warmup_iterations` | 10 | iteration | 排除首次编译和缓存建立 |
 | `preflight.measure_iterations` | 50 | iteration | 预测总运行时间 |
 | `trace.chunk_events` | 自动调优后冻结 | event | 设备 trace chunk 容量 |
+| `diagnostic.throughput_report_interval_events` | 100000 | completed_event | 周期开发模式的事件采样间隔 |
+| `diagnostic.throughput_report_interval_seconds` | 30 | second | 周期开发模式的最长静默间隔 |
+| `diagnostic.throughput_warmup_samples` | 3 | sample | 吞吐稳定判定前丢弃的预热样本数 |
+| `diagnostic.throughput_stability_window_samples` | 5 | sample | 吞吐与周期投影同时判稳的连续窗口数 |
+| `diagnostic.throughput_required_stable_windows` | 2 | window | 允许提前停止前连续通过的稳定窗口数 |
+| `diagnostic.throughput_stability_relative_span` | 0.02 | ratio | 窗口内吞吐和周期投影允许的最大相对跨度 |
+| `diagnostic.throughput_minimum_completion_fraction` | 0.55 | ratio | 越过主要增密阶段后允许诊断提前停止的最小迭代完成比例 |
 | `trace.max_inflight_chunks` | 自动调优后冻结 | chunk | GPU 与 CPU 重叠深度 |
 | `trace-sample.query_ranges` | 命令显式指定 | query range | quick-validation terminal 选择 |
 | `trace-sample.max_events` | 命令显式指定 | event | quick-validation 闭包事件上限 |

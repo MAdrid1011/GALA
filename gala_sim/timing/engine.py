@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 import heapq
+import time
+from typing import Callable
 
 import numpy as np
 
@@ -46,6 +49,21 @@ class CycleResult:
     memory_requests: tuple[MemoryRequestRecord, ...]
 
 
+@dataclass(frozen=True)
+class CycleProgress:
+    phase: str
+    completed_events: int
+    total_events: int
+    completed_iterations: int
+    total_iterations: int
+    last_completed_iteration: int | None
+    simulated_cycles: int
+    elapsed_seconds: float
+    last_completed_iteration_events: int | None = None
+    last_completed_iteration_cycles: int | None = None
+    last_completed_iteration_elapsed_seconds: float | None = None
+
+
 @dataclass
 class _InFlight:
     completion_cycle: int
@@ -62,26 +80,58 @@ class _DependencyIndex:
     dependents: np.ndarray
 
     @classmethod
-    def from_trace(cls, trace: Trace) -> "_DependencyIndex":
+    def from_trace(
+        cls,
+        trace: Trace,
+        *,
+        progress: Callable[[str, int, int], None] | None = None,
+        progress_interval_events: int | None = None,
+        progress_interval_seconds: float | None = None,
+    ) -> "_DependencyIndex":
         event_count = trace.event_count
         remaining = np.asarray(
             trace.events["dependency_count"], dtype=np.uint32
         ).copy()
         reverse_counts = np.zeros(event_count, dtype=np.uint64)
         if trace.dependencies.size:
-            np.add.at(reverse_counts, trace.dependencies, 1)
+            scan_size = max(progress_interval_events or trace.dependencies.size, 1)
+            next_time = (
+                time.monotonic() + progress_interval_seconds
+                if progress_interval_seconds is not None else None
+            )
+            for start in range(0, int(trace.dependencies.size), scan_size):
+                end = min(start + scan_size, int(trace.dependencies.size))
+                np.add.at(reverse_counts, trace.dependencies[start:end], 1)
+                if progress is not None and next_time is not None and time.monotonic() >= next_time:
+                    progress("dependency_count", end, int(trace.dependencies.size))
+                    next_time = time.monotonic() + progress_interval_seconds
         offsets = np.empty(event_count + 1, dtype=np.uint64)
         offsets[0] = 0
         np.cumsum(reverse_counts, out=offsets[1:])
         dependents = np.empty(trace.dependencies.size, dtype=np.uint64)
         cursors = offsets[:-1].copy()
-        for row in trace.events:
+        started_at = time.monotonic()
+        next_time = (
+            started_at + progress_interval_seconds
+            if progress_interval_seconds is not None else None
+        )
+        for row_index, row in enumerate(trace.events, start=1):
             event_id = int(row["event_id"])
             for raw_dependency in trace.dependency_ids(row):
                 dependency = int(raw_dependency)
                 position = int(cursors[dependency])
                 dependents[position] = event_id
                 cursors[dependency] += 1
+            if (
+                progress is not None
+                and next_time is not None
+                and time.monotonic() >= next_time
+            ):
+                progress("dependency_fill", row_index, event_count)
+                now = time.monotonic()
+                next_time = now + progress_interval_seconds
+        if progress is not None:
+            progress("dependency_fill", event_count, event_count)
         return cls(remaining, offsets, dependents)
 
     def for_event(self, event_id: int):
@@ -276,19 +326,124 @@ class CycleEngine:
             raise CycleConfigurationError("cache instance count is not configured")
         return gaussian_id % instances
 
-    def run(self, trace: Trace, *, validate_input: bool = True) -> CycleResult:
+    def run(
+        self,
+        trace: Trace,
+        *,
+        validate_input: bool = True,
+        progress: Callable[[CycleProgress], None] | None = None,
+        progress_interval_events: int | None = None,
+        progress_interval_seconds: float | None = None,
+    ) -> CycleResult:
         """Run a trace; only callers that just validated it may disable validation."""
+        progress_values = (
+            progress is not None,
+            progress_interval_events is not None,
+            progress_interval_seconds is not None,
+        )
+        if any(progress_values) and not all(progress_values):
+            raise ValueError("cycle progress callback and intervals must be provided together")
+        if progress_interval_events is not None and progress_interval_events <= 0:
+            raise ValueError("cycle progress interval must be positive")
+        if progress_interval_seconds is not None and progress_interval_seconds <= 0:
+            raise ValueError("cycle progress seconds must be positive")
+        started_at = time.monotonic()
+
+        def run_phase(phase: str, operation, *, total_iterations: int = 0):
+            if progress is None or progress_interval_seconds is None:
+                return operation()
+            progress(CycleProgress(
+                phase=phase,
+                completed_events=0,
+                total_events=trace.event_count,
+                completed_iterations=0,
+                total_iterations=total_iterations,
+                last_completed_iteration=None,
+                simulated_cycles=0,
+                elapsed_seconds=time.monotonic() - started_at,
+            ))
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                future = executor.submit(operation)
+                while True:
+                    try:
+                        return future.result(timeout=progress_interval_seconds)
+                    except FutureTimeoutError:
+                        progress(CycleProgress(
+                            phase=phase,
+                            completed_events=0,
+                            total_events=trace.event_count,
+                            completed_iterations=0,
+                            total_iterations=total_iterations,
+                            last_completed_iteration=None,
+                            simulated_cycles=0,
+                            elapsed_seconds=time.monotonic() - started_at,
+                        ))
+
         if validate_input:
-            validate_trace(trace)
+            run_phase("validation", lambda: validate_trace(trace))
         if not self.config.modules:
             raise CycleConfigurationError("cycle modules are not configured")
         completed: dict[int, int] = {}
-        dependency_index = _DependencyIndex.from_trace(trace)
-        ready = [
-            (int(event_id), 0)
-            for event_id in np.flatnonzero(dependency_index.remaining == 0)
-        ]
-        heapq.heapify(ready)
+        iteration_ids = np.array([], dtype=np.uint32)
+        iteration_totals = np.array([], dtype=np.uint64)
+        iteration_positions = np.array([], dtype=np.int64)
+        iteration_completed = np.array([], dtype=np.uint64)
+        iteration_done = np.array([], dtype=np.bool_)
+        contiguous_iteration_position = 0
+        contiguous_iteration_events = 0
+        completed_iterations = 0
+        last_completed_iteration: int | None = None
+        last_completed_iteration_events: int | None = None
+        last_completed_iteration_cycles: int | None = None
+        last_completed_iteration_elapsed_seconds: float | None = None
+        if progress is not None:
+            iteration_values = np.asarray(trace.events["iteration_id"])
+            max_iteration = int(iteration_values.max()) if iteration_values.size else 0
+            iteration_totals = np.zeros(max_iteration + 1, dtype=np.uint64)
+            scan_events = max(progress_interval_events or 1, 1)
+            next_iteration_progress_time = time.monotonic() + progress_interval_seconds
+            for start in range(0, int(iteration_values.size), scan_events):
+                chunk = iteration_values[start:start + scan_events]
+                iteration_totals += np.bincount(
+                    chunk.astype(np.int64, copy=False), minlength=max_iteration + 1
+                ).astype(np.uint64, copy=False)
+                if time.monotonic() >= next_iteration_progress_time:
+                    progress(CycleProgress(
+                        phase="iteration_index",
+                        completed_events=0,
+                        total_events=trace.event_count,
+                        completed_iterations=0,
+                        total_iterations=0,
+                        last_completed_iteration=None,
+                        simulated_cycles=0,
+                        elapsed_seconds=time.monotonic() - started_at,
+                    ))
+                    next_iteration_progress_time = time.monotonic() + progress_interval_seconds
+            iteration_ids = np.flatnonzero(iteration_totals).astype(np.uint32)
+            compact_totals = iteration_totals[iteration_ids]
+            iteration_positions = np.full(max_iteration + 1, -1, dtype=np.int64)
+            iteration_positions[iteration_ids] = np.arange(iteration_ids.size)
+            iteration_totals = compact_totals
+            iteration_completed = np.zeros(iteration_ids.size, dtype=np.uint64)
+            iteration_done = np.zeros(iteration_ids.size, dtype=np.bool_)
+
+        dependency_index = run_phase(
+            "dependency_index",
+            lambda: _DependencyIndex.from_trace(trace),
+            total_iterations=int(iteration_ids.size),
+        )
+
+        def build_ready() -> list[tuple[int, int]]:
+            ready_events = [
+                (int(event_id), 0)
+                for event_id in np.flatnonzero(dependency_index.remaining == 0)
+            ]
+            heapq.heapify(ready_events)
+            return ready_events
+
+        ready = run_phase(
+            "ready_queue", build_ready, total_iterations=int(iteration_ids.size)
+        )
         remaining_events = len(trace.events)
         in_flight: list[tuple[int, int, int, str]] = []
         module_busy_until = {name: 0 for name in self.modules}
@@ -313,6 +468,12 @@ class CycleEngine:
         closed_versions: set[int] = set()
         memory_requests = 0
         cycle = 0
+        next_progress_event = progress_interval_events
+        next_progress_time = (
+            started_at + progress_interval_seconds
+            if progress_interval_seconds is not None else None
+        )
+        last_progress_completed = -1
         ready_scan_window = max(
             self.config.candidate_lanes,
             sum(module.timing.ports for module in self.modules.values()),
@@ -374,6 +535,32 @@ class CycleEngine:
                 else:
                     completed[event_id] = finish
                     remaining_events -= 1
+                    if progress is not None:
+                        iteration_id = int(trace.events[event_id]["iteration_id"])
+                        iteration_position = int(iteration_positions[iteration_id])
+                        iteration_completed[iteration_position] += 1
+                        if (
+                            iteration_completed[iteration_position]
+                            == iteration_totals[iteration_position]
+                        ):
+                            iteration_done[iteration_position] = True
+                            while (
+                                contiguous_iteration_position < iteration_done.size
+                                and iteration_done[contiguous_iteration_position]
+                            ):
+                                completed_iterations += 1
+                                last_completed_iteration = int(
+                                    iteration_ids[contiguous_iteration_position]
+                                )
+                                contiguous_iteration_events += int(
+                                    iteration_totals[contiguous_iteration_position]
+                                )
+                                last_completed_iteration_events = contiguous_iteration_events
+                                last_completed_iteration_cycles = finish
+                                last_completed_iteration_elapsed_seconds = (
+                                    time.monotonic() - started_at
+                                )
+                                contiguous_iteration_position += 1
                     for raw_dependent in dependency_index.for_event(event_id):
                         dependent = int(raw_dependent)
                         remaining = int(dependency_index.remaining[dependent])
@@ -390,6 +577,34 @@ class CycleEngine:
                     if relation_seed_inflight < 0:
                         raise CycleConfigurationError("negative relation seed FIFO occupancy")
                 progressed = True
+            if (
+                progress is not None
+                and next_progress_event is not None
+                and next_progress_time is not None
+                and (
+                    len(completed) >= next_progress_event
+                    or time.monotonic() >= next_progress_time
+                )
+            ):
+                now = time.monotonic()
+                progress(CycleProgress(
+                    phase="replay",
+                    completed_events=len(completed),
+                    total_events=trace.event_count,
+                    completed_iterations=completed_iterations,
+                    total_iterations=int(iteration_ids.size),
+                    last_completed_iteration=last_completed_iteration,
+                    simulated_cycles=cycle,
+                    elapsed_seconds=now - started_at,
+                    last_completed_iteration_events=last_completed_iteration_events,
+                    last_completed_iteration_cycles=last_completed_iteration_cycles,
+                    last_completed_iteration_elapsed_seconds=(
+                        last_completed_iteration_elapsed_seconds
+                    ),
+                ))
+                last_progress_completed = len(completed)
+                next_progress_event = len(completed) + progress_interval_events
+                next_progress_time = now + progress_interval_seconds
             candidates: list[tuple[int, int]] = []
             for _ in range(ready_scan_window):
                 if not ready:
@@ -586,6 +801,26 @@ class CycleEngine:
                 cycle = min(next_points)
             else:
                 cycle += 1
+        if (
+            progress is not None
+            and len(completed) > 0
+            and len(completed) != last_progress_completed
+        ):
+            progress(CycleProgress(
+                phase="replay",
+                completed_events=len(completed),
+                total_events=trace.event_count,
+                completed_iterations=completed_iterations,
+                total_iterations=int(iteration_ids.size),
+                last_completed_iteration=last_completed_iteration,
+                simulated_cycles=max(completed.values(), default=0),
+                elapsed_seconds=time.monotonic() - started_at,
+                last_completed_iteration_events=last_completed_iteration_events,
+                last_completed_iteration_cycles=last_completed_iteration_cycles,
+                last_completed_iteration_elapsed_seconds=(
+                    last_completed_iteration_elapsed_seconds
+                ),
+            ))
         module_counters = {name: module.counters.as_dict() for name, module in self.modules.items()}
         if cache_states:
             cache_totals: dict[str, int] = {key: 0 for key in next(iter(cache_states.values())).counters}

@@ -657,6 +657,65 @@ def test_ablation_runner_reports_each_completed_variant() -> None:
     assert completed == [run.variant.bits for run in runs]
 
 
+def test_cycle_progress_reports_complete_iterations_without_duplicate_final_sample() -> None:
+    from gala_sim.timing import CycleProgress
+
+    samples: list[CycleProgress] = []
+    result = CycleEngine(_config()).run(
+        _trace(), progress=samples.append,
+        progress_interval_events=2, progress_interval_seconds=3600,
+    )
+    assert result.total_cycles > 0
+    assert samples[-1].completed_events == _trace().event_count
+    assert samples[-1].completed_iterations == samples[-1].total_iterations == 1
+    replay_samples = [sample for sample in samples if sample.phase == "replay"]
+    assert len({sample.completed_events for sample in replay_samples}) == len(replay_samples)
+
+
+def test_default_cycle_run_does_not_build_iteration_diagnostics(monkeypatch) -> None:
+    def forbidden(*args, **kwargs):
+        raise AssertionError("default replay must not scan iteration diagnostics")
+
+    monkeypatch.setattr(np, "bincount", forbidden)
+    assert CycleEngine(_config()).run(_trace()).total_cycles > 0
+
+
+def test_progress_diagnostics_do_not_change_cycle_result() -> None:
+    baseline = CycleEngine(_config()).run(_trace())
+    samples = []
+    monitored = CycleEngine(_config()).run(
+        _trace(), progress=samples.append,
+        progress_interval_events=2, progress_interval_seconds=3600,
+    )
+    assert monitored == baseline
+    assert {sample.phase for sample in samples} >= {
+        "validation", "dependency_index", "ready_queue", "replay",
+    }
+
+
+def test_cycle_progress_uses_contiguous_iteration_prefix() -> None:
+    builder = TraceBuilder()
+    builder.emit(TraceEvent(
+        iteration_id=2, primitive_kind=int(PrimitiveKind.RELATION),
+        query_id=2, gaussian_id=2, relation_id=2,
+        resource_class=int(ResourceClass.RELATION),
+    ))
+    builder.emit(TraceEvent(
+        iteration_id=1, primitive_kind=int(PrimitiveKind.RELATION),
+        query_id=1, gaussian_id=1, relation_id=1,
+        resource_class=int(ResourceClass.RELATION),
+    ))
+    samples = []
+    CycleEngine(_config()).run(
+        builder.finish(), progress=samples.append,
+        progress_interval_events=1, progress_interval_seconds=3600,
+    )
+    replay = [sample for sample in samples if sample.phase == "replay"]
+    assert replay[0].completed_events == 1
+    assert replay[0].completed_iterations == 0
+    assert replay[-1].completed_iterations == replay[-1].total_iterations == 2
+
+
 def test_ablation_runner_can_parallelize_independent_variants() -> None:
     from gala_sim.ablation.runner import run_matrix
 

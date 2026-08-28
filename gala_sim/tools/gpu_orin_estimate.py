@@ -218,6 +218,49 @@ def estimate_files(
     return result
 
 
+def load_proxy_anchor(path: Path | None) -> tuple[float, dict[str, object]] | None:
+    """Load a non-formal Orin proxy for live ASIC diagnostics."""
+
+    if path is None:
+        return None
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise OrinEstimateError("Orin anchor must be a JSON object")
+    if document.get("status") != "proxy_estimate":
+        raise OrinEstimateError("Orin anchor must have status=proxy_estimate")
+    if document.get("formal_performance_eligible") is not False:
+        raise OrinEstimateError("Orin anchor must be non-formal")
+    total = document.get("total")
+    if not isinstance(total, dict):
+        raise OrinEstimateError("Orin anchor lacks total")
+    try:
+        milliseconds = float(total["estimated_orin_ms"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise OrinEstimateError(
+            "Orin anchor total lacks estimated_orin_ms"
+        ) from error
+    if not math.isfinite(milliseconds) or milliseconds <= 0:
+        raise OrinEstimateError("Orin anchor estimated_orin_ms must be positive")
+    raw_interval = total.get("interval_ms")
+    interval: dict[str, float] | None = None
+    if raw_interval is not None:
+        if not isinstance(raw_interval, Mapping):
+            raise OrinEstimateError("Orin anchor interval_ms must be a mapping")
+        low = _positive(raw_interval.get("low"), "Orin anchor interval low")
+        high = _positive(raw_interval.get("high"), "Orin anchor interval high")
+        if low > milliseconds or milliseconds > high:
+            raise OrinEstimateError("Orin anchor estimate must lie inside interval")
+        interval = {"low": low, "high": high}
+    return milliseconds / 1000.0, {
+        "path": str(path.resolve()),
+        "status": document["status"],
+        "result_scope": document.get("result_scope"),
+        "estimated_orin_ms": milliseconds,
+        "interval_ms": interval,
+        "formal_performance_eligible": False,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="python -m gala_sim.tools.gpu_orin_estimate")
     parser.add_argument("--normalization", type=Path, required=True)

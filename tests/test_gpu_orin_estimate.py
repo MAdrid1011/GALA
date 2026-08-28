@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import pytest
 
-from gala_sim.cli.main import _load_orin_anchor
-from gala_sim.tools.gpu_orin_estimate import OrinEstimateError, estimate_normalized
+from gala_sim.tools.gpu_orin_estimate import (
+    OrinEstimateError, estimate_normalized, load_proxy_anchor,
+)
 
 
 def _reference() -> dict:
@@ -69,4 +70,18 @@ def test_cli_anchor_loader_requires_nonformal_proxy(tmp_path) -> None:
         encoding="utf-8",
     )
     with pytest.raises(ValueError, match="status=proxy_estimate"):
-        _load_orin_anchor(path)
+        load_proxy_anchor(path)
+
+
+def test_proxy_anchor_loader_preserves_valid_interval(tmp_path) -> None:
+    path = tmp_path / "anchor.json"
+    path.write_text(
+        '{"status":"proxy_estimate", "formal_performance_eligible":false,'
+        ' "total":{"estimated_orin_ms":2000,'
+        ' "interval_ms":{"low":1500,"high":2500}}}',
+        encoding="utf-8",
+    )
+    loaded = load_proxy_anchor(path)
+    assert loaded is not None
+    assert loaded[0] == pytest.approx(2)
+    assert loaded[1]["interval_ms"] == {"low": 1500, "high": 2500}

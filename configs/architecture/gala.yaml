@@ -405,6 +405,49 @@ parameters:
       source: docs/IMPLEMENTATION_STATUS.md:84-stream-validator-calibration
       scope: software
       status: frozen
+  diagnostic:
+    throughput_report_interval_events:
+      value: 100000
+      unit: completed_event
+      source: docs/08_PERFORMANCE_ENGINEERING.md:runtime-throughput-diagnostic
+      scope: workflow
+      status: frozen
+    throughput_report_interval_seconds:
+      value: 30
+      unit: second
+      source: docs/08_PERFORMANCE_ENGINEERING.md:runtime-throughput-diagnostic
+      scope: workflow
+      status: frozen
+    throughput_warmup_samples:
+      value: 3
+      unit: sample
+      source: docs/08_PERFORMANCE_ENGINEERING.md:runtime-throughput-diagnostic
+      scope: workflow
+      status: frozen
+    throughput_stability_window_samples:
+      value: 5
+      unit: sample
+      source: docs/08_PERFORMANCE_ENGINEERING.md:runtime-throughput-diagnostic
+      scope: workflow
+      status: frozen
+    throughput_required_stable_windows:
+      value: 2
+      unit: window
+      source: docs/08_PERFORMANCE_ENGINEERING.md:runtime-throughput-diagnostic
+      scope: workflow
+      status: frozen
+    throughput_stability_relative_span:
+      value: 0.02
+      unit: ratio
+      source: docs/08_PERFORMANCE_ENGINEERING.md:runtime-throughput-diagnostic
+      scope: workflow
+      status: frozen
+    throughput_minimum_completion_fraction:
+      value: 0.55
+      unit: ratio
+      source: docs/08_PERFORMANCE_ENGINEERING.md:runtime-throughput-diagnostic
+      scope: workflow
+      status: frozen
   latency:
     relation_constructor:
       latency:
