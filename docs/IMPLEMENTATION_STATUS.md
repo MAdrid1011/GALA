@@ -165,6 +165,11 @@ R²-Gaussian 的官方 CUDA 扩展仍没有直接导出完整 CLAMP 事件缓冲
 
 关系记录 decoder 输出现按迭代边界合并，每个非空 flush 最多执行一次 D2H；flush 在最后一个 query 的 backward 到达、下一迭代、optimizer step、Gaussian 集合修改和最终写出之前发生，并要求每个捕获 query 恰有一次类型匹配且已关联 loss 的 backward。v9 decoder 的 raw terminal CUDA scanner 已通过 CPU 逐索引对照；完整一迭代和 `600:601` 跨迭代窗口的质量与结构+生命周期 validator 均已通过，下一项 trace 工作是正式完整训练 capture，而不是重复 smoke。
 
+本轮新增的真实虚拟包生命周期短门使用固定官方入口执行到第 601 次迭代，仅捕获第 600--601 窗口。虚拟包 manifest 位于仓库外
+`GALA-runtime/trace-smoke/r2_gaussian_chest_virtual_capture_600_601_v3/virtual_trace_manifest.json`，状态为 `passed`：4 个 packet、589,824 个 query、1,331,283 个 candidate、144,922,250 条 relation，逻辑展开事件公式为 `candidate + 6*relation + 3*query = 872,634,255`；窗口包含一次 collection、9,706 个 clone parent、9,706 个 clone child、145 个 prune、一次 optimizer 和一次 no-op optimizer。该结果没有展开或写出数十 GB 事件列，仍明确 `formal_performance_eligible=false`。
+
+对同一窗口的旧 raw-column trace 已有独立全量结构+生命周期 PASS，但其来自另一 CUDA 运行，关系数为 144,911,313；两次运行的差异属于官方 backward/排序的非确定性，哈希和跨运行计数均只作记录，不作为拒绝条件。以旧窗口直接启动完整周期回放时，300 秒内持续报告 `validation`/`iteration_index` 而完成事件为 0，随后按长任务门控停止；这证明重复全量验证索引是当前入口瓶颈，不能把该探针称为 Base ASIC 周期结果。依赖闭包批量读取修复已在提交 `3c29841` 推送，完整测试为 `217 passed, 1 skipped`。
+
 ## 下一步入口条件
 
 在没有 AGX Orin 实机的条件下，已用 16 组本地归一化报告和显式公开规格参考生成工程静态锚点
