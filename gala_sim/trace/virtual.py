@@ -122,6 +122,7 @@ class VirtualTraceLifecycleValidator:
     _open_commit_seen: set[int] = field(default_factory=set)
     _open_commit_all_active: bool = False
     _next_query_base: int | None = None
+    _confirmed_query_bases: set[int] = field(default_factory=set)
     last_closed_iteration: int | None = None
     _ledgers: list[VirtualIterationLedger] | None = None
 
@@ -157,8 +158,23 @@ class VirtualTraceLifecycleValidator:
         self.current_queries += packet.query_count
         self.current_candidates += packet.candidate_count
         self.current_relations += relations
-        self.current_backward_relations += relations
         self.current_physical_bytes += packet.physical_bytes
+        if packet.backward_confirmed:
+            self.accept_backward_confirmation(packet)
+
+    def accept_backward_confirmation(self, packet: VirtualTracePacket) -> None:
+        """Record the independent backward hook for an accepted packet."""
+
+        self._select_iteration(packet.iteration_id)
+        if self._next_query_base is None or (
+            packet.query_base + packet.query_count > self._next_query_base
+        ):
+            raise ValueError("backward confirmation refers to an unknown query packet")
+        marker = packet.query_base
+        if marker in self._confirmed_query_bases:
+            raise ValueError("virtual backward confirmation is duplicated")
+        self._confirmed_query_bases.add(marker)
+        self.current_backward_relations += packet.logical_relation_count
 
     def accept_lifecycle(self, record: VirtualLifecycleRecord) -> None:
         self._select_iteration(record.iteration_id)
@@ -335,6 +351,7 @@ class VirtualTracePacket:
     field_mask: int = 0
     loss_flags: int = 0
     ssim_radius: int = 0
+    backward_confirmed: bool = False
 
     def __post_init__(self) -> None:
         if self.iteration_id < 0 or self.template_id < 0 or self.query_base < 0:

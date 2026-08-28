@@ -130,7 +130,7 @@ def test_virtual_cycle_replay_rejects_unbounded_expansion(tmp_path: Path) -> Non
         point_ids=np.asarray([0], dtype=np.int64),
         point_keys=np.asarray([0], dtype=np.uint64),
         masks=masks,
-        loss_flags=1,
+        loss_flags=1, backward_confirmed=True,
     )
     with pytest.raises(CycleConfigurationError, match="max_total_events"):
         CycleEngine(_config()).run_virtual(
@@ -154,7 +154,7 @@ def test_virtual_cycle_replay_rejects_reused_output_directory(tmp_path: Path) ->
         point_ids=np.asarray([0], dtype=np.int64),
         point_keys=np.asarray([0], dtype=np.uint64),
         masks=masks,
-        loss_flags=1,
+        loss_flags=1, backward_confirmed=True,
     )
     with pytest.raises(CycleConfigurationError, match="new empty trace_root"):
         CycleEngine(_config()).run_virtual(
@@ -174,7 +174,7 @@ def test_virtual_forward_dependencies_preserve_relation_pairing() -> None:
         point_ids=np.asarray([0, 1, 2], dtype=np.int64),
         point_keys=np.asarray([0, 0, 0], dtype=np.uint64),
         masks=masks,
-        loss_flags=1,
+        loss_flags=1, backward_confirmed=True,
     )
     packets = tuple(VirtualQueryEventExpander(max_events=8).expand(source))
     events = np.concatenate([packet.events for packet in packets])
@@ -211,7 +211,7 @@ def test_online_cycle_replay_consumes_packets_without_trace_columns() -> None:
         point_ids=np.asarray([0], dtype=np.int64),
         point_keys=np.asarray([0], dtype=np.uint64),
         masks=masks,
-        loss_flags=1,
+        loss_flags=1, backward_confirmed=True,
     )
     engine = CycleEngine(_config())
     session = engine.online_session(
@@ -237,7 +237,7 @@ def test_online_cycle_replay_keeps_lifecycle_events_in_same_frontier() -> None:
         point_ids=np.asarray([0], dtype=np.int64),
         point_keys=np.asarray([0], dtype=np.uint64),
         masks=masks,
-        loss_flags=1,
+        loss_flags=1, backward_confirmed=True,
     )
     engine = CycleEngine(_config())
     session = engine.online_session(max_events=4, initial_gaussian_count=1)

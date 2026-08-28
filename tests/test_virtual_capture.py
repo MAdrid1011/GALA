@@ -36,6 +36,7 @@ def _packet(*, iteration: int = 1, point_id: int = 0) -> VirtualTracePacket:
         masks=masks,
         field_mask=STATE_FIELD_MASK,
         loss_flags=LOSS_L1,
+        backward_confirmed=True,
     )
 
 

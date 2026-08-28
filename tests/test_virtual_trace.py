@@ -168,7 +168,7 @@ def test_query_expander_builds_a_valid_full_query_chain() -> None:
         iteration_id=1, template_id=1, query_base=10, query_shape=(1, 2),
         point_ids=np.asarray([0, 1], dtype=np.int64),
         point_keys=np.asarray([0, 0], dtype=np.uint64), masks=masks,
-        loss_flags=1,
+        loss_flags=1, backward_confirmed=True,
     )
     expander = VirtualQueryEventExpander(max_events=2)
     packets = list(expander.expand(source))
@@ -203,7 +203,7 @@ def test_lifecycle_validator_tracks_updates_lineage_and_iteration_ledger() -> No
         iteration_id=600, template_id=1, query_base=0, query_shape=(1, 1),
         point_ids=np.asarray([0, 1], dtype=np.int64),
         point_keys=np.asarray([0, 0], dtype=np.uint64), masks=masks,
-        loss_flags=1,
+        loss_flags=1, backward_confirmed=True,
     )
     validator.accept_packet(packet)
     validator.accept_lifecycle(VirtualLifecycleRecord(
@@ -254,6 +254,42 @@ def test_lifecycle_validator_rejects_cross_iteration_open_transaction() -> None:
     ))
     with pytest.raises(ValueError, match="open update"):
         validator.close_iteration(1)
+
+
+def test_lifecycle_validator_rejects_incomplete_optimizer_commit_set() -> None:
+    validator = VirtualTraceLifecycleValidator(initial_gaussian_count=2)
+    validator.accept_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_BEGIN, 0,
+        field_mask=1, transaction_kind=2,
+    ))
+    validator.accept_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_COMMIT, 0,
+        field_mask=1, gaussian_id=0, transaction_kind=2,
+    ))
+    with pytest.raises(ValueError, match="incomplete commits"):
+        validator.accept_lifecycle(VirtualLifecycleRecord(
+            1, VirtualLifecycleKind.UPDATE_END, 0,
+            field_mask=1, transaction_kind=2,
+        ))
+
+
+def test_lifecycle_validator_rejects_noncontiguous_query_base() -> None:
+    validator = VirtualTraceLifecycleValidator(initial_gaussian_count=1)
+    masks = _mask(1, 8)
+    masks[0, 0] = 1
+    first = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 1),
+        point_ids=np.asarray([0]), point_keys=np.asarray([0], dtype=np.uint64),
+        masks=masks, backward_confirmed=True,
+    )
+    second = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=2, query_shape=(1, 1),
+        point_ids=np.asarray([0]), point_keys=np.asarray([0], dtype=np.uint64),
+        masks=masks, backward_confirmed=True,
+    )
+    validator.accept_packet(first)
+    with pytest.raises(ValueError, match="query base is not contiguous"):
+        validator.accept_packet(second)
 
 
 def test_stream_bounds_inflight_packets_and_accounts_physical_bytes() -> None:

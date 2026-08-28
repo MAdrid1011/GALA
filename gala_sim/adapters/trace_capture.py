@@ -704,7 +704,7 @@ class TraceSession:
                     raise RuntimeError("virtual capture consumer is not initialized")
                 packet = replace(
                     item.virtual_packet, loss_flags=item.loss_flags,
-                    ssim_radius=item.ssim_radius,
+                    ssim_radius=item.ssim_radius, backward_confirmed=True,
                 )
                 self._virtual_consumer.accept_query(packet)
                 self._audit_increment("cuda_valid_relations", packet.logical_relation_count)
