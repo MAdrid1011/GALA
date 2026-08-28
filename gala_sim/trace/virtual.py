@@ -480,6 +480,15 @@ class VirtualTracePacket:
         table = _POPCOUNT8
         return int(table[self.masks.view(np.uint8)].sum(dtype=np.uint64))
 
+    @property
+    def relation_counts_by_candidate(self) -> np.ndarray:
+        """Return exact set-bit relation counts for each candidate row."""
+
+        if self.masks.size == 0:
+            return np.zeros(self.candidate_count, dtype=np.uint64)
+        counts = _POPCOUNT8[self.masks.view(np.uint8)].sum(axis=1, dtype=np.uint64)
+        return np.asarray(counts, dtype=np.uint64)
+
     def iter_candidates(self) -> Iterator[tuple[int, int, int, int, bool]]:
         """Yield ``(index, point_id, key, state_version, has_relation)``."""
 

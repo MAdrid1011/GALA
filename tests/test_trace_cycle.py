@@ -18,7 +18,13 @@ from gala_sim.clamp import (
 )
 from gala_sim.adapters.trace_capture import FIELD_DENSITY
 from gala_sim.ablation import run_matrix
-from gala_sim.timing import CycleConfig, CycleConfigurationError, CycleEngine, ModuleTiming
+from gala_sim.timing import (
+    BufferedVirtualCycleConsumer,
+    CycleConfig,
+    CycleConfigurationError,
+    CycleEngine,
+    ModuleTiming,
+)
 from gala_sim.timing.engine import _DependencyIndex
 from gala_sim.timing.memory import Ramulator2Backend, RecordedMemoryBackend
 from gala_sim.config import load_config
@@ -297,6 +303,46 @@ def test_online_cycle_replay_consumes_exact_semantic_workset_sidecar() -> None:
     assert result.module_counters["semantic_cache"]["workset_keys"] == 1
     assert result.module_counters["semantic_cache"]["workset_uses"] == 2
     assert result.module_counters["semantic_cache"]["workset_releases"] == 1
+
+
+def test_buffered_virtual_consumer_derives_totals_before_lifecycle() -> None:
+    masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
+    masks[0, 0] = 0b11
+    source = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 2),
+        point_ids=np.asarray([0], dtype=np.int64), point_keys=np.asarray([0], dtype=np.uint64),
+        masks=masks, loss_flags=1, backward_confirmed=True,
+    )
+    timing = ModuleTiming(latency=2, initiation_interval=1, queue_capacity=8, ports=1, banks=2)
+    config = CycleConfig(
+        modules={name: timing for name in (
+            "relation_constructor", "fusion_issue", "semantic_cache", "compute_pod",
+            "bidirectional_query", "reconstruction_update", "shared_sram",
+        )},
+        memory=_Memory(), clock_frequency_hz=500_000_000,
+        relation_seed_fifo_entries=8, candidate_lanes=3,
+        cache_instances=1, cache_capacity_per_instance=4,
+        cache_directory_banks=1, cache_sector_bytes=64,
+    )
+    sink = BufferedVirtualCycleConsumer(
+        CycleEngine(config, policy="variant:0001").online_session(
+            max_events=4, initial_gaussian_count=1,
+        )
+    )
+    sink.accept_query_packet(source)
+    sink.accept_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_BEGIN, 0, field_mask=1, transaction_kind=2,
+    ))
+    sink.accept_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_COMMIT, 0, field_mask=1,
+        transaction_kind=2, all_active=True,
+    ))
+    sink.accept_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_END, 0, field_mask=1, transaction_kind=2,
+    ))
+    sink.close_iteration(1)
+    result = sink.finish()
+    assert result.module_counters["semantic_cache"]["workset_uses"] == 2
 
 
 def test_formal_cycle_records_but_does_not_gate_on_configuration_hash() -> None:

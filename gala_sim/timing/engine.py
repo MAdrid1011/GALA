@@ -1300,6 +1300,24 @@ class CycleReplaySession:
         for event_packet in self._expander.expand(packet):
             self.accept_event_packet(event_packet)
 
+    def register_semantic_workset_totals(
+        self, totals: Mapping[tuple[int, int], int]
+    ) -> None:
+        """Register exact totals before their cache-request events arrive."""
+
+        self._ensure_open()
+        for key, value in totals.items():
+            normalized_key = (int(key[0]), int(key[1]))
+            normalized_value = int(value)
+            if normalized_key[0] < 0 or normalized_key[1] < 0 or normalized_value <= 0:
+                raise ValueError("semantic workset totals must use positive keyed counts")
+            existing = self.semantic_workset_totals.get(normalized_key)
+            if existing is not None and existing != normalized_value:
+                raise CycleConfigurationError(
+                    f"semantic workset total changed for key {normalized_key}"
+                )
+            self.semantic_workset_totals[normalized_key] = normalized_value
+
     def accept_lifecycle(self, record: VirtualLifecycleRecord) -> None:
         """Insert a lifecycle event with a dependency on the live frontier.
 
@@ -1786,3 +1804,67 @@ class CycleReplaySession:
             elapsed_seconds=now - self._started_at,
         ))
         self._last_progress_report = now
+
+
+class BufferedVirtualCycleConsumer:
+    """Feed one complete iteration of virtual packets into an online session.
+
+    Semantic workset totals are unknowable until all queries for the current
+    state version have arrived.  This adapter therefore buffers only the
+    compact point list/key/mask packets for one iteration, derives exact
+    per-key totals, registers them, and forwards the packets before the first
+    lifecycle record can enter the cycle session.
+    """
+
+    def __init__(self, session: CycleReplaySession) -> None:
+        self.session = session
+        self._packets: list[VirtualTracePacket] = []
+        self._iteration: int | None = None
+        self._finished = False
+
+    def accept_query_packet(self, packet: VirtualTracePacket) -> None:
+        if self._finished:
+            raise RuntimeError("buffered virtual consumer is finalized")
+        if self._iteration is None:
+            self._iteration = packet.iteration_id
+        if packet.iteration_id != self._iteration:
+            raise ValueError("buffered virtual consumer changed iteration without a close")
+        self._packets.append(packet)
+
+    def accept_lifecycle(self, record: VirtualLifecycleRecord) -> None:
+        if self._iteration is None:
+            self._iteration = record.iteration_id
+        if record.iteration_id != self._iteration:
+            raise ValueError("buffered virtual consumer lifecycle changed iteration")
+        self._flush_packets()
+        self.session.accept_lifecycle(record)
+
+    def close_iteration(self, iteration_id: int) -> None:
+        if self._iteration != iteration_id:
+            raise ValueError("buffered virtual consumer iteration close does not match")
+        self._flush_packets()
+        self.session.close_iteration(iteration_id)
+        self._iteration = None
+
+    def finish(self) -> CycleResult:
+        if self._finished:
+            raise RuntimeError("buffered virtual consumer is already finalized")
+        self._flush_packets()
+        self._finished = True
+        return self.session.finish()
+
+    def _flush_packets(self) -> None:
+        if not self._packets:
+            return
+        totals: dict[tuple[int, int], int] = defaultdict(int)
+        for packet in self._packets:
+            counts = packet.relation_counts_by_candidate
+            for gaussian_id, count in zip(packet.point_ids, counts, strict=True):
+                if int(count):
+                    key = (int(gaussian_id), int(packet.state_version))
+                    totals[key] += int(count)
+        self.session.register_semantic_workset_totals(totals)
+        packets = tuple(self._packets)
+        self._packets.clear()
+        for packet in packets:
+            self.session.accept_query_packet(packet)
