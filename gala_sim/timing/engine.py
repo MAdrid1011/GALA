@@ -1273,6 +1273,38 @@ class CycleReplaySession:
     def global_event_id(self) -> int:
         return self._stream_validator.next_event_id
 
+    @property
+    def quiescent(self) -> bool:
+        """Whether no online event, queue, memory, or cache work remains."""
+
+        return not self._quiescence_violations()
+
+    def _quiescence_violations(self) -> tuple[str, ...]:
+        violations: list[str] = []
+        if self._events:
+            violations.append("events")
+        if self._in_flight:
+            violations.append("in_flight")
+        if self._memory_waiters:
+            violations.append("memory_waiters")
+        if self._ready:
+            violations.append("ready")
+        if self._fusion_pending or any(self._fusion_inputs.values()):
+            violations.append("fusion_queues")
+        if self._dependents:
+            violations.append("dependents")
+        if any(value for value in self._module_inflight.values()):
+            violations.append("module_inflight")
+        if self._cache_fill_done or self._cache_fill_request:
+            violations.append("cache_fill")
+        if self._cache_event_state:
+            violations.append("cache_events")
+        if self._workset_by_request:
+            violations.append("workset_requests")
+        if self._relation_seed_inflight:
+            violations.append("relation_seed_fifo")
+        return tuple(violations)
+
     def accept_event_packet(self, packet: VirtualEventPacket) -> None:
         self._ensure_open()
         if packet.final_packet:
@@ -1481,9 +1513,10 @@ class CycleReplaySession:
     def finish(self) -> CycleResult:
         self._ensure_open()
         self._drain()
-        if self._events or self._in_flight or self._memory_waiters:
+        violations = self._quiescence_violations()
+        if violations:
             raise CycleConfigurationError(
-                "online replay is not quiescent at finish"
+                "online replay is not quiescent at finish: " + ",".join(violations)
             )
         terminal = VirtualEventPacket(
             packet_id=self._stream_validator.next_packet_id,

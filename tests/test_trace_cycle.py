@@ -232,6 +232,7 @@ def test_online_cycle_replay_consumes_packets_without_trace_columns() -> None:
     assert result.event_counts["RELATION"] == 1
     assert session.pending_event_count == 0
     assert session.resident_completion_markers == 0
+    assert session.quiescent
 
 
 def test_online_cycle_replay_reports_progress() -> None:
