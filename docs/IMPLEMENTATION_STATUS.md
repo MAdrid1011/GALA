@@ -6,6 +6,8 @@
 
 - 2026-08-29 查询负载规则的独立接线已通过回归：A 单独开启时使用三条有界 F/C/A FIFO 的真实负载排序，同时保持 Base 单发射宽度；在线 `CycleReplaySession` 会排空调度 FIFO 和待融合输入。定向测试 2 项、全套测试 `295 passed, 1 skipped, 2 warnings`。当前没有可用于绝对性能合理性、数量级检查或 ASIC 达标判断的静态锚点；双窗口 `144,550 cycles` 仅是同一真实 trace、同一 Ramulator 后端和同一资源配置下的 Base ASIC 比较分母，不能解释为外部锚点、可达目标或性能上界。`speedup_vs_orin` 继续保持 `unavailable`。
 
+- 2026-08-29 在同一 `r2_gaussian_chest_median_packets_v1` 双窗口真实物理包 trace、同一 LPDDR5-6400 Ramulator 和冻结资源包络上完成 Base、两类 Oracle、两类实际机制与联合入口对照。Base `0000` 为 `144,550 cycles`；实际 Query `143,663 cycles`（`1.006174x`），Query future-visible Oracle `144,177 cycles`，portfolio 胜者为实际 Query；实际 Residency `144,549 cycles`（`1.0000069x`），Residency Oracle `144,550 cycles`；完整 `full` 为 `143,662 cycles`，与十六项矩阵 `1111` 完全一致。所有事件均完成且结果目录状态为 `passed`，但 trace 仍是 `quick_cycle_validation`，不具备正式 30,000 iteration 性能资格。Base 的主要停顿为双向查询 `reduction_bank=15,212,818`、`query_datapath=587,748`，以及 ComputePod `compute_resource=473,396`；实际 Query 将前者降至 `15,199,619`，但端到端只减少 `887 cycles`。实际 Residency 的语义缓存请求由 `19,777` 降至 `547`，却只减少 `1 cycle`。这组分解说明当前不是千倍级可达提升，资源必要下界也不能充当目标或锚点。
+
 - 查询调度运行时已对齐权威 Fusion Issue 合同：配置显式冻结每条候选源 FIFO 为 32 项；Query State 按八 lane pack 分配真实物理槽并在完整 F/C/A、生成关闭和归约可读后复用；候选冲突同时检查查询状态、归约键和目标资源；年龄由实际入队周期计算。离线与在线 consumer 均在最后一个查询归约依赖完成时选择真实完成时间最晚的 credit owner，支持一个归约被多个消费者共享。新增容量、槽复用、目标冲突、年龄和 owner 生命周期回归；编译与全量测试为 `293 passed, 1 skipped`。该实现尚未形成正式周期结果，下一入口仍是同一双窗口真实 trace 的同后端 Base/Oracle/实际机制对照。
 
 - 固定的 R²-Gaussian 提交 `f2579bfddd9aac009cb797c8503bef8119bbd022` 可核验，官方 Chest 数据清单包含 153 个文件、元数据哈希和文件级 SHA-256。
@@ -193,7 +195,7 @@ R²-Gaussian 的官方 CUDA 扩展仍没有直接导出完整 CLAMP 事件缓冲
 3. Base ASIC、两个 Oracle 和覆盖外路径冻结后，完成 A/B/C/D、联合运行和十六项消融；`1111` 必须与完整 GALA 周期完全一致。
 4. AGX Orin 若要形成正式换算，必须在同一校准套件、数据类型和批量范围下取得 Orin 实测向量；在此之前结果块保持 `agx_orin_estimate.status=unavailable`，不得以峰值规格比补值。
 
-当前不报告面积、功耗、能量、能效、正式周期或论文加速比。
+当前不报告面积、功耗、能量、能效、正式周期或论文加速比。上述双窗口结果仅用于同一工作量下的机制覆盖范围、Oracle 和相对 Base ASIC 诊断；在正式 30,000 iteration trace 逐字段闭合前，不将其升级为论文端到端周期。
 
 ## 2026-08-28 完整物理包技术样本诊断
 
