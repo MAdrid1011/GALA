@@ -35,6 +35,8 @@ RASTER_TEMPLATE_ID = 1
 VOXEL_TEMPLATE_ID = 2
 RASTER_BLOCK = (16, 16)
 VOXEL_BLOCK = (8, 8, 8)
+LOSS_SSIM = 1 << 1
+LOSS_TV = 1 << 2
 
 
 @dataclass(frozen=True)
@@ -58,13 +60,17 @@ class VirtualTracePacket:
     state_version: int = 0
     field_mask: int = 0
     loss_flags: int = 0
+    ssim_radius: int = 0
 
     def __post_init__(self) -> None:
         if self.iteration_id < 0 or self.template_id < 0 or self.query_base < 0:
             raise ValueError("virtual trace packet identifiers must be non-negative")
         if not self.query_shape or any(int(value) <= 0 for value in self.query_shape):
             raise ValueError("virtual trace packet query shape must be positive")
-        if self.state_version < 0 or self.field_mask < 0 or self.loss_flags < 0:
+        if (
+            self.state_version < 0 or self.field_mask < 0
+            or self.loss_flags < 0 or self.ssim_radius < 0
+        ):
             raise ValueError("virtual trace packet state fields must be non-negative")
         point_ids = np.asarray(self.point_ids)
         point_keys = np.asarray(self.point_keys)
@@ -552,6 +558,431 @@ class VirtualRelationEventExpander:
         )
         self.next_packet_id += 1
         return packet
+
+
+@dataclass
+class VirtualQueryEventExpander:
+    """Expand one packet through the complete query/backward event chain.
+
+    The expansion is still bounded: relation columns are rescanned in
+    ``max_events`` batches for each stage, and only query-sized dependency
+    frontiers are retained while a packet is emitted.  Update transactions and
+    cross-iteration lineage are intentionally supplied by the lifecycle
+    expander, not synthesized here.
+    """
+
+    max_events: int
+    state_record_bytes: int = 128
+    relation_candidate_bytes: int = 0
+    next_event_id: int = 0
+    next_relation_id: int = 0
+    next_packet_id: int = 0
+
+    def __post_init__(self) -> None:
+        if self.max_events <= 0 or self.state_record_bytes <= 0:
+            raise ValueError("virtual query expander limits must be positive")
+        if self.relation_candidate_bytes < 0:
+            raise ValueError("relation candidate bytes must be non-negative")
+
+    def expand(self, source: VirtualTracePacket) -> Iterator[VirtualEventPacket]:
+        if source.loss_flags == 0:
+            raise ValueError("virtual query expansion requires a captured loss consumer")
+        candidate_start = self.next_event_id
+        relation_start = candidate_start + source.candidate_count
+        relation_count = source.logical_relation_count
+        relation_base = self.next_relation_id
+        query_count = source.query_count
+        close_start = relation_start + relation_count
+        request_start = close_start + query_count
+        return_start = request_start + relation_count
+        forward_start = return_start + relation_count
+        reduction_start = forward_start + relation_count
+        consumer_start = reduction_start + query_count
+        adjoint_start = consumer_start + query_count
+        gradient_start = adjoint_start + relation_count
+        self.next_event_id = gradient_start + relation_count
+        self.next_relation_id += relation_count
+
+        yield from self._candidates(source, candidate_start)
+        yield from self._relations(
+            source, candidate_start, relation_start, relation_base, emitted_before=0
+        )
+        counts = self._relation_counts(source)
+        yield from self._query_closes(source, close_start, relation_start, counts)
+        yield from self._one_dependency_stage(
+            source, PrimitiveKind.CACHE_REQUEST, ResourceClass.CACHE,
+            request_start, relation_start, source.candidate_count,
+            relation_base, source,
+        )
+        yield from self._one_dependency_stage(
+            source, PrimitiveKind.CACHE_RETURN, ResourceClass.CACHE,
+            return_start, request_start, source.candidate_count,
+            relation_base, source,
+        )
+        yield from self._forward_stage(
+            source, forward_start, relation_start, return_start, relation_base
+        )
+        yield from self._reductions(source, reduction_start, close_start, forward_start, counts)
+        yield from self._consumers(source, consumer_start, reduction_start)
+        yield from self._adjoint_gradient(
+            source, adjoint_start, gradient_start, consumer_start,
+            relation_base,
+        )
+
+    def _candidates(
+        self, source: VirtualTracePacket, event_start: int
+    ) -> Iterator[VirtualEventPacket]:
+        for start in range(0, source.candidate_count, self.max_events):
+            end = min(start + self.max_events, source.candidate_count)
+            rows = np.empty(end - start, dtype=event_dtype())
+            rows[:] = TraceEvent().as_tuple()
+            rows["event_id"] = np.arange(event_start + start, event_start + end, dtype=np.uint64)
+            rows["iteration_id"] = source.iteration_id
+            rows["primitive_kind"] = int(PrimitiveKind.RELATION_CANDIDATE)
+            rows["gaussian_id"] = source.point_ids[start:end]
+            rows["state_version"] = source.state_version
+            rows["resource_class"] = int(ResourceClass.RELATION)
+            rows["address_token"] = source.point_keys[start:end]
+            rows["data_bytes"] = self.relation_candidate_bytes
+            rows["template_id"] = source.template_id
+            rows["field_mask"] = source.field_mask
+            rows["flags"] = np.any(source.masks[start:end], axis=1)
+            yield self._make_event_packet(rows, np.empty(0, dtype=dependency_dtype()))
+
+    def _relations(
+        self,
+        source: VirtualTracePacket,
+        candidate_start: int,
+        event_start: int,
+        relation_base: int,
+        *,
+        emitted_before: int,
+    ) -> Iterator[VirtualEventPacket]:
+        for columns in source.iter_relation_arrays(self.max_events):
+            candidates, query_ids, gaussian_ids, _keys = columns
+            count = int(candidates.size)
+            rows = np.empty(count, dtype=event_dtype())
+            rows[:] = TraceEvent().as_tuple()
+            rows["event_id"] = np.arange(
+                event_start + emitted_before,
+                event_start + emitted_before + count,
+                dtype=np.uint64,
+            )
+            rows["iteration_id"] = source.iteration_id
+            rows["primitive_kind"] = int(PrimitiveKind.RELATION)
+            rows["query_id"] = query_ids
+            rows["gaussian_id"] = gaussian_ids
+            rows["state_version"] = source.state_version
+            rows["relation_id"] = np.arange(
+                relation_base + emitted_before,
+                relation_base + emitted_before + count,
+                dtype=np.int64,
+            )
+            rows["resource_class"] = int(ResourceClass.RELATION)
+            rows["address_token"] = gaussian_ids * self.state_record_bytes
+            rows["template_id"] = source.template_id
+            rows["field_mask"] = source.field_mask
+            dependencies = np.asarray(
+                candidate_start + candidates, dtype=dependency_dtype()
+            )
+            emitted_before += count
+            yield self._make_event_packet(rows, dependencies)
+
+    def _relation_counts(self, source: VirtualTracePacket) -> np.ndarray:
+        counts = np.zeros(source.query_count, dtype=np.uint64)
+        for _candidates, query_ids, _gaussians, _keys in source.iter_relation_arrays(self.max_events):
+            offsets = query_ids - source.query_base
+            np.add.at(counts, offsets, 1)
+        return counts
+
+    def _query_closes(
+        self,
+        source: VirtualTracePacket,
+        event_start: int,
+        relation_start: int,
+        counts: np.ndarray,
+    ) -> Iterator[VirtualEventPacket]:
+        relation_prefix = np.empty(counts.size + 1, dtype=np.uint64)
+        relation_prefix[0] = 0
+        np.cumsum(counts, out=relation_prefix[1:])
+        for start in range(0, source.query_count, self.max_events):
+            end = min(start + self.max_events, source.query_count)
+            rows = np.empty(end - start, dtype=event_dtype())
+            rows[:] = TraceEvent().as_tuple()
+            rows["event_id"] = np.arange(event_start + start, event_start + end, dtype=np.uint64)
+            rows["iteration_id"] = source.iteration_id
+            rows["primitive_kind"] = int(PrimitiveKind.QUERY_CLOSE)
+            rows["query_id"] = source.query_base + np.arange(start, end, dtype=np.int64)
+            rows["state_version"] = source.state_version
+            rows["resource_class"] = int(ResourceClass.RELATION)
+            rows["template_id"] = source.template_id
+            rows["field_mask"] = source.field_mask
+            dependency_parts = [
+                np.arange(
+                    relation_start + int(relation_prefix[index]),
+                    relation_start + int(relation_prefix[index + 1]),
+                    dtype=dependency_dtype(),
+                )
+                for index in range(start, end)
+            ]
+            dependencies = np.concatenate(
+                dependency_parts or [np.empty(0, dtype=dependency_dtype())]
+            )
+            local_prefix = np.empty((end - start) + 1, dtype=np.uint64)
+            local_prefix[0] = 0
+            np.cumsum(counts[start:end], out=local_prefix[1:])
+            rows["dependency_begin"] = np.asarray(
+                local_prefix[:-1], dtype=np.uint64,
+            )
+            rows["dependency_count"] = counts[start:end].astype(np.uint32, copy=False)
+            yield self._make_event_packet(rows, dependencies)
+
+    def _one_dependency_stage(
+        self,
+        source: VirtualTracePacket,
+        primitive: PrimitiveKind,
+        resource: ResourceClass,
+        event_start: int,
+        dependency_start: int,
+        candidate_count: int,
+        relation_base: int,
+        _unused_source: VirtualTracePacket,
+    ) -> Iterator[VirtualEventPacket]:
+        emitted = 0
+        for columns in source.iter_relation_arrays(self.max_events):
+            _candidates, query_ids, gaussian_ids, _keys = columns
+            count = int(query_ids.size)
+            rows = np.empty(count, dtype=event_dtype())
+            rows[:] = TraceEvent().as_tuple()
+            rows["event_id"] = np.arange(event_start + emitted, event_start + emitted + count, dtype=np.uint64)
+            rows["iteration_id"] = source.iteration_id
+            rows["primitive_kind"] = int(primitive)
+            rows["query_id"] = query_ids
+            rows["gaussian_id"] = gaussian_ids
+            rows["state_version"] = source.state_version
+            rows["relation_id"] = np.arange(relation_base + emitted, relation_base + emitted + count, dtype=np.int64)
+            rows["resource_class"] = int(resource)
+            rows["address_token"] = gaussian_ids * self.state_record_bytes
+            if primitive in {PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN}:
+                rows["data_bytes"] = self.state_record_bytes
+            rows["template_id"] = source.template_id
+            rows["field_mask"] = source.field_mask
+            dependencies = np.arange(dependency_start + emitted, dependency_start + emitted + count, dtype=dependency_dtype())
+            emitted += count
+            yield self._make_event_packet(rows, dependencies)
+
+    def _forward_stage(
+        self, source: VirtualTracePacket, event_start: int,
+        relation_start: int, return_start: int, relation_base: int,
+    ) -> Iterator[VirtualEventPacket]:
+        emitted = 0
+        for columns in source.iter_relation_arrays(self.max_events):
+            _candidates, query_ids, gaussian_ids, _keys = columns
+            count = int(query_ids.size)
+            rows = np.empty(count, dtype=event_dtype())
+            rows[:] = TraceEvent().as_tuple()
+            rows["event_id"] = np.arange(event_start + emitted, event_start + emitted + count, dtype=np.uint64)
+            rows["iteration_id"] = source.iteration_id
+            rows["primitive_kind"] = int(PrimitiveKind.FORWARD)
+            rows["query_id"] = query_ids
+            rows["gaussian_id"] = gaussian_ids
+            rows["state_version"] = source.state_version
+            rows["relation_id"] = np.arange(
+                relation_base + emitted, relation_base + emitted + count,
+                dtype=np.int64,
+            )
+            rows["resource_class"] = int(ResourceClass.ISSUE)
+            rows["address_token"] = gaussian_ids * self.state_record_bytes
+            rows["template_id"] = source.template_id
+            rows["field_mask"] = source.field_mask
+            dependencies = np.empty(count * 2, dtype=dependency_dtype())
+            relation_ids = relation_start + emitted
+            dependencies[0::2] = relation_ids
+            dependencies[1::2] = return_start + emitted
+            rows["dependency_begin"] = np.arange(0, count * 2, 2, dtype=np.uint64)
+            rows["dependency_count"] = 2
+            emitted += count
+            yield self._make_event_packet(rows, dependencies)
+
+    def _reductions(
+        self, source: VirtualTracePacket, event_start: int,
+        close_start: int, forward_start: int, counts: np.ndarray,
+    ) -> Iterator[VirtualEventPacket]:
+        prefix = np.empty(counts.size + 1, dtype=np.uint64)
+        prefix[0] = 0
+        np.cumsum(counts, out=prefix[1:])
+        for start in range(0, source.query_count, self.max_events):
+            end = min(start + self.max_events, source.query_count)
+            rows = np.empty(end - start, dtype=event_dtype())
+            rows[:] = TraceEvent().as_tuple()
+            rows["event_id"] = np.arange(event_start + start, event_start + end, dtype=np.uint64)
+            rows["iteration_id"] = source.iteration_id
+            rows["primitive_kind"] = int(PrimitiveKind.QUERY_REDUCTION)
+            rows["query_id"] = source.query_base + np.arange(start, end, dtype=np.int64)
+            rows["state_version"] = source.state_version
+            rows["reduction_key"] = rows["query_id"]
+            rows["resource_class"] = int(ResourceClass.QUERY)
+            rows["template_id"] = source.template_id
+            rows["field_mask"] = source.field_mask
+            dependency_parts = []
+            for query in range(start, end):
+                dependency_parts.append(np.concatenate((
+                    np.asarray([close_start + query], dtype=dependency_dtype()),
+                    np.arange(
+                        forward_start + int(prefix[query]),
+                        forward_start + int(prefix[query + 1]),
+                        dtype=dependency_dtype(),
+                    ),
+                )))
+            dependencies = np.concatenate(
+                dependency_parts or [np.empty(0, dtype=dependency_dtype())]
+            )
+            local_counts = counts[start:end] + 1
+            local_prefix = np.empty((end - start) + 1, dtype=np.uint64)
+            local_prefix[0] = 0
+            np.cumsum(local_counts, out=local_prefix[1:])
+            rows["dependency_begin"] = np.asarray(
+                local_prefix[:-1], dtype=np.uint64,
+            )
+            rows["dependency_count"] = local_counts.astype(np.uint32, copy=False)
+            yield self._make_event_packet(rows, dependencies)
+
+    def _consumers(
+        self, source: VirtualTracePacket, event_start: int, reduction_start: int,
+    ) -> Iterator[VirtualEventPacket]:
+        for start in range(0, source.query_count, self.max_events):
+            end = min(start + self.max_events, source.query_count)
+            rows = np.empty(end - start, dtype=event_dtype())
+            rows[:] = TraceEvent().as_tuple()
+            rows["event_id"] = np.arange(event_start + start, event_start + end, dtype=np.uint64)
+            rows["iteration_id"] = source.iteration_id
+            rows["primitive_kind"] = int(PrimitiveKind.CONSUMER)
+            rows["query_id"] = source.query_base + np.arange(start, end, dtype=np.int64)
+            rows["state_version"] = source.state_version
+            rows["consumer_id"] = rows["query_id"]
+            rows["reduction_key"] = rows["query_id"]
+            rows["resource_class"] = int(ResourceClass.QUERY)
+            rows["template_id"] = source.template_id
+            rows["flags"] = source.loss_flags
+            dependency_lists = [
+                _consumer_offsets(source, query) for query in range(start, end)
+            ]
+            dependencies = np.concatenate([
+                reduction_start + np.asarray(offsets, dtype=dependency_dtype())
+                for offsets in dependency_lists
+            ] or [np.empty(0, dtype=dependency_dtype())])
+            local_counts = np.asarray(
+                [len(offsets) for offsets in dependency_lists], dtype=np.uint64
+            )
+            local_prefix = np.empty((end - start) + 1, dtype=np.uint64)
+            local_prefix[0] = 0
+            np.cumsum(local_counts, out=local_prefix[1:])
+            rows["dependency_begin"] = np.asarray(
+                local_prefix[:-1], dtype=np.uint64,
+            )
+            rows["dependency_count"] = np.asarray(
+                local_counts, dtype=np.uint32
+            )
+            yield self._make_event_packet(rows, dependencies)
+
+    def _adjoint_gradient(
+        self, source: VirtualTracePacket, adjoint_start: int, gradient_start: int,
+        consumer_start: int, relation_base: int,
+    ) -> Iterator[VirtualEventPacket]:
+        emitted = 0
+        for columns in source.iter_relation_arrays(self.max_events):
+            _candidates, query_ids, gaussian_ids, _keys = columns
+            count = int(query_ids.size)
+            local_queries = query_ids - source.query_base
+            rows = np.empty(count * 2, dtype=event_dtype())
+            rows[:] = TraceEvent().as_tuple()
+            rows["event_id"] = np.arange(
+                adjoint_start + emitted * 2,
+                adjoint_start + (emitted + count) * 2,
+                dtype=np.uint64,
+            )
+            rows["iteration_id"] = source.iteration_id
+            rows["query_id"] = np.repeat(query_ids, 2)
+            rows["gaussian_id"] = np.repeat(gaussian_ids, 2)
+            rows["state_version"] = source.state_version
+            rows["relation_id"] = np.repeat(
+                np.arange(relation_base + emitted, relation_base + emitted + count), 2
+            )
+            rows["address_token"] = np.repeat(
+                gaussian_ids * self.state_record_bytes, 2
+            )
+            rows["template_id"] = source.template_id
+            rows["field_mask"] = source.field_mask
+            rows["primitive_kind"][0::2] = int(PrimitiveKind.ADJOINT)
+            rows["primitive_kind"][1::2] = int(PrimitiveKind.GRADIENT_REDUCTION)
+            rows["resource_class"][0::2] = int(ResourceClass.ISSUE)
+            rows["resource_class"][1::2] = int(ResourceClass.QUERY)
+            rows["reduction_key"][1::2] = gaussian_ids
+            dependencies = np.empty(count * 2, dtype=dependency_dtype())
+            dependencies[0::2] = consumer_start + local_queries
+            dependencies[1::2] = np.arange(
+                adjoint_start + emitted * 2,
+                adjoint_start + (emitted + count) * 2,
+                2,
+                dtype=dependency_dtype(),
+            )
+            rows["dependency_begin"] = np.arange(0, count * 2, dtype=np.uint64)
+            rows["dependency_count"] = 1
+            emitted += count
+            yield self._make_event_packet(rows, dependencies)
+
+    def _make_event_packet(
+        self, rows: np.ndarray, dependencies: np.ndarray
+    ) -> VirtualEventPacket:
+        rows = np.asarray(rows, dtype=event_dtype())
+        if dependencies.size and int(rows["dependency_count"].sum()) == 0:
+            rows["dependency_begin"] = np.arange(
+                dependencies.size, dtype=np.uint64
+            )
+            rows["dependency_count"] = 1
+        packet = VirtualEventPacket(
+            packet_id=self.next_packet_id,
+            global_event_start=int(rows["event_id"][0]) if rows.size else self.next_event_id,
+            events=rows,
+            dependencies=np.asarray(dependencies, dtype=dependency_dtype()),
+        )
+        self.next_packet_id += 1
+        return packet
+
+
+def _consumer_offsets(source: VirtualTracePacket, query: int) -> np.ndarray:
+    """Return local reduction offsets for one exact loss consumer."""
+
+    if source.loss_flags & LOSS_SSIM:
+        if len(source.query_shape) != 2:
+            raise ValueError("SSIM consumer requires a raster query shape")
+        height, width = source.query_shape
+        y, x = divmod(query, width)
+        radius = source.ssim_radius
+        ys = np.arange(max(0, y - radius), min(height, y + radius + 1))
+        xs = np.arange(max(0, x - radius), min(width, x + radius + 1))
+        return (ys[:, None] * width + xs[None, :]).reshape(-1).astype(np.int64)
+    if source.loss_flags & LOSS_TV:
+        if len(source.query_shape) != 3:
+            raise ValueError("TV consumer requires a voxel query shape")
+        voxel_x, voxel_y, voxel_z = source.query_shape
+        x, remainder = divmod(query, voxel_y * voxel_z)
+        y, z = divmod(remainder, voxel_z)
+        offsets = [query]
+        if x > 0:
+            offsets.append(query - voxel_y * voxel_z)
+        if x + 1 < voxel_x:
+            offsets.append(query + voxel_y * voxel_z)
+        if y > 0:
+            offsets.append(query - voxel_z)
+        if y + 1 < voxel_y:
+            offsets.append(query + voxel_z)
+        if z > 0:
+            offsets.append(query - 1)
+        if z + 1 < voxel_z:
+            offsets.append(query + 1)
+        return np.asarray(offsets, dtype=np.int64)
+    return np.asarray([query], dtype=np.int64)
 
 
 @dataclass

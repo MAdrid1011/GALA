@@ -104,6 +104,7 @@ def decode_raster_virtual_packet(
     state_version: int = 0,
     field_mask: int = 0,
     loss_flags: int = 0,
+    ssim_radius: int = 0,
 ) -> VirtualTracePacket:
     """Copy one raster work buffer into an exact bounded virtual packet."""
 
@@ -126,6 +127,7 @@ def decode_raster_virtual_packet(
         state_version=state_version,
         field_mask=field_mask,
         loss_flags=loss_flags,
+        ssim_radius=ssim_radius,
     )
 
 
@@ -144,6 +146,7 @@ def decode_voxel_virtual_packet(
     state_version: int = 0,
     field_mask: int = 0,
     loss_flags: int = 0,
+    ssim_radius: int = 0,
 ) -> VirtualTracePacket:
     """Copy one voxel work buffer into an exact bounded virtual packet."""
 
@@ -166,6 +169,7 @@ def decode_voxel_virtual_packet(
         state_version=state_version,
         field_mask=field_mask,
         loss_flags=loss_flags,
+        ssim_radius=ssim_radius,
     )
 
 

@@ -16,6 +16,7 @@ from .virtual import (
     VirtualEventPacket,
     VirtualRelationEventExpander,
     VirtualEventStreamValidator,
+    VirtualQueryEventExpander,
 )
 
 __all__ = [
@@ -40,4 +41,5 @@ __all__ = [
     "VirtualEventPacket",
     "VirtualRelationEventExpander",
     "VirtualEventStreamValidator",
+    "VirtualQueryEventExpander",
 ]

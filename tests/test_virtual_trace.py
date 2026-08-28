@@ -8,10 +8,14 @@ import pytest
 
 from gala_sim.trace import (
     VirtualEventStreamValidator,
+    VirtualQueryEventExpander,
+    Trace,
     VirtualRelationEventExpander,
     VirtualTracePacket,
     VirtualTraceStream,
 )
+from gala_sim.clamp.events import event_dtype, dependency_dtype, EVENT_SCHEMA_VERSION
+from gala_sim.trace import validate_trace
 
 
 def _mask(candidate_count: int, words: int) -> np.ndarray:
@@ -151,6 +155,41 @@ def test_event_stream_validator_rejects_rebased_or_unclosed_packets() -> None:
         ))
     with pytest.raises(ValueError, match="final"):
         validator.finalize()
+
+
+def test_query_expander_builds_a_valid_full_query_chain() -> None:
+    masks = _mask(2, 8)
+    masks[0, 0] = np.uint32(1)
+    masks[1, 0] = np.uint32((1 << 0) | (1 << 1))
+    source = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=10, query_shape=(1, 2),
+        point_ids=np.asarray([0, 1], dtype=np.int64),
+        point_keys=np.asarray([0, 0], dtype=np.uint64), masks=masks,
+        loss_flags=1,
+    )
+    expander = VirtualQueryEventExpander(max_events=2)
+    packets = list(expander.expand(source))
+    validator = VirtualEventStreamValidator()
+    for packet in packets:
+        validator.accept(packet)
+    assert validator.accepted_events == 26
+    rows = []
+    dependencies = []
+    dependency_offset = 0
+    for packet in packets:
+        part = packet.events.copy()
+        part["dependency_begin"] += dependency_offset
+        rows.append(part)
+        dependencies.append(packet.dependencies)
+        dependency_offset += packet.dependencies.size
+    trace = Trace(
+        np.concatenate(rows),
+        np.concatenate(dependencies or [np.empty(0, dtype=dependency_dtype())]),
+        np.empty(0, dtype=np.dtype("<f4")),
+        {"schema_version": EVENT_SCHEMA_VERSION},
+    )
+    report = validate_trace(trace)
+    assert report.event_count == 26
 
 
 def test_stream_bounds_inflight_packets_and_accounts_physical_bytes() -> None:

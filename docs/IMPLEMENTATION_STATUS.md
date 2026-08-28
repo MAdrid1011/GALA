@@ -84,14 +84,16 @@
 
 ## 当前入口
 
-2026-08-28 已加入 `gala_sim.trace.virtual` 的有界工作缓冲区原型。`VirtualTracePacket`
-保留官方 raster/voxel 的 point list、point key 和完整 valid mask，并以稳定的全局
-query 顺序惰性枚举真实 relation；`VirtualTraceStream` 使用有界生产/消费队列、物理
-包字节和峰值驻留统计，并在配置的不活动期限内停止无进展运行。该原型已经通过 raster、
-voxel、边界 bit、关系批次和生产/消费超时单元测试，但目前仍是生产端工作包，尚未包含
-CLAMP 全局 event/dependency、缓存返回、更新事务、Ramulator 请求或跨包语义工作集状态。
-因此它尚未接入正式 CUDA capture、validator 或 CycleEngine，也不能提升当前三万次
-trace、Base ASIC、Oracle 或消融结果的资格。
+2026-08-28 已加入 `gala_sim.trace.virtual` 的有界工作缓冲区和全局事件包原型。
+`VirtualTracePacket` 保留官方 raster/voxel 的 point list、point key 和完整 valid mask，
+并以稳定的全局 query 顺序惰性枚举真实 relation。`VirtualQueryEventExpander` 现在能
+在全局连续 ID 下生成候选、关系、缓存请求/返回、前向、查询归约、消费者、伴随和梯度
+归约事件；`VirtualEventStreamValidator` 检查包号、事件连续性、外部依赖和前向依赖。
+`VirtualTraceStream` 使用有界生产/消费队列、物理包字节和峰值驻留统计，并在配置的不活动
+期限内停止无进展运行。当前原型仍缺少跨包语义工作集 sidecar、Ramulator 未完成请求、
+UPDATE_BEGIN/COMMIT/END、Clone/Split/Prune lineage 和迭代级状态屏障，尚未接入正式
+CUDA capture、validator 或 CycleEngine，也不能提升当前三万次 trace、Base ASIC、Oracle
+或消融结果的资格。
 
 R²-Gaussian + Chest 已结束正式 GPU 计数器采集。性能分析固定使用前 16 组代表采样、已有 collection 报告和历史可用报告，不再追求 62 组穷举覆盖；这 16 组是本组合的性能采样上限，不再启动第 17--54 组。采样结果明确标注 `representative_gpu_performance_estimate`，保留精确内容覆盖率、按真实出现频次加权覆盖率、外推模式和逐阶段离散度，不能解释为穷举计数或正式 Orin 实测。哈希只记录，不参与任何通过或拒绝判断。
 
