@@ -265,3 +265,29 @@ Base 首次完整闭合为 `144,550 cycles`（500 MHz 下 `0.289100 ms`），墙
 完整测试当前为 `284 passed, 1 skipped, 2 warnings`。`3341x`、`3495x` 和所有公开规格
 Orin extrapolation 已彻底退出性能判断，不能作为正式结果、静态锚点、数量级检查、方向判断或
 ASIC 达标门槛。Orin 平台结果保持 `unavailable`，直到取得同套件实测向量。
+
+双窗口 Query portfolio 已在修正后的 owner-gradient 生命周期上闭合。Base ASIC 为 `144,550`
+cycles，实际 Query 机制为 `143,782` cycles，future-visible Query 为 `144,416` cycles；portfolio
+保留实际机制为最佳已知成员，对 Base 的加速为 `1.005341x`。future 策略比实际机制慢 `634`
+cycles，因此状态为 `portfolio_best_known_not_proven_upper_bound`，不能称作已经证明的 Oracle 上界。
+
+双窗口实际 Residency 最初在 `cycle 107,390` 死锁。失败时两个 relation window 均未释放，关系
+存储占满 `16,384` 条；根因不是硬件容量不足，而是 Residency 候选排序错误地按 Gaussian ID
+重排了关系构造、前向和反向等非缓存模块，使两个窗口交错占满存储。排序现只在语义缓存候选原有
+槽位内聚合相同 Gaussian，非缓存候选的相对顺序保持不变。修复后实际 Residency 完成全部
+`846,012` 个事件和两个窗口，得到 `144,549` cycles，相对 Base 为 `1.0000069x`。它把片外状态
+请求从 `19,777` 降到 `547`、Ramulator 请求累计延迟从 `2,215,553` 降到 `37,416` cycles，但端到端
+只缩短一个周期。future-visible Residency 与 Base 都是 `144,550` cycles，因此当前证据说明语义
+驻留覆盖的内存等待不是该双窗口端到端关键路径。
+
+同一 trace 的资源必要下界已在修正后的 `144,550-cycle` Base 上重算。Query、Residency 和联合
+情形的共同必要下界均为 `21,284` cycles，限制项是 ComputePod microcontext 槽的总需求，必要
+条件最多仍未排除 `6.79x` 空间。该数值假设全局池化并忽略每簇碎片、依赖耦合和可达调度，只是
+不可突破的乐观下界，不是可达性能、目标、Oracle 或锚点。Base 的真实停顿记录显示双向查询归约
+Bank 从 cycle `448` 到 `129,299` 几乎持续冲突；当前 Python 实现仍用 `query_id` 排序代替权威
+实现的实时 `F/C/A` 负载状态和 `(released_work, completed_queries, -remaining_work)` 比较规则。
+下一入口是按权威 C++ 状态机补齐查询负载规则和每 Pod 有界就绪队列，再重跑同一 Base、Query
+实际机制和受资源约束 portfolio；在此之前不启动十六项消融。
+
+完整测试更新为 `285 passed, 1 skipped, 2 warnings`。上述结果均为
+`quick_cycle_validation`，不外推到正式 30K；`speedup_vs_orin` 继续保持 `unavailable`。

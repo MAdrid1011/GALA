@@ -880,6 +880,30 @@ def test_semantic_residency_multicasts_real_ready_requests_without_dropping_depe
     assert np.array_equal(trace.dependencies, dependencies_before)
 
 
+def test_semantic_residency_ordering_is_scoped_to_cache_candidates() -> None:
+    builder = TraceBuilder()
+    event_ids = [
+        builder.emit(TraceEvent(
+            primitive_kind=int(kind), gaussian_id=gaussian_id,
+            query_id=event_id, resource_class=int(resource),
+            data_bytes=64 if kind is PrimitiveKind.CACHE_REQUEST else 0,
+        ))
+        for event_id, (kind, gaussian_id, resource) in enumerate((
+            (PrimitiveKind.RELATION, 9, ResourceClass.RELATION),
+            (PrimitiveKind.CACHE_REQUEST, 8, ResourceClass.CACHE),
+            (PrimitiveKind.FORWARD, 1, ResourceClass.COMPUTE),
+            (PrimitiveKind.CACHE_REQUEST, 2, ResourceClass.CACHE),
+            (PrimitiveKind.RELATION, 0, ResourceClass.RELATION),
+        ))
+    ]
+    trace = builder.finish()
+    engine = CycleEngine(_config(), policy="residency")
+
+    ordered = engine._ordered_candidates(trace, event_ids)
+
+    assert ordered == [event_ids[0], event_ids[3], event_ids[2], event_ids[1], event_ids[4]]
+
+
 def test_query_close_keeps_state_resident_until_update_end() -> None:
     builder = TraceBuilder()
     first_request = builder.emit(TraceEvent(

@@ -627,11 +627,23 @@ class CycleEngine:
                 )
             base_order = sorted(base_order, key=future_plan.query_priority)
         if self.selection.semantic_residency and not self.selection.residency_oracle:
-            base_order = sorted(base_order, key=lambda event_id: (
-                0 if PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
-                in {PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN} else 1,
-                int(trace.events[event_id]["gaussian_id"]), event_id,
-            ))
+            cache_kinds = {PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN}
+            cache_positions = [
+                position for position, event_id in enumerate(base_order)
+                if PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
+                in cache_kinds
+            ]
+            ordered_cache = sorted(
+                (base_order[position] for position in cache_positions),
+                key=lambda event_id: (
+                    int(trace.events[event_id]["gaussian_id"]), event_id,
+                ),
+            )
+            base_order = list(base_order)
+            for position, event_id in zip(
+                cache_positions, ordered_cache, strict=True,
+            ):
+                base_order[position] = event_id
         if self.selection.query_load_rules:
             base_order = sorted(base_order, key=lambda event_id: (
                 int(trace.events[event_id]["query_id"]),
