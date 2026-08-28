@@ -34,6 +34,10 @@ def _parser() -> argparse.ArgumentParser:
         help="keep validated capture columns in bounded chunks without final mmap merge",
     )
     parser.add_argument(
+        "--virtual-capture", action="store_true",
+        help="capture exact bounded CUDA work-buffer packets without raw event columns",
+    )
+    parser.add_argument(
         "--capture-iteration-range", type=_iteration_range, default=None,
         metavar="START:END",
         help="capture an inclusive validation window while executing all training iterations",
@@ -47,14 +51,29 @@ def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     state_record_bytes = int(os.environ.get("GALA_TRACE_STATE_RECORD_BYTES", "128"))
     chunk_events = int(os.environ.get("GALA_TRACE_CHUNK_EVENTS", "65536"))
+    inactivity_timeout_seconds = float(
+        os.environ.get("GALA_TRACE_INACTIVITY_TIMEOUT_SECONDS", "300")
+    )
+    progress_interval_seconds = float(
+        os.environ.get("GALA_TRACE_PROGRESS_INTERVAL_SECONDS", "30")
+    )
     if state_record_bytes <= 0:
         raise ValueError("GALA_TRACE_STATE_RECORD_BYTES must be positive")
     if chunk_events <= 0:
         raise ValueError("GALA_TRACE_CHUNK_EVENTS must be positive")
+    if inactivity_timeout_seconds <= 0:
+        raise ValueError("GALA_TRACE_INACTIVITY_TIMEOUT_SECONDS must be positive")
+    if progress_interval_seconds <= 0:
+        raise ValueError("GALA_TRACE_PROGRESS_INTERVAL_SECONDS must be positive")
+    if args.virtual_capture and args.stream_only:
+        raise ValueError("--virtual-capture and --stream-only are mutually exclusive")
     session = TraceSession(
         args.trace_output, state_record_bytes=state_record_bytes,
         chunk_events=chunk_events, stream_only=args.stream_only,
         capture_iteration_range=args.capture_iteration_range,
+        virtual_capture=args.virtual_capture,
+        inactivity_timeout_seconds=inactivity_timeout_seconds,
+        progress_interval_seconds=progress_interval_seconds,
     )
     session.install()
     original_argv = sys.argv

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -18,9 +18,14 @@ from gala_sim.clamp import (
 )
 from gala_sim.clamp.builder import TraceChunkManifest
 from gala_sim.clamp.events import dependency_dtype, event_dtype
-from gala_sim.trace import Trace, TraceWriter
+from gala_sim.trace import (
+    Trace, TraceWriter, VirtualLifecycleKind, VirtualLifecycleRecord,
+)
 
-from .buffer_decoder import load_buffer_decoder
+from .buffer_decoder import (
+    decode_raster_virtual_packet, decode_voxel_virtual_packet, load_buffer_decoder,
+)
+from .virtual_capture import VirtualCaptureConsumer
 
 
 RASTER_TEMPLATE_ID = 1
@@ -76,6 +81,7 @@ class _PendingQuery:
     ssim_radius: int = 0
     candidate_records_path: Path | None = None
     relation_records_path: Path | None = None
+    virtual_packet: Any | None = None
 
 
 @dataclass
@@ -88,6 +94,9 @@ class TraceSession:
     chunk_events: int = 65536
     stream_only: bool = False
     capture_iteration_range: tuple[int, int] | None = None
+    virtual_capture: bool = False
+    inactivity_timeout_seconds: float = 300.0
+    progress_interval_seconds: float = 30.0
     _builder: ChunkedTraceBuilder = field(init=False)
     _decoder: Any = field(default=None, init=False)
     _iteration: int = field(default=0, init=False)
@@ -120,16 +129,30 @@ class TraceSession:
     _state_ready_event: int | None = field(default=None, init=False)
     _capture_error: str | None = field(default=None, init=False)
     _capture_window_started: bool = field(default=False, init=False)
+    _virtual_consumer: VirtualCaptureConsumer | None = field(default=None, init=False)
+    _virtual_collection_begin: bool = field(default=False, init=False)
 
     def __post_init__(self) -> None:
         if self.capture_iteration_range is not None:
             start, end = self.capture_iteration_range
             if start <= 0 or end < start:
                 raise ValueError("capture iteration range must have 1 <= start <= end")
+        if self.inactivity_timeout_seconds <= 0:
+            raise ValueError("capture inactivity timeout must be positive")
+        if self.progress_interval_seconds <= 0:
+            raise ValueError("capture progress interval must be positive")
         self._builder = ChunkedTraceBuilder(
             self.chunk_events, chunk_root=self.output_root / ".capture_chunks",
             stream_only=self.stream_only,
         )
+        if self.virtual_capture:
+            self._virtual_consumer = VirtualCaptureConsumer(
+                self.output_root, max_events=self.chunk_events,
+                state_record_bytes=self.state_record_bytes,
+                relation_candidate_bytes=self.relation_candidate_bytes,
+                inactivity_timeout_seconds=self.inactivity_timeout_seconds,
+                progress_interval_seconds=self.progress_interval_seconds,
+            )
 
     def install(self) -> None:
         if self._installed:
@@ -171,7 +194,7 @@ class TraceSession:
         self._originals.clear()
         self._installed = False
 
-    def finish(self) -> Trace | TraceChunkManifest:
+    def finish(self) -> Trace | TraceChunkManifest | dict[str, Any]:
         if self._capture_error is not None:
             raise RuntimeError(
                 "trace capture cannot finish after a collection failure: "
@@ -180,6 +203,11 @@ class TraceSession:
         self._flush_pending_queries()
         if self.capture_iteration_range is not None and not self._capture_window_started:
             raise RuntimeError("trace capture iteration range was never reached")
+        if self.virtual_capture:
+            self._close_virtual_iteration()
+            if self._virtual_consumer is None:
+                raise RuntimeError("virtual capture consumer is not initialized")
+            return self._virtual_consumer.finish(capture_audit=self._audit)
         audit = dict(self._audit)
         audit.setdefault("relation_record_device_batches", 0)
         audit.setdefault("relation_record_d2h_batches", 0)
@@ -319,10 +347,13 @@ class TraceSession:
         self._pending_backward_events.clear()
         self._completed_backward_buffers.clear()
         self._capture_window_started = True
+        if self.virtual_capture:
+            self._ensure_virtual_consumer()
 
     def _wrap_learning_rate(self, original: Any) -> Any:
         def wrapped(model: Any, iteration: int, *args: Any, **kwargs: Any) -> Any:
             self._flush_pending_queries()
+            self._close_virtual_iteration()
             self._iteration = int(iteration)
             self._ensure_gaussians(int(model.get_xyz.shape[0]))
             if self._iteration_capture_enabled():
@@ -334,6 +365,8 @@ class TraceSession:
         def wrapped(model: Any, *args: Any, **kwargs: Any) -> Any:
             result = original(model, *args, **kwargs)
             self._initialize_or_validate_gaussians(int(model.get_xyz.shape[0]))
+            if self.virtual_capture and self.capture_iteration_range is None:
+                self._ensure_virtual_consumer()
             optimizer = model.optimizer
             original_step = optimizer.step
 
@@ -364,9 +397,19 @@ class TraceSession:
                 raise RuntimeError("prune result does not match stable Gaussian ID count")
             if self._iteration_capture_enabled() and self._modification_action != "split":
                 for gaussian_id in removed_ids:
-                    self._emit_set_modification(
-                        gaussian_id, flags=MOD_PRUNE, reduction_key=gaussian_id
-                    )
+                    if self.virtual_capture:
+                        self._ensure_virtual_collection_begin()
+                        self._accept_virtual_lifecycle(VirtualLifecycleRecord(
+                            self._iteration, VirtualLifecycleKind.PRUNE,
+                            self._state_version, gaussian_id=gaussian_id,
+                            transaction_kind=UPDATE_BEGIN_COLLECTION,
+                        ))
+                        self._audit_increment("collection_modification_events")
+                        self._audit_increment("collection_prune_events")
+                    else:
+                        self._emit_set_modification(
+                            gaussian_id, flags=MOD_PRUNE, reduction_key=gaussian_id
+                        )
             return result
         return wrapped
 
@@ -401,6 +444,10 @@ class TraceSession:
                 raise RuntimeError("clone event count does not match selected Gaussian count")
             if not self._iteration_capture_enabled():
                 return result
+            if self.virtual_capture:
+                self._ensure_virtual_collection_begin()
+                self._accept_virtual_clone_records(parents, new_ids)
+                return result
             for parent, child in zip(parents, new_ids):
                 parent_event = self._emit_set_modification(
                     parent, flags=MOD_CLONE_PARENT, reduction_key=parent
@@ -431,6 +478,21 @@ class TraceSession:
             if len(new_ids) != expected:
                 raise RuntimeError("split event count does not match selected Gaussian count")
             if not self._iteration_capture_enabled():
+                return result
+            if self.virtual_capture:
+                self._ensure_virtual_collection_begin()
+                offset = 0
+                for parent in parents:
+                    children = new_ids[offset:offset + int(N)]
+                    offset += int(N)
+                    self._accept_virtual_lifecycle(VirtualLifecycleRecord(
+                        self._iteration, VirtualLifecycleKind.SPLIT, self._state_version,
+                        parent_id=parent, child_ids=tuple(children),
+                        transaction_kind=UPDATE_BEGIN_COLLECTION,
+                    ))
+                    self._audit_increment("collection_modification_events", len(children) + 1)
+                    self._audit_increment("collection_split_child_events", len(children))
+                    self._audit_increment("collection_split_parent_events")
                 return result
             children_by_parent: dict[int, list[int]] = {parent: [] for parent in parents}
             for child, parent in zip(new_ids, self._split_child_lineage(parents, int(N))):
@@ -509,6 +571,11 @@ class TraceSession:
                 geometry, binning, int(means.shape[0]), int(rendered),
                 int(start), int(count), height, width
             ),
+            virtual_packet_fn=lambda query_base: decode_raster_virtual_packet(
+                self._decoder, geometry, binning, int(means.shape[0]), int(rendered),
+                height, width, iteration_id=self._iteration, query_base=query_base,
+                state_version=self._state_version, field_mask=STATE_FIELD_MASK,
+            ),
         )
 
     def _capture_voxel(self, args: tuple[Any, ...], result: tuple[Any, ...]) -> None:
@@ -527,6 +594,11 @@ class TraceSession:
                 geometry, binning, int(means.shape[0]), int(rendered),
                 int(start), int(count), *dimensions
             ),
+            virtual_packet_fn=lambda query_base: decode_voxel_virtual_packet(
+                self._decoder, geometry, binning, int(means.shape[0]), int(rendered),
+                *dimensions, iteration_id=self._iteration, query_base=query_base,
+                state_version=self._state_version, field_mask=STATE_FIELD_MASK,
+            ),
         )
 
     def _capture_query(
@@ -534,6 +606,7 @@ class TraceSession:
         query_shape: tuple[int, ...], records_fn: Callable[[], Any],
         *, template_id: int, field_mask: int,
         record_chunk_fn: Callable[[int, int], Any] | None = None,
+        virtual_packet_fn: Callable[[int], Any] | None = None,
     ) -> None:
         if rendered < 0 or not query_shape or any(value <= 0 for value in query_shape):
             raise ValueError("decoded trace dimensions and candidate count must be positive")
@@ -550,6 +623,26 @@ class TraceSession:
         self._completed_backward_buffers.discard(binning_pointer)
         if output_pointer in self._pending_query_by_output or output_pointer in self._output_contexts:
             raise RuntimeError("captured query reused a live output buffer pointer")
+        if self.virtual_capture:
+            if virtual_packet_fn is None:
+                raise RuntimeError("virtual capture query has no packet decoder")
+            virtual_packet = virtual_packet_fn(query_base)
+            point_indexes = np.asarray(virtual_packet.point_ids, dtype=np.int64)
+            if point_indexes.size and (
+                int(point_indexes.min()) < 0
+                or int(point_indexes.max()) >= len(self._gaussian_ids)
+            ):
+                raise ValueError("virtual packet contains an invalid Gaussian index")
+            stable_ids = np.asarray(self._gaussian_ids, dtype=np.int64)[point_indexes]
+            virtual_packet = replace(virtual_packet, point_ids=stable_ids)
+            pending = _PendingQuery(
+                None, rendered, query_base, query_shape, binning_pointer, output_pointer,
+                template_id, field_mask, virtual_packet=virtual_packet,
+            )
+            self._pending_queries.append(pending)
+            self._pending_query_by_buffer[binning_pointer] = pending
+            self._pending_query_by_output[output_pointer] = pending
+            return
         candidate_records_path: Path | None = None
         relation_records_path: Path | None = None
         records: Any | None = None
@@ -595,6 +688,32 @@ class TraceSession:
             expected_template = VOXEL_TEMPLATE_ID if voxel else RASTER_TEMPLATE_ID
             if item.template_id != expected_template:
                 raise RuntimeError("captured backward kind does not match its forward context")
+
+        if self.virtual_capture:
+            pending = tuple(self._pending_queries)
+            self._pending_queries.clear()
+            self._pending_query_by_buffer.clear()
+            self._pending_query_by_output.clear()
+            self._pending_backward_buffers.clear()
+            for item in pending:
+                if item.virtual_packet is None:
+                    raise RuntimeError("virtual query has no decoded packet")
+                if self._virtual_consumer is None:
+                    raise RuntimeError("virtual capture consumer is not initialized")
+                packet = replace(
+                    item.virtual_packet, loss_flags=item.loss_flags,
+                    ssim_radius=item.ssim_radius,
+                )
+                self._virtual_consumer.accept_query(packet)
+                self._audit_increment("cuda_valid_relations", packet.logical_relation_count)
+                self._audit_increment("captured_backward_calls")
+                self._audit_increment("captured_backward_relations", packet.logical_relation_count)
+                self._audit_increment("captured_consumers", packet.query_count)
+            self._pending_backwards.clear()
+            self._completed_backward_buffers.update(
+                item.binning_pointer for item in pending
+            )
+            return
 
         empty_records = (
             np.empty((0, 4), dtype=np.int64), np.empty((0, 4), dtype=np.int64)
@@ -1183,6 +1302,35 @@ class TraceSession:
     def _capture_update(self, model: Any, *, field_mask: int) -> None:
         self._ensure_gaussians(int(model.get_xyz.shape[0]))
         self._audit_increment("optimizer_steps")
+        if self.virtual_capture:
+            self._ensure_virtual_consumer()
+            self._accept_virtual_lifecycle(VirtualLifecycleRecord(
+                self._iteration, VirtualLifecycleKind.UPDATE_BEGIN,
+                self._state_version, field_mask=field_mask,
+                transaction_kind=UPDATE_BEGIN_OPTIMIZER,
+            ))
+            self._audit_increment("update_begin_events")
+            if field_mask:
+                self._accept_virtual_lifecycle(VirtualLifecycleRecord(
+                    self._iteration, VirtualLifecycleKind.UPDATE_COMMIT,
+                    self._state_version, field_mask=field_mask,
+                    transaction_kind=UPDATE_BEGIN_OPTIMIZER, all_active=True,
+                ))
+                self._audit_increment("optimizer_updated_gaussians", len(self._gaussian_ids))
+            else:
+                self._audit_increment("optimizer_noop_steps")
+            self._accept_virtual_lifecycle(VirtualLifecycleRecord(
+                self._iteration, VirtualLifecycleKind.UPDATE_END,
+                self._state_version, field_mask=field_mask,
+                transaction_kind=UPDATE_BEGIN_OPTIMIZER,
+            ))
+            self._audit_increment("update_end_events")
+            if field_mask:
+                self._state_version += 1
+            self._pending_gradients.clear()
+            self._pending_backward_events.clear()
+            self._prior_transition_events.clear()
+            return
         begin = self._emit_update_begin(
             flags=UPDATE_BEGIN_OPTIMIZER, dependencies=self._backward_dependencies(),
         )
@@ -1290,11 +1438,26 @@ class TraceSession:
         self._collection_active = True
         self._collection_begin_event = None
         self._collection_events = []
+        self._virtual_collection_begin = False
 
     def _finish_collection_transaction(self) -> None:
         if not self._collection_active:
             raise RuntimeError("collection modification transaction is not active")
         self._collection_active = False
+        if self.virtual_capture:
+            if self._virtual_collection_begin:
+                self._accept_virtual_lifecycle(VirtualLifecycleRecord(
+                    self._iteration, VirtualLifecycleKind.UPDATE_END,
+                    self._state_version, field_mask=STATE_FIELD_MASK,
+                    transaction_kind=UPDATE_BEGIN_COLLECTION,
+                ))
+                self._audit_increment("update_end_events")
+                self._audit_increment("collection_modification_transactions")
+                self._state_version += 1
+            self._virtual_collection_begin = False
+            self._collection_begin_event = None
+            self._collection_events = []
+            return
         if self._collection_events:
             self._audit_increment("collection_modification_transactions")
             if self._collection_begin_event is None:
@@ -1314,6 +1477,18 @@ class TraceSession:
     def _emit_set_modification(self, gaussian_id: int, *, flags: int,
                                reduction_key: int,
                                dependencies: Any = ()) -> int:
+        if self.virtual_capture:
+            self._ensure_virtual_collection_begin()
+            kind = {
+                MOD_PRUNE: VirtualLifecycleKind.PRUNE,
+            }.get(flags)
+            if kind is None:
+                raise RuntimeError("virtual lineage must be emitted as a grouped record")
+            self._accept_virtual_lifecycle(VirtualLifecycleRecord(
+                self._iteration, kind, self._state_version,
+                gaussian_id=int(gaussian_id), transaction_kind=UPDATE_BEGIN_COLLECTION,
+            ))
+            return 0
         begin = self._ensure_collection_begin()
         event = self._builder.emit(TraceEvent(
             iteration_id=self._iteration,
@@ -1331,6 +1506,49 @@ class TraceSession:
             f"collection_{ModificationKind(flags).name.lower()}_events"
         )
         return event
+
+    def _ensure_virtual_consumer(self) -> VirtualCaptureConsumer:
+        if not self.virtual_capture or self._virtual_consumer is None:
+            raise RuntimeError("virtual capture consumer is not enabled")
+        if not self._virtual_consumer.initialized:
+            self._virtual_consumer.initialize_gaussians(len(self._gaussian_ids))
+        return self._virtual_consumer
+
+    def _accept_virtual_lifecycle(self, record: VirtualLifecycleRecord) -> None:
+        self._ensure_virtual_consumer().accept_lifecycle(record)
+
+    def _ensure_virtual_collection_begin(self) -> None:
+        if not self._collection_active:
+            raise RuntimeError("collection modification occurred outside densify_and_prune")
+        if self._virtual_collection_begin:
+            return
+        self._accept_virtual_lifecycle(VirtualLifecycleRecord(
+            self._iteration, VirtualLifecycleKind.UPDATE_BEGIN,
+            self._state_version, field_mask=STATE_FIELD_MASK,
+            transaction_kind=UPDATE_BEGIN_COLLECTION,
+        ))
+        self._virtual_collection_begin = True
+        self._audit_increment("update_begin_events")
+
+    def _accept_virtual_clone_records(
+        self, parents: tuple[int, ...], children: list[int]
+    ) -> None:
+        for parent, child in zip(parents, children, strict=True):
+            self._accept_virtual_lifecycle(VirtualLifecycleRecord(
+                self._iteration, VirtualLifecycleKind.CLONE, self._state_version,
+                parent_id=parent, child_ids=(child,),
+                transaction_kind=UPDATE_BEGIN_COLLECTION,
+            ))
+            self._audit_increment("collection_modification_events", 2)
+            self._audit_increment("collection_clone_parent_events")
+            self._audit_increment("collection_clone_child_events")
+
+    def _close_virtual_iteration(self) -> None:
+        if not self.virtual_capture or self._virtual_consumer is None:
+            return
+        iteration = self._virtual_consumer.current_iteration
+        if iteration is not None:
+            self._virtual_consumer.close_iteration(iteration)
 
     @staticmethod
     def _optimizer_field_mask(optimizer: Any) -> int:

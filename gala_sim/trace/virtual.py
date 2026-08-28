@@ -65,6 +65,7 @@ class VirtualLifecycleRecord:
     parent_id: int = -1
     child_ids: tuple[int, ...] = ()
     transaction_kind: int = 0
+    all_active: bool = False
 
     def __post_init__(self) -> None:
         if self.iteration_id < 0 or self.state_version < 0 or self.field_mask < 0:
@@ -75,6 +76,8 @@ class VirtualLifecycleRecord:
             raise ValueError("virtual lifecycle child IDs must be non-negative")
         if self.transaction_kind not in {0, TRANSACTION_COLLECTION, TRANSACTION_OPTIMIZER}:
             raise ValueError("virtual lifecycle transaction kind is invalid")
+        if self.all_active and self.kind is not VirtualLifecycleKind.UPDATE_COMMIT:
+            raise ValueError("all-active lifecycle records must be optimizer commits")
 
 
 @dataclass(frozen=True)
@@ -164,6 +167,14 @@ class VirtualTraceLifecycleValidator:
         if record.kind is VirtualLifecycleKind.UPDATE_COMMIT:
             if self._open_update is None:
                 raise ValueError("virtual update commit has no begin")
+            transaction_kind, begin_mask, _ = self._open_update
+            if transaction_kind != TRANSACTION_OPTIMIZER:
+                raise ValueError("virtual update commit is outside an optimizer transaction")
+            if record.transaction_kind != transaction_kind or record.field_mask != begin_mask:
+                raise ValueError("virtual update commit does not match its transaction")
+            if record.all_active:
+                self.current_optimizer_commits += len(self.active_gaussians or ())
+                return
             if record.gaussian_id not in (self.active_gaussians or set()):
                 raise ValueError("virtual update commit refers to an inactive Gaussian")
             self.current_optimizer_commits += 1
@@ -191,6 +202,8 @@ class VirtualTraceLifecycleValidator:
             if self._open_update is None:
                 raise ValueError("virtual update end has no begin")
             transaction_kind, begin_mask, _ = self._open_update
+            if record.transaction_kind != transaction_kind:
+                raise ValueError("virtual update end does not match its transaction")
             if record.field_mask != begin_mask:
                 raise ValueError("virtual update masks do not match")
             if begin_mask:

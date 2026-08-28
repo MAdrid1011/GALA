@@ -129,6 +129,8 @@ FMA、EXP、LOG、RCP、SQRT、SRAM、CAM、互连和寄存器流水延迟不写
 | `preflight.warmup_iterations` | 10 | iteration | 排除首次编译和缓存建立 |
 | `preflight.measure_iterations` | 50 | iteration | 预测总运行时间 |
 | `trace.chunk_events` | 自动调优后冻结 | event | 设备 trace chunk 容量 |
+| `trace.inactivity_timeout_seconds` | 300 | second | 虚拟 trace 数据包或日志无推进时的终止门限 |
+| `trace.progress_interval_seconds` | 30 | second | 虚拟 trace 结构化吞吐日志的最长间隔 |
 | `diagnostic.throughput_report_interval_events` | 100000 | completed_event | 周期开发模式的事件采样间隔 |
 | `diagnostic.throughput_report_interval_seconds` | 30 | second | 周期开发模式的最长静默间隔 |
 | `diagnostic.throughput_warmup_samples` | 3 | sample | 吞吐稳定判定前丢弃的预热样本数 |
