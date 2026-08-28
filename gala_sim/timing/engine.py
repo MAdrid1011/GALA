@@ -1228,6 +1228,8 @@ class CycleReplaySession:
         self._query_packets = 0
         self._closed_iterations = 0
         self._last_lifecycle_event: int | None = None
+        self._state_barrier_event: int | None = None
+        self._backward_frontier: tuple[int, ...] = ()
         self._finalized = False
         self._started_at = time.monotonic()
         self._last_progress_report = self._started_at
@@ -1297,8 +1299,22 @@ class CycleReplaySession:
         self._ensure_open()
         self._lifecycle.accept_packet(packet)
         self._query_packets += 1
-        for event_packet in self._expander.expand(packet):
+        terminal_ids: list[int] = []
+        external_dependencies = (
+            (self._state_barrier_event,)
+            if self._state_barrier_event is not None else ()
+        )
+        for event_packet in self._expander.expand(
+            packet, external_dependencies=external_dependencies
+        ):
+            terminal_ids.extend(
+                int(event_id) for event_id in event_packet.events["event_id"][
+                    event_packet.events["primitive_kind"]
+                    == int(PrimitiveKind.GRADIENT_REDUCTION)
+                ]
+            )
             self.accept_event_packet(event_packet)
+        self._backward_frontier = (*self._backward_frontier, *terminal_ids)
 
     def register_semantic_workset_totals(
         self, totals: Mapping[tuple[int, int], int]
@@ -1340,13 +1356,18 @@ class CycleReplaySession:
         }[record.kind]
         base_dependencies = (
             tuple(record.dependency_ids)
-            if record.dependency_ids else tuple(self._events)
+            if record.dependency_ids else (
+                self._backward_frontier or tuple(self._events)
+            )
         )
         gaussian_ids = (
             tuple(record.active_ids)
             if record.kind is VirtualLifecycleKind.UPDATE_COMMIT
             and record.all_active and record.active_ids
-            else (record.gaussian_id,)
+            else ((record.parent_id, *record.child_ids)
+                  if record.kind in {
+                      VirtualLifecycleKind.CLONE, VirtualLifecycleKind.SPLIT,
+                  } and record.child_ids else (record.gaussian_id,))
         )
         for gaussian_id in gaussian_ids:
             event_id = self._stream_validator.next_event_id
@@ -1363,7 +1384,15 @@ class CycleReplaySession:
             row["resource_class"] = int(ResourceClass.UPDATE)
             row["field_mask"] = record.field_mask
             row["template_id"] = 0
-            row["flags"] = record.transaction_kind
+            row["flags"] = (
+                int(record.kind)
+                if record.kind in {
+                    VirtualLifecycleKind.PRUNE,
+                    VirtualLifecycleKind.CLONE,
+                    VirtualLifecycleKind.SPLIT,
+                }
+                else record.transaction_kind
+            )
             row["dependency_begin"] = 0
             row["dependency_count"] = len(dependency_ids)
             event_packet = VirtualEventPacket(
@@ -1374,6 +1403,9 @@ class CycleReplaySession:
             )
             self._last_lifecycle_event = event_id
             self.accept_event_packet(event_packet)
+        if record.kind is VirtualLifecycleKind.UPDATE_END:
+            self._state_barrier_event = self._last_lifecycle_event
+            self._backward_frontier = ()
 
     def close_iteration(self, iteration_id: int) -> None:
         self._ensure_open()

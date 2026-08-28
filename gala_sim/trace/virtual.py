@@ -894,7 +894,12 @@ class VirtualQueryEventExpander:
         if self.relation_candidate_bytes < 0:
             raise ValueError("relation candidate bytes must be non-negative")
 
-    def expand(self, source: VirtualTracePacket) -> Iterator[VirtualEventPacket]:
+    def expand(
+        self,
+        source: VirtualTracePacket,
+        *,
+        external_dependencies: tuple[int, ...] = (),
+    ) -> Iterator[VirtualEventPacket]:
         if source.loss_flags == 0:
             raise ValueError("virtual query expansion requires a captured loss consumer")
         candidate_start = self.next_event_id
@@ -913,7 +918,9 @@ class VirtualQueryEventExpander:
         self.next_event_id = gradient_start + relation_count
         self.next_relation_id += relation_count
 
-        yield from self._candidates(source, candidate_start)
+        if any(dependency < 0 for dependency in external_dependencies):
+            raise ValueError("virtual query external dependencies must be non-negative")
+        yield from self._candidates(source, candidate_start, external_dependencies)
         yield from self._relations(
             source, candidate_start, relation_start, relation_base, emitted_before=0
         )
@@ -940,7 +947,8 @@ class VirtualQueryEventExpander:
         )
 
     def _candidates(
-        self, source: VirtualTracePacket, event_start: int
+        self, source: VirtualTracePacket, event_start: int,
+        external_dependencies: tuple[int, ...] = (),
     ) -> Iterator[VirtualEventPacket]:
         for start in range(0, source.candidate_count, self.max_events):
             end = min(start + self.max_events, source.candidate_count)
@@ -957,7 +965,14 @@ class VirtualQueryEventExpander:
             rows["template_id"] = source.template_id
             rows["field_mask"] = source.field_mask
             rows["flags"] = np.any(source.masks[start:end], axis=1)
-            yield self._make_event_packet(rows, np.empty(0, dtype=dependency_dtype()))
+            dependencies = np.asarray(
+                external_dependencies if start == 0 else (),
+                dtype=dependency_dtype(),
+            )
+            if dependencies.size:
+                rows["dependency_begin"][0] = 0
+                rows["dependency_count"][0] = dependencies.size
+            yield self._make_event_packet(rows, dependencies)
 
     def _relations(
         self,

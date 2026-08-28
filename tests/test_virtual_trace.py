@@ -195,6 +195,19 @@ def test_query_expander_builds_a_valid_full_query_chain() -> None:
     assert report.event_count == 26
 
 
+def test_query_expander_carries_external_state_barrier_on_first_candidate() -> None:
+    masks = _mask(1, 8)
+    masks[0, 0] = 1
+    source = VirtualTracePacket(
+        iteration_id=2, template_id=1, query_base=0, query_shape=(1, 1),
+        point_ids=np.asarray([0]), point_keys=np.asarray([0], dtype=np.uint64),
+        masks=masks, loss_flags=1, backward_confirmed=True,
+    )
+    expander = VirtualQueryEventExpander(max_events=2, next_event_id=4)
+    packets = tuple(expander.expand(source, external_dependencies=(1, 3)))
+    assert packets[0].dependency_ids(0).tolist() == [1, 3]
+
+
 def test_lifecycle_validator_tracks_updates_lineage_and_iteration_ledger() -> None:
     validator = VirtualTraceLifecycleValidator(initial_gaussian_count=2)
     masks = _mask(2, 8)
