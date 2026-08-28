@@ -94,6 +94,17 @@ configs/
 
 设备缓冲区满时，使用 CUDA stream 将完整 chunk 异步复制到固定页内存。CPU 周期线程消费上一个 chunk，GPU 同时生成下一个 chunk。追踪格式使用按列 NumPy 数组或 Arrow IPC，字段类型由 `gala-clamp-events-v2` schema 固定。`UPDATE_BEGIN` 与 `UPDATE_END` 包围优化器提交或集合修改事务；`UPDATE_END.field_mask == 0` 是不推进状态版本的控制屏障，非零掩码才关闭旧版本并推进状态。禁止逐事件 JSON 和逐事件 Python 回调。
 
+对于 R²-Gaussian 的密集 raster/voxel 查询，追踪层还提供
+`gala-trace-virtual-packet-v1` 工作缓冲区表示。每个包保留官方 CUDA 输出的
+`point_list`、`point_key` 和完整 `uint32` valid-mask，不保存展开后的关系事件；
+置位 bit 与真实 Gaussian-query relation 一一对应。`VirtualTracePacket` 只属于
+生产端的有界工作包，不能直接作为周期 trace 或跳过生命周期检查。后续的有界
+事件展开器必须为所有事件分配全局连续 `event_id`，保留全局依赖 ID、跨包状态版本、
+未完成缓存读和语义工作集 sidecar，再将全局事件包交给 validator 和周期执行器。
+生产线程与消费线程之间最多保留配置数量的包；生产、消费、关系数量、物理包字节数
+和峰值驻留字节数写入运行记录。任一生产或消费方向连续五分钟没有进展时，运行必须
+停止并标记失败，不得把工作缓冲包当作已完成的正式 trace。
+
 ## 5. 周期执行器
 
 周期执行器以模块下一次状态变化为调度粒度。全局内核维护少量模块唤醒项，每个硬件模块维护自己的输入队列、在途项、完成队列和可用资源周期。调度器从当前最早唤醒周期跳到下一周期，并批量处理同周期事件。

@@ -7,6 +7,13 @@ from .validator import (
 )
 from .sink import DeviceTraceSink, NumpyChunkSink
 from .sample import QueryRange, TraceSampleConfig, dependency_closed_query_sample
+from .virtual import (
+    MASK_WORD_BITS,
+    VirtualTracePacket,
+    VirtualTraceProgress,
+    VirtualTraceRun,
+    VirtualTraceStream,
+)
 
 __all__ = [
     "TRACE_SCHEMA_VERSION",
@@ -22,4 +29,9 @@ __all__ = [
     "QueryRange",
     "TraceSampleConfig",
     "dependency_closed_query_sample",
+    "MASK_WORD_BITS",
+    "VirtualTracePacket",
+    "VirtualTraceProgress",
+    "VirtualTraceRun",
+    "VirtualTraceStream",
 ]

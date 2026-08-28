@@ -84,6 +84,15 @@
 
 ## 当前入口
 
+2026-08-28 已加入 `gala_sim.trace.virtual` 的有界工作缓冲区原型。`VirtualTracePacket`
+保留官方 raster/voxel 的 point list、point key 和完整 valid mask，并以稳定的全局
+query 顺序惰性枚举真实 relation；`VirtualTraceStream` 使用有界生产/消费队列、物理
+包字节和峰值驻留统计，并在配置的不活动期限内停止无进展运行。该原型已经通过 raster、
+voxel、边界 bit、关系批次和生产/消费超时单元测试，但目前仍是生产端工作包，尚未包含
+CLAMP 全局 event/dependency、缓存返回、更新事务、Ramulator 请求或跨包语义工作集状态。
+因此它尚未接入正式 CUDA capture、validator 或 CycleEngine，也不能提升当前三万次
+trace、Base ASIC、Oracle 或消融结果的资格。
+
 R²-Gaussian + Chest 已结束正式 GPU 计数器采集。性能分析固定使用前 16 组代表采样、已有 collection 报告和历史可用报告，不再追求 62 组穷举覆盖；这 16 组是本组合的性能采样上限，不再启动第 17--54 组。采样结果明确标注 `representative_gpu_performance_estimate`，保留精确内容覆盖率、按真实出现频次加权覆盖率、外推模式和逐阶段离散度，不能解释为穷举计数或正式 Orin 实测。哈希只记录，不参与任何通过或拒绝判断。
 
 本轮决策后的入口是：先冻结统一硬件/时序/trace 配置，随后只对质量与完整性执行一次全量 trace 验证，性能迭代使用可配置的代表性依赖闭包，最后运行 Base ASIC 和两个受资源约束 Oracle。16 组采样已经足以支撑该阶段的本地 GPU 性能参数化；增加到 60 多组只会扩大重复采集时间，不改变当前采样估计的定义。

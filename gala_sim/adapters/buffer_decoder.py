@@ -12,6 +12,8 @@ from typing import Any
 
 import numpy as np
 
+from gala_sim.trace.virtual import VirtualTracePacket
+
 
 @lru_cache(maxsize=1)
 def load_buffer_decoder() -> Any:
@@ -85,6 +87,85 @@ def decode_voxel_buffers(
         np.asarray(point_ids, dtype=np.int64),
         np.asarray(point_keys, dtype=np.uint64),
         np.asarray(ranges, dtype=np.int64),
+    )
+
+
+def decode_raster_virtual_packet(
+    decoder: Any,
+    geometry_buffer: Any,
+    binning_buffer: Any,
+    gaussian_count: int,
+    rendered: int,
+    image_height: int,
+    image_width: int,
+    *,
+    iteration_id: int,
+    query_base: int,
+    state_version: int = 0,
+    field_mask: int = 0,
+    loss_flags: int = 0,
+) -> VirtualTracePacket:
+    """Copy one raster work buffer into an exact bounded virtual packet."""
+
+    point_ids = decoder.copy_raster_point_list(binning_buffer, int(rendered)).cpu().numpy()
+    point_keys = decoder.copy_raster_point_keys(binning_buffer, int(rendered)).cpu().numpy()
+    masks = decoder.raster_valid_masks(
+        geometry_buffer, binning_buffer, int(gaussian_count), int(rendered),
+        int(image_height), int(image_width),
+    )
+    if hasattr(masks, "detach"):
+        masks = masks.detach().cpu().numpy()
+    return VirtualTracePacket(
+        iteration_id=iteration_id,
+        template_id=1,
+        query_base=query_base,
+        query_shape=(int(image_height), int(image_width)),
+        point_ids=point_ids,
+        point_keys=point_keys,
+        masks=np.asarray(masks, dtype=np.dtype("<u4")),
+        state_version=state_version,
+        field_mask=field_mask,
+        loss_flags=loss_flags,
+    )
+
+
+def decode_voxel_virtual_packet(
+    decoder: Any,
+    geometry_buffer: Any,
+    binning_buffer: Any,
+    gaussian_count: int,
+    rendered: int,
+    voxel_x: int,
+    voxel_y: int,
+    voxel_z: int,
+    *,
+    iteration_id: int,
+    query_base: int,
+    state_version: int = 0,
+    field_mask: int = 0,
+    loss_flags: int = 0,
+) -> VirtualTracePacket:
+    """Copy one voxel work buffer into an exact bounded virtual packet."""
+
+    point_ids = decoder.copy_voxel_point_list(binning_buffer, int(rendered)).cpu().numpy()
+    point_keys = decoder.copy_voxel_point_keys(binning_buffer, int(rendered)).cpu().numpy()
+    masks = decoder.voxel_valid_masks(
+        geometry_buffer, binning_buffer, int(gaussian_count), int(rendered),
+        int(voxel_x), int(voxel_y), int(voxel_z),
+    )
+    if hasattr(masks, "detach"):
+        masks = masks.detach().cpu().numpy()
+    return VirtualTracePacket(
+        iteration_id=iteration_id,
+        template_id=2,
+        query_base=query_base,
+        query_shape=(int(voxel_x), int(voxel_y), int(voxel_z)),
+        point_ids=point_ids,
+        point_keys=point_keys,
+        masks=np.asarray(masks, dtype=np.dtype("<u4")),
+        state_version=state_version,
+        field_mask=field_mask,
+        loss_flags=loss_flags,
     )
 
 
