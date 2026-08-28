@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from pathlib import Path
+
+from gala_sim.config import load_config
 
 from gala_sim.clamp.builder import TraceBuilder
 from gala_sim.clamp.events import PrimitiveKind, TraceEvent
@@ -107,6 +110,31 @@ def test_cycle_bounds_only_rule_out_targets_proven_below_a_necessary_floor() -> 
     assert reachability["full"].status == "ruled_out_by_necessary_lower_bound"
     assert reachability["full"].minimum_uncovered_cycles == 128
     assert reachability["full"].maximum_coverable_cycles == 272
+
+
+def test_query_loss_bound_uses_registered_query_issue_width() -> None:
+    builder = TraceBuilder()
+    for query_id in range(17):
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.CONSUMER),
+            query_id=query_id,
+        ))
+    config = CycleConfig.from_gala(
+        load_config(Path(__file__).parents[1] / "configs/architecture/gala.yaml"),
+        _Memory(),
+    )
+    report = analyze_cycle_lower_bounds(
+        CycleEngine(config),
+        builder.finish(),
+        base_asic_cycles=100,
+        targets={"query": 2.0, "residency": 2.0, "full": 2.0},
+    )
+    component = next(
+        item for item in report.scenarios[0].components
+        if item.name == "bidirectional_query.loss_fma_lanes"
+    )
+    assert component.cycles == 5
+    assert component.evidence["queries_per_cycle"] == 16
 
 
 def test_semantic_cache_instances_have_independent_ports_and_banks() -> None:

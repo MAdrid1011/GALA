@@ -10,7 +10,11 @@ import numpy as np
 
 from gala_sim.clamp.events import PrimitiveKind
 from gala_sim.trace.model import Trace
-from gala_sim.timing.packets import PhysicalPacketStage, RelationPacketPlan
+from gala_sim.timing.packets import (
+    PhysicalPacketStage,
+    RelationPacketPlan,
+    RelationWindowPlan,
+)
 
 
 @dataclass(frozen=True)
@@ -301,9 +305,10 @@ def _query_components(
         return []
     banks = engine.config.query_reduction_banks
     loss_lanes = engine.config.query_loss_fma_lanes
+    loss_slots = engine.config.query_loss_queries_per_cycle
     replay_lanes = engine.config.query_adjoint_replay_lanes
     groups = engine.config.query_partial_sum_groups_per_bank
-    assert banks is not None and loss_lanes is not None
+    assert banks is not None and loss_lanes is not None and loss_slots is not None
     assert replay_lanes is not None and groups is not None
     timing = engine.modules["bidirectional_query"].timing
     kinds = trace.events["primitive_kind"]
@@ -345,16 +350,70 @@ def _query_components(
         category="query_loss",
         cycles=_issue_completion_bound(
             consumers,
-            ports=1,
+            ports=loss_slots,
             initiation_interval=timing.initiation_interval,
             minimum_service=timing.latency,
         ),
         evidence={
             "consumer_events": consumers,
             "fma_lanes_per_consumer": loss_lanes,
+            "queries_per_cycle": loss_slots,
+            "fma_lanes_per_query_issue": loss_lanes // loss_slots,
         },
-        limitation="One consumer occupies the frozen vector loss datapath; dependencies are free.",
+        limitation="Uses the configured query issue width and assumes every consumer is ready; dependencies and volume-bank conflicts are free.",
     ))
+
+    volume_banks = engine.config.query_volume_banks
+    assert volume_banks is not None
+    volume_reads = np.zeros(volume_banks, dtype=np.int64)
+    volume_writes = np.zeros(volume_banks, dtype=np.int64)
+    seen_volume_stages: set[int] = set()
+    for raw_event_id, row in enumerate(trace.events):
+        kind = PrimitiveKind(int(row["primitive_kind"]))
+        if kind not in {
+            PrimitiveKind.QUERY_REDUCTION,
+            PrimitiveKind.CONSUMER,
+            PrimitiveKind.ADJOINT,
+        }:
+            continue
+        physical_stage = packet_plan.stage_for_event(raw_event_id)
+        if physical_stage is not None:
+            if physical_stage.stage_id in seen_volume_stages:
+                continue
+            seen_volume_stages.add(physical_stage.stage_id)
+            query_ids = tuple(
+                int(trace.events[event_id]["query_id"])
+                for event_id in physical_stage.event_ids
+            )
+        else:
+            query_ids = (int(row["query_id"]),)
+        if kind in {PrimitiveKind.CONSUMER, PrimitiveKind.ADJOINT}:
+            for query_id in query_ids:
+                volume_reads[query_id % volume_banks] += 1
+        if kind in {PrimitiveKind.CONSUMER, PrimitiveKind.QUERY_REDUCTION}:
+            for query_id in query_ids:
+                volume_writes[query_id % volume_banks] += 1
+
+    for direction, counts in (("read", volume_reads), ("write", volume_writes)):
+        busiest = int(np.max(counts, initial=0))
+        if not busiest:
+            continue
+        components.append(CycleBoundComponent(
+            name=f"bidirectional_query.volume_{direction}_banks",
+            category="query_volume_bank",
+            cycles=_issue_completion_bound(
+                busiest,
+                ports=1,
+                initiation_interval=timing.initiation_interval,
+                minimum_service=timing.latency,
+            ),
+            evidence={
+                "volume_banks": volume_banks,
+                "accesses_per_bank": counts.tolist(),
+                "busiest_bank_accesses": busiest,
+            },
+            limitation="One access per SRAM bank per cycle; assumes all accesses are ready and ignores read/write pipeline coupling.",
+        ))
 
     replay_counts = np.zeros(replay_lanes, dtype=np.int64)
     seen_stages: set[int] = set()
@@ -475,7 +534,17 @@ def _compute_components(
     if not capacities or not templates:
         return []
     demand: dict[str, int] = {}
+    demand_by_pod: dict[int, dict[str, int]] = {}
     count_by_path: dict[str, int] = {}
+    pods = int(capacities.get("pods", 1))
+    clusters = int(capacities.get("clusters", 1))
+    if clusters % pods:
+        raise ValueError("ComputePod clusters are not divisible by Pod count")
+    capacity_per_pod = {
+        resource: int(value) // pods
+        for resource, value in capacities.items()
+        if resource not in {"pods", "clusters_per_pod"}
+    }
     compute_items = _module_work_items(engine, trace, "compute_pod", packet_plan)
     for event_id, physical_stage in compute_items:
         row = trace.events[event_id]
@@ -485,33 +554,46 @@ def _compute_components(
         )
         path_name = engine.modules["compute_pod"]._path_for(kind)
         count_by_path[path_name] = count_by_path.get(path_name, 0) + 1
-        demand["cluster_issue"] = demand.get("cluster_issue", 0) + (
-            profile.cluster_issue_slots * profile.cluster_issue_cycles
-        )
-        demand["microcontext_slots"] = demand.get("microcontext_slots", 0) + (
-            profile.packet_last_result_offset or profile.latency
-        )
+        event_demand: dict[str, int] = {
+            "cluster_issue": profile.cluster_issue_slots * profile.cluster_issue_cycles,
+            "microcontext_slots": profile.packet_last_result_offset or profile.latency,
+        }
         for stage in profile.stages:
             for resource, value in engine.modules["compute_pod"]._demands(stage):
                 if value and resource in capacities:
-                    demand[resource] = demand.get(resource, 0) + value
+                    event_demand[resource] = event_demand.get(resource, 0) + value
+        pod = int(row["gaussian_id"]) % pods if int(row["gaussian_id"]) >= 0 else 0
+        pod_demand = demand_by_pod.setdefault(pod, {})
+        for resource, value in event_demand.items():
+            demand[resource] = demand.get(resource, 0) + value
+            pod_demand[resource] = pod_demand.get(resource, 0) + value
     components: list[CycleBoundComponent] = []
     for resource, total in sorted(demand.items()):
         capacity = int(capacities[resource])
+        pod_cycles = [
+            math.ceil(pod_values.get(resource, 0) / capacity_per_pod[resource])
+            for pod_values in demand_by_pod.values()
+            if pod_values.get(resource, 0)
+        ]
         components.append(CycleBoundComponent(
             name=f"compute_pod.{resource}",
             category="compute_reservation",
-            cycles=math.ceil(total / capacity),
+            cycles=max(math.ceil(total / capacity), max(pod_cycles, default=0)),
             evidence={
                 "total_slot_cycles_or_demands": total,
                 "global_capacity_per_cycle": capacity,
+                "pod_demand": {
+                    str(pod): values.get(resource, 0)
+                    for pod, values in sorted(demand_by_pod.items())
+                },
+                "pod_capacity_per_cycle": capacity_per_pod[resource],
                 "event_count_by_path": dict(sorted(count_by_path.items())),
                 "logical_lane_events": sum(
                     len(stage.event_ids) if stage is not None else 1
                     for _event_id, stage in compute_items
                 ),
             },
-            limitation="Uses globally pooled capacity and ignores per-cluster fragmentation.",
+            limitation="Aggregates flexible cluster assignment within each Pod; it is still optimistic because it ignores stage overlap and exact per-cluster packing.",
         ))
     return components
 
@@ -588,34 +670,118 @@ def _capacity_diagnostics(
 ) -> dict[str, Any]:
     instances = engine.config.cache_instances
     capacity = engine.config.cache_capacity_per_instance
-    if not instances or not capacity:
-        return {
-            "relation_packets": _packet_diagnostics(trace, packet_plan),
-            "semantic_cache": {"status": "unavailable_configuration"},
-        }
-    mask = trace.events["primitive_kind"] == int(PrimitiveKind.CACHE_REQUEST)
-    unique_by_instance: dict[int, set[tuple[int, int]]] = {
-        instance: set() for instance in range(instances)
-    }
-    for row in trace.events[mask]:
-        gaussian_id = int(row["gaussian_id"])
-        unique_by_instance[gaussian_id % instances].add(
-            (gaussian_id, int(row["state_version"]))
-        )
-    counts = {str(key): len(value) for key, value in unique_by_instance.items()}
-    return {
+    diagnostics: dict[str, Any] = {
         "relation_packets": _packet_diagnostics(trace, packet_plan),
-        "semantic_cache": {
+    }
+    if not instances or not capacity:
+        diagnostics["semantic_cache"] = {"status": "unavailable_configuration"}
+    else:
+        mask = trace.events["primitive_kind"] == int(PrimitiveKind.CACHE_REQUEST)
+        unique_by_instance: dict[int, set[tuple[int, int]]] = {
+            instance: set() for instance in range(instances)
+        }
+        for row in trace.events[mask]:
+            gaussian_id = int(row["gaussian_id"])
+            unique_by_instance[gaussian_id % instances].add(
+                (gaussian_id, int(row["state_version"]))
+            )
+        counts = {str(key): len(value) for key, value in unique_by_instance.items()}
+        diagnostics["semantic_cache"] = {
             "instances": instances,
             "active_records_per_instance": capacity,
             "unique_keys_per_instance": counts,
             "all_unique_keys_fit_without_eviction": max(counts.values(), default=0) <= capacity,
             "interpretation": "Unique-key capacity check, not a timed liveness proof.",
+        }
+
+    relation_windows = _relation_window_diagnostics(engine, trace, packet_plan)
+    diagnostics["relation_windows"] = relation_windows
+
+    replay_capacity = engine.config.query_replay_queue_entries
+    replay_keys: dict[tuple[int, int], int] = {}
+    consumers: set[tuple[int, int]] = set()
+    for row in trace.events:
+        kind = PrimitiveKind(int(row["primitive_kind"]))
+        key = (int(row["iteration_id"]), int(row["query_id"]))
+        if kind is PrimitiveKind.ADJOINT:
+            replay_keys[key] = replay_keys.get(key, 0) + 1
+        elif kind is PrimitiveKind.CONSUMER:
+            consumers.add(key)
+    diagnostics["query_replay"] = {
+        "capacity_entries": replay_capacity,
+        "queries_with_adjoint_replay": len(replay_keys),
+        "consumer_queries_with_replay": len(consumers & replay_keys.keys()),
+        "max_adjoint_lanes_per_query": max(replay_keys.values(), default=0),
+        "interpretation": "Identity and multiplicity counts only; event order is not a liveness proof.",
+    }
+
+    capacities = engine.config.compute_resource_capacities or {}
+    pods = int(capacities.get("pods", 1))
+    clusters_per_pod = int(capacities.get("clusters_per_pod", capacities.get("clusters", 1)))
+    owner_keys: dict[int, set[tuple[int, int, int]]] = {}
+    for row in trace.events:
+        if PrimitiveKind(int(row["primitive_kind"])) is not PrimitiveKind.ADJOINT:
+            continue
+        gaussian_id = int(row["gaussian_id"])
+        if gaussian_id < 0:
+            continue
+        pod = gaussian_id % pods
+        cluster = pod * clusters_per_pod + gaussian_id % clusters_per_pod
+        owner_keys.setdefault(cluster, set()).add(
+            (int(row["iteration_id"]), gaussian_id, int(row["state_version"]))
+        )
+    diagnostics["owner_gradient"] = {
+        "slots_per_cluster": engine.config.owner_gradient_slots_per_cluster,
+        "unique_epoch_keys_per_cluster": {
+            str(cluster): len(keys) for cluster, keys in sorted(owner_keys.items())
         },
-        "module_queues": {
-            name: module.timing.queue_capacity
-            for name, module in engine.modules.items()
-        },
+        "max_unique_epoch_keys_per_cluster": max(
+            (len(keys) for keys in owner_keys.values()), default=0,
+        ),
+        "interpretation": "Unique-key capacity check; exact in-flight lifetime still depends on dependencies.",
+    }
+
+    envelope = engine.config.resource_envelope
+    usage = engine.config.resource_usage
+    diagnostics["shared_sram"] = {
+        "envelope_bytes": envelope.shared_sram_bytes if envelope is not None else None,
+        "usage_bytes": usage.shared_sram_bytes if usage is not None else None,
+        "usage_regions": dict(usage.regions) if usage is not None else {},
+        "status": "checked" if envelope is not None and usage is not None else "unavailable_configuration",
+    }
+    diagnostics["module_queues"] = {
+        name: module.timing.queue_capacity
+        for name, module in engine.modules.items()
+    }
+    return diagnostics
+
+
+def _relation_window_diagnostics(
+    engine: Any, trace: Trace, packet_plan: RelationPacketPlan,
+) -> dict[str, Any]:
+    """Report declared window/store occupancy without guessing a schedule."""
+
+    window_plan = RelationWindowPlan.from_trace(trace, packet_plan)
+    if window_plan is None:
+        return {"status": "unavailable_trace_sidecar"}
+    descriptors = window_plan.descriptors
+    records = [descriptor.relation_records for descriptor in descriptors]
+    capacity = engine.config.query_relation_window_entries
+    store_capacity = engine.config.query_relation_store_records
+    return {
+        "status": "declared",
+        "declared_windows": len(descriptors),
+        "relation_records_per_window": records,
+        "max_relation_records_per_window": max(records, default=0),
+        "window_capacity": capacity,
+        "relation_store_capacity_records": store_capacity,
+        "every_window_fits_store": (
+            store_capacity is None or max(records, default=0) <= store_capacity
+        ),
+        "declared_windows_fit_table": (
+            capacity is None or len(descriptors) <= capacity
+        ),
+        "interpretation": "Declared packet occupancy only; simultaneous liveness follows dependency order.",
     }
 
 

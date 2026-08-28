@@ -14,6 +14,19 @@
   ComputePod `compute_resource`、查询 `reduction_bank` 和关系存储 `relation_store_capacity`；
   因此当前只证明门控语义和周期闭合，尚未达到新锚点，也不具备正式 30,000 iteration 资格。
 
+- 2026-08-29 已从外部模拟器 `main` 快进拉取并确认带分解锚点提交 `2fd7866` 已包含在已推送的
+  `260f1c0` 中。当前静态目标按 A/B 配置分别记录软件端点与匹配 GALA 硬件端点：R²-Gaussian
+  + Chest 的硬件端点为 A0B0 `2.430x`、A1B0 `3.513x`、A0B1 `3.507x`、A1B1 `6.436x`；
+  相对 Base ASIC 的派生参考为 Query `1.445679x`、Residency `1.443210x`、Full `2.648560x`。
+  这些值仍标记为 `anchor_not_measurement`，不参与周期参数拟合，也不冒充可达上限。
+
+- 2026-08-29 周期边界模型已补齐查询损失 16 query/cycle 合同、query-volume SRAM 读写 Bank
+  必要工作量、ComputePod 按 Pod 的资源下界，以及关系窗口/记录存储、回放队列、owner-gradient
+  槽位和共享 SRAM 容量诊断。对同一 `846,012` 事件双窗口 quick trace 的静态计算约 16 秒完成，
+  资源受限必要下界为 `23,280 cycles`，相对 Base `144,550 cycles` 的乐观最大加速为 `6.209x`。
+  该值只用于排除不可能目标和定位工程优化空间，仍不等同于可达调度或正式性能结果；新增回归后
+  全套测试为 `309 passed, 1 skipped, 2 warnings`。
+
 ## 已通过
 
 - 2026-08-29 生命周期与 lineage 修复后的最小真实双窗口 Base 回放已重新完成：`846,012/846,012` 个事件、`1,289,964` 条依赖，原生 LPDDR5-6400 Ramulator 2 返回 `144,550 cycles`（500 MHz 下 `0.289100 ms`），记录位于仓库外 `GALA-runtime/records/r2_gaussian_chest_median_packets_base_post_lineage_v1/`。该结果只证明最新依赖实现仍能闭合同一 quick trace，不是正式 30,000 iteration 周期，也不是绝对性能锚点。
