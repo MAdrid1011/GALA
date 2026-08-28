@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import asdict
+import json
 import os
 from pathlib import Path
 import runpy
@@ -38,9 +40,30 @@ def _parser() -> argparse.ArgumentParser:
         help="capture exact bounded CUDA work-buffer packets without raw event columns",
     )
     parser.add_argument(
+        "--virtual-capture-audit-only", action="store_true",
+        help="capture and validate virtual packet ledgers without online cycle replay",
+    )
+    parser.add_argument(
         "--capture-iteration-range", type=_iteration_range, default=None,
         metavar="START:END",
         help="capture an inclusive validation window while executing all training iterations",
+    )
+    parser.add_argument(
+        "--online-cycle-config", type=Path, default=None,
+        help="attach bounded virtual capture to an online cycle replay using this Gala config",
+    )
+    parser.add_argument(
+        "--online-ramulator-build-manifest", type=Path, default=None,
+        help="Ramulator 2 bridge build manifest for online virtual replay",
+    )
+    parser.add_argument(
+        "--online-ramulator-config", type=Path, default=None,
+        help="Ramulator 2 configuration for online virtual replay",
+    )
+    parser.add_argument(
+        "--online-cycle-policy", default="base",
+        choices=("base", "query_oracle", "residency_oracle", "full"),
+        help="cycle policy used by the bounded online virtual replay",
     )
     parser.add_argument("train_script", type=Path)
     parser.add_argument("train_args", nargs=argparse.REMAINDER)
@@ -67,11 +90,66 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("GALA_TRACE_PROGRESS_INTERVAL_SECONDS must be positive")
     if args.virtual_capture and args.stream_only:
         raise ValueError("--virtual-capture and --stream-only are mutually exclusive")
+    online_options = (
+        args.online_cycle_config,
+        args.online_ramulator_build_manifest,
+        args.online_ramulator_config,
+    )
+    if args.virtual_capture_audit_only and not args.virtual_capture:
+        raise ValueError("--virtual-capture-audit-only requires --virtual-capture")
+    if not args.virtual_capture and any(value is not None for value in online_options):
+        raise ValueError("online cycle replay requires --virtual-capture")
+    if args.virtual_capture_audit_only and any(value is not None for value in online_options):
+        raise ValueError("audit-only virtual capture cannot enable online cycle replay")
+    if args.virtual_capture and not args.virtual_capture_audit_only:
+        if any(value is None for value in online_options):
+            raise ValueError(
+                "online cycle replay requires cycle config, Ramulator build manifest, and Ramulator config"
+            )
+        from gala_sim.timing import BufferedVirtualCycleConsumer, CycleConfig, CycleEngine
+        from gala_sim.timing.memory import NativeRamulator2Binding, Ramulator2Backend
+        from gala_sim.config import load_config
+
+        online_config = load_config(args.online_cycle_config)
+        online_config.require_ready()
+        configured_chunk_events = int(online_config.value("trace.chunk_events"))
+        max_inflight_chunks = int(online_config.value("trace.max_inflight_chunks"))
+        if configured_chunk_events <= 0 or max_inflight_chunks <= 0:
+            raise ValueError("online trace frontier parameters must be positive")
+        max_frontier_events = configured_chunk_events * max_inflight_chunks
+        for required_path in (
+            args.online_ramulator_build_manifest,
+            args.online_ramulator_config,
+        ):
+            if not required_path.is_file():
+                raise ValueError(f"online cycle input does not exist: {required_path}")
+        online_sinks: list[BufferedVirtualCycleConsumer] = []
+
+        def consumer_factory(initial_gaussian_count: int) -> BufferedVirtualCycleConsumer:
+            binding = NativeRamulator2Binding.from_build_manifest(
+                args.online_ramulator_build_manifest, args.online_ramulator_config,
+            )
+            cycle_config = CycleConfig.from_gala(
+                online_config, Ramulator2Backend(binding),
+            )
+            sink = BufferedVirtualCycleConsumer(
+                CycleEngine(cycle_config, policy=args.online_cycle_policy).online_session(
+                    max_events=chunk_events,
+                    max_frontier_events=max_frontier_events,
+                    initial_gaussian_count=initial_gaussian_count,
+                )
+            )
+            online_sinks.append(sink)
+            return sink
+    else:
+        consumer_factory = None
+        online_sinks = []
     session = TraceSession(
         args.trace_output, state_record_bytes=state_record_bytes,
         chunk_events=chunk_events, stream_only=args.stream_only,
         capture_iteration_range=args.capture_iteration_range,
         virtual_capture=args.virtual_capture,
+        virtual_packet_consumer_factory=consumer_factory,
         inactivity_timeout_seconds=inactivity_timeout_seconds,
         progress_interval_seconds=progress_interval_seconds,
     )
@@ -87,6 +165,38 @@ def main(argv: list[str] | None = None) -> int:
         try:
             if completed:
                 session.finish()
+                if online_sinks and online_sinks[0].result is not None:
+                    online_result = {
+                        "schema_version": "gala-online-virtual-cycle-v1",
+                        "result_scope": "online_virtual_cycle_replay",
+                        "formal_performance_eligible": False,
+                        "limits": {
+                            "packet_event_batch": chunk_events,
+                            "configured_trace_chunk_events": configured_chunk_events,
+                            "max_inflight_chunks": max_inflight_chunks,
+                            "max_frontier_events": max_frontier_events,
+                            "inactivity_timeout_seconds": inactivity_timeout_seconds,
+                            "progress_interval_seconds": progress_interval_seconds,
+                        },
+                        "frontier": {
+                            "peak_frontier_events": online_sinks[0].session.peak_frontier_events,
+                            "resident_completion_markers": (
+                                online_sinks[0].session.resident_completion_markers
+                            ),
+                        },
+                        "semantic_workset": {
+                            "exact": True,
+                            "retained_keys_at_finish": len(
+                                online_sinks[0].session.semantic_workset_totals
+                            ),
+                        },
+                        "cycle": asdict(online_sinks[0].result),
+                    }
+                    args.trace_output.mkdir(parents=True, exist_ok=True)
+                    (args.trace_output / "online_cycle_result.json").write_text(
+                        json.dumps(online_result, ensure_ascii=True, sort_keys=True, indent=2) + "\n",
+                        encoding="utf-8",
+                    )
         finally:
             sys.argv = original_argv
     return 0

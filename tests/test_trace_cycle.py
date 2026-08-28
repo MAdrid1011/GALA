@@ -30,6 +30,7 @@ from gala_sim.timing.memory import Ramulator2Backend, RecordedMemoryBackend
 from gala_sim.config import load_config
 from gala_sim.trace import NumpyChunkSink, TraceReader, TraceWriter, TraceValidationError, validate_trace
 from gala_sim.trace import (
+    VirtualEventPacket,
     VirtualLifecycleKind,
     VirtualLifecycleRecord,
     VirtualQueryEventExpander,
@@ -230,6 +231,29 @@ def test_online_cycle_replay_consumes_packets_without_trace_columns() -> None:
     assert len(result.completion_cycles) == 10
     assert result.event_counts["RELATION"] == 1
     assert session.pending_event_count == 0
+    assert session.resident_completion_markers == 0
+
+
+def test_online_cycle_replay_rejects_frontier_overflow_before_advancing_ids() -> None:
+    rows = np.empty(2, dtype=event_dtype())
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = (0, 1)
+    rows["primitive_kind"] = int(PrimitiveKind.RELATION_CANDIDATE)
+    rows["resource_class"] = int(ResourceClass.RELATION)
+    packet = VirtualEventPacket(
+        packet_id=0,
+        global_event_start=0,
+        events=rows,
+        dependencies=np.empty(0, dtype=dependency_dtype()),
+    )
+    session = CycleEngine(_config()).online_session(
+        max_events=4, max_frontier_events=1
+    )
+    with pytest.raises(CycleConfigurationError, match="max_frontier_events"):
+        session.accept_event_packet(packet)
+    assert session.global_event_id == 0
+    assert session.pending_event_count == 0
+    assert session.peak_frontier_events == 0
 
 
 def test_online_cycle_replay_keeps_lifecycle_events_in_same_frontier() -> None:
@@ -343,6 +367,11 @@ def test_buffered_virtual_consumer_derives_totals_before_lifecycle() -> None:
     sink.close_iteration(1)
     result = sink.finish()
     assert result.module_counters["semantic_cache"]["workset_uses"] == 2
+    assert sink.result is result
+    assert sink.session.semantic_workset_totals == {}
+    assert sink.session._workset_seen == {}
+    assert sink.session._workset_by_request == {}
+    assert sink.session._cache_event_state == {}
 
 
 def test_formal_cycle_records_but_does_not_gate_on_configuration_hash() -> None:

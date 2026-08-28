@@ -78,12 +78,12 @@
 - 2026-08-28 曾在 GPU 空闲时启动一次完整 30,000 iteration `stream_only` trace 补采，5 分钟门点仍停在首轮 CPU 序列化，GPU 利用率为 `0%`、无训练日志或 manifest 推进，`events.raw` 已达约 `45.8 GB`、进程 RSS 约 `9.8 GB`，遂按门控停止并保留现场 `GALA-runtime/trace-smoke/r2_gaussian_chest_trace_v11_full30k/`。该目录没有完成 manifest，不能进入 validator 或周期；结合已通过的一迭代 `577,268,206` events 证据，继续到 30,000 iteration 会产生不可用规模，因此不再重复该补采。
 - 有界虚拟捕获已接入官方 CUDA raster/voxel、loss、backward、optimizer 和集合修改钩子。真实 Chest 一迭代短门在约 `9.02 s` 内自然完成，直接从 point list、point key 和完整 valid mask 得到 `2` 个查询包、`294,912` 个 query、`690,928` 个 candidate、`95,948,757` 条 relation 和 `577,268,206` 个逻辑事件，与旧完整一迭代 raw-column manifest 逐项一致；物理包流为 `33,602,912 bytes`，峰值单包 `32,506,992 bytes`，未生成约 `61.19 GB` 的事件列。optimizer 使用当前全部活动 Gaussian 的精确批量提交记录，Clone/Split/Prune 保留稳定 ID、父子关系和版本事务。该短门没有附加周期包消费者，故 manifest 固定 `formal_performance_eligible=false`、`event_stream_validated=false`，不能作为正式 trace 或周期结果。
 - `CycleEngine.run_virtual()` 已提供有界快速回放入口：多个虚拟数据包共享一个事件扩展器、全局事件编号、依赖、缓存、融合、内存等待和 Ramulator 状态；调用方必须显式提供 `max_events` 与 `max_total_events`，入口会在展开前按 `candidates + 6*relations + 3*queries` 拒绝超限，并拒绝复用已有输出目录。两包测试得到连续 `20` 个事件并成功回放，超出上限时不写 chunk manifest。该入口明确标记 `result_scope=quick_cycle_validation`、`formal_performance_eligible=false`；它仍会在上限内生成 mmap raw columns，不能用于三万次正式周期。正式路径仍需持久化周期状态、增量依赖 frontier、跨包语义工作集和最终 quiescence 检查。
-- `CycleReplaySession` 已提供不写 expanded raw columns 的增量事件消费：每个 `VirtualEventPacket` 到达后注册全局依赖、立即推进模块/融合/cache/Ramulator 状态，完成事件行从内存 frontier 释放；生命周期事件进入同一全局事件编号空间，结束时要求 packet frontier、生命周期 ledger 和内存等待均 quiescent。当前生命周期格式仍缺官方 backward/gradient 精确 sidecar，且 semantic workset 仍使用保守的单次读取值，因此该入口暂不具备正式性能资格。
-- `VirtualCaptureConsumer` 已支持把 query packet、lifecycle record、iteration close 和 finish 统一分发给对象式在线消费者；`TraceSession` 可通过 `virtual_packet_consumer` 注入该消费者，默认仍不自动启动周期模拟。原有 callable query 回调保持兼容，未连接消费者的捕获继续标记为非正式结果。
+- `CycleReplaySession` 已提供不写 expanded raw columns 的增量事件消费：每个 `VirtualEventPacket` 到达后注册全局依赖、立即推进模块/融合/cache/Ramulator 状态，完成事件行从内存 frontier 释放；生命周期事件进入同一全局事件编号空间，结束时要求 packet frontier、生命周期 ledger 和内存等待均 quiescent。新增 resident frontier 上限由冻结的 `trace.chunk_events × trace.max_inflight_chunks` 推导，完成事件 ID 和 semantic workset bookkeeping 会在连续完成或迭代闭合后压缩回收；该入口仍因正式 30k 逐字段闭合尚未完成而不具备正式性能资格。
+- `VirtualCaptureConsumer` 已支持把 query packet、lifecycle record、iteration close 和 finish 统一分发给对象式在线消费者；`TraceSession` 可通过 `virtual_packet_consumer` 或延迟 factory 注入该消费者。`trace_runner --virtual-capture` 在提供真实周期配置和 Ramulator 绑定时自动连接 `BufferedVirtualCycleConsumer`，缺少这些输入必须显式使用 `--virtual-capture-audit-only`；原有低层 audit-only API 保持兼容。
 - 虚拟 packet 新增独立 `backward_confirmed` 标记；生命周期 validator 不再把 relation 数自动当成 backward 数，而是在真实 backward hook 确认后计数，并检查 query base 连续性和非零 optimizer 的 ordered active Gaussian 提交集合。正式 capture 仍需把 gradient 依赖 sidecar 进一步传入周期事件。
 - 修复 voxel 有界 decoder 的 point-key 布局解析：现在读取与 `voxel_masks_kernel`/relation kernel 相同的第一个 uint64 key 数组，不再跳过到后续辅助数组；新增边界 tile 回归覆盖 query `512` 的映射。
 - `CycleReplaySession` 现在可接收精确 `semantic_workset_totals[(gaussian_id, state_version)]` sidecar，在事件注册顺序中生成并校验每个 cache request 的 ordinal、total、remaining 与 last-use；cache fill/return/release 使用该 sidecar，缺少 sidecar 时仍保持保守模式并不升级正式资格。
-- 新增 `BufferedVirtualCycleConsumer`：按迭代暂存紧凑 point list/key/mask，计算该 state version 的精确 Gaussian 使用总数后再送入 `CycleReplaySession`，并将后续生命周期记录接到同一全局事件前沿；暂存内容不包含 expanded raw columns，迭代边界仍受生命周期和 quiescence 门控制。
+- 新增 `BufferedVirtualCycleConsumer`：按迭代暂存紧凑 point list/key/mask，计算该 state version 的精确 Gaussian 使用总数后再送入 `CycleReplaySession`，并将后续生命周期记录接到同一全局事件前沿；暂存内容不包含 expanded raw columns，迭代边界仍受生命周期和 quiescence 门控制。在线结果清单记录 packet batch、resident frontier 峰值、完成标记、semantic workset 精确模式和 300 秒无进展门限。
 - `VirtualTraceStream` 的驻留资源统计已改为队列中等待包与当前 consumer 持有包的总字节数，而非最大单包；变长包和并行生产消费回归已通过。
 - 生命周期 sidecar 已增加 `dependency_ids` 与有序 `active_ids`：在线会话优先使用生产端给出的真实前置，`all_active` optimizer commit 按稳定 Gaussian 展开为独立 UPDATE_COMMIT；官方捕获已记录 optimizer/collection begin 的活动快照，backward/gradient terminal 和父子修改依赖仍待 hook 侧补齐。
 - 在线 query 扩展已把每轮真实 GRADIENT_REDUCTION terminal 作为后续 optimizer/collection begin 默认依赖，并将上一 UPDATE_END 作为下一状态版本首个 candidate 的外部屏障；Clone/Split 的 parent 与 child 均生成 SET_MODIFICATION。生产端显式 `dependency_ids` 仍可覆盖默认前沿，用于逐字段对照冻结后的精确拓扑。
@@ -105,9 +105,10 @@ ledger。
 `VirtualTraceStream` 使用有界生产/消费队列、物理包字节和峰值驻留统计，并在配置的不活动
 期限内停止无进展运行。`TraceSession --virtual-capture` 已接入正式 CUDA work buffer、
 loss/backward 确认、UPDATE_BEGIN/COMMIT/END、Clone/Split/Prune lineage 和迭代级状态
-ledger；捕获时不再展开完整事件链，而是把仍驻留于有界内存的精确数据包交给同步消费者。
-当前仍缺跨包语义工作集 sidecar和直接消费这些数据包的 CycleEngine 状态机，包括全局周期、
-依赖 frontier、ready/in-flight 队列、cache/Ramulator waiters、融合调度和关闭版本状态，
+ledger；捕获时不再展开完整事件链，而是把仍驻留于有界内存的精确数据包交给在线
+`BufferedVirtualCycleConsumer`。在线 consumer 已能持久化全局周期、依赖 frontier、
+ready/in-flight 队列、cache/Ramulator waiters、融合调度和关闭版本状态，并由真实 Ramulator
+配置驱动；当前仍缺正式 30k packet 流的逐字段等价、完整生命周期 sidecar 对照和最终资源门，
 因此尚不能提升三万次 trace、Base ASIC、Oracle 或消融结果的资格。
 
 R²-Gaussian + Chest 已结束正式 GPU 计数器采集。性能分析固定使用前 16 组代表采样、已有 collection 报告和历史可用报告，不再追求 62 组穷举覆盖；这 16 组是本组合的性能采样上限，不再启动第 17--54 组。采样结果明确标注 `representative_gpu_performance_estimate`，保留精确内容覆盖率、按真实出现频次加权覆盖率、外推模式和逐阶段离散度，不能解释为穷举计数或正式 Orin 实测。哈希只记录，不参与任何通过或拒绝判断。

@@ -24,6 +24,7 @@ from .virtual import (
     TRANSACTION_COLLECTION,
     TRANSACTION_OPTIMIZER,
 )
+from .compare import VirtualRecordComparison, compare_virtual_packet_records
 
 __all__ = [
     "TRACE_SCHEMA_VERSION",
@@ -54,4 +55,6 @@ __all__ = [
     "VirtualTraceLifecycleValidator",
     "TRANSACTION_COLLECTION",
     "TRANSACTION_OPTIMIZER",
+    "VirtualRecordComparison",
+    "compare_virtual_packet_records",
 ]

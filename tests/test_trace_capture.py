@@ -396,6 +396,21 @@ def test_capture_iteration_range_parser_rejects_invalid_bounds() -> None:
         _iteration_range("2:1")
 
 
+def test_trace_runner_virtual_capture_requires_explicit_online_or_audit_scope(
+    tmp_path: Path,
+) -> None:
+    from gala_sim.adapters.trace_runner import main
+
+    with pytest.raises(ValueError, match="requires cycle config"):
+        main(["--trace-output", str(tmp_path / "trace"), "--virtual-capture", "train.py"])
+    with pytest.raises(ValueError, match="requires --virtual-capture"):
+        main([
+            "--trace-output", str(tmp_path / "trace"),
+            "--online-cycle-config", "configs/architecture/gala.yaml",
+            "train.py",
+        ])
+
+
 def test_query_and_backward_batches_preserve_capture_order_across_chunk_sizes(
     tmp_path: Path,
 ) -> None:

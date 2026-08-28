@@ -1006,6 +1006,7 @@ class CycleEngine:
         self,
         *,
         max_events: int,
+        max_frontier_events: int | None = None,
         initial_gaussian_count: int = 0,
         semantic_workset_totals: Mapping[tuple[int, int], int] | None = None,
         retain_completion_cycles: bool = False,
@@ -1017,6 +1018,7 @@ class CycleEngine:
         return CycleReplaySession(
             self,
             max_events=max_events,
+            max_frontier_events=max_frontier_events,
             initial_gaussian_count=initial_gaussian_count,
             semantic_workset_totals=semantic_workset_totals,
             retain_completion_cycles=retain_completion_cycles,
@@ -1166,6 +1168,7 @@ class CycleReplaySession:
         engine: CycleEngine,
         *,
         max_events: int,
+        max_frontier_events: int | None = None,
         initial_gaussian_count: int = 0,
         semantic_workset_totals: Mapping[tuple[int, int], int] | None = None,
         retain_completion_cycles: bool = False,
@@ -1174,12 +1177,15 @@ class CycleReplaySession:
     ) -> None:
         if max_events <= 0:
             raise ValueError("online virtual event batch size must be positive")
+        if max_frontier_events is not None and max_frontier_events <= 0:
+            raise ValueError("online resident frontier bound must be positive")
         if initial_gaussian_count < 0:
             raise ValueError("initial Gaussian count must be non-negative")
         if progress_interval_seconds is not None and progress_interval_seconds <= 0:
             raise ValueError("online progress interval must be positive")
         self.engine = engine
         self.max_events = max_events
+        self.max_frontier_events = max_frontier_events
         self.retain_completion_cycles = retain_completion_cycles
         self.semantic_workset_totals = dict(semantic_workset_totals or {})
         if any(key[0] < 0 or key[1] < 0 or value <= 0
@@ -1195,6 +1201,7 @@ class CycleReplaySession:
         self._remaining: dict[int, int] = {}
         self._dependents: dict[int, list[int]] = defaultdict(list)
         self._completed_ids: set[int] = set()
+        self._completed_through = -1
         self._completion_cycles: dict[int, int] = {}
         self._ready: list[tuple[int, int]] = []
         self._fusion_pending: list[tuple[int, TaskKind]] = []
@@ -1217,12 +1224,15 @@ class CycleReplaySession:
         self._cache_event_state: dict[int, tuple[SemanticCacheState, tuple[int, int], CacheLookup]] = {}
         self._workset_seen: dict[tuple[int, int], int] = defaultdict(int)
         self._workset_by_request: dict[int, tuple[int, int, int, bool]] = {}
+        self._workset_use_count = 0
+        self._workset_release_count = 0
         self._cache_keys_by_version: dict[int, list[tuple[SemanticCacheState, tuple[int, int]]] ] = {}
         self._closed_versions: set[int] = set()
         self._memory_requests = 0
         self._event_counts = {kind.name: 0 for kind in PrimitiveKind}
         self._accepted_events = 0
         self._completed_events = 0
+        self._peak_frontier_events = 0
         self._cycle = 0
         self._source_packets = 0
         self._query_packets = 0
@@ -1239,6 +1249,18 @@ class CycleReplaySession:
         return len(self._events)
 
     @property
+    def peak_frontier_events(self) -> int:
+        """Largest number of unresolved event rows retained by this session."""
+
+        return self._peak_frontier_events
+
+    @property
+    def resident_completion_markers(self) -> int:
+        """Completed IDs not yet compacted into the dense prefix watermark."""
+
+        return len(self._completed_ids)
+
+    @property
     def global_event_id(self) -> int:
         return self._stream_validator.next_event_id
 
@@ -1246,10 +1268,21 @@ class CycleReplaySession:
         self._ensure_open()
         if packet.final_packet:
             raise ValueError("final packet is reserved for finish()")
+        if (
+            self.max_frontier_events is not None
+            and len(self._events) + packet.event_count > self.max_frontier_events
+        ):
+            raise CycleConfigurationError(
+                "online resident frontier exceeds max_frontier_events"
+            )
         self._stream_validator.accept(packet)
         for index, row in enumerate(packet.events):
             event_id = int(row["event_id"])
-            if event_id in self._events or event_id in self._completed_ids:
+            if (
+                event_id in self._events
+                or event_id in self._completed_ids
+                or event_id <= self._completed_through
+            ):
                 raise CycleConfigurationError(f"duplicate online event {event_id}")
             dependencies = tuple(int(value) for value in packet.dependency_ids(index))
             unresolved = 0
@@ -1258,7 +1291,10 @@ class CycleReplaySession:
                     raise CycleConfigurationError(
                         f"online event {event_id} has a forward dependency"
                     )
-                if dependency not in self._completed_ids:
+                if (
+                    dependency > self._completed_through
+                    and dependency not in self._completed_ids
+                ):
                     if dependency not in self._events:
                         raise CycleConfigurationError(
                             f"online event {event_id} references an unknown dependency {dependency}"
@@ -1266,6 +1302,9 @@ class CycleReplaySession:
                     unresolved += 1
                     self._dependents[dependency].append(event_id)
             self._events[event_id] = row.copy()
+            self._peak_frontier_events = max(
+                self._peak_frontier_events, len(self._events)
+            )
             self._dependencies[event_id] = dependencies
             self._remaining[event_id] = unresolved
             kind = PrimitiveKind(int(row["primitive_kind"]))
@@ -1284,6 +1323,7 @@ class CycleReplaySession:
                 self._workset_by_request[event_id] = (
                     ordinal, total, total - ordinal, ordinal + 1 == total
                 )
+                self._workset_use_count += 1
                 self._workset_seen[key] = ordinal + 1
             self._event_counts[kind.name] += 1
             self._accepted_events += 1
@@ -1291,6 +1331,7 @@ class CycleReplaySession:
                 self._push_ready(event_id, 0)
         self._source_packets += 1
         self._drain()
+        self._compact_completed_prefix()
         self._report_progress()
 
     def accept_query_packet(self, packet: VirtualTracePacket) -> None:
@@ -1413,6 +1454,21 @@ class CycleReplaySession:
         self._closed_iterations += 1
         self._drain()
 
+    def retire_semantic_workset_totals(
+        self, keys: Iterable[tuple[int, int]]
+    ) -> None:
+        """Release exact workset bookkeeping after a quiescent iteration."""
+
+        self._ensure_open()
+        if self._events or self._in_flight or self._memory_waiters:
+            raise CycleConfigurationError(
+                "cannot retire semantic worksets before online replay is quiescent"
+            )
+        for raw_key in keys:
+            key = (int(raw_key[0]), int(raw_key[1]))
+            self.semantic_workset_totals.pop(key, None)
+            self._workset_seen.pop(key, None)
+
     def finish(self) -> CycleResult:
         self._ensure_open()
         self._drain()
@@ -1456,11 +1512,8 @@ class CycleReplaySession:
             counters["semantic_cache"].update(cache_totals)
         counters["semantic_cache"]["memory_requests"] = self._memory_requests
         counters["semantic_cache"]["workset_keys"] = len(self.semantic_workset_totals)
-        counters["semantic_cache"]["workset_uses"] = sum(self._workset_seen.values())
-        counters["semantic_cache"]["workset_releases"] = sum(
-            1 for _ordinal, _total, _remaining, last_use in self._workset_by_request.values()
-            if last_use
-        )
+        counters["semantic_cache"]["workset_uses"] = self._workset_use_count
+        counters["semantic_cache"]["workset_releases"] = self._workset_release_count
         audit_records = getattr(self.engine.config.memory, "audit_records", None)
         memory_records = tuple(audit_records()) if callable(audit_records) else ()
         return CycleResult(
@@ -1480,6 +1533,27 @@ class CycleReplaySession:
     def _ensure_open(self) -> None:
         if self._finalized:
             raise RuntimeError("online replay session is already finalized")
+
+    def _compact_completed_prefix(self) -> None:
+        """Collapse a quiescent dense packet's completed IDs to one watermark."""
+
+        if self._events or self._in_flight or self._memory_waiters:
+            return
+        expected_end = self._stream_validator.next_event_id - 1
+        if expected_end <= self._completed_through:
+            return
+        expected_start = self._completed_through + 1
+        expected_count = expected_end - expected_start + 1
+        if (
+            len(self._completed_ids) != expected_count
+            or min(self._completed_ids, default=expected_start) != expected_start
+            or max(self._completed_ids, default=expected_end) != expected_end
+        ):
+            raise CycleConfigurationError(
+                "online completed event prefix is not dense at quiescence"
+            )
+        self._completed_ids.clear()
+        self._completed_through = expected_end
 
     def _push_ready(self, event_id: int, stage: int) -> None:
         task_kind = self._fusion_kind(event_id, stage)
@@ -1795,21 +1869,30 @@ class CycleReplaySession:
                 state.fill_complete(
                     key, remaining_uses=int(pending["remaining_uses"])
                 )
+                instance = self.engine._cache_instance(int(row["gaussian_id"]))
+                self._cache_fill_request.pop((instance, key), None)
+                self._cache_fill_done.pop((instance, key), None)
         if kind is PrimitiveKind.CACHE_RETURN and stage == len(stages) - 1 and self._cache_states:
             deps = self._dependencies[event_id]
             request_ids = [dependency for dependency in deps if dependency in self._cache_event_state]
             if len(request_ids) != 1:
                 raise CycleConfigurationError(f"cache return {event_id} has no unique request")
-            state, key, _lookup = self._cache_event_state[request_ids[0]]
+            request_id = request_ids[0]
+            state, key, _lookup = self._cache_event_state[request_id]
             state.complete_read(key)
-            workset = self._workset_by_request.get(request_ids[0])
+            workset = self._workset_by_request.get(request_id)
             if workset is None or workset[3]:
                 state.close(key)
+            if workset is not None:
+                if workset[3]:
+                    self._workset_release_count += 1
+                self._workset_by_request.pop(request_id, None)
+            self._cache_event_state.pop(request_id, None)
         if kind is PrimitiveKind.UPDATE_END and stage == len(stages) - 1:
             version = int(row["state_version"])
             if int(row["field_mask"]) != 0:
                 self._closed_versions.add(version)
-                for state, key in self._cache_keys_by_version.get(version, []):
+                for state, key in self._cache_keys_by_version.pop(version, []):
                     state.close(key)
         if stage + 1 < len(stages):
             self._push_ready(event_id, stage + 1)
@@ -1863,7 +1946,9 @@ class BufferedVirtualCycleConsumer:
         self.session = session
         self._packets: list[VirtualTracePacket] = []
         self._iteration: int | None = None
+        self._iteration_workset_keys: set[tuple[int, int]] = set()
         self._finished = False
+        self.result: CycleResult | None = None
 
     def accept_query_packet(self, packet: VirtualTracePacket) -> None:
         if self._finished:
@@ -1887,14 +1972,20 @@ class BufferedVirtualCycleConsumer:
             raise ValueError("buffered virtual consumer iteration close does not match")
         self._flush_packets()
         self.session.close_iteration(iteration_id)
+        self.session.retire_semantic_workset_totals(self._iteration_workset_keys)
+        self._iteration_workset_keys.clear()
         self._iteration = None
 
     def finish(self) -> CycleResult:
         if self._finished:
             raise RuntimeError("buffered virtual consumer is already finalized")
         self._flush_packets()
+        if self._iteration_workset_keys:
+            self.session.retire_semantic_workset_totals(self._iteration_workset_keys)
+            self._iteration_workset_keys.clear()
         self._finished = True
-        return self.session.finish()
+        self.result = self.session.finish()
+        return self.result
 
     def _flush_packets(self) -> None:
         if not self._packets:
@@ -1906,6 +1997,7 @@ class BufferedVirtualCycleConsumer:
                 if int(count):
                     key = (int(gaussian_id), int(packet.state_version))
                     totals[key] += int(count)
+        self._iteration_workset_keys.update(totals)
         self.session.register_semantic_workset_totals(totals)
         packets = tuple(self._packets)
         self._packets.clear()

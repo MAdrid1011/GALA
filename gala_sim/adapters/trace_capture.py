@@ -96,6 +96,7 @@ class TraceSession:
     capture_iteration_range: tuple[int, int] | None = None
     virtual_capture: bool = False
     virtual_packet_consumer: Any | None = None
+    virtual_packet_consumer_factory: Callable[[int], Any] | None = None
     inactivity_timeout_seconds: float = 300.0
     progress_interval_seconds: float = 30.0
     _builder: ChunkedTraceBuilder = field(init=False)
@@ -142,6 +143,10 @@ class TraceSession:
             raise ValueError("capture inactivity timeout must be positive")
         if self.progress_interval_seconds <= 0:
             raise ValueError("capture progress interval must be positive")
+        if self.virtual_packet_consumer is not None and self.virtual_packet_consumer_factory is not None:
+            raise ValueError(
+                "virtual packet consumer and consumer factory are mutually exclusive"
+            )
         self._builder = ChunkedTraceBuilder(
             self.chunk_events, chunk_root=self.output_root / ".capture_chunks",
             stream_only=self.stream_only,
@@ -1514,6 +1519,14 @@ class TraceSession:
     def _ensure_virtual_consumer(self) -> VirtualCaptureConsumer:
         if not self.virtual_capture or self._virtual_consumer is None:
             raise RuntimeError("virtual capture consumer is not enabled")
+        if (
+            self.virtual_packet_consumer_factory is not None
+            and self._virtual_consumer.packet_consumer is None
+        ):
+            consumer = self.virtual_packet_consumer_factory(len(self._gaussian_ids))
+            if consumer is None:
+                raise RuntimeError("virtual packet consumer factory returned None")
+            self._virtual_consumer.packet_consumer = consumer
         if not self._virtual_consumer.initialized:
             self._virtual_consumer.initialize_gaussians(len(self._gaussian_ids))
         return self._virtual_consumer

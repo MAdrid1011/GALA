@@ -12,4 +12,5 @@
 
 `python -m gala_sim.adapters.trace_runner --capture-iteration-range START:END` 在完整执行此前训练迭代的前提下，只记录闭区间内的事件。窗口开始时以当时真实 Gaussian 集合建立局部稳定 ID epoch；产物固定标记为 quick trace validation，不能进入正式性能结果。
 
-`--virtual-capture` 从官方 CUDA 工作缓冲区保存有界的 point list、point key 和 valid mask，并在对应 loss 与 backward 均完成后消费数据包。`GALA_TRACE_INACTIVITY_TIMEOUT_SECONDS` 控制无数据包进展的停止门，默认 300 秒；`GALA_TRACE_PROGRESS_INTERVAL_SECONDS` 控制结构化吞吐日志间隔，默认 30 秒；该模式不生成完整 raw event columns。
+`--virtual-capture` 默认要求同时提供 `--online-cycle-config`、
+`--online-ramulator-build-manifest` 和 `--online-ramulator-config`，从官方 CUDA 工作缓冲区保存有界的 point list、point key 和 valid mask，并在对应 loss 与 backward 均完成后直接消费到 `CycleReplaySession`。缺少在线周期输入时使用显式 `--virtual-capture-audit-only`，仅生成捕获 ledger，不生成周期结果。`GALA_TRACE_INACTIVITY_TIMEOUT_SECONDS` 控制无数据包进展的停止门，默认 300 秒；`GALA_TRACE_PROGRESS_INTERVAL_SECONDS` 控制结构化吞吐日志间隔，默认 30 秒；该模式不生成完整 raw event columns。

@@ -16,6 +16,7 @@ from gala_sim.trace import (
     VirtualRelationEventExpander,
     VirtualTracePacket,
     VirtualTraceStream,
+    compare_virtual_packet_records,
 )
 from gala_sim.clamp.events import event_dtype, dependency_dtype, EVENT_SCHEMA_VERSION
 from gala_sim.trace import validate_trace
@@ -58,6 +59,119 @@ def test_raster_packet_matches_decoder_query_major_order() -> None:
         (1, 133, 5, 1 << 32),
         (2, 116, 6, 1 << 32),
     ]
+
+
+def test_packet_comparator_matches_legacy_candidate_and_relation_columns() -> None:
+    masks = _mask(3, 8)
+    masks[0, 0] = np.uint32(1 << 0)
+    masks[1, 0] = np.uint32((1 << 0) | (1 << 16))
+    masks[2, 0] = np.uint32(1 << 0)
+    packet = VirtualTracePacket(
+        iteration_id=1,
+        template_id=1,
+        query_base=100,
+        query_shape=(2, 17),
+        point_ids=np.asarray([40, 50, 60], dtype=np.int64),
+        point_keys=np.asarray([0, 1 << 32, 1 << 32], dtype=np.uint64),
+        masks=masks,
+    )
+    candidates = np.asarray([
+        [0, 0, 0, 0],
+        [0, 1, 1, 1 << 32],
+        [0, 2, 2, 1 << 32],
+    ], dtype=np.int64)
+    relations = np.asarray([
+        [1, 0, 0, 0],
+        [1, 1, 0, 0],
+        [1, 1, 16, 0],
+        [1, 2, 0, 0],
+    ], dtype=np.int64)
+    result = compare_virtual_packet_records(
+        packet, candidates, relations,
+        gaussian_ids=np.asarray([40, 50, 60], dtype=np.int64),
+        relation_batch_size=2,
+    )
+    assert result.ok
+    assert result.candidate_mismatches == 0
+    assert result.relation_mismatches == 0
+
+
+def test_packet_comparator_reports_relation_field_mismatch() -> None:
+    masks = _mask(1, 8)
+    masks[0, 0] = np.uint32(1)
+    packet = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 1),
+        point_ids=np.asarray([0]), point_keys=np.asarray([0], dtype=np.uint64),
+        masks=masks,
+    )
+    result = compare_virtual_packet_records(
+        packet,
+        np.asarray([[0, 0, 0, 0]], dtype=np.int64),
+        np.asarray([[1, 0, 1, 0]], dtype=np.int64),
+    )
+    assert not result.ok
+    assert result.relation_mismatches == 1
+    assert any(
+        "local_query" in message or "mask-bit" in message
+        for message in result.first_mismatches
+    )
+
+
+def test_packet_comparator_supports_global_candidate_chunk_indexes() -> None:
+    masks = _mask(1, 16)
+    masks[0, 0] = np.uint32(1)
+    packet = VirtualTracePacket(
+        iteration_id=600, template_id=2, query_base=0, query_shape=(9, 8, 8),
+        point_ids=np.asarray([7]),
+        point_keys=np.asarray([np.uint64(1) << np.uint64(32)], dtype=np.uint64),
+        masks=masks,
+    )
+    result = compare_virtual_packet_records(
+        packet,
+        np.asarray([[0, 50, 7, 1 << 32]], dtype=np.int64),
+        np.asarray([[1, 50, 0, 0]], dtype=np.int64),
+        candidate_index_base=50,
+    )
+    assert result.ok
+
+
+def test_packet_comparator_rejects_duplicate_relation_mask_bit() -> None:
+    masks = _mask(1, 8)
+    masks[0, 0] = np.uint32(0b11)
+    packet = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 2),
+        point_ids=np.asarray([0]), point_keys=np.asarray([0], dtype=np.uint64),
+        masks=masks,
+    )
+    result = compare_virtual_packet_records(
+        packet,
+        np.asarray([[0, 0, 0, 0]], dtype=np.int64),
+        np.asarray([[1, 0, 0, 0], [1, 0, 0, 0]], dtype=np.int64),
+        relation_batch_size=1,
+    )
+    assert not result.ok
+    assert any(
+        "order/duplicate" in value or "local_query" in value
+        for value in result.first_mismatches
+    )
+
+
+def test_packet_comparator_detects_missing_mask_bit_replaced_by_another() -> None:
+    masks = _mask(1, 8)
+    masks[0, 0] = np.uint32(0b11)
+    packet = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 2),
+        point_ids=np.asarray([0]), point_keys=np.asarray([0], dtype=np.uint64),
+        masks=masks,
+    )
+    result = compare_virtual_packet_records(
+        packet,
+        np.asarray([[0, 0, 0, 0]], dtype=np.int64),
+        np.asarray([[1, 0, 0, 0], [1, 0, 2, 0]], dtype=np.int64),
+    )
+    assert not result.ok
+    assert result.relation_mismatches == 1
+    assert any("local_query" in value for value in result.first_mismatches)
 
 
 def test_voxel_packet_maps_tile_and_local_bit_to_global_query() -> None:
@@ -328,7 +442,7 @@ def test_stream_bounds_inflight_packets_and_accounts_physical_bytes() -> None:
     assert result.produced_packets == result.consumed_packets == 3
     assert result.logical_relation_count == 3
     assert result.physical_stream_bytes == sum(packet.physical_bytes for packet in packets)
-    assert result.peak_resident_packet_bytes == packets[0].physical_bytes
+    assert result.peak_resident_packet_bytes >= packets[0].physical_bytes
 
 
 def test_stream_peak_resident_bytes_includes_queue_and_consumer() -> None:

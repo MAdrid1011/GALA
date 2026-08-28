@@ -114,6 +114,31 @@ def test_virtual_consumer_dispatches_query_and_lifecycle_to_online_sink(tmp_path
     assert sink.finished is True
 
 
+def test_trace_session_creates_online_consumer_after_gaussian_initialization(
+    tmp_path: Path,
+) -> None:
+    calls: list[int] = []
+    sink = _PacketLifecycleSink()
+
+    def factory(initial_count: int) -> _PacketLifecycleSink:
+        calls.append(initial_count)
+        return sink
+
+    session = TraceSession(
+        tmp_path,
+        virtual_capture=True,
+        virtual_packet_consumer_factory=factory,
+    )
+    session._ensure_gaussians(3)
+    assert calls == []
+    session._ensure_virtual_consumer()
+    assert calls == [3]
+    session._ensure_virtual_consumer()
+    assert calls == [3]
+    session.finish()
+    assert sink.finished is True
+
+
 def test_trace_session_virtual_path_skips_relation_record_decoder(tmp_path: Path) -> None:
     session = TraceSession(tmp_path, chunk_events=2, virtual_capture=True)
     session._iteration = 1
