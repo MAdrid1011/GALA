@@ -6,6 +6,7 @@ from dataclasses import asdict
 import json
 import os
 from pathlib import Path
+import signal
 import subprocess
 import time
 from typing import Any, Callable, Mapping
@@ -17,6 +18,7 @@ from gala_sim.metrics import QualityConfig
 from gala_sim.results import RunManifest
 from gala_sim.results.run import RunOutputWriter
 from gala_sim.tools.preflight import GpuSample, sample_gpustat
+from gala_sim.tools.inactivity import InactivityTimeoutError, InactivityWatchdog
 
 from .chest import load_chest_manifest
 from .r2_gaussian import _read_latest_metrics
@@ -24,6 +26,32 @@ from .r2_gaussian import _read_latest_metrics
 
 class NativeReferenceError(RuntimeError):
     """Raised when the frozen native reference cannot produce a valid result."""
+
+
+def _process_cpu_seconds(pid: int) -> float | None:
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text(encoding="utf-8")
+        fields = stat.rsplit(")", 1)[1].split()
+        return (int(fields[11]) + int(fields[12])) / os.sysconf("SC_CLK_TCK")
+    except (FileNotFoundError, OSError, ValueError, IndexError):
+        return None
+
+
+def _terminate_process_group(process: subprocess.Popen[str], grace_seconds: float = 10.0) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except (OSError, ProcessLookupError):
+        process.terminate()
+    try:
+        process.wait(timeout=grace_seconds)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except (OSError, ProcessLookupError):
+            process.kill()
+        process.wait()
 
 
 def _command_from_freeze(freeze: Mapping[str, Any]) -> tuple[list[str], str, Path, Path]:
@@ -173,6 +201,9 @@ def run_native_reference(
     output: Path,
     *,
     sample_fn: Callable[[], GpuSample] = sample_gpustat,
+    inactivity_timeout_seconds: float | None = None,
+    monotonic_fn: Callable[[], float] = time.monotonic,
+    sleep_fn: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
     """Execute the exact frozen official command after a passing preflight."""
 
@@ -206,6 +237,15 @@ def run_native_reference(
             "argv": command,
         },
     }
+    timeout_seconds = float(
+        inactivity_timeout_seconds
+        if inactivity_timeout_seconds is not None
+        else config.value("preflight.inactivity_timeout_seconds")
+    )
+    sample_interval_seconds = float(config.value("preflight.gpustat_interval_seconds"))
+    watchdog = InactivityWatchdog(
+        timeout_seconds=timeout_seconds, monotonic_fn=monotonic_fn,
+    )
     try:
         initial = sample_fn()
     except RuntimeError as error:
@@ -237,8 +277,9 @@ def run_native_reference(
             stderr_path.open("w", encoding="utf-8") as stderr_stream:
         process = subprocess.Popen(
             command, cwd=working_directory, stdout=stdout_stream, stderr=stderr_stream,
-            text=True,
+            text=True, start_new_session=True,
         )
+        inactivity_failure: str | None = None
         while process.poll() is None:
             try:
                 sample = sample_fn()
@@ -260,7 +301,17 @@ def run_native_reference(
                 except subprocess.TimeoutExpired:
                     process.kill()
                 break
-            time.sleep(1.0)
+            try:
+                watchdog.observe(
+                    gpu_active=sample.utilization_percent > 0,
+                    byte_count=stdout_path.stat().st_size + stderr_path.stat().st_size,
+                    cpu_seconds=_process_cpu_seconds(process.pid),
+                )
+            except InactivityTimeoutError as error:
+                inactivity_failure = str(error)
+                _terminate_process_group(process)
+                break
+            sleep_fn(sample_interval_seconds)
         returncode = process.wait()
     finished = time.time()
     gpu_reference: dict[str, Any] = {
@@ -280,8 +331,18 @@ def run_native_reference(
         "stderr_path": str(stderr_path),
         "stderr_sha256": sha256_file(stderr_path),
         "gpu_samples": samples,
+        "watchdog": watchdog.report(
+            status="terminated" if inactivity_failure is not None else "completed"
+        ),
     }
     writer = RunOutputWriter(output)
+    if inactivity_failure is not None:
+        gpu_reference["error"] = inactivity_failure
+        _write_failed(
+            output, gpu_reference, "watchdog_inactivity_timeout",
+            checks=identity_checks,
+        )
+        raise NativeReferenceError("watchdog_inactivity_timeout")
     if sampling_error is not None:
         gpu_reference["error"] = sampling_error
         _write_failed(

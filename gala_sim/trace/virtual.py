@@ -22,6 +22,8 @@ import numpy as np
 
 from gala_sim.clamp.events import (
     PrimitiveKind,
+    RELATION_PACKET_LANE_MASK_SHIFT,
+    RELATION_PACKET_METADATA_VALID,
     ResourceClass,
     TraceEvent,
     dependency_dtype,
@@ -40,6 +42,131 @@ LOSS_SSIM = 1 << 1
 LOSS_TV = 1 << 2
 TRANSACTION_COLLECTION = 1
 TRANSACTION_OPTIMIZER = 2
+
+
+def _query_packet_coordinates(
+    query_ids: np.ndarray, source: "VirtualTracePacket", query_lanes: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Return protocol pack bases and lanes for source-row-major query IDs.
+
+    R2-Gaussian stores both raster X and voxel Z in the fastest-changing source
+    dimension.  The CLAMP adapter maps that dimension to the protocol X axis,
+    so flooring only that coordinate preserves every row/brick boundary.
+    """
+
+    if not 0 < query_lanes <= 8:
+        raise ValueError("relation query lanes must be in [1, 8]")
+    axis_extent = int(source.query_shape[-1])
+    offsets = np.asarray(query_ids, dtype=np.int64) - source.query_base
+    axis_coordinates = offsets % axis_extent
+    lanes = axis_coordinates % query_lanes
+    bases = np.asarray(query_ids - lanes, dtype=np.int64)
+    return bases, np.asarray(lanes, dtype=np.int64)
+
+
+def _query_packet_flags(
+    query_ids: np.ndarray, source: "VirtualTracePacket", query_lanes: int,
+) -> np.ndarray:
+    """Encode lane metadata for query-domain packets, including edge masks."""
+
+    bases, lanes = _query_packet_coordinates(query_ids, source, query_lanes)
+    offsets = bases - source.query_base
+    row = offsets // int(source.query_shape[-1])
+    lane_masks = np.zeros(query_ids.size, dtype=np.uint32)
+    for lane in range(query_lanes):
+        target = offsets + lane
+        valid = (
+            (target >= 0)
+            & (target < source.query_count)
+            & (target // int(source.query_shape[-1]) == row)
+        )
+        lane_masks |= valid.astype(np.uint32) << np.uint32(lane)
+    return (
+        np.uint32(RELATION_PACKET_METADATA_VALID)
+        | lanes.astype(np.uint32)
+        | (lane_masks << np.uint32(RELATION_PACKET_LANE_MASK_SHIFT))
+    )
+
+
+def _relation_packet_flags(
+    candidates: np.ndarray,
+    query_ids: np.ndarray,
+    source: "VirtualTracePacket",
+    query_lanes: int,
+) -> np.ndarray:
+    """Encode the original sparse packet mask for each logical relation."""
+
+    bases, lanes = _query_packet_coordinates(query_ids, source, query_lanes)
+    packet_offsets = bases - source.query_base
+    row = packet_offsets // int(source.query_shape[-1])
+    lane_masks = np.zeros(query_ids.size, dtype=np.uint32)
+    candidate_indices = np.asarray(candidates, dtype=np.int64)
+    candidate_tiles = np.right_shift(
+        np.asarray(source.point_keys[candidate_indices], dtype=np.uint64), 32,
+    ).astype(np.int64, copy=False)
+    for lane in range(query_lanes):
+        target = packet_offsets + lane
+        in_domain = (target >= 0) & (target < source.query_count)
+        safe_target = np.where(in_domain, target, 0)
+        target_tiles, local_queries = _tile_and_local_query_arrays(
+            source, safe_target,
+        )
+        in_domain &= (
+            (target // int(source.query_shape[-1]) == row)
+            & (target_tiles == candidate_tiles)
+        )
+        words = source.masks[
+            candidate_indices, local_queries // MASK_WORD_BITS
+        ]
+        active = in_domain & (
+            ((words >> (local_queries % MASK_WORD_BITS)) & np.uint32(1)) != 0
+        )
+        lane_masks |= active.astype(np.uint32) << np.uint32(lane)
+    active_lane = (lane_masks & (np.uint32(1) << lanes.astype(np.uint32))) != 0
+    if not np.all(active_lane):
+        raise ValueError("logical relation is inactive in its source packet mask")
+    return (
+        np.uint32(RELATION_PACKET_METADATA_VALID)
+        | lanes.astype(np.uint32)
+        | (lane_masks << np.uint32(RELATION_PACKET_LANE_MASK_SHIFT))
+    )
+
+
+def _tile_and_local_query_arrays(
+    source: "VirtualTracePacket", query_offsets: np.ndarray,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Vectorized equivalent of ``VirtualTracePacket._tile_and_local_query``."""
+
+    offsets = np.asarray(query_offsets, dtype=np.int64)
+    if source.template_id == RASTER_TEMPLATE_ID:
+        height, width = source.query_shape
+        del height
+        y, x = np.divmod(offsets, width)
+        blocks_x = (width + RASTER_BLOCK[1] - 1) // RASTER_BLOCK[1]
+        tiles = (y // RASTER_BLOCK[0]) * blocks_x + x // RASTER_BLOCK[1]
+        local = (y % RASTER_BLOCK[0]) * RASTER_BLOCK[1] + x % RASTER_BLOCK[1]
+        return tiles, local
+    if source.template_id == VOXEL_TEMPLATE_ID:
+        voxel_x, voxel_y, voxel_z = source.query_shape
+        del voxel_x
+        x, remainder = np.divmod(offsets, voxel_y * voxel_z)
+        y, z = np.divmod(remainder, voxel_z)
+        blocks_x = (
+            source.query_shape[0] + VOXEL_BLOCK[0] - 1
+        ) // VOXEL_BLOCK[0]
+        blocks_y = (voxel_y + VOXEL_BLOCK[1] - 1) // VOXEL_BLOCK[1]
+        tiles = (
+            (z // VOXEL_BLOCK[2]) * blocks_x * blocks_y
+            + (y // VOXEL_BLOCK[1]) * blocks_x
+            + x // VOXEL_BLOCK[0]
+        )
+        local = (
+            (x % VOXEL_BLOCK[0]) * VOXEL_BLOCK[1] * VOXEL_BLOCK[2]
+            + (y % VOXEL_BLOCK[1]) * VOXEL_BLOCK[2]
+            + z % VOXEL_BLOCK[2]
+        )
+        return tiles, local
+    raise ValueError(f"unsupported virtual trace template: {source.template_id}")
 
 
 class VirtualLifecycleKind(IntEnum):
@@ -499,6 +626,29 @@ class VirtualTracePacket:
         counts = _POPCOUNT8[self.masks.view(np.uint8)].sum(axis=1, dtype=np.uint64)
         return np.asarray(counts, dtype=np.uint64)
 
+    def relation_packet_counts_by_candidate(
+        self, *, query_lanes: int, max_relations: int,
+    ) -> np.ndarray:
+        """Count distinct physical query packs read by each candidate."""
+
+        if not 0 < query_lanes <= 8 or max_relations <= 0:
+            raise ValueError("relation packet count limits are invalid")
+        counts = np.zeros(self.candidate_count, dtype=np.uint64)
+        last_base = np.full(self.candidate_count, -1, dtype=np.int64)
+        for candidates, query_ids, _gaussian_ids, _keys in self.iter_relation_arrays(
+            max_relations
+        ):
+            bases, _lanes = _query_packet_coordinates(
+                query_ids, self, query_lanes,
+            )
+            pairs = np.unique(np.stack((candidates, bases), axis=1), axis=0)
+            pair_candidates = pairs[:, 0].astype(np.int64, copy=False)
+            pair_bases = pairs[:, 1].astype(np.int64, copy=False)
+            new_packet = pair_bases != last_base[pair_candidates]
+            np.add.at(counts, pair_candidates[new_packet], 1)
+            np.maximum.at(last_base, pair_candidates, pair_bases)
+        return counts
+
     def iter_candidates(self) -> Iterator[tuple[int, int, int, int, bool]]:
         """Yield ``(index, point_id, key, state_version, has_relation)``."""
 
@@ -766,12 +916,17 @@ class VirtualRelationEventExpander:
     max_events: int
     state_record_bytes: int = 128
     relation_candidate_bytes: int = 0
+    relation_query_lanes: int = 1
     next_event_id: int = 0
     next_relation_id: int = 0
     next_packet_id: int = 0
 
     def __post_init__(self) -> None:
-        if self.max_events <= 0 or self.state_record_bytes <= 0:
+        if (
+            self.max_events <= 0
+            or self.state_record_bytes <= 0
+            or not 0 < self.relation_query_lanes <= 8
+        ):
             raise ValueError("virtual event expander limits must be positive")
         if self.relation_candidate_bytes < 0:
             raise ValueError("relation candidate bytes must be non-negative")
@@ -843,6 +998,9 @@ class VirtualRelationEventExpander:
         rows["resource_class"] = int(ResourceClass.RELATION)
         rows["template_id"] = source.template_id
         rows["field_mask"] = source.field_mask
+        rows["flags"] = _relation_packet_flags(
+            candidates, query_ids, source, self.relation_query_lanes,
+        )
         rows["address_token"] = np.asarray(
             gaussian_ids * self.state_record_bytes, dtype=np.uint64
         )
@@ -884,12 +1042,17 @@ class VirtualQueryEventExpander:
     max_events: int
     state_record_bytes: int = 128
     relation_candidate_bytes: int = 0
+    relation_query_lanes: int = 1
     next_event_id: int = 0
     next_relation_id: int = 0
     next_packet_id: int = 0
 
     def __post_init__(self) -> None:
-        if self.max_events <= 0 or self.state_record_bytes <= 0:
+        if (
+            self.max_events <= 0
+            or self.state_record_bytes <= 0
+            or not 0 < self.relation_query_lanes <= 8
+        ):
             raise ValueError("virtual query expander limits must be positive")
         if self.relation_candidate_bytes < 0:
             raise ValueError("relation candidate bytes must be non-negative")
@@ -1007,6 +1170,9 @@ class VirtualQueryEventExpander:
             rows["address_token"] = gaussian_ids * self.state_record_bytes
             rows["template_id"] = source.template_id
             rows["field_mask"] = source.field_mask
+            rows["flags"] = _relation_packet_flags(
+                candidates, query_ids, source, self.relation_query_lanes,
+            )
             dependencies = np.asarray(
                 candidate_start + candidates, dtype=dependency_dtype()
             )
@@ -1042,6 +1208,9 @@ class VirtualQueryEventExpander:
             rows["resource_class"] = int(ResourceClass.RELATION)
             rows["template_id"] = source.template_id
             rows["field_mask"] = source.field_mask
+            rows["flags"] = _query_packet_flags(
+                rows["query_id"], source, self.relation_query_lanes,
+            )
             dependency_parts = [
                 np.arange(
                     relation_start + int(relation_prefix[index]),
@@ -1075,7 +1244,7 @@ class VirtualQueryEventExpander:
     ) -> Iterator[VirtualEventPacket]:
         emitted = 0
         for columns in source.iter_relation_arrays(self.max_events):
-            _candidates, query_ids, gaussian_ids, _keys = columns
+            candidates, query_ids, gaussian_ids, _keys = columns
             count = int(query_ids.size)
             rows = np.empty(count, dtype=event_dtype())
             rows[:] = TraceEvent().as_tuple()
@@ -1092,6 +1261,9 @@ class VirtualQueryEventExpander:
                 rows["data_bytes"] = self.state_record_bytes
             rows["template_id"] = source.template_id
             rows["field_mask"] = source.field_mask
+            rows["flags"] = _relation_packet_flags(
+                candidates, query_ids, source, self.relation_query_lanes,
+            )
             dependencies = np.arange(dependency_start + emitted, dependency_start + emitted + count, dtype=dependency_dtype())
             emitted += count
             yield self._make_event_packet(rows, dependencies)
@@ -1102,7 +1274,7 @@ class VirtualQueryEventExpander:
     ) -> Iterator[VirtualEventPacket]:
         emitted = 0
         for columns in source.iter_relation_arrays(self.max_events):
-            _candidates, query_ids, gaussian_ids, _keys = columns
+            candidates, query_ids, gaussian_ids, _keys = columns
             count = int(query_ids.size)
             rows = np.empty(count, dtype=event_dtype())
             rows[:] = TraceEvent().as_tuple()
@@ -1120,6 +1292,9 @@ class VirtualQueryEventExpander:
             rows["address_token"] = gaussian_ids * self.state_record_bytes
             rows["template_id"] = source.template_id
             rows["field_mask"] = source.field_mask
+            rows["flags"] = _relation_packet_flags(
+                candidates, query_ids, source, self.relation_query_lanes,
+            )
             dependencies = np.empty(count * 2, dtype=dependency_dtype())
             relation_ids = relation_start + emitted + np.arange(
                 count, dtype=dependency_dtype()
@@ -1220,7 +1395,7 @@ class VirtualQueryEventExpander:
     ) -> Iterator[VirtualEventPacket]:
         emitted = 0
         for columns in source.iter_relation_arrays(self.max_events):
-            _candidates, query_ids, gaussian_ids, _keys = columns
+            candidates, query_ids, gaussian_ids, _keys = columns
             count = int(query_ids.size)
             local_queries = query_ids - source.query_base
             rows = np.empty(count * 2, dtype=event_dtype())
@@ -1246,6 +1421,10 @@ class VirtualQueryEventExpander:
             rows["primitive_kind"][1::2] = int(PrimitiveKind.GRADIENT_REDUCTION)
             rows["resource_class"][0::2] = int(ResourceClass.ISSUE)
             rows["resource_class"][1::2] = int(ResourceClass.QUERY)
+            packet_flags = _relation_packet_flags(
+                candidates, query_ids, source, self.relation_query_lanes,
+            )
+            rows["flags"] = np.repeat(packet_flags, 2)
             rows["reduction_key"][1::2] = gaussian_ids
             dependencies = np.empty(count * 2, dtype=dependency_dtype())
             dependencies[0::2] = consumer_start + local_queries

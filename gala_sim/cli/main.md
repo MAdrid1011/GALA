@@ -10,11 +10,17 @@
 
 `trace-sample --trace <dir> --output <dir> --query-range START:COUNT --max-events N --max-dependencies N --scan-events N --scan-backend cpu|cuda|auto` 从一个或多个 query range 的 consumer/gradient terminal 出发，抽取完整传递依赖闭包。输出保留真实 relation、地址、字节数和依赖，只能用于快速周期验证。
 
+`trace-packetize --trace <quick-dir> --output <new-dir> --query-domain TEMPLATE:BASE:DIMxDIM[xDIM] --query-lanes N` 为旧版 dependency-closed quick trace 派生物理 RelationPacket lane/mask 元数据。命令只允许 quick trace，只修改 packetized event 的 `flags`，写盘前验证其他事件列、依赖和 payload 完全不变，并验证物理包计划；输出不提升正式性能或质量资格。
+
+`trace-captured-packets --manifest <json> --output <dir> --max-events N --query-lanes N --initial-gaussian-count N` 从 CUDA 捕获器保存的 candidate-major 四列记录抽取 manifest 指定的 canonical tile/brick，重建原始 sparse mask，并完整展开前向、查询消费者、伴随和梯度链。输出前执行结构验证和物理包计划验证，结果固定为 quick validation，不作为正式性能或质量结果。
+
 `trace-validate --trace <dir> [--scan-events N] [--index-directory DIR]` 对完整 trace 执行结构和生命周期校验。显式扫描块和临时索引目录只改变软件验证吞吐、临时空间和峰值，不改变检查集合；省略扫描块时沿用 trace capture chunk。`--index-directory` 必须与 `--scan-events` 一起使用。
 
-其余入口为 `config-check`、`cycle-preflight`、`trace-validate`、`cycle-replay` 和 `ablation`。query sample 和显式迭代窗口 trace 默认均被周期入口拒绝；调用者必须显式传入 `--quick-validation`，输出 manifest 会固定 `formal_performance_eligible=false`。`ablation --parallel-workers N` 可并行运行独立变体；父进程按固定 `0000..1111` 顺序收集并验证结果。正式范围的 `ablation --orin-anchor <json>` 会在每个变体完成时输出相对于 Base ASIC 和静态 Orin 锚点的加速比，并写出非正式比较 sidecar；快速验证 trace 禁止使用该选项。
+其余入口为 `config-check`、`cycle-preflight`、`trace-validate`、`cycle-replay` 和 `ablation`。query sample 和显式迭代窗口 trace 默认均被周期入口拒绝；调用者必须显式传入 `--quick-validation`，输出 manifest 会固定 `formal_performance_eligible=false`。`ablation --parallel-workers N` 可并行运行独立变体；父进程按固定 `0000..1111` 顺序收集并验证结果。消融进度只输出绝对周期和相对 Base ASIC 的加速比；没有同套件 AGX Orin 实测校准时，不生成 Orin 比较。
 
-`cycle-replay --throughput-progress` 按完整迭代输出运行健康状态、墙钟事件吞吐、每事件模拟周期和总周期投影。只有显式增加 `--stop-when-throughput-stable` 才允许稳定窗口提前结束；该路径要求输出目录不存在或为空，只写 `throughput.json`、非正式 manifest 和标明非正式资格的状态记录，不写 `cycles.json`。不带早停选项时始终保留完整重放语义。`--orin-anchor <json>` 只把非正式静态锚点及其不确定区间加入实时工程诊断；anchor 必须包含 `workload_iterations`，周期入口会按当前重放迭代数缩放 Orin 时间，拒绝工作量不明确的旧 anchor。
+`cycle-replay --throughput-progress` 按完整迭代输出运行健康状态、墙钟事件吞吐、每事件模拟周期、总周期投影和按配置时钟换算的 ASIC 秒数。只有显式增加 `--stop-when-throughput-stable` 才允许稳定窗口提前结束；该路径要求输出目录不存在或为空，只写 `throughput.json`、非正式 manifest 和标明非正式资格的状态记录，不写 `cycles.json`。不带早停选项时始终保留完整重放语义。公开规格 extrapolation 不接入周期诊断，也不生成任何 `speedup_vs_orin` 字段。
+
+所有 `cycle-replay` 运行都启用配置化 inactivity watchdog。准备阶段以阶段切换或显著进程 CPU 时间作为推进；正式 replay 阶段只有完成事件数或完成迭代数增长才续时，周期心跳与日志打印本身不续时。连续达到门限后输出固定为 `failed_cycle/watchdog_inactivity_timeout`，不写 `cycles.json`。
 
 ## Internal Helpers
 

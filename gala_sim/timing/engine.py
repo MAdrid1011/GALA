@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from collections import defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from functools import lru_cache
 import heapq
 from pathlib import Path
@@ -35,6 +35,8 @@ from gala_sim.trace.validator import validate_trace
 
 from .config import CycleConfig, ModuleTiming
 from .memory import MemoryRequestRecord
+from .oracle import FutureTracePlan
+from .packets import PhysicalPacketStage, RelationPacketPlan
 from .modules import (
     BidirectionalQueryUnit,
     CacheBackpressure,
@@ -66,6 +68,21 @@ class MechanismSelection:
 
 
 @dataclass(frozen=True)
+class OraclePortfolioMember:
+    name: str
+    policy: str
+    status: str
+    total_cycles: int | None
+    failure_reason: str | None
+
+
+@dataclass(frozen=True)
+class OraclePortfolio:
+    winner: str
+    members: tuple[OraclePortfolioMember, ...]
+
+
+@dataclass(frozen=True)
 class CycleResult:
     total_cycles: int
     module_counters: dict[str, dict[str, int]]
@@ -75,6 +92,7 @@ class CycleResult:
     policy: str
     oracle_status: str
     memory_requests: tuple[MemoryRequestRecord, ...]
+    oracle_portfolio: OraclePortfolio | None = None
 
 
 @dataclass(frozen=True)
@@ -221,12 +239,19 @@ def _iteration_index_from_metadata(
 class CycleEngine:
     """Run the same trace for Base, Oracle, or mechanism-specific policies."""
 
-    def __init__(self, config: CycleConfig, *, policy: str = "base") -> None:
+    def __init__(
+        self,
+        config: CycleConfig,
+        *,
+        policy: str = "base",
+        _oracle_portfolio_member: bool = False,
+    ) -> None:
         valid_variants = {f"variant:{bits:04b}" for bits in range(16)}
         if policy not in {"base", "query_oracle", "residency_oracle", "query", "residency", "full"} | valid_variants:
             raise ValueError(f"unknown cycle policy: {policy}")
         self.config = config
         self.policy = policy
+        self._oracle_portfolio_member = _oracle_portfolio_member
         self.selection = self._selection_for_policy(policy)
         self.issue_scheduler = FusionIssueScheduler(
             candidate_lanes=config.candidate_lanes,
@@ -239,7 +264,13 @@ class CycleEngine:
             "relation_constructor": RelationConstructor("relation_constructor", config.modules["relation_constructor"], counters["relation_constructor"]),
             "fusion_issue": FusionIssueUnit("fusion_issue", config.modules["fusion_issue"], counters["fusion_issue"]),
             "semantic_cache": GaussianSemanticCache("semantic_cache", config.modules["semantic_cache"], counters["semantic_cache"]),
-            "compute_pod": ComputePod("compute_pod", config.modules["compute_pod"], counters["compute_pod"]),
+            "compute_pod": ComputePod(
+                "compute_pod", config.modules["compute_pod"], counters["compute_pod"],
+                template_profiles=(dict(config.compute_templates)
+                                   if config.compute_templates is not None else None),
+                resource_capacities=(dict(config.compute_resource_capacities)
+                                     if config.compute_resource_capacities is not None else None),
+            ),
             "bidirectional_query": BidirectionalQueryUnit("bidirectional_query", config.modules["bidirectional_query"], counters["bidirectional_query"]),
             "reconstruction_update": ReconstructionUpdateUnit("reconstruction_update", config.modules["reconstruction_update"], counters["reconstruction_update"]),
             "shared_sram": SharedSram("shared_sram", config.modules["shared_sram"], counters["shared_sram"]),
@@ -287,16 +318,28 @@ class CycleEngine:
         if kind is PrimitiveKind.QUERY_REDUCTION:
             return ("bidirectional_query",)
         if kind is PrimitiveKind.GRADIENT_REDUCTION:
-            return ("bidirectional_query", "compute_pod")
+            return ("bidirectional_query",)
         if kind is PrimitiveKind.CONSUMER:
-            return ("fusion_issue", "compute_pod", "bidirectional_query")
+            return ("fusion_issue", "bidirectional_query")
         if kind is PrimitiveKind.ADJOINT:
             return ("fusion_issue", "compute_pod", "bidirectional_query")
         return ("fusion_issue", "compute_pod")
 
-    def _ordered_candidates(self, trace: Trace, candidates: list[int]) -> list[int]:
+    def _ordered_candidates(
+        self,
+        trace: Trace,
+        candidates: list[int],
+        *,
+        future_plan: FutureTracePlan | None = None,
+    ) -> list[int]:
         base_order = candidates
-        if self.selection.semantic_residency:
+        if self.selection.query_oracle:
+            if future_plan is None:
+                raise CycleConfigurationError(
+                    "query Oracle candidate ordering requires a future plan"
+                )
+            base_order = sorted(base_order, key=future_plan.query_priority)
+        if self.selection.semantic_residency and not self.selection.residency_oracle:
             base_order = sorted(base_order, key=lambda event_id: (
                 0 if PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
                 in {PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN} else 1,
@@ -310,7 +353,11 @@ class CycleEngine:
         return base_order
 
     @staticmethod
-    def _task_packet(trace: Trace, event_id: int) -> TaskPacket:
+    def _task_packet(
+        trace: Trace,
+        event_id: int,
+        packet_stage: PhysicalPacketStage | None = None,
+    ) -> TaskPacket:
         row = trace.events[event_id]
         kind = PrimitiveKind(int(row["primitive_kind"]))
         task_kind = {
@@ -342,17 +389,27 @@ class CycleEngine:
             template_id=int(row["template_id"]),
             address_token=int(row["address_token"]),
             task_kind=task_kind,
+            conflict_query_ids=(
+                tuple(
+                    int(trace.events[member]["query_id"])
+                    for member in packet_stage.event_ids
+                )
+                if task_kind is TaskKind.FORWARD and packet_stage is not None
+                else ()
+            ),
         )
 
     @staticmethod
     def _selection_for_policy(policy: str) -> MechanismSelection:
+        if policy == "query_oracle":
+            return MechanismSelection(False, False, True, False, query_oracle=True)
+        if policy == "residency_oracle":
+            return MechanismSelection(False, True, False, True, residency_oracle=True)
         aliases = {
             "base": "0000",
             "query": "1010",
             "residency": "0101",
             "full": "1111",
-            "query_oracle": "1010",
-            "residency_oracle": "0101",
         }
         bits = aliases.get(policy, policy.removeprefix("variant:"))
         return MechanismSelection(
@@ -364,6 +421,129 @@ class CycleEngine:
             residency_oracle=policy == "residency_oracle",
         )
 
+    def _future_plan(
+        self,
+        trace: Trace,
+        dependency_index: _DependencyIndex,
+        packet_plan: RelationPacketPlan,
+    ) -> FutureTracePlan:
+        service_cycles = np.empty(trace.event_count, dtype=np.uint64)
+        for event_id, row in enumerate(trace.events):
+            kind = PrimitiveKind(int(row["primitive_kind"]))
+            physical_stage = packet_plan.stage_for_event(event_id)
+            total = 0
+            for module_name in self._stages_for(kind):
+                if (
+                    physical_stage is not None
+                    and module_name == "compute_pod"
+                    and kind is PrimitiveKind.FORWARD
+                    and self.config.compute_templates is not None
+                ):
+                    compute = self.modules[module_name]
+                    assert isinstance(compute, ComputePod)
+                    path = compute.path_for(int(row["template_id"]), kind)
+                    lane = physical_stage.lanes[
+                        physical_stage.event_ids.index(event_id)
+                    ]
+                    total += path.packet_completion_offset(lane)
+                else:
+                    total += self._physical_service_cycles(
+                        module_name, row, kind, physical_stage,
+                    )
+            service_cycles[event_id] = total
+        return FutureTracePlan.from_trace(
+            trace,
+            event_service_cycles=service_cycles,
+            dependent_offsets=dependency_index.offsets,
+            dependents=dependency_index.dependents,
+            packet_plan=packet_plan,
+        )
+
+    def _select_query_oracle_candidates(
+        self,
+        trace: Trace,
+        event_ids: Iterable[int],
+        future_plan: FutureTracePlan,
+        packet_plan: RelationPacketPlan | None = None,
+    ) -> tuple[int, ...]:
+        """Exactly maximize future weight for the frozen three-port issue contract."""
+
+        if (
+            self.config.candidate_lanes != 3
+            or any(
+                self._fusion_port_limit(kind)[1] != 1
+                for kind in (
+                    PrimitiveKind.FORWARD,
+                    PrimitiveKind.CONSUMER,
+                    PrimitiveKind.ADJOINT,
+                )
+            )
+        ):
+            raise CycleConfigurationError(
+                "query Oracle requires the frozen three-candidate, one-port-per-class contract"
+            )
+        by_kind: dict[TaskKind, list[tuple[int, int, TaskPacket]]] = {
+            TaskKind.FORWARD: [],
+            TaskKind.CONSUMER: [],
+            TaskKind.ADJOINT: [],
+        }
+        fusion = self.modules["fusion_issue"]
+        for event_id in event_ids:
+            packet = self._task_packet(
+                trace, event_id,
+                packet_plan.stage_for_event(event_id) if packet_plan is not None else None,
+            )
+            weight = int(future_plan.critical_cycles[event_id])
+            bank = fusion.bank(int(trace.events[event_id]["address_token"]))
+            by_kind[packet.task_kind].append((weight, bank, packet))
+        for candidates in by_kind.values():
+            candidates.sort(key=lambda item: (-item[0], item[2].event_id))
+
+        kinds = sorted(by_kind, key=lambda kind: len(by_kind[kind]))
+        best_score = -1
+        best_ids: tuple[int, ...] = ()
+        empty: tuple[int, int, TaskPacket | None] = (0, -1, None)
+        first_options = [empty, *by_kind[kinds[0]]]
+        second_options = [empty, *by_kind[kinds[1]]]
+        third_options = by_kind[kinds[2]]
+        for first in first_options:
+            for second in second_options:
+                selected_packets = tuple(
+                    option[2] for option in (first, second) if option[2] is not None
+                )
+                conflict_keys: set[tuple[ReductionDomain, int]] = set()
+                conflict_free = True
+                for packet in selected_packets:
+                    if not packet.conflict_keys.isdisjoint(conflict_keys):
+                        conflict_free = False
+                        break
+                    conflict_keys.update(packet.conflict_keys)
+                banks = {
+                    option[1] for option in (first, second) if option[2] is not None
+                }
+                if not conflict_free or len(banks) != len(selected_packets):
+                    continue
+                third = empty
+                for option in third_options:
+                    packet = option[2]
+                    assert packet is not None
+                    if packet.conflict_keys.isdisjoint(conflict_keys) and option[1] not in banks:
+                        third = option
+                        break
+                options = (first, second, third)
+                ids = tuple(
+                    option[2].event_id
+                    for option in options if option[2] is not None
+                )
+                score = sum(option[0] for option in options)
+                stable_ids = tuple(sorted(ids))
+                if score > best_score or (
+                    score == best_score and stable_ids < tuple(sorted(best_ids))
+                ):
+                    best_score = score
+                    best_ids = ids
+        return best_ids
+
     def _fusion_port_limit(self, kind: PrimitiveKind) -> tuple[str, int]:
         timing_ports = self.config.modules["fusion_issue"].ports
         if kind is PrimitiveKind.FORWARD:
@@ -373,6 +553,112 @@ class CycleEngine:
         if kind is PrimitiveKind.ADJOINT:
             return "adjoint", self.config.fusion_adjoint_ports or timing_ports
         raise CycleConfigurationError(f"invalid fusion task kind: {kind.name}")
+
+    def _module_issue_ports(self, module_name: str) -> int:
+        """Return the actual issue slots represented by a module instance.
+
+        The legacy ``compute_pod`` timing port is an aggregate fixture value.
+        Production profiles expose the frozen 20-cluster organization, so the
+        scheduler must not collapse those clusters behind that fixture port.
+        """
+
+        if module_name == "compute_pod" and self.config.compute_templates is not None:
+            capacities = self.config.compute_resource_capacities or {}
+            issue_slots = capacities.get("cluster_issue")
+            if issue_slots is None or issue_slots <= 0:
+                raise CycleConfigurationError(
+                    "compute template profiles require positive cluster issue capacity"
+                )
+            return int(issue_slots)
+        if module_name == "semantic_cache" and self.config.cache_instances is not None:
+            return (
+                self.modules[module_name].timing.ports
+                * self.config.cache_instances
+            )
+        return self.modules[module_name].timing.ports
+
+    def _module_partition_count(self, module_name: str) -> int:
+        if module_name == "semantic_cache" and self.config.cache_instances is not None:
+            return self.config.cache_instances
+        return 1
+
+    def _module_partition(self, module_name: str, row: np.void) -> int:
+        if module_name == "semantic_cache" and self.config.cache_instances is not None:
+            return self._cache_instance(int(row["gaussian_id"]))
+        return 0
+
+    def _module_partition_issue_limit(self, module_name: str) -> int:
+        if module_name == "semantic_cache" and self.config.cache_instances is not None:
+            return self.modules[module_name].timing.ports
+        return self._module_issue_ports(module_name)
+
+    def _module_lane_indices(self, module_name: str, row: np.void) -> range:
+        if module_name == "semantic_cache" and self.config.cache_instances is not None:
+            ports = self.modules[module_name].timing.ports
+            begin = self._module_partition(module_name, row) * ports
+            return range(begin, begin + ports)
+        return range(self._module_issue_ports(module_name))
+
+    def _module_bank_partition(
+        self, module_name: str, row: np.void,
+    ) -> tuple[int, int]:
+        return (
+            self._module_partition(module_name, row),
+            self.modules[module_name].bank(int(row["address_token"])),
+        )
+
+    def _ready_scan_window(self, module_name: str) -> int:
+        width = max(
+            self.config.candidate_lanes,
+            self._module_partition_issue_limit(module_name),
+        )
+        if (
+            module_name == "semantic_cache"
+            and self.selection.semantic_residency
+            and self.config.cache_multicast_destinations is not None
+        ):
+            width = max(width, self.config.cache_multicast_destinations)
+        return width
+
+    def _uses_generic_module_limits(self, module_name: str) -> bool:
+        return not (
+            module_name == "compute_pod" and self.config.compute_templates is not None
+        )
+
+    def _service_cycles(
+        self, module_name: str, row: np.void, kind: PrimitiveKind,
+    ) -> int:
+        module = self.modules[module_name]
+        if isinstance(module, ComputePod):
+            try:
+                return module.service_cycles_for(int(row["template_id"]), kind)
+            except KeyError as error:
+                raise CycleConfigurationError(str(error)) from error
+        return module.service_cycles()
+
+    def _physical_service_cycles(
+        self,
+        module_name: str,
+        row: np.void,
+        kind: PrimitiveKind,
+        packet_stage: PhysicalPacketStage | None,
+    ) -> int:
+        """Return resource-retirement latency for one physical task."""
+
+        if (
+            packet_stage is not None
+            and module_name == "compute_pod"
+            and kind in {PrimitiveKind.FORWARD, PrimitiveKind.ADJOINT}
+            and self.config.compute_templates is not None
+        ):
+            module = self.modules[module_name]
+            assert isinstance(module, ComputePod)
+            try:
+                path = module.path_for(int(row["template_id"]), kind)
+            except KeyError as error:
+                raise CycleConfigurationError(str(error)) from error
+            return path.packet_last_result_offset or path.latency
+        return self._service_cycles(module_name, row, kind)
 
     def _residency_states(self) -> dict[int, SemanticCacheState]:
         if self.config.cache_instances is None:
@@ -423,6 +709,17 @@ class CycleEngine:
             raise ValueError("cycle progress interval must be positive")
         if progress_interval_seconds is not None and progress_interval_seconds <= 0:
             raise ValueError("cycle progress seconds must be positive")
+        if (
+            (self.selection.query_oracle or self.selection.residency_oracle)
+            and not self._oracle_portfolio_member
+        ):
+            return self._run_oracle_portfolio(
+                trace,
+                validate_input=validate_input,
+                progress=progress,
+                progress_interval_events=progress_interval_events,
+                progress_interval_seconds=progress_interval_seconds,
+            )
         started_at = time.monotonic()
 
         def run_phase(phase: str, operation, *, total_iterations: int = 0):
@@ -459,6 +756,12 @@ class CycleEngine:
             run_phase("validation", lambda: validate_trace(trace))
         if not self.config.modules:
             raise CycleConfigurationError("cycle modules are not configured")
+        packet_plan = run_phase(
+            "relation_packet_plan",
+            lambda: RelationPacketPlan.from_trace(
+                trace, query_lanes=self.config.relation_query_lanes,
+            ),
+        )
         completed: dict[int, int] = {}
         iteration_ids = np.array([], dtype=np.uint32)
         iteration_totals = np.array([], dtype=np.uint64)
@@ -533,6 +836,27 @@ class CycleEngine:
             ),
             total_iterations=int(iteration_ids.size),
         )
+        future_plan = (
+            run_phase(
+                "oracle_future_plan",
+                lambda: self._future_plan(trace, dependency_index, packet_plan),
+                total_iterations=int(iteration_ids.size),
+            )
+            if self.selection.query_oracle or self.selection.residency_oracle
+            else None
+        )
+        oracle_unissued_cache_requests = (
+            {
+                key: set(event_ids)
+                for key, event_ids in future_plan.cache_request_positions.items()
+            }
+            if self.selection.residency_oracle and future_plan is not None
+            else {}
+        )
+        oracle_remaining_cache_uses = (
+            {key: len(event_ids) for key, event_ids in oracle_unissued_cache_requests.items()}
+            if self.selection.residency_oracle else {}
+        )
 
         def build_ready() -> list[tuple[int, int]]:
             return [
@@ -543,13 +867,22 @@ class CycleEngine:
         initial_ready = run_phase(
             "ready_queue", build_ready, total_iterations=int(iteration_ids.size)
         )
-        ready: list[tuple[int, int]] = []
-        fusion_pending: list[tuple[int, TaskKind]] = []
+        ready: dict[tuple[str, int], list[tuple[int, int]]] = defaultdict(list)
+        fusion_pending: list[tuple[tuple[int, int], int, TaskKind]] = []
         fusion_inputs: dict[TaskKind, list[int]] = {
             TaskKind.FORWARD: [],
             TaskKind.CONSUMER: [],
             TaskKind.ADJOINT: [],
         }
+        fusion_oracle_inputs: list[tuple[tuple[int, int], int, TaskKind]] = []
+        packet_ready_members: dict[int, set[int]] = defaultdict(set)
+        packet_ready_stages: set[tuple[int, int]] = set()
+
+        def fusion_priority(event_id: int) -> tuple[int, int]:
+            if self.selection.query_oracle:
+                assert future_plan is not None
+                return future_plan.query_priority(event_id)
+            return event_id, event_id
 
         def fusion_kind(event_id: int, stage: int) -> TaskKind | None:
             if not self.selection.overlap_guided_issue or stage != 0:
@@ -562,16 +895,61 @@ class CycleEngine:
             }.get(kind)
 
         def push_ready(event_id: int, stage: int) -> None:
+            physical_stage = packet_plan.stage_for_event(event_id)
+            if physical_stage is not None:
+                if stage == 0:
+                    members = packet_ready_members[physical_stage.stage_id]
+                    members.add(event_id)
+                    if len(members) < len(physical_stage.event_ids):
+                        return
+                    if len(members) > len(physical_stage.event_ids):
+                        raise CycleConfigurationError(
+                            f"physical packet stage {physical_stage.stage_id} became ready twice"
+                        )
+                elif event_id != physical_stage.head_event_id:
+                    raise CycleConfigurationError(
+                        "only a physical packet head may advance module stages"
+                    )
+                ready_key = (physical_stage.stage_id, stage)
+                if ready_key in packet_ready_stages:
+                    return
+                packet_ready_stages.add(ready_key)
+                event_id = physical_stage.head_event_id
             task_kind = fusion_kind(event_id, stage)
             if task_kind is None:
-                heapq.heappush(ready, (event_id, stage))
+                kind = PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
+                module_name = self._stages_for(kind)[stage]
+                partition = self._module_partition(
+                    module_name, trace.events[event_id]
+                )
+                heapq.heappush(
+                    ready[(module_name, partition)], (event_id, stage)
+                )
             else:
-                heapq.heappush(fusion_pending, (event_id, task_kind))
+                heapq.heappush(
+                    fusion_pending,
+                    (fusion_priority(event_id), event_id, task_kind),
+                )
 
         def requeue_candidate(event_id: int, stage: int) -> None:
+            physical_stage = packet_plan.stage_for_event(event_id)
+            if physical_stage is not None:
+                event_id = physical_stage.head_event_id
             task_kind = fusion_kind(event_id, stage)
             if task_kind is None:
-                heapq.heappush(ready, (event_id, stage))
+                kind = PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
+                module_name = self._stages_for(kind)[stage]
+                partition = self._module_partition(
+                    module_name, trace.events[event_id]
+                )
+                heapq.heappush(
+                    ready[(module_name, partition)], (event_id, stage)
+                )
+            elif self.selection.query_oracle:
+                heapq.heappush(
+                    fusion_oracle_inputs,
+                    (fusion_priority(event_id), event_id, task_kind),
+                )
             else:
                 heapq.heappush(fusion_inputs[task_kind], event_id)
 
@@ -579,14 +957,20 @@ class CycleEngine:
             push_ready(event_id, stage)
         remaining_events = len(trace.events)
         in_flight: list[tuple[int, int, int, str]] = []
+        lane_outputs: list[tuple[int, int]] = []
+        separate_lane_completion: set[int] = set()
         module_busy_until = {
-            name: [0] * module.timing.ports
-            for name, module in self.modules.items()
+            name: [0] * self._module_issue_ports(name)
+            for name in self.modules
         }
         fusion_busy_until = {name: 0 for name in ("forward", "consumer", "adjoint")}
-        module_inflight = {name: 0 for name in self.modules}
+        module_inflight = {
+            (name, partition): 0
+            for name in self.modules
+            for partition in range(self._module_partition_count(name))
+        }
         relation_seed_inflight = 0
-        bank_busy: dict[tuple[str, int, int], int] = {}
+        bank_busy: dict[tuple[str, int, int, int], int] = {}
         residency_enabled = self.selection.semantic_residency
         cache_states = (
             self._residency_states()
@@ -598,11 +982,17 @@ class CycleEngine:
         cache_fill_request: dict[tuple[int, tuple[int, int]], int] = {}
         memory_waiters: dict[int, list[tuple[int, int, str, int]]] = {}
         cache_event_state: dict[int, tuple[SemanticCacheState, tuple[int, int], CacheLookup]] = {}
+        # A multicast reserves one active read per real destination event.  The
+        # follower events remain in the dependency graph, but do not perform a
+        # second directory lookup or memory fill.
+        cache_multicast_followers: dict[
+            int, tuple[SemanticCacheState, tuple[int, int]]
+        ] = {}
         cache_keys_by_version: dict[
             int, list[tuple[SemanticCacheState, tuple[int, int]]]
         ] = {}
         semantic_worksets = (
-            SemanticWorksets.from_trace(trace)
+            SemanticWorksets.from_trace(trace, packet_plan)
             if self.selection.semantic_worksets else None
         )
         closed_versions: set[int] = set()
@@ -614,11 +1004,52 @@ class CycleEngine:
             if progress_interval_seconds is not None else None
         )
         last_progress_completed = -1
-        ready_scan_window = max(
-            self.config.candidate_lanes,
-            sum(module.timing.ports for module in self.modules.values()),
-        )
-        while remaining_events or in_flight:
+
+        def complete_logical_event(event_id: int, finish: int) -> None:
+            nonlocal remaining_events, completed_iterations
+            nonlocal contiguous_iteration_position, contiguous_iteration_events
+            nonlocal last_completed_iteration, last_completed_iteration_events
+            nonlocal last_completed_iteration_cycles
+            nonlocal last_completed_iteration_elapsed_seconds
+            if event_id in completed:
+                raise CycleConfigurationError(f"event {event_id} completed twice")
+            completed[event_id] = finish
+            remaining_events -= 1
+            if progress is not None:
+                iteration_id = int(trace.events[event_id]["iteration_id"])
+                iteration_position = int(iteration_positions[iteration_id])
+                iteration_completed[iteration_position] += 1
+                if iteration_completed[iteration_position] == iteration_totals[iteration_position]:
+                    iteration_done[iteration_position] = True
+                    while (
+                        contiguous_iteration_position < iteration_done.size
+                        and iteration_done[contiguous_iteration_position]
+                    ):
+                        completed_iterations += 1
+                        last_completed_iteration = int(
+                            iteration_ids[contiguous_iteration_position]
+                        )
+                        contiguous_iteration_events += int(
+                            iteration_totals[contiguous_iteration_position]
+                        )
+                        last_completed_iteration_events = contiguous_iteration_events
+                        last_completed_iteration_cycles = finish
+                        last_completed_iteration_elapsed_seconds = (
+                            time.monotonic() - started_at
+                        )
+                        contiguous_iteration_position += 1
+            for raw_dependent in dependency_index.for_event(event_id):
+                dependent = int(raw_dependent)
+                remaining = int(dependency_index.remaining[dependent])
+                if remaining <= 0:
+                    raise CycleConfigurationError(
+                        f"dependency count underflow at event {dependent}"
+                    )
+                dependency_index.remaining[dependent] = remaining - 1
+                if remaining == 1:
+                    push_ready(dependent, 0)
+
+        while remaining_events or in_flight or lane_outputs:
             # Bank reservations are scoped to one cycle.  Drop old entries so
             # long traces do not retain one dictionary item per cycle.
             bank_busy = {
@@ -647,13 +1078,18 @@ class CycleEngine:
             while in_flight and in_flight[0][0] <= cycle:
                 finish, event_id, stage, module_name = heapq.heappop(in_flight)
                 self.modules[module_name].complete(event_id, finish)
-                module_inflight[module_name] -= 1
-                if module_inflight[module_name] < 0:
+                row = trace.events[event_id]
+                inflight_key = (
+                    module_name, self._module_partition(module_name, row)
+                )
+                module_inflight[inflight_key] -= 1
+                if module_inflight[inflight_key] < 0:
                     raise CycleConfigurationError(
                         f"negative in-flight count for {module_name}"
                     )
                 stages = self._stages_for(PrimitiveKind(int(trace.events[event_id]["primitive_kind"])))
                 kind = PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
+                physical_stage = packet_plan.stage_for_event(event_id)
                 if kind is PrimitiveKind.CACHE_REQUEST and stage == 0 and event_id in cache_event_state:
                     state, key, lookup = cache_event_state[event_id]
                     if lookup is CacheLookup.MISS:
@@ -661,13 +1097,29 @@ class CycleEngine:
                             semantic_worksets.for_event(event_id)
                             if semantic_worksets is not None else None
                         )
+                        pending = state.pending.get(key)
+                        if pending is None:
+                            raise CycleConfigurationError(
+                                f"cache fill for {event_id} has no pending state"
+                            )
+                        waiter_count = int(pending["waiters"])
                         state.fill_complete(
                             key,
-                            remaining_uses=(
-                                int(workset["remaining_uses"])
-                                if workset is not None else 1
-                            ),
+                            remaining_uses=int(pending["remaining_uses"]),
                         )
+                        max_destinations = self.config.cache_multicast_destinations
+                        if max_destinations is not None and max_destinations > 1:
+                            remaining_waiters = waiter_count
+                            while remaining_waiters > 1:
+                                destinations = min(
+                                    remaining_waiters, max_destinations
+                                )
+                                state.begin_multicast(
+                                    key,
+                                    destinations=destinations,
+                                    readers_already_active=True,
+                                )
+                                remaining_waiters -= destinations
                         if int(trace.events[event_id]["state_version"]) in closed_versions:
                             state.close(key)
                 if cache_states and kind is PrimitiveKind.CACHE_RETURN and stage == len(stages) - 1:
@@ -678,7 +1130,16 @@ class CycleEngine:
                         )
                     state, key, _ = cache_event_state[int(request_ids[0])]
                     state.complete_read(key)
-                    if semantic_worksets is not None:
+                    if self.selection.residency_oracle:
+                        remaining_uses = oracle_remaining_cache_uses[key] - 1
+                        if remaining_uses < 0:
+                            raise CycleConfigurationError(
+                                f"negative Oracle remaining-use count for {key}"
+                            )
+                        oracle_remaining_cache_uses[key] = remaining_uses
+                        if remaining_uses == 0:
+                            state.close(key)
+                    elif semantic_worksets is not None:
                         request_event_id = int(request_ids[0])
                         if bool(semantic_worksets.for_event(request_event_id)["last_use"]):
                             state.close(key)
@@ -693,49 +1154,24 @@ class CycleEngine:
                 if stage + 1 < len(stages):
                     push_ready(event_id, stage + 1)
                 else:
-                    completed[event_id] = finish
-                    remaining_events -= 1
-                    if progress is not None:
-                        iteration_id = int(trace.events[event_id]["iteration_id"])
-                        iteration_position = int(iteration_positions[iteration_id])
-                        iteration_completed[iteration_position] += 1
-                        if (
-                            iteration_completed[iteration_position]
-                            == iteration_totals[iteration_position]
-                        ):
-                            iteration_done[iteration_position] = True
-                            while (
-                                contiguous_iteration_position < iteration_done.size
-                                and iteration_done[contiguous_iteration_position]
-                            ):
-                                completed_iterations += 1
-                                last_completed_iteration = int(
-                                    iteration_ids[contiguous_iteration_position]
-                                )
-                                contiguous_iteration_events += int(
-                                    iteration_totals[contiguous_iteration_position]
-                                )
-                                last_completed_iteration_events = contiguous_iteration_events
-                                last_completed_iteration_cycles = finish
-                                last_completed_iteration_elapsed_seconds = (
-                                    time.monotonic() - started_at
-                                )
-                                contiguous_iteration_position += 1
-                    for raw_dependent in dependency_index.for_event(event_id):
-                        dependent = int(raw_dependent)
-                        remaining = int(dependency_index.remaining[dependent])
-                        if remaining <= 0:
-                            raise CycleConfigurationError(
-                                f"dependency count underflow at event {dependent}"
-                            )
-                        dependency_index.remaining[dependent] = remaining - 1
-                        if remaining == 1:
-                            push_ready(dependent, 0)
+                    if event_id in separate_lane_completion:
+                        separate_lane_completion.remove(event_id)
+                    else:
+                        logical_events = (
+                            physical_stage.event_ids
+                            if physical_stage is not None else (event_id,)
+                        )
+                        for logical_event in logical_events:
+                            complete_logical_event(logical_event, finish)
                 if (PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
                         is PrimitiveKind.RELATION_CANDIDATE):
                     relation_seed_inflight -= 1
                     if relation_seed_inflight < 0:
                         raise CycleConfigurationError("negative relation seed FIFO occupancy")
+                progressed = True
+            while lane_outputs and lane_outputs[0][0] <= cycle:
+                finish, event_id = heapq.heappop(lane_outputs)
+                complete_logical_event(event_id, finish)
                 progressed = True
             if (
                 progress is not None
@@ -767,35 +1203,76 @@ class CycleEngine:
                 next_progress_time = now + progress_interval_seconds
             if self.selection.overlap_guided_issue:
                 fusion_capacity = self.modules["fusion_issue"].timing.queue_capacity
-                fusion_occupancy = sum(len(queue) for queue in fusion_inputs.values())
+                fusion_occupancy = (
+                    len(fusion_oracle_inputs)
+                    if self.selection.query_oracle
+                    else sum(len(queue) for queue in fusion_inputs.values())
+                )
                 while fusion_pending and fusion_occupancy < fusion_capacity:
-                    event_id, task_kind = heapq.heappop(fusion_pending)
-                    heapq.heappush(fusion_inputs[task_kind], event_id)
-                    self.issue_scheduler.observe_arrival((
-                        self._task_packet(trace, event_id),
-                    ))
+                    priority, event_id, task_kind = heapq.heappop(fusion_pending)
+                    if self.selection.query_oracle:
+                        heapq.heappush(
+                            fusion_oracle_inputs,
+                            (priority, event_id, task_kind),
+                        )
+                    else:
+                        heapq.heappush(fusion_inputs[task_kind], event_id)
+                        self.issue_scheduler.observe_arrival((
+                            self._task_packet(
+                                trace, event_id,
+                                packet_plan.stage_for_event(event_id),
+                            ),
+                        ))
                     fusion_occupancy += 1
                 if fusion_pending:
                     self.modules["fusion_issue"].counters.queue_stalls += 1
                     self._record_stall(
                         cycle, "fusion_issue", "input_queue_capacity",
-                        fusion_pending[0][0],
+                        fusion_pending[0][1],
                     )
             candidates: list[tuple[int, int]] = []
-            for _ in range(ready_scan_window):
-                if not ready:
-                    break
-                candidates.append(heapq.heappop(ready))
+            for ready_key in tuple(ready):
+                queue = ready[ready_key]
+                module_name, _partition = ready_key
+                scan_window = self._ready_scan_window(module_name)
+                for _ in range(scan_window):
+                    if not queue:
+                        break
+                    candidates.append(heapq.heappop(queue))
+                if not queue:
+                    del ready[ready_key]
             if self.selection.overlap_guided_issue:
-                for task_kind in (
-                    TaskKind.FORWARD, TaskKind.CONSUMER, TaskKind.ADJOINT,
-                ):
-                    if fusion_inputs[task_kind]:
-                        candidates.append((heapq.heappop(fusion_inputs[task_kind]), 0))
+                if self.selection.query_oracle:
+                    assert future_plan is not None
+                    selected_ids = set(self._select_query_oracle_candidates(
+                        trace,
+                        (entry[1] for entry in fusion_oracle_inputs),
+                        future_plan,
+                        packet_plan,
+                    ))
+                    retained: list[tuple[tuple[int, int], int, TaskKind]] = []
+                    while fusion_oracle_inputs:
+                        entry = heapq.heappop(fusion_oracle_inputs)
+                        if entry[1] in selected_ids:
+                            candidates.append((entry[1], 0))
+                        else:
+                            retained.append(entry)
+                    for entry in retained:
+                        heapq.heappush(fusion_oracle_inputs, entry)
+                else:
+                    for task_kind in (
+                        TaskKind.FORWARD, TaskKind.CONSUMER, TaskKind.ADJOINT,
+                    ):
+                        if fusion_inputs[task_kind]:
+                            candidates.append((heapq.heappop(fusion_inputs[task_kind]), 0))
             fusion_issued = 0
             fusion_port_issued: dict[str, int] = {}
-            issued_modules: dict[str, int] = {}
-            ordered_ids = self._ordered_candidates(trace, [item[0] for item in candidates])
+            issued_modules: dict[tuple[str, int], int] = {}
+            ordered_ids = self._ordered_candidates(
+                trace,
+                [item[0] for item in candidates],
+                future_plan=future_plan,
+            )
             ordered = [(event_id, dict(candidates)[event_id]) for event_id in ordered_ids]
             fusion_packets: dict[int, TaskPacket] = {}
             fusion_selected: set[int] = set()
@@ -807,8 +1284,15 @@ class CycleEngine:
                         PrimitiveKind.CONSUMER,
                         PrimitiveKind.ADJOINT,
                     }:
-                        fusion_packets[event_id] = self._task_packet(trace, event_id)
-                decision = self.issue_scheduler.select(fusion_packets.values())
+                        fusion_packets[event_id] = self._task_packet(
+                            trace, event_id,
+                            packet_plan.stage_for_event(event_id),
+                        )
+                decision = (
+                    self.issue_scheduler.select_in_order(fusion_packets.values())
+                    if self.selection.query_oracle
+                    else self.issue_scheduler.select(fusion_packets.values())
+                )
                 fusion_selected = {task.event_id for task in decision.accepted}
                 fusion_order = iter(
                     task.event_id for task in (*decision.accepted, *decision.rejected)
@@ -818,13 +1302,37 @@ class CycleEngine:
                     if event_id in fusion_packets else (event_id, stage)
                     for event_id, stage in ordered
                 ]
-            for event_id, stage in ordered:
+            for ordered_position, (event_id, stage) in enumerate(ordered):
                 row = trace.events[event_id]
                 kind = PrimitiveKind(int(row["primitive_kind"]))
+                physical_stage = packet_plan.stage_for_event(event_id)
                 stages = self._stages_for(kind)
                 module_name = stages[stage]
                 module = self.modules[module_name]
                 timing = module.timing
+                multicast_follower = (
+                    cache_multicast_followers.get(event_id)
+                    if kind is PrimitiveKind.CACHE_REQUEST and stage == 0
+                    else None
+                )
+                if multicast_follower is not None:
+                    state, key = multicast_follower
+                    cache_multicast_followers.pop(event_id, None)
+                    cache_event_state[event_id] = (state, key, CacheLookup.HIT)
+                    cache_keys_by_version.setdefault(key[1], []).append((state, key))
+                    completion = cycle + self._physical_service_cycles(
+                        module_name, row, kind, physical_stage,
+                    )
+                    heapq.heappush(
+                        in_flight, (completion, event_id, stage, module_name)
+                    )
+                    inflight_key = (
+                        module_name, self._module_partition(module_name, row)
+                    )
+                    module_inflight[inflight_key] += 1
+                    module.counters.accepted += 1
+                    progressed = True
+                    continue
                 if (
                     module_name == "fusion_issue" and stage == 0
                     and self.selection.overlap_guided_issue
@@ -854,6 +1362,8 @@ class CycleEngine:
                 if not module.accepts_kind(kind):
                     raise CycleConfigurationError(f"{module_name} does not accept {kind.name}")
                 fusion_port_name: str | None = None
+                module_partition = self._module_partition(module_name, row)
+                module_issue_key = (module_name, module_partition)
                 if (
                     module_name == "fusion_issue" and stage == 0
                     and self.selection.overlap_guided_issue
@@ -864,7 +1374,10 @@ class CycleEngine:
                         self._record_stall(cycle, module_name, "port", event_id)
                         requeue_candidate(event_id, stage)
                         continue
-                elif issued_modules.get(module_name, 0) >= timing.ports:
+                elif (
+                    issued_modules.get(module_issue_key, 0)
+                    >= self._module_partition_issue_limit(module_name)
+                ):
                     module.counters.port_stalls += 1
                     self._record_stall(cycle, module_name, "port", event_id)
                     requeue_candidate(event_id, stage)
@@ -875,8 +1388,8 @@ class CycleEngine:
                 else:
                     module_lanes = module_busy_until[module_name]
                     module_lane = next(
-                        (index for index, value in enumerate(module_lanes)
-                         if value <= cycle),
+                        (index for index in self._module_lane_indices(module_name, row)
+                         if module_lanes[index] <= cycle),
                         None,
                     )
                     if module_lane is None:
@@ -890,7 +1403,8 @@ class CycleEngine:
                     self._record_stall(cycle, module_name, "initiation_interval", event_id)
                     requeue_candidate(event_id, stage)
                     continue
-                if module_inflight[module_name] >= timing.queue_capacity:
+                if (self._uses_generic_module_limits(module_name)
+                        and module_inflight[module_issue_key] >= timing.queue_capacity):
                     module.counters.queue_stalls += 1
                     self._record_stall(cycle, module_name, "queue_capacity", event_id)
                     requeue_candidate(event_id, stage)
@@ -901,12 +1415,26 @@ class CycleEngine:
                     self._record_stall(cycle, module_name, "seed_fifo", event_id)
                     requeue_candidate(event_id, stage)
                     continue
-                bank_key = (module_name, cycle, module.bank(int(row["address_token"])))
-                if bank_key in bank_busy:
+                bank_partition, bank = self._module_bank_partition(module_name, row)
+                bank_key = (module_name, cycle, bank_partition, bank)
+                if self._uses_generic_module_limits(module_name) and bank_key in bank_busy:
                     module.counters.bank_conflicts += 1
                     self._record_stall(cycle, module_name, "bank", event_id)
-                    heapq.heappush(ready, (event_id, stage))
+                    requeue_candidate(event_id, stage)
                     continue
+                compute_plan: tuple[tuple[str, int, int], ...] = ()
+                if module_name == "compute_pod":
+                    try:
+                        compute_plan = module.reservation_plan(  # type: ignore[attr-defined]
+                            int(row["template_id"]), kind, cycle
+                        )
+                    except KeyError as error:
+                        raise CycleConfigurationError(str(error)) from error
+                    if not module.can_reserve(compute_plan, cycle):  # type: ignore[attr-defined]
+                        module.counters.queue_stalls += 1
+                        self._record_stall(cycle, module_name, "compute_resource", event_id)
+                        requeue_candidate(event_id, stage)
+                        continue
                 if kind is PrimitiveKind.CACHE_REQUEST and stage == 0:
                     completion: int | None
                     data_bytes = int(row["data_bytes"])
@@ -918,6 +1446,42 @@ class CycleEngine:
                         instance = self._cache_instance(int(row["gaussian_id"]))
                         state = cache_states[instance]
                         key = (int(row["gaussian_id"]), int(row["state_version"]))
+                        multicast_followers: tuple[int, ...] = ()
+                        if (
+                            self.selection.residency_oracle
+                            and key not in state.active
+                            and key not in state.pending
+                            and len(state.active) + len(state.pending) >= state.capacity
+                        ):
+                            assert future_plan is not None
+                            evictable = [
+                                candidate_key
+                                for candidate_key, record in state.active.items()
+                                if int(record["active_reads"]) == 0
+                            ]
+                            if evictable:
+                                def next_unissued(candidate_key: tuple[int, int]) -> int | None:
+                                    requests = oracle_unissued_cache_requests.get(
+                                        candidate_key, set()
+                                    )
+                                    return min(requests) if requests else None
+
+                                victim = max(
+                                    evictable,
+                                    key=lambda candidate_key: (
+                                        next_unissued(candidate_key) is None,
+                                        next_unissued(candidate_key) or 0,
+                                        candidate_key,
+                                    ),
+                                )
+                                state.evict_for_oracle(victim)
+                        if self.selection.residency_oracle:
+                            oracle_requests = oracle_unissued_cache_requests.get(key)
+                            if oracle_requests is None or event_id not in oracle_requests:
+                                raise CycleConfigurationError(
+                                    f"Oracle cache request {event_id} was issued more than once"
+                                )
+                            oracle_requests.remove(event_id)
                         try:
                             workset = (
                                 semantic_worksets.for_event(event_id)
@@ -933,12 +1497,46 @@ class CycleEngine:
                                     int(workset["total_uses"])
                                     if workset is not None else None
                                 ),
+                                resident_remaining_uses=(
+                                    oracle_remaining_cache_uses[key]
+                                    if self.selection.residency_oracle else None
+                                ),
                             )
                         except CacheBackpressure:
+                            if self.selection.residency_oracle:
+                                oracle_unissued_cache_requests[key].add(event_id)
                             module.counters.queue_stalls += 1
                             self._record_stall(cycle, module_name, "cache_capacity", event_id)
                             requeue_candidate(event_id, stage)
                             continue
+                        # Scope multicast only over actual ready queue heads in
+                        # this scheduling pass.  The configured width includes
+                        # the leader, so every added destination is backed by a
+                        # real cache-request event and keeps its dependencies.
+                        max_destinations = self.config.cache_multicast_destinations
+                        if (
+                            lookup is CacheLookup.HIT
+                            and max_destinations is not None
+                            and max_destinations > 1
+                            and key in state.active
+                        ):
+                            candidates_for_multicast: list[int] = []
+                            for candidate_id, candidate_stage in ordered[ordered_position + 1:]:
+                                if candidate_stage != 0:
+                                    continue
+                                candidate_row = trace.events[candidate_id]
+                                if PrimitiveKind(int(candidate_row["primitive_kind"])) is not PrimitiveKind.CACHE_REQUEST:
+                                    continue
+                                candidate_key = (
+                                    int(candidate_row["gaussian_id"]),
+                                    int(candidate_row["state_version"]),
+                                )
+                                if candidate_key != key:
+                                    continue
+                                candidates_for_multicast.append(candidate_id)
+                                if len(candidates_for_multicast) + 1 >= max_destinations:
+                                    break
+                            multicast_followers = tuple(candidates_for_multicast)
                         cache_event_state[event_id] = (state, key, lookup)
                         state_version = int(row["state_version"])
                         if state_version in closed_versions:
@@ -947,7 +1545,7 @@ class CycleEngine:
                             )
                         cache_keys_by_version.setdefault(state_version, []).append((state, key))
                         if lookup is CacheLookup.HIT:
-                            completion = cycle + module.service_cycles()
+                            completion = cycle + self._service_cycles(module_name, row, kind)
                         else:
                             if lookup is CacheLookup.MISS:
                                 memory_requests += 1
@@ -981,13 +1579,29 @@ class CycleEngine:
                             if async_memory:
                                 memory_waiters.setdefault(request_id, []).append((
                                     event_id, stage, module_name,
-                                    cycle + module.service_cycles(),
+                                    cycle + self._physical_service_cycles(
+                                        module_name, row, kind, physical_stage,
+                                    ),
                                 ))
                                 completion = None
                             else:
                                 if memory_done > cycle + timing.latency:
                                     module.counters.memory_wait_cycles += memory_done - cycle - timing.latency
-                                completion = max(cycle + module.service_cycles(), memory_done)
+                                completion = max(
+                                    cycle + self._physical_service_cycles(
+                                        module_name, row, kind, physical_stage,
+                                    ), memory_done,
+                                )
+                        if multicast_followers:
+                            if completion is None:
+                                raise CycleConfigurationError(
+                                    "active cache hit cannot await a memory fill"
+                                )
+                            state.begin_multicast(
+                                key, destinations=len(multicast_followers)
+                            )
+                            for follower_id in multicast_followers:
+                                cache_multicast_followers[follower_id] = (state, key)
                     else:
                         memory_requests += 1
                         if async_memory:
@@ -999,7 +1613,9 @@ class CycleEngine:
                             )
                             memory_waiters[request_id] = [(
                                 event_id, stage, module_name,
-                                cycle + module.service_cycles(),
+                                cycle + self._physical_service_cycles(
+                                    module_name, row, kind, physical_stage,
+                                ),
                             )]
                             completion = None
                         else:
@@ -1011,9 +1627,33 @@ class CycleEngine:
                             )
                             if memory_done > cycle + timing.latency:
                                 module.counters.memory_wait_cycles += memory_done - cycle - timing.latency
-                            completion = max(cycle + module.service_cycles(), memory_done)
+                            completion = max(
+                                cycle + self._physical_service_cycles(
+                                    module_name, row, kind, physical_stage,
+                                ), memory_done,
+                            )
                 else:
-                    completion = cycle + module.service_cycles()
+                    completion = cycle + self._physical_service_cycles(
+                        module_name, row, kind, physical_stage,
+                    )
+                if (
+                    physical_stage is not None
+                    and module_name == "compute_pod"
+                    and kind is PrimitiveKind.FORWARD
+                    and stage == len(stages) - 1
+                    and self.config.compute_templates is not None
+                ):
+                    compute = self.modules[module_name]
+                    assert isinstance(compute, ComputePod)
+                    path = compute.path_for(int(row["template_id"]), kind)
+                    for logical_event, lane in zip(
+                        physical_stage.event_ids, physical_stage.lanes, strict=True,
+                    ):
+                        heapq.heappush(
+                            lane_outputs,
+                            (cycle + path.packet_completion_offset(lane), logical_event),
+                        )
+                    separate_lane_completion.add(event_id)
                 if completion is not None:
                     heapq.heappush(in_flight, (completion, event_id, stage, module_name))
                 if fusion_port_name is not None:
@@ -1023,13 +1663,20 @@ class CycleEngine:
                     module_busy_until[module_name][module_lane] = (
                         cycle + timing.initiation_interval
                     )
-                bank_busy[bank_key] = cycle
-                module_inflight[module_name] += 1
+                if self._uses_generic_module_limits(module_name):
+                    bank_busy[bank_key] = cycle
+                module_inflight[module_issue_key] += 1
                 if kind is PrimitiveKind.RELATION_CANDIDATE:
                     relation_seed_inflight += 1
                 module.counters.accepted += 1
-                module.counters.busy_cycles += timing.latency
-                issued_modules[module_name] = issued_modules.get(module_name, 0) + 1
+                module.counters.busy_cycles += self._physical_service_cycles(
+                    module_name, row, kind, physical_stage,
+                )
+                if compute_plan:
+                    module.reserve(compute_plan)  # type: ignore[attr-defined]
+                issued_modules[module_issue_key] = (
+                    issued_modules.get(module_issue_key, 0) + 1
+                )
                 if module_name == "fusion_issue" and stage == 0:
                     fusion_issued += 1
                     if self.selection.overlap_guided_issue:
@@ -1047,15 +1694,20 @@ class CycleEngine:
                 next_points = [point for point in (in_flight[0][0] if in_flight else None,
                                                    min((value for lanes in module_busy_until.values()
                                                         for value in lanes if value > cycle), default=None),
-                                                   min((point for point in fusion_busy_until.values()
+                    min((point for point in fusion_busy_until.values()
                                                         if point > cycle), default=None),
+                                                   lane_outputs[0][0] if lane_outputs else None,
                                                    memory_wakeup)
                                if point is not None and point > cycle]
                 if not next_points:
                     if ready and any(key[1] == cycle for key in bank_busy):
                         cycle += 1
                         continue
-                    blocked = tuple(event_id for event_id, _ in ready[:8])
+                    blocked = tuple(
+                        event_id
+                        for queue in ready.values()
+                        for event_id, _stage in queue[:8]
+                    )[:8]
                     raise CycleConfigurationError(f"deadlock at cycle {cycle}, pending={blocked}")
                 cycle = min(next_points)
             else:
@@ -1106,8 +1758,127 @@ class CycleEngine:
             event_counts={kind.name: int((trace.events["primitive_kind"] == int(kind)).sum())
                           for kind in PrimitiveKind},
             policy=self.policy,
-            oracle_status=("heuristic_unproven" if self.policy.endswith("_oracle") else "not_applicable"),
+            oracle_status=(
+                "future_visible_resource_constrained"
+                if self.policy.endswith("_oracle") else "not_applicable"
+            ),
             memory_requests=memory_request_records,
+        )
+
+    def _run_oracle_portfolio(
+        self,
+        trace: Trace,
+        *,
+        validate_input: bool,
+        progress: Callable[[CycleProgress], None] | None,
+        progress_interval_events: int | None,
+        progress_interval_seconds: float | None,
+    ) -> CycleResult:
+        oracle_policy = self.policy
+        actual_policy = "query" if self.selection.query_oracle else "residency"
+        clone = getattr(self.config.memory, "clone", None)
+        if callable(getattr(self.config.memory, "submit_async", None)) and not callable(clone):
+            raise CycleConfigurationError(
+                "Oracle portfolio requires a cloneable asynchronous memory backend"
+            )
+
+        def member_config() -> CycleConfig:
+            return replace(
+                self.config,
+                memory=clone() if callable(clone) else self.config.memory,
+            )
+
+        last_progress: dict[str, CycleProgress] = {}
+
+        def member_progress(member: str) -> Callable[[CycleProgress], None] | None:
+            if progress is None:
+                return None
+
+            def report(item: CycleProgress) -> None:
+                last_progress[member] = item
+                progress(replace(
+                    item, phase=f"oracle_portfolio_{member}_{item.phase}"
+                ))
+
+            return report
+
+        actual: CycleResult | None
+        actual_error: CycleConfigurationError | None = None
+        try:
+            actual = CycleEngine(member_config(), policy=actual_policy).run(
+                trace,
+                validate_input=validate_input,
+                progress=member_progress("actual"),
+                progress_interval_events=progress_interval_events,
+                progress_interval_seconds=progress_interval_seconds,
+            )
+        except CycleConfigurationError as error:
+            actual = None
+            actual_error = error
+        future: CycleResult | None
+        future_error: CycleConfigurationError | None = None
+        try:
+            future = CycleEngine(
+                member_config(),
+                policy=oracle_policy,
+                _oracle_portfolio_member=True,
+            ).run(
+                trace,
+                validate_input=False,
+                progress=member_progress("future"),
+                progress_interval_events=progress_interval_events,
+                progress_interval_seconds=progress_interval_seconds,
+            )
+        except CycleConfigurationError as error:
+            future = None
+            future_error = error
+        candidates = [
+            (name, result) for name, result in (("actual", actual), ("future", future))
+            if result is not None
+        ]
+        if not candidates:
+            raise CycleConfigurationError(
+                "all Oracle portfolio members failed: "
+                f"actual={actual_error}; future={future_error}"
+            )
+        winner_member, winner = min(
+            candidates, key=lambda candidate: candidate[1].total_cycles
+        )
+        portfolio = OraclePortfolio(
+            winner=winner_member,
+            members=(
+                OraclePortfolioMember(
+                    name="actual",
+                    policy=actual_policy,
+                    status="passed" if actual is not None else "failed_cycle",
+                    total_cycles=actual.total_cycles if actual is not None else None,
+                    failure_reason=str(actual_error) if actual_error is not None else None,
+                ),
+                OraclePortfolioMember(
+                    name="future",
+                    policy=oracle_policy,
+                    status="passed" if future is not None else "failed_cycle",
+                    total_cycles=future.total_cycles if future is not None else None,
+                    failure_reason=str(future_error) if future_error is not None else None,
+                ),
+            ),
+        )
+        if progress is not None:
+            final_progress = last_progress.get(winner_member)
+            if final_progress is None:
+                raise CycleConfigurationError(
+                    "Oracle portfolio member produced no final progress sample"
+                )
+            progress(replace(
+                final_progress,
+                phase="replay",
+                simulated_cycles=winner.total_cycles,
+            ))
+        return replace(
+            winner,
+            policy=oracle_policy,
+            oracle_status="portfolio_best_known_not_proven_upper_bound",
+            oracle_portfolio=portfolio,
         )
 
     def online_session(
@@ -1122,6 +1893,11 @@ class CycleEngine:
         progress_interval_seconds: float | None = None,
     ) -> "CycleReplaySession":
         """Create a persistent packet consumer without trace-column staging."""
+
+        if self.selection.query_oracle or self.selection.residency_oracle:
+            raise CycleConfigurationError(
+                "future-visible Oracle replay requires a complete trace"
+            )
 
         return CycleReplaySession(
             self,
@@ -1183,7 +1959,10 @@ class CycleEngine:
             chunk_root=root / ".virtual_chunks",
             stream_only=True,
         )
-        expander = VirtualQueryEventExpander(max_events=max_events)
+        expander = VirtualQueryEventExpander(
+            max_events=max_events,
+            relation_query_lanes=self.config.relation_query_lanes,
+        )
         stream_validator = VirtualEventStreamValidator()
         source_count = 0
         expanded_events = 0
@@ -1301,7 +2080,10 @@ class CycleReplaySession:
             raise ValueError("semantic workset totals must use positive keyed counts")
         self.progress = progress
         self.progress_interval_seconds = progress_interval_seconds
-        self._expander = VirtualQueryEventExpander(max_events=max_events)
+        self._expander = VirtualQueryEventExpander(
+            max_events=max_events,
+            relation_query_lanes=engine.config.relation_query_lanes,
+        )
         self._stream_validator = VirtualEventStreamValidator()
         self._lifecycle = VirtualTraceLifecycleValidator(initial_gaussian_count)
         self._events: dict[int, np.void] = {}
@@ -1312,20 +2094,31 @@ class CycleReplaySession:
         self._completed_ids: set[int] = set()
         self._completed_through = -1
         self._completion_cycles: dict[int, int] = {}
-        self._ready: list[tuple[int, int]] = []
+        self._ready: dict[
+            tuple[str, int], list[tuple[int, int]]
+        ] = defaultdict(list)
         self._fusion_pending: list[tuple[int, TaskKind]] = []
         self._fusion_inputs: dict[TaskKind, list[int]] = {
             TaskKind.FORWARD: [], TaskKind.CONSUMER: [], TaskKind.ADJOINT: [],
         }
         self._in_flight: list[tuple[int, int, int, str]] = []
+        self._lane_outputs: list[tuple[int, int]] = []
+        self._separate_lane_completion: set[int] = set()
+        self._packet_stage_by_event: dict[int, PhysicalPacketStage] = {}
+        self._packet_ready_members: dict[int, set[int]] = defaultdict(set)
+        self._packet_ready_stages: set[tuple[int, int]] = set()
         self._module_busy_until = {
-            name: [0] * module.timing.ports
-            for name, module in engine.modules.items()
+            name: [0] * engine._module_issue_ports(name)
+            for name in engine.modules
         }
         self._fusion_busy_until = {name: 0 for name in ("forward", "consumer", "adjoint")}
-        self._module_inflight = {name: 0 for name in engine.modules}
+        self._module_inflight = {
+            (name, partition): 0
+            for name in engine.modules
+            for partition in range(engine._module_partition_count(name))
+        }
         self._relation_seed_inflight = 0
-        self._bank_busy: dict[tuple[str, int, int], int] = {}
+        self._bank_busy: dict[tuple[str, int, int, int], int] = {}
         self._cache_states = (
             engine._residency_states()
             if engine.selection.semantic_residency else {}
@@ -1334,6 +2127,9 @@ class CycleReplaySession:
         self._cache_fill_request: dict[tuple[int, tuple[int, int]], int] = {}
         self._memory_waiters: dict[int, list[tuple[int, int, str, int]]] = {}
         self._cache_event_state: dict[int, tuple[SemanticCacheState, tuple[int, int], CacheLookup]] = {}
+        self._cache_multicast_followers: dict[
+            int, tuple[SemanticCacheState, tuple[int, int]]
+        ] = {}
         self._workset_seen: dict[tuple[int, int], int] = defaultdict(int)
         self._workset_by_request: dict[int, tuple[int, int, int, bool]] = {}
         self._workset_use_count = 0
@@ -1344,6 +2140,7 @@ class CycleReplaySession:
         self._event_counts = {kind.name: 0 for kind in PrimitiveKind}
         self._accepted_events = 0
         self._completed_events = 0
+        self._last_completion_cycle = 0
         self._peak_frontier_events = 0
         self._cycle = 0
         self._source_packets = 0
@@ -1412,6 +2209,8 @@ class CycleReplaySession:
             violations.append("events")
         if self._in_flight:
             violations.append("in_flight")
+        if self._lane_outputs:
+            violations.append("lane_outputs")
         if self._memory_waiters:
             violations.append("memory_waiters")
         if self._ready:
@@ -1426,6 +2225,8 @@ class CycleReplaySession:
             violations.append("cache_fill")
         if self._cache_event_state:
             violations.append("cache_events")
+        if self._cache_multicast_followers:
+            violations.append("cache_multicast")
         if self._workset_by_request:
             violations.append("workset_requests")
         if self._relation_seed_inflight:
@@ -1479,7 +2280,16 @@ class CycleReplaySession:
             )
             self._dependencies[event_id] = dependencies
             self._remaining[event_id] = unresolved
-            if kind is PrimitiveKind.CACHE_REQUEST and self.semantic_workset_totals:
+            physical_stage = self._packet_stage_by_event.get(event_id)
+            physical_reader = (
+                physical_stage is None
+                or physical_stage.head_event_id == event_id
+            )
+            if (
+                kind is PrimitiveKind.CACHE_REQUEST
+                and physical_reader
+                and self.semantic_workset_totals
+            ):
                 key = (int(row["gaussian_id"]), int(row["state_version"]))
                 total = self.semantic_workset_totals.get(key)
                 if total is None:
@@ -1533,28 +2343,44 @@ class CycleReplaySession:
             (self._state_barrier_event,)
             if self._state_barrier_event is not None else ()
         )
-        for event_packet in self._expander.expand(
+        event_packets = tuple(self._expander.expand(
             packet, external_dependencies=external_dependencies
-        ):
+        ))
+        packet_plan = RelationPacketPlan.from_event_packets(
+            event_packets,
+            query_lanes=self.engine.config.relation_query_lanes,
+        )
+        for physical_stage in packet_plan.stages:
+            for event_id in physical_stage.event_ids:
+                if event_id in self._packet_stage_by_event:
+                    raise CycleConfigurationError(
+                        f"online event {event_id} has duplicate packet metadata"
+                    )
+                self._packet_stage_by_event[event_id] = physical_stage
+        for event_packet in event_packets:
+            if (
+                self.max_frontier_events is not None
+                and self.pending_event_count + event_packet.event_count
+                > self.max_frontier_events
+            ):
+                self._drain()
+                self._compact_completed_prefix()
+                if (
+                    self.pending_event_count + event_packet.event_count
+                    > self.max_frontier_events
+                ):
+                    raise CycleConfigurationError(
+                        "max_frontier_events cannot hold the open physical packet frontier"
+                    )
             terminal_ids.extend(
                 int(event_id) for event_id in event_packet.events["event_id"][
                     event_packet.events["primitive_kind"]
                     == int(PrimitiveKind.GRADIENT_REDUCTION)
                 ]
             )
-            # A CUDA work-buffer packet is the arrival unit.  Its expanded
-            # event sub-packets must enter the frontier before the scheduler
-            # advances, otherwise each sub-packet edge introduces artificial
-            # serialization that is absent from the equivalent trace replay.
-            if (
-                self.max_frontier_events is not None
-                and self.pending_event_count + event_packet.event_count
-                > self.max_frontier_events
-            ):
-                # Keep the online stream bounded.  This is a frontier
-                # backpressure point, not a semantic packet boundary.
-                self._drain()
-                self._compact_completed_prefix()
+            # The complete plan is known before registration.  A drain may
+            # occur between expanded chunks, but incomplete physical stages
+            # have no ready head and therefore cannot issue early.
             self.accept_event_packet(event_packet, _drain_after=False)
             # Large frontier fills can spend substantial wall time registering
             # rows before the next drain; keep the long-run monitor live.
@@ -1722,7 +2548,7 @@ class CycleReplaySession:
         audit_records = getattr(self.engine.config.memory, "audit_records", None)
         memory_records = tuple(audit_records()) if callable(audit_records) else ()
         return CycleResult(
-            total_cycles=self._cycle,
+            total_cycles=self._last_completion_cycle,
             module_counters=counters,
             stalls=self.engine._stall_records(),
             completion_cycles=(dict(self._completion_cycles)
@@ -1761,16 +2587,54 @@ class CycleReplaySession:
         self._completed_through = expected_end
 
     def _push_ready(self, event_id: int, stage: int) -> None:
+        physical_stage = self._packet_stage_by_event.get(event_id)
+        if physical_stage is not None:
+            packet_key = physical_stage.head_event_id
+            if stage == 0:
+                members = self._packet_ready_members[packet_key]
+                members.add(event_id)
+                if len(members) < len(physical_stage.event_ids):
+                    return
+                if len(members) > len(physical_stage.event_ids):
+                    raise CycleConfigurationError(
+                        f"online physical packet {packet_key} became ready twice"
+                    )
+            elif event_id != physical_stage.head_event_id:
+                raise CycleConfigurationError(
+                    "only an online physical packet head may advance stages"
+                )
+            ready_key = (packet_key, stage)
+            if ready_key in self._packet_ready_stages:
+                return
+            self._packet_ready_stages.add(ready_key)
+            event_id = physical_stage.head_event_id
         task_kind = self._fusion_kind(event_id, stage)
         if task_kind is None:
-            heapq.heappush(self._ready, (event_id, stage))
+            kind = self._kinds[event_id]
+            module_name = self.engine._stages_for(kind)[stage]
+            partition = self.engine._module_partition(
+                module_name, self._events[event_id]
+            )
+            heapq.heappush(
+                self._ready[(module_name, partition)], (event_id, stage)
+            )
         else:
             heapq.heappush(self._fusion_pending, (event_id, task_kind))
 
     def _requeue(self, event_id: int, stage: int) -> None:
+        physical_stage = self._packet_stage_by_event.get(event_id)
+        if physical_stage is not None:
+            event_id = physical_stage.head_event_id
         task_kind = self._fusion_kind(event_id, stage)
         if task_kind is None:
-            heapq.heappush(self._ready, (event_id, stage))
+            kind = self._kinds[event_id]
+            module_name = self.engine._stages_for(kind)[stage]
+            partition = self.engine._module_partition(
+                module_name, self._events[event_id]
+            )
+            heapq.heappush(
+                self._ready[(module_name, partition)], (event_id, stage)
+            )
         else:
             heapq.heappush(self._fusion_inputs[task_kind], event_id)
 
@@ -1807,6 +2671,16 @@ class CycleReplaySession:
             reduction_domain=domain, state_version=int(row["state_version"]),
             template_id=int(row["template_id"]), address_token=int(row["address_token"]),
             task_kind=task_kind,
+            conflict_query_ids=(
+                tuple(
+                    int(self._events[member]["query_id"])
+                    for member in physical_stage.event_ids
+                )
+                if task_kind is TaskKind.FORWARD
+                and (physical_stage := self._packet_stage_by_event.get(event_id))
+                is not None
+                else ()
+            ),
         )
 
     def _ordered(self, candidates: list[tuple[int, int]]) -> list[tuple[int, int]]:
@@ -1826,11 +2700,7 @@ class CycleReplaySession:
 
     def _drain(self) -> None:
         async_memory = callable(getattr(self.engine.config.memory, "submit_async", None))
-        ready_scan_window = max(
-            self.engine.config.candidate_lanes,
-            sum(module.timing.ports for module in self.engine.modules.values()),
-        )
-        while self._ready or self._in_flight or self._memory_waiters:
+        while self._ready or self._in_flight or self._memory_waiters or self._lane_outputs:
             # Bank reservations are scoped to one cycle.  Drop old entries so
             # long packet streams do not retain one dictionary item per cycle.
             self._bank_busy = {
@@ -1840,7 +2710,7 @@ class CycleReplaySession:
             self._report_progress()
             self._cycle_fusion_issued = 0
             self._cycle_fusion_ports: dict[str, int] = {}
-            self._cycle_module_issued: dict[str, int] = {}
+            self._cycle_module_issued: dict[tuple[str, int], int] = {}
             progressed = False
             if async_memory:
                 self.engine.config.memory.advance(self._cycle)  # type: ignore[attr-defined]
@@ -1859,6 +2729,16 @@ class CycleReplaySession:
             while self._in_flight and self._in_flight[0][0] <= self._cycle:
                 self._complete_stage(*heapq.heappop(self._in_flight))
                 progressed = True
+            while self._lane_outputs and self._lane_outputs[0][0] <= self._cycle:
+                finish, event_id = heapq.heappop(self._lane_outputs)
+                physical_stage = self._packet_stage_by_event.get(event_id)
+                retain = bool(
+                    physical_stage is not None
+                    and physical_stage.head_event_id == event_id
+                    and event_id in self._separate_lane_completion
+                )
+                self._complete_logical_event(event_id, finish, retain=retain)
+                progressed = True
             if self.engine.selection.overlap_guided_issue:
                 capacity = self.engine.modules["fusion_issue"].timing.queue_capacity
                 occupancy = sum(len(queue) for queue in self._fusion_inputs.values())
@@ -1868,10 +2748,16 @@ class CycleReplaySession:
                     self.engine.issue_scheduler.observe_arrival((self._task_packet(event_id),))
                     occupancy += 1
             candidates: list[tuple[int, int]] = []
-            for _ in range(ready_scan_window):
-                if not self._ready:
-                    break
-                candidates.append(heapq.heappop(self._ready))
+            for ready_key in tuple(self._ready):
+                queue = self._ready[ready_key]
+                module_name, _partition = ready_key
+                scan_window = self.engine._ready_scan_window(module_name)
+                for _ in range(scan_window):
+                    if not queue:
+                        break
+                    candidates.append(heapq.heappop(queue))
+                if not queue:
+                    del self._ready[ready_key]
             if self.engine.selection.overlap_guided_issue:
                 for task_kind in (TaskKind.FORWARD, TaskKind.CONSUMER, TaskKind.ADJOINT):
                     if self._fusion_inputs[task_kind]:
@@ -1894,8 +2780,43 @@ class CycleReplaySession:
                         (next(order), stage) if event_id in fusion_packets else (event_id, stage)
                         for event_id, stage in ordered
                     ]
-                for event_id, stage in ordered:
-                    if self._try_issue(event_id, stage, selected, async_memory):
+                for ordered_position, (event_id, stage) in enumerate(ordered):
+                    multicast_followers: tuple[int, ...] = ()
+                    if (
+                        stage == 0
+                        and self._kinds[event_id] is PrimitiveKind.CACHE_REQUEST
+                    ):
+                        max_destinations = (
+                            self.engine.config.cache_multicast_destinations
+                        )
+                        if max_destinations is not None and max_destinations > 1:
+                            row = self._events[event_id]
+                            key = (
+                                int(row["gaussian_id"]),
+                                int(row["state_version"]),
+                            )
+                            followers: list[int] = []
+                            for candidate_id, candidate_stage in ordered[ordered_position + 1:]:
+                                if (
+                                    candidate_stage != 0
+                                    or self._kinds[candidate_id]
+                                    is not PrimitiveKind.CACHE_REQUEST
+                                ):
+                                    continue
+                                candidate_row = self._events[candidate_id]
+                                if (
+                                    int(candidate_row["gaussian_id"]),
+                                    int(candidate_row["state_version"]),
+                                ) != key:
+                                    continue
+                                followers.append(candidate_id)
+                                if len(followers) + 1 >= max_destinations:
+                                    break
+                            multicast_followers = tuple(followers)
+                    if self._try_issue(
+                        event_id, stage, selected, async_memory,
+                        multicast_followers=multicast_followers,
+                    ):
                         progressed = True
             if not progressed:
                 memory_wakeup = (
@@ -1907,6 +2828,7 @@ class CycleReplaySession:
                     min((value for lanes in self._module_busy_until.values()
                          for value in lanes if value > self._cycle), default=None),
                     min((value for value in self._fusion_busy_until.values() if value > self._cycle), default=None),
+                    self._lane_outputs[0][0] if self._lane_outputs else None,
                     memory_wakeup,
                 ) if point is not None and point > self._cycle]
                 if not next_points:
@@ -1922,13 +2844,43 @@ class CycleReplaySession:
             else:
                 self._cycle += 1
 
-    def _try_issue(self, event_id: int, stage: int, selected: set[int], async_memory: bool) -> bool:
+    def _try_issue(
+        self,
+        event_id: int,
+        stage: int,
+        selected: set[int],
+        async_memory: bool,
+        *,
+        multicast_followers: tuple[int, ...] = (),
+    ) -> bool:
         row = self._events[event_id]
         kind = self._kinds[event_id]
+        physical_stage = self._packet_stage_by_event.get(event_id)
         stages = self.engine._stages_for(kind)
         module_name = stages[stage]
         module = self.engine.modules[module_name]
         timing = module.timing
+        follower_state = (
+            self._cache_multicast_followers.get(event_id)
+            if kind is PrimitiveKind.CACHE_REQUEST and stage == 0 else None
+        )
+        if follower_state is not None:
+            state, key = follower_state
+            self._cache_multicast_followers.pop(event_id, None)
+            self._cache_event_state[event_id] = (state, key, CacheLookup.HIT)
+            self._cache_keys_by_version.setdefault(key[1], []).append((state, key))
+            completion = self._cycle + self.engine._physical_service_cycles(
+                module_name, row, kind, physical_stage,
+            )
+            heapq.heappush(
+                self._in_flight, (completion, event_id, stage, module_name)
+            )
+            inflight_key = (
+                module_name, self.engine._module_partition(module_name, row)
+            )
+            self._module_inflight[inflight_key] += 1
+            module.counters.accepted += 1
+            return True
         if (module_name == "fusion_issue" and stage == 0
                 and self.engine.selection.overlap_guided_issue and event_id not in selected):
             module.counters.port_stalls += 1
@@ -1948,6 +2900,8 @@ class CycleReplaySession:
         if not module.accepts_kind(kind):
             raise CycleConfigurationError(f"{module_name} does not accept {kind.name}")
         port_name: str | None = None
+        module_partition = self.engine._module_partition(module_name, row)
+        module_issue_key = (module_name, module_partition)
         if module_name == "fusion_issue" and stage == 0 and self.engine.selection.overlap_guided_issue:
             port_name, limit = self.engine._fusion_port_limit(kind)
             used = getattr(self, "_cycle_fusion_ports", {}).get(port_name, 0)
@@ -1956,7 +2910,10 @@ class CycleReplaySession:
                 self.engine._record_stall(self._cycle, module_name, "port", event_id)
                 self._requeue(event_id, stage)
                 return False
-        elif getattr(self, "_cycle_module_issued", {}).get(module_name, 0) >= timing.ports:
+        elif (
+            getattr(self, "_cycle_module_issued", {}).get(module_issue_key, 0)
+            >= self.engine._module_partition_issue_limit(module_name)
+        ):
             module.counters.port_stalls += 1
             self.engine._record_stall(self._cycle, module_name, "port", event_id)
             self._requeue(event_id, stage)
@@ -1967,8 +2924,8 @@ class CycleReplaySession:
         else:
             module_lanes = self._module_busy_until[module_name]
             module_lane = next(
-                (index for index, value in enumerate(module_lanes)
-                 if value <= self._cycle),
+                (index for index in self.engine._module_lane_indices(module_name, row)
+                 if module_lanes[index] <= self._cycle),
                 None,
             )
             if module_lane is None:
@@ -1984,7 +2941,8 @@ class CycleReplaySession:
             self.engine._record_stall(self._cycle, module_name, "initiation_interval", event_id)
             self._requeue(event_id, stage)
             return False
-        if self._module_inflight[module_name] >= timing.queue_capacity:
+        if (self.engine._uses_generic_module_limits(module_name)
+                and self._module_inflight[module_issue_key] >= timing.queue_capacity):
             module.counters.queue_stalls += 1
             self.engine._record_stall(self._cycle, module_name, "queue_capacity", event_id)
             self._requeue(event_id, stage)
@@ -1994,17 +2952,64 @@ class CycleReplaySession:
             self.engine._record_stall(self._cycle, module_name, "seed_fifo", event_id)
             self._requeue(event_id, stage)
             return False
-        bank_key = (module_name, self._cycle, module.bank(int(row["address_token"])))
-        if bank_key in self._bank_busy:
+        bank_partition, bank = self.engine._module_bank_partition(module_name, row)
+        bank_key = (module_name, self._cycle, bank_partition, bank)
+        if (self.engine._uses_generic_module_limits(module_name)
+                and bank_key in self._bank_busy):
             module.counters.bank_conflicts += 1
             self.engine._record_stall(self._cycle, module_name, "bank", event_id)
             self._requeue(event_id, stage)
             return False
-        completion: int | None = self._issue_memory_if_needed(
-            event_id, stage, kind, module_name, timing, async_memory
+        compute_plan: tuple[tuple[str, int, int], ...] = ()
+        if module_name == "compute_pod":
+            try:
+                compute_plan = module.reservation_plan(  # type: ignore[attr-defined]
+                    int(row["template_id"]), kind, self._cycle
+                )
+            except KeyError as error:
+                raise CycleConfigurationError(str(error)) from error
+            if not module.can_reserve(compute_plan, self._cycle):  # type: ignore[attr-defined]
+                module.counters.queue_stalls += 1
+                self.engine._record_stall(
+                    self._cycle, module_name, "compute_resource", event_id
+                )
+                self._requeue(event_id, stage)
+                return False
+        service_cycles = self.engine._physical_service_cycles(
+            module_name, row, kind, physical_stage,
         )
+        try:
+            completion: int | None = self._issue_memory_if_needed(
+                event_id, stage, kind, module_name, timing, service_cycles,
+                async_memory, multicast_followers=multicast_followers,
+            )
+        except CacheBackpressure:
+            module.counters.queue_stalls += 1
+            self.engine._record_stall(
+                self._cycle, module_name, "cache_capacity", event_id
+            )
+            self._requeue(event_id, stage)
+            return False
         if completion is not None:
             heapq.heappush(self._in_flight, (completion, event_id, stage, module_name))
+        if (
+            physical_stage is not None
+            and module_name == "compute_pod"
+            and kind is PrimitiveKind.FORWARD
+            and stage == len(stages) - 1
+            and self.engine.config.compute_templates is not None
+        ):
+            compute = self.engine.modules[module_name]
+            assert isinstance(compute, ComputePod)
+            path = compute.path_for(int(row["template_id"]), kind)
+            for logical_event, lane in zip(
+                physical_stage.event_ids, physical_stage.lanes, strict=True,
+            ):
+                heapq.heappush(
+                    self._lane_outputs,
+                    (self._cycle + path.packet_completion_offset(lane), logical_event),
+                )
+            self._separate_lane_completion.add(event_id)
         if port_name:
             self._fusion_busy_until[port_name] = self._cycle + timing.initiation_interval
         else:
@@ -2012,13 +3017,18 @@ class CycleReplaySession:
             self._module_busy_until[module_name][module_lane] = (
                 self._cycle + timing.initiation_interval
             )
-        self._bank_busy[bank_key] = self._cycle
-        self._module_inflight[module_name] += 1
+        if self.engine._uses_generic_module_limits(module_name):
+            self._bank_busy[bank_key] = self._cycle
+        self._module_inflight[module_issue_key] += 1
         if kind is PrimitiveKind.RELATION_CANDIDATE:
             self._relation_seed_inflight += 1
         module.counters.accepted += 1
-        module.counters.busy_cycles += timing.latency
-        self._cycle_module_issued[module_name] = self._cycle_module_issued.get(module_name, 0) + 1
+        module.counters.busy_cycles += service_cycles
+        if compute_plan:
+            module.reserve(compute_plan)  # type: ignore[attr-defined]
+        self._cycle_module_issued[module_issue_key] = (
+            self._cycle_module_issued.get(module_issue_key, 0) + 1
+        )
         if module_name == "fusion_issue" and stage == 0:
             self._cycle_fusion_issued = getattr(self, "_cycle_fusion_issued", 0) + 1
             if self.engine.selection.overlap_guided_issue:
@@ -2029,9 +3039,11 @@ class CycleReplaySession:
 
     def _issue_memory_if_needed(self, event_id: int, stage: int, kind: PrimitiveKind,
                                 module_name: str, timing: ModuleTiming,
-                                async_memory: bool) -> int | None:
+                                service_cycles: int,
+                                async_memory: bool, *,
+                                multicast_followers: tuple[int, ...] = ()) -> int | None:
         if kind is not PrimitiveKind.CACHE_REQUEST or stage != 0:
-            return self._cycle + timing.latency
+            return self._cycle + service_cycles
         row = self._events[event_id]
         data_bytes = int(row["data_bytes"])
         if data_bytes <= 0:
@@ -2044,13 +3056,13 @@ class CycleReplaySession:
                     is_write=False, arrival_cycle=self._cycle,
                 )
                 self._memory_waiters[request_id] = [(event_id, stage, module_name,
-                                                     self._cycle + timing.latency)]
+                                                     self._cycle + service_cycles)]
                 return None
             memory_done = self.engine.config.memory.submit(
                 address=int(row["address_token"]), size_bytes=data_bytes,
                 is_write=False, arrival_cycle=self._cycle,
             )
-            return max(self._cycle + timing.latency, memory_done)
+            return max(self._cycle + service_cycles, memory_done)
         instance = self.engine._cache_instance(int(row["gaussian_id"]))
         key = (int(row["gaussian_id"]), int(row["state_version"]))
         state = self._cache_states[instance]
@@ -2063,7 +3075,18 @@ class CycleReplaySession:
         self._cache_event_state[event_id] = (state, key, lookup)
         self._cache_keys_by_version.setdefault(key[1], []).append((state, key))
         if lookup is CacheLookup.HIT:
-            return self._cycle + timing.latency
+            if multicast_followers and key in state.active:
+                available_followers = tuple(
+                    follower_id for follower_id in multicast_followers
+                    if follower_id not in self._cache_multicast_followers
+                )
+                if available_followers:
+                    state.begin_multicast(
+                        key, destinations=len(available_followers)
+                    )
+                    for follower_id in available_followers:
+                        self._cache_multicast_followers[follower_id] = (state, key)
+            return self._cycle + service_cycles
         self._memory_requests += 1
         if lookup is CacheLookup.MISS:
             if async_memory:
@@ -2084,17 +3107,21 @@ class CycleReplaySession:
             raise CycleConfigurationError(f"merged cache request {event_id} has no fill completion")
         if async_memory:
             self._memory_waiters.setdefault(request_id, []).append(
-                (event_id, stage, module_name, self._cycle + timing.latency)
+                (event_id, stage, module_name, self._cycle + service_cycles)
             )
             return None
-        return max(self._cycle + timing.latency, request_id)
+        return max(self._cycle + service_cycles, request_id)
 
     def _complete_stage(self, finish: int, event_id: int, stage: int, module_name: str) -> None:
         module = self.engine.modules[module_name]
         module.complete(event_id, finish)
-        self._module_inflight[module_name] -= 1
         row = self._events[event_id]
+        inflight_key = (
+            module_name, self.engine._module_partition(module_name, row)
+        )
+        self._module_inflight[inflight_key] -= 1
         kind = self._kinds[event_id]
+        physical_stage = self._packet_stage_by_event.get(event_id)
         stages = self.engine._stages_for(kind)
         if (
             kind is PrimitiveKind.RELATION_CANDIDATE
@@ -2113,9 +3140,21 @@ class CycleReplaySession:
                     raise CycleConfigurationError(
                         f"cache fill for {event_id} has no pending state"
                     )
+                waiter_count = int(pending["waiters"])
                 state.fill_complete(
                     key, remaining_uses=int(pending["remaining_uses"])
                 )
+                max_destinations = self.engine.config.cache_multicast_destinations
+                if max_destinations is not None and max_destinations > 1:
+                    remaining_waiters = waiter_count
+                    while remaining_waiters > 1:
+                        destinations = min(remaining_waiters, max_destinations)
+                        state.begin_multicast(
+                            key,
+                            destinations=destinations,
+                            readers_already_active=True,
+                        )
+                        remaining_waiters -= destinations
                 instance = self.engine._cache_instance(int(row["gaussian_id"]))
                 self._cache_fill_request.pop((instance, key), None)
                 self._cache_fill_done.pop((instance, key), None)
@@ -2144,8 +3183,25 @@ class CycleReplaySession:
         if stage + 1 < len(stages):
             self._push_ready(event_id, stage + 1)
             return
+        if event_id in self._separate_lane_completion:
+            self._separate_lane_completion.remove(event_id)
+            self._drop_event(event_id)
+            return
+        logical_events = (
+            physical_stage.event_ids
+            if physical_stage is not None else (event_id,)
+        )
+        for logical_event in logical_events:
+            self._complete_logical_event(logical_event, finish)
+
+    def _complete_logical_event(
+        self, event_id: int, finish: int, *, retain: bool = False,
+    ) -> None:
+        if event_id in self._completed_ids or event_id <= self._completed_through:
+            raise CycleConfigurationError(f"online event {event_id} completed twice")
         self._completed_ids.add(event_id)
         self._completed_events += 1
+        self._last_completion_cycle = max(self._last_completion_cycle, finish)
         if self.retain_completion_cycles:
             self._completion_cycles[event_id] = finish
         for dependent in self._dependents.pop(event_id, []):
@@ -2155,10 +3211,15 @@ class CycleReplaySession:
             self._remaining[dependent] = remaining
             if remaining == 0:
                 self._push_ready(dependent, 0)
+        if not retain:
+            self._drop_event(event_id)
+
+    def _drop_event(self, event_id: int) -> None:
         self._events.pop(event_id, None)
         self._kinds.pop(event_id, None)
         self._dependencies.pop(event_id, None)
         self._remaining.pop(event_id, None)
+        self._packet_stage_by_event.pop(event_id, None)
 
     def _report_progress(self, *, force: bool = False) -> None:
         if self.progress is None:
@@ -2240,7 +3301,10 @@ class BufferedVirtualCycleConsumer:
             return
         totals: dict[tuple[int, int], int] = defaultdict(int)
         for packet in self._packets:
-            counts = packet.relation_counts_by_candidate
+            counts = packet.relation_packet_counts_by_candidate(
+                query_lanes=self.session.engine.config.relation_query_lanes,
+                max_relations=self.session.max_events,
+            )
             for gaussian_id, count in zip(packet.point_ids, counts, strict=True):
                 if int(count):
                     key = (int(gaussian_id), int(packet.state_version))

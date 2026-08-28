@@ -20,6 +20,7 @@
 | `issue.consumer_ports` | 1 | port | 三输出交叉开关 |
 | `issue.adjoint_ports` | 1 | port | 三输出交叉开关 |
 | `cache.instances` | 4 | cache | 每 Pod 一个缓存 |
+| `latency.semantic_cache.ports` | 1 | port_per_cache_instance | 每个 Pod 缓存各自独立的目录/Active SRAM 接纳端口，不是四个实例共享的全局端口 |
 | `cache.directory_banks_per_instance` | 4 | bank | 语义驻留目录 |
 | `cache.directory_entries_per_bank` | 256 | entry | 语义驻留目录 |
 | `cache.active_records_per_instance` | 1024 | record | Active SRAM |
@@ -35,7 +36,13 @@
 | `compute.transcendental_lanes_per_cluster` | 2 | lane | 可配置超越函数流水 |
 | `compute.reduction_inputs_per_cluster` | 16 | input | 十六输入归约树 |
 | `compute.microcontexts_per_cluster` | 4 | context | 计算簇微上下文 |
+| `compute.relations_per_microcontext` | 8 | query lane | 每个物理微上下文内 RelationPacket 的八个查询 lane，不是八个独立 context |
+| `compute.cluster_issue_slots_per_cluster` | 2 | slot | 二维 interaction 的两条配对算术路径 |
 | `compute.microcontext_bytes_per_cluster` | 6656 | byte | 6.5 KiB 设计值 |
+| `compute.template_profiles[1].paths.forward` | pack 4，first 17，last 20，2 lane/cycle | cycle | GALA `ffadc13d`: `interaction_2d` |
+| `compute.template_profiles[1].paths.adjoint` | pack 8，first 27，last 34，1 cycle/lane | cycle | GALA `ffadc13d`: `interaction_2d_adjoint` |
+| `compute.template_profiles[2].paths.forward` | pack 8，first 27，last 34，1 lane/cycle | cycle | GALA `ffadc13d`: `interaction_3d` |
+| `compute.template_profiles[2].paths.adjoint` | pack 24，first 47，last 68，3 cycle/lane | cycle | GALA `ffadc13d`: `interaction_3d_adjoint` |
 | `query.reduction_banks` | 64 | bank | 双向查询执行单元 |
 | `query.partial_sum_groups_per_bank` | 4 | group | 交错部分和 |
 | `query.loss_fma_lanes` | 32 | lane | 查询损失单元 |
@@ -128,11 +135,13 @@ FMA、EXP、LOG、RCP、SQRT、SRAM、CAM、互连和寄存器流水延迟不写
 | `ncu.isolated_invocation_ordinals` | `CUDAFunctor_add<float>: [4862]` | launch ordinal list | 有实测 watchdog 证据的启动序号必须单独采集 |
 | `preflight.warmup_iterations` | 10 | iteration | 排除首次编译和缓存建立 |
 | `preflight.measure_iterations` | 50 | iteration | 预测总运行时间 |
+| `preflight.inactivity_timeout_seconds` | 300 | second | 官方长任务无 GPU、日志或进程 CPU 推进时的终止门限 |
 | `trace.chunk_events` | 自动调优后冻结 | event | 设备 trace chunk 容量 |
 | `trace.inactivity_timeout_seconds` | 300 | second | 虚拟 trace 数据包或日志无推进时的终止门限 |
 | `trace.progress_interval_seconds` | 30 | second | 虚拟 trace 结构化吞吐日志的最长间隔 |
 | `diagnostic.throughput_report_interval_events` | 100000 | completed_event | 周期开发模式的事件采样间隔 |
 | `diagnostic.throughput_report_interval_seconds` | 30 | second | 周期开发模式的最长静默间隔 |
+| `diagnostic.inactivity_timeout_seconds` | 300 | second | 周期入口无完成事件或迭代推进时的终止门限 |
 | `diagnostic.throughput_warmup_samples` | 3 | sample | 吞吐稳定判定前丢弃的预热样本数 |
 | `diagnostic.throughput_stability_window_samples` | 5 | sample | 吞吐与周期投影同时判稳的连续窗口数 |
 | `diagnostic.throughput_required_stable_windows` | 2 | window | 允许提前停止前连续通过的稳定窗口数 |

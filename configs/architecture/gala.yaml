@@ -206,6 +206,30 @@ parameters:
       source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
       scope: hardware
       status: frozen
+    boundary_selectors_per_cluster:
+      value: 3
+      unit: selector
+      source: docs/03_HARDWARE_CONTRACT.md:compute-pod
+      scope: hardware
+      status: frozen
+    fma_latency:
+      value: 5
+      unit: cycle
+      source: docs/04_PARAMETER_REGISTRY.md:compute-template-timing
+      scope: hardware
+      status: frozen
+    transcendental_latency:
+      value: 7
+      unit: cycle
+      source: docs/04_PARAMETER_REGISTRY.md:compute-template-timing
+      scope: hardware
+      status: frozen
+    reduction_latency:
+      value: 4
+      unit: cycle
+      source: docs/04_PARAMETER_REGISTRY.md:compute-template-timing
+      scope: hardware
+      status: frozen
     transcendental_lanes_per_cluster:
       value: 2
       unit: lane
@@ -224,10 +248,100 @@ parameters:
       source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
       scope: hardware
       status: frozen
+    relations_per_microcontext:
+      value: 8
+      unit: relation_slot
+      source: GALA design config ffadc13d6167cbe3ff50135935d02fa076a0700c:packet.query_lanes
+      scope: hardware
+      status: frozen
+    cluster_issue_slots_per_cluster:
+      value: 2
+      unit: slot
+      source: GALA design config ffadc13d6167cbe3ff50135935d02fa076a0700c:execution_modes.interaction_2d.cluster_interactions_per_cycle
+      scope: hardware
+      status: frozen
     microcontext_bytes_per_cluster:
       value: 6656
       unit: byte
       source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      scope: hardware
+      status: frozen
+    template_profiles:
+      value:
+        - template_id: 1
+          paths:
+            forward:
+              cluster_issue_slots: 1
+              cluster_issue_cycles: 4
+              packet_first_result_latency: 17
+              packet_last_result_offset: 20
+              packet_lane_issue_interval: 1
+              packet_lanes_per_issue: 2
+              packet_completion_at_last: false
+              stages:
+                - {name: TRANSFORM, latency: 5, fma_groups: 1}
+                - {name: EVALUATE, latency: 7, transcendental_lanes: 1}
+                - {name: COMBINE, latency: 5, fma_groups: 1}
+            adjoint:
+              cluster_issue_slots: 1
+              cluster_issue_cycles: 8
+              packet_first_result_latency: 27
+              packet_last_result_offset: 34
+              packet_lane_issue_interval: 1
+              packet_lanes_per_issue: 1
+              packet_completion_at_last: true
+              stages:
+                - {name: TRANSFORM, latency: 5, fma_groups: 1}
+                - {name: EVALUATE, latency: 7, transcendental_lanes: 1}
+                - {name: COMBINE, latency: 5, fma_groups: 1, feedback_lanes: 1}
+                - {name: COMBINE, latency: 5, fma_groups: 1, feedback_lanes: 1}
+                - {name: COMBINE, latency: 5, fma_groups: 1, feedback_lanes: 1}
+            gradient_reduction:
+              cluster_issue_slots: 2
+              cluster_issue_cycles: 1
+              stages:
+                - {name: COMBINE, latency: 4, reduction_trees: 1}
+        - template_id: 2
+          paths:
+            forward:
+              cluster_issue_slots: 1
+              cluster_issue_cycles: 8
+              packet_first_result_latency: 27
+              packet_last_result_offset: 34
+              packet_lane_issue_interval: 1
+              packet_lanes_per_issue: 1
+              packet_completion_at_last: false
+              stages:
+                - {name: TRANSFORM, latency: 5, fma_groups: 1}
+                - {name: TRANSFORM, latency: 5, fma_groups: 1}
+                - {name: TRANSFORM, latency: 5, fma_groups: 1}
+                - {name: EVALUATE, latency: 7, transcendental_lanes: 1}
+                - {name: COMBINE, latency: 5, fma_groups: 1}
+            adjoint:
+              cluster_issue_slots: 1
+              cluster_issue_cycles: 24
+              packet_first_result_latency: 47
+              packet_last_result_offset: 68
+              packet_lane_issue_interval: 3
+              packet_lanes_per_issue: 1
+              packet_completion_at_last: true
+              stages:
+                - {name: TRANSFORM, latency: 5, fma_groups: 1}
+                - {name: TRANSFORM, latency: 5, fma_groups: 1}
+                - {name: TRANSFORM, latency: 5, fma_groups: 1}
+                - {name: EVALUATE, latency: 7, transcendental_lanes: 1}
+                - {name: COMBINE, latency: 5, fma_groups: 1, feedback_lanes: 1}
+                - {name: COMBINE, latency: 5, fma_groups: 1, feedback_lanes: 1}
+                - {name: COMBINE, latency: 5, fma_groups: 1, feedback_lanes: 1}
+                - {name: COMBINE, latency: 5, fma_groups: 1, feedback_lanes: 1}
+                - {name: COMBINE, latency: 5, fma_groups: 1, feedback_lanes: 1}
+            gradient_reduction:
+              cluster_issue_slots: 2
+              cluster_issue_cycles: 1
+              stages:
+                - {name: COMBINE, latency: 4, reduction_trees: 1}
+      unit: profile_sequence
+      source: GALA design config ffadc13d6167cbe3ff50135935d02fa076a0700c:execution_modes.interaction_2d/interaction_2d_adjoint/interaction_3d/interaction_3d_adjoint; R2-Gaussian f2579bfddd9aac009cb797c8503bef8119bbd022 source operator audit
       scope: hardware
       status: frozen
   query:
@@ -362,6 +476,12 @@ parameters:
       scope: functional
       status: frozen
   preflight:
+    inactivity_timeout_seconds:
+      value: 300
+      unit: second
+      source: docs/04_PARAMETER_REGISTRY.md:run-strategy
+      scope: workflow
+      status: frozen
     long_run_threshold_seconds:
       value: 3600
       unit: second
@@ -406,6 +526,12 @@ parameters:
       scope: software
       status: frozen
   diagnostic:
+    inactivity_timeout_seconds:
+      value: 300
+      unit: second
+      source: docs/04_PARAMETER_REGISTRY.md:runtime-throughput-diagnostic
+      scope: workflow
+      status: frozen
     throughput_report_interval_events:
       value: 100000
       unit: completed_event
@@ -532,7 +658,7 @@ parameters:
         status: frozen
       ports:
         value: 1
-        unit: port
+        unit: port_per_cache_instance
         source: docs/03_HARDWARE_CONTRACT.md:semantic-cache
         scope: hardware
         status: frozen

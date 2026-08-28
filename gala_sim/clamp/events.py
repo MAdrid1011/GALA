@@ -11,6 +11,53 @@ import numpy as np
 EVENT_SCHEMA_VERSION: Final[str] = "gala-clamp-events-v2"
 NULL_ID: Final[int] = -1
 
+# Relation-chain events use the high flag bit as an explicit discriminator so
+# their packet metadata cannot be confused with kind-specific low-bit flags.
+RELATION_PACKET_METADATA_VALID: Final[int] = 1 << 31
+RELATION_PACKET_LANE_BITS: Final[int] = 3
+RELATION_PACKET_LANE_MASK_SHIFT: Final[int] = RELATION_PACKET_LANE_BITS
+RELATION_PACKET_LANE_MASK_BITS: Final[int] = 8
+RELATION_PACKET_LANE_MASK: Final[int] = (1 << RELATION_PACKET_LANE_BITS) - 1
+RELATION_PACKET_QUERY_MASK: Final[int] = (
+    (1 << RELATION_PACKET_LANE_MASK_BITS) - 1
+) << RELATION_PACKET_LANE_MASK_SHIFT
+
+
+def encode_relation_packet_flags(*, lane: int, lane_mask: int) -> int:
+    """Encode one scalar event's position in an eight-lane RelationPacket."""
+
+    if not 0 <= lane < RELATION_PACKET_LANE_MASK_BITS:
+        raise ValueError("relation packet lane is outside the protocol width")
+    if not 0 < lane_mask < (1 << RELATION_PACKET_LANE_MASK_BITS):
+        raise ValueError("relation packet lane mask is outside the protocol width")
+    if not lane_mask & (1 << lane):
+        raise ValueError("relation packet lane is not active in its lane mask")
+    return (
+        RELATION_PACKET_METADATA_VALID
+        | lane
+        | (lane_mask << RELATION_PACKET_LANE_MASK_SHIFT)
+    )
+
+
+def decode_relation_packet_flags(flags: int) -> tuple[int, int]:
+    """Return ``(lane, lane_mask)`` from a relation-chain event."""
+
+    if not flags & RELATION_PACKET_METADATA_VALID:
+        raise ValueError("event has no relation packet metadata")
+    lane = flags & RELATION_PACKET_LANE_MASK
+    lane_mask = (
+        flags & RELATION_PACKET_QUERY_MASK
+    ) >> RELATION_PACKET_LANE_MASK_SHIFT
+    if not lane_mask & (1 << lane):
+        raise ValueError("relation packet metadata has an inactive event lane")
+    return lane, lane_mask
+
+
+def has_relation_packet_metadata(flags: int) -> bool:
+    """Return whether ``flags`` carries the relation packet layout."""
+
+    return bool(flags & RELATION_PACKET_METADATA_VALID)
+
 
 class PrimitiveKind(IntEnum):
     RELATION_CANDIDATE = 1

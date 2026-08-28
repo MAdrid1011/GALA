@@ -50,13 +50,12 @@ Base ASIC 关闭四项核心优化，保留完整通用硬件和正确的数值�
 
 ## 6. AGX Orin 基线换算
 
-当前 AGX Orin 实机校准不可用。为便于检查 ASIC 周期是否落在合理数量级，仓库另提供
-`gala_sim.tools.gpu_orin_estimate` 工程代理：它把已测的本地阶段权重与显式公开规格参考向量结合，
-并为每个类别给出不确定区间。生成代理时必须通过 `--workload-iterations` 声明总时间对应的训练迭代数；
-周期诊断会先按当前重放迭代数缩放该时间，再计算加速比。该代理输出固定为 `status=proxy_estimate`、
-`formal_performance_eligible=false`，只能作为带明确假设的非正式规格代理和异常检查；它不改变正式归一化状态，
-不生成 `speedup_vs_orin`，不能作为 ASIC 达标或加速比门槛，也不能替代同一校准套件、数据类型和批量范围下的 AGX Orin 实测向量。
+当前 AGX Orin 实机校准不可用。`gala_sim.tools.gpu_orin_estimate` 仅保留公开规格 extrapolation
+及其假设，输出固定为 `status=proxy_estimate`、`formal_performance_eligible=false` 和
+`performance_comparison_eligible=false`。公开峰值规格不能预测端到端 Orin 时间，因此该数值不接入周期诊断，
+不用于性能比较、数量级检查、方向判断或 ASIC 达标门槛，也不生成 `speedup_vs_orin`。只有同一校准套件、
+数据类型和批量范围下的 AGX Orin 实测向量才能恢复平台比较。
 
 软件参考在实现者实际使用的 NVIDIA GPU 上测量，并保存原始设备时间。到 AGX Orin 的换算按执行阶段进行，每个阶段分别使用可移植校准程序测得 FP32 FMA、EXP、LOG、RCP、SQRT、有效显存带宽、原子操作、kernel 发射和同步开销。换算使用同版本 CUDA、相同数据类型和相同批量区间，不使用峰值算力比或单一全局系数。
 
-AGX Orin 参考向量固定为 1.30 GHz、2048 个 Ampere CUDA Core 和 204.8 GB/s 峰值带宽，并保存对应软件栈与校准结果的版本。每个模型阶段根据其实际指令、访存和发射计数组合本地与 Orin 校准项，得到 Orin 等效时间。原始本地时间、阶段权重、校准比和换算后时间同时写入结果。缺少某项 Orin 校准时将结果标记为 `provisional_normalization`，不得用邻近项目代填。
+设备说明可记录 AGX Orin 的 1.30 GHz、2048 个 Ampere CUDA Core 和 204.8 GB/s 峰值带宽，但这些字段不是性能校准向量。每个模型阶段必须根据实际指令、访存和发射计数组合本地与 Orin 实测校准项，得到 Orin 等效时间。原始本地时间、阶段权重、校准比和换算后时间同时写入结果。缺少任一 Orin 校准项时平台结果保持 `unavailable`，不得用公开规格、邻近项目或拟合值代填。

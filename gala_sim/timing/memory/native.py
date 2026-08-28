@@ -33,6 +33,7 @@ def _inspect_configuration(path: Path) -> dict[str, int | str]:
         raise MissingMemoryBackend("Ramulator configuration has no controllers")
     channel_width: int | None = None
     data_rate: int | None = None
+    read_latency: int | None = None
     for controller in controllers:
         if not isinstance(controller, dict) or controller.get("impl") != "LPDDR5":
             raise MissingMemoryBackend("Ramulator controller is not LPDDR5")
@@ -44,14 +45,25 @@ def _inspect_configuration(path: Path) -> dict[str, int | str]:
         if not isinstance(timing, list) or not timing:
             raise MissingMemoryBackend("Ramulator LPDDR5 timing is absent")
         rate = int(timing[0])
+        current_read_latency = int(dram.get("read_latency", 0))
+        if current_read_latency <= 0:
+            raise MissingMemoryBackend("Ramulator LPDDR5 read latency is absent")
         channel_width = width if channel_width is None else channel_width
         data_rate = rate if data_rate is None else data_rate
-        if width != channel_width or rate != data_rate:
+        read_latency = (
+            current_read_latency if read_latency is None else read_latency
+        )
+        if (
+            width != channel_width
+            or rate != data_rate
+            or current_read_latency != read_latency
+        ):
             raise MissingMemoryBackend("Ramulator controllers are not homogeneous")
     return {
         "channels": len(controllers),
         "channel_width_bits": int(channel_width or 0),
         "data_rate_mtps": int(data_rate or 0),
+        "read_latency_cycles": int(read_latency or 0),
     }
 
 

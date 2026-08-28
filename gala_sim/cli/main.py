@@ -8,6 +8,7 @@ import json
 from pathlib import Path
 import shlex
 import sys
+import time
 
 from gala_sim.ablation import run_matrix
 from gala_sim.config import load_config, pending_parameters
@@ -15,7 +16,9 @@ from gala_sim.results import AblationRow, write_ablation_csv
 from gala_sim.results.run import RunOutputWriter
 from gala_sim.results.manifest import write_json
 from gala_sim.identity import sha256_file
-from gala_sim.timing import CycleConfig, CycleEngine
+from gala_sim.timing import (
+    CycleConfig, CycleEngine, RelationPacketPlan, analyze_cycle_lower_bounds,
+)
 from gala_sim.timing.memory import NativeRamulator2Binding, Ramulator2Backend
 from gala_sim.timing.resources import ResourceUsage
 from gala_sim.tools.cycle_preflight import run_cycle_preflight, write_cycle_preflight
@@ -23,12 +26,16 @@ from gala_sim.tools.cycle_throughput import (
     ThroughputConverged, ThroughputDiagnosticConfig, ThroughputMonitor,
     require_empty_diagnostic_output,
 )
-from gala_sim.tools.gpu_orin_estimate import load_proxy_anchor
+from gala_sim.tools.inactivity import (
+    InactivityTimeoutError, InactivityWatchdog, observe_cycle_progress,
+)
 from gala_sim.tools.preflight import run_native_preflight
 from gala_sim.adapters.native_reference import run_native_reference
 from gala_sim.trace import (
+    CAPTURED_PACKET_SAMPLE_SCHEMA_VERSION, CapturedPacketSpec, QueryDomain,
     QueryRange, TraceReader, TraceSampleConfig, TraceValidationConfig, TraceWriter,
-    dependency_closed_query_sample, validate_trace,
+    complete_captured_packet_sample, dependency_closed_query_sample,
+    derive_quick_relation_packets, validate_packet_derivation, validate_trace,
 )
 
 
@@ -72,6 +79,20 @@ def _parser() -> argparse.ArgumentParser:
     sample.add_argument(
         "--scan-backend", choices=("auto", "cpu", "cuda"), default="auto",
     )
+    packetize = commands.add_parser("trace-packetize")
+    packetize.add_argument("--trace", type=Path, required=True)
+    packetize.add_argument("--output", type=Path, required=True)
+    packetize.add_argument(
+        "--query-domain", action="append", required=True, type=_query_domain,
+        help="TEMPLATE:BASE:DIMxDIM[xDIM] row-major query domain",
+    )
+    packetize.add_argument("--query-lanes", type=int, required=True)
+    captured = commands.add_parser("trace-captured-packets")
+    captured.add_argument("--manifest", type=Path, required=True)
+    captured.add_argument("--output", type=Path, required=True)
+    captured.add_argument("--max-events", type=int, required=True)
+    captured.add_argument("--query-lanes", type=int, required=True)
+    captured.add_argument("--initial-gaussian-count", type=int, required=True)
     replay = commands.add_parser("cycle-replay")
     replay.add_argument("--trace", type=Path, required=True)
     replay.add_argument("--config", type=Path, required=True)
@@ -86,10 +107,19 @@ def _parser() -> argparse.ArgumentParser:
     replay.add_argument("--quick-validation", action="store_true")
     replay.add_argument("--throughput-progress", action="store_true")
     replay.add_argument("--stop-when-throughput-stable", action="store_true")
-    replay.add_argument(
-        "--orin-anchor", type=Path, default=None,
-        help="non-formal static AGX Orin estimate for live speedup diagnostics",
-    )
+    bounds = commands.add_parser("cycle-bounds")
+    bounds.add_argument("--trace", type=Path, required=True)
+    bounds.add_argument("--config", type=Path, required=True)
+    bounds.add_argument("--ramulator-binding", default=None)
+    bounds.add_argument("--ramulator-build-manifest", type=Path, default=None)
+    bounds.add_argument("--ramulator-config", type=Path, default=None)
+    bounds.add_argument("--resource-usage", type=Path, required=True)
+    bounds.add_argument("--output", type=Path, required=True)
+    bounds.add_argument("--quick-validation", action="store_true")
+    bounds.add_argument("--base-cycles", type=int, required=True)
+    bounds.add_argument("--query-target", type=float, required=True)
+    bounds.add_argument("--residency-target", type=float, required=True)
+    bounds.add_argument("--full-target", type=float, required=True)
     ablation = commands.add_parser("ablation")
     ablation.add_argument("--trace", type=Path, required=True)
     ablation.add_argument("--config", type=Path, required=True)
@@ -102,10 +132,6 @@ def _parser() -> argparse.ArgumentParser:
     ablation.add_argument("--output", type=Path, required=True)
     ablation.add_argument("--quick-validation", action="store_true")
     ablation.add_argument("--parallel-workers", type=int, default=1)
-    ablation.add_argument(
-        "--orin-anchor", type=Path, default=None,
-        help="non-formal static AGX Orin estimate for live speedup diagnostics",
-    )
     return parser
 
 
@@ -115,6 +141,19 @@ def _query_range(value: str) -> QueryRange:
         raise argparse.ArgumentTypeError("query range must use START:COUNT")
     try:
         return QueryRange(int(start), int(count))
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def _query_domain(value: str) -> QueryDomain:
+    parts = value.split(":")
+    if len(parts) != 3:
+        raise argparse.ArgumentTypeError(
+            "query domain must use TEMPLATE:BASE:DIMxDIM[xDIM]"
+        )
+    try:
+        shape = tuple(int(extent) for extent in parts[2].split("x"))
+        return QueryDomain(int(parts[0]), int(parts[1]), shape)
     except ValueError as error:
         raise argparse.ArgumentTypeError(str(error)) from error
 
@@ -205,6 +244,47 @@ def main(argv: list[str] | None = None) -> int:
             result = run_native_reference(config, freeze, preflight, args.output)
             print(json.dumps(result, sort_keys=True))
             return 0
+        if args.command == "trace-captured-packets":
+            if args.output.exists() and any(args.output.iterdir()):
+                raise ValueError("captured packet output directory must be empty")
+            document = json.loads(args.manifest.read_text(encoding="utf-8"))
+            if (
+                not isinstance(document, dict)
+                or document.get("schema_version")
+                != CAPTURED_PACKET_SAMPLE_SCHEMA_VERSION
+                or not isinstance(document.get("packets"), list)
+            ):
+                raise ValueError("captured packet manifest is malformed")
+            specs = tuple(
+                CapturedPacketSpec.from_dict(item)
+                for item in document["packets"]
+                if isinstance(item, dict)
+            )
+            if len(specs) != len(document["packets"]):
+                raise ValueError("captured packet manifest contains a non-object packet")
+            captured_trace = complete_captured_packet_sample(
+                specs,
+                max_events=args.max_events,
+                query_lanes=args.query_lanes,
+                initial_gaussian_count=args.initial_gaussian_count,
+            )
+            validate_trace(captured_trace)
+            plan = RelationPacketPlan.from_trace(
+                captured_trace, query_lanes=args.query_lanes,
+            )
+            TraceWriter().write(captured_trace, args.output, validate=False)
+            print(json.dumps({
+                "status": "passed",
+                "events": captured_trace.event_count,
+                "dependencies": int(captured_trace.dependencies.size),
+                "logical_relation_events": int(sum(
+                    packet["relation_count"]
+                    for packet in captured_trace.metadata["trace_sample"]["packets"]
+                )),
+                "physical_relation_packets": plan.relation_packet_count,
+                "formal_performance_eligible": False,
+            }, sort_keys=True))
+            return 0
         trace = TraceReader().read(args.trace, validate=False, mmap_mode="r")
         if args.command == "trace-validate":
             if args.index_directory is not None and args.scan_events is None:
@@ -244,6 +324,32 @@ def main(argv: list[str] | None = None) -> int:
                 "status": "passed",
             }, sort_keys=True))
             return 0
+        if args.command == "trace-packetize":
+            if args.trace.resolve() == args.output.resolve():
+                raise ValueError("packetized output must differ from its source trace")
+            if args.output.exists() and any(args.output.iterdir()):
+                raise ValueError("packetized output directory must be empty")
+            derived = derive_quick_relation_packets(
+                trace, tuple(args.query_domain), query_lanes=args.query_lanes,
+            )
+            validate_packet_derivation(trace, derived)
+            plan = RelationPacketPlan.from_trace(
+                derived, query_lanes=args.query_lanes,
+            )
+            TraceWriter().write(derived, args.output, validate=False)
+            derivation = derived.metadata["relation_packet_derivation"]
+            print(json.dumps({
+                "status": "passed",
+                "events": derived.event_count,
+                "dependencies": int(derived.dependencies.size),
+                "logical_relation_events": derivation["logical_relation_events"],
+                "physical_relation_packets": plan.relation_packet_count,
+                "mean_active_lanes": (
+                    derivation["logical_relation_events"] / plan.relation_packet_count
+                ),
+                "formal_performance_eligible": False,
+            }, sort_keys=True))
+            return 0
         sample_metadata = trace.metadata.get("trace_sample")
         window_metadata = trace.metadata.get("trace_window")
         if sample_metadata is not None:
@@ -267,9 +373,6 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.quick_validation and not quick_scope:
             raise ValueError("--quick-validation requires a sampled or windowed trace")
-        orin_anchor = load_proxy_anchor(args.orin_anchor)
-        if orin_anchor is not None and quick_scope:
-            raise ValueError("--orin-anchor cannot be used with quick-validation traces")
         gala_config = load_config(args.config)
         binding = _load_binding(
             args.ramulator_binding, args.ramulator_build_manifest,
@@ -287,46 +390,88 @@ def main(argv: list[str] | None = None) -> int:
         if binding is None:
             raise ValueError("formal cycle run requires a Ramulator 2 binding")
         config = CycleConfig.from_gala(gala_config, binding, resource_usage=usage)
+        if args.command == "cycle-bounds":
+            validate_trace(trace)
+            report = analyze_cycle_lower_bounds(
+                CycleEngine(config, policy="base"),
+                trace,
+                base_asic_cycles=args.base_cycles,
+                targets={
+                    "query": args.query_target,
+                    "residency": args.residency_target,
+                    "full": args.full_target,
+                },
+            )
+            args.output.mkdir(parents=True, exist_ok=True)
+            write_json(report.as_dict(), args.output / "cycle_lower_bounds.json")
+            write_json({
+                "result_scope": (
+                    "quick_cycle_validation" if quick_scope else "formal_performance"
+                ),
+                "formal_performance_eligible": not quick_scope,
+                "trace_sample": sample_metadata,
+                "trace_window": window_metadata,
+            }, args.output / "manifest.json")
+            write_json({
+                "status": "passed",
+                "checks": {
+                    "necessary_bounds_only": True,
+                    "formal_performance_eligible": not quick_scope,
+                },
+            }, args.output / "status.json")
+            print(json.dumps({
+                "status": "passed",
+                "reachability": [
+                    {
+                        "scenario": item.scenario,
+                        "lower_bound_cycles": item.lower_bound_cycles,
+                        "maximum_possible_speedup_vs_base_asic": (
+                            item.maximum_possible_speedup_vs_base_asic
+                        ),
+                        "status": item.status,
+                    }
+                    for item in report.reachability
+                ],
+            }, sort_keys=True))
+            return 0
         if args.command == "cycle-replay":
-            if orin_anchor is not None and not (
-                args.throughput_progress or args.stop_when_throughput_stable
-            ):
-                raise ValueError("--orin-anchor requires cycle throughput diagnostics")
-            if orin_anchor is not None and orin_anchor[1].get("workload_iterations") is None:
-                raise ValueError(
-                    "--orin-anchor must declare workload_iterations for comparable speedup"
-                )
             if args.stop_when_throughput_stable:
                 require_empty_diagnostic_output(args.output)
+            monitor_config = ThroughputDiagnosticConfig.from_gala(gala_config)
+            inactivity_watchdog = InactivityWatchdog(
+                timeout_seconds=float(
+                    gala_config.value("diagnostic.inactivity_timeout_seconds")
+                )
+            )
             monitor: ThroughputMonitor | None = None
             if args.throughput_progress or args.stop_when_throughput_stable:
-                monitor_config = ThroughputDiagnosticConfig.from_gala(gala_config)
                 monitor = ThroughputMonitor(
                     monitor_config,
                     stop_when_stable=args.stop_when_throughput_stable,
-                    clock_frequency_hz=(
-                        config.clock_frequency_hz if orin_anchor is not None else None
-                    ),
-                    orin_anchor_seconds=(
-                        orin_anchor[0] if orin_anchor is not None else None
-                    ),
-                    orin_anchor_interval_seconds=(
-                        (
-                            float(orin_anchor[1]["interval_ms"]["low"]) / 1000.0,
-                            float(orin_anchor[1]["interval_ms"]["high"]) / 1000.0,
-                        )
-                        if orin_anchor is not None
-                        and isinstance(orin_anchor[1].get("interval_ms"), dict)
-                        else None
-                    ),
-                    orin_anchor_iterations=(
-                        int(orin_anchor[1]["workload_iterations"])
-                        if orin_anchor is not None else None
-                    ),
+                    clock_frequency_hz=config.clock_frequency_hz,
                 )
 
             def cycle_progress(progress) -> None:
+                observe_cycle_progress(
+                    inactivity_watchdog,
+                    phase=progress.phase,
+                    completed_events=progress.completed_events,
+                    completed_iterations=progress.completed_iterations,
+                    cpu_seconds=time.process_time(),
+                )
                 if monitor is None:
+                    print(json.dumps({
+                        "phase": progress.phase,
+                        "runtime": {
+                            "status": "active",
+                            "completed_events": progress.completed_events,
+                            "total_events": progress.total_events,
+                            "completed_iterations": progress.completed_iterations,
+                            "total_iterations": progress.total_iterations,
+                            "elapsed_seconds": progress.elapsed_seconds,
+                        },
+                        "watchdog": inactivity_watchdog.report(status="active"),
+                    }, sort_keys=True), file=sys.stderr, flush=True)
                     return
                 try:
                     report = monitor.observe(progress)
@@ -363,25 +508,41 @@ def main(argv: list[str] | None = None) -> int:
                         report["samples"][-1] if report["samples"] else None
                     ),
                     "stability": report["stability"],
+                    "watchdog": inactivity_watchdog.report(status="active"),
                 }, sort_keys=True), file=sys.stderr, flush=True)
 
             try:
                 result = CycleEngine(config, policy=args.policy).run(
                     trace,
-                    progress=cycle_progress if monitor is not None else None,
-                    progress_interval_events=(
-                        monitor.config.report_interval_events if monitor is not None else None
-                    ),
-                    progress_interval_seconds=(
-                        monitor.config.report_interval_seconds if monitor is not None else None
-                    ),
+                    progress=cycle_progress,
+                    progress_interval_events=monitor_config.report_interval_events,
+                    progress_interval_seconds=monitor_config.report_interval_seconds,
                 )
+            except InactivityTimeoutError as error:
+                writer = RunOutputWriter(args.output)
+                watchdog_report = inactivity_watchdog.report(status="terminated")
+                write_json({
+                    "result_scope": "aborted_inactivity_watchdog",
+                    "formal_performance_eligible": False,
+                    "termination": "watchdog_inactivity_timeout",
+                    "policy": args.policy,
+                    "watchdog": watchdog_report,
+                }, args.output / "manifest.json")
+                writer.write_status(
+                    "failed_cycle", reason="watchdog_inactivity_timeout",
+                    checks={"error": str(error), "watchdog": watchdog_report},
+                )
+                print(json.dumps({
+                    "status": "failed_cycle",
+                    "reason": "watchdog_inactivity_timeout",
+                    "watchdog": watchdog_report,
+                }, sort_keys=True), file=sys.stderr, flush=True)
+                return 2
             except ThroughputConverged as converged:
                 diagnostic = {
                     **converged.report,
                     "termination": "stopped_on_stable_throughput",
                     "policy": args.policy,
-                    "static_anchor": orin_anchor[1] if orin_anchor is not None else None,
                 }
                 write_json(diagnostic, args.output / "throughput.json")
                 write_json({
@@ -409,7 +570,6 @@ def main(argv: list[str] | None = None) -> int:
                     **monitor.report(),
                     "termination": "complete_trace_replay",
                     "policy": args.policy,
-                    "static_anchor": orin_anchor[1] if orin_anchor is not None else None,
                 }, args.output / "throughput.json")
             writer.write_manifest({
                 "result_scope": (
@@ -438,12 +598,6 @@ def main(argv: list[str] | None = None) -> int:
                 "speedup_vs_base_asic": base_cycles / run.result.total_cycles,
                 "completed": True,
             }
-            if orin_anchor is not None:
-                anchor_seconds, anchor_record = orin_anchor
-                progress_record["static_anchor_speedup_vs_orin"] = (
-                    anchor_seconds * config.clock_frequency_hz / run.result.total_cycles
-                )
-                progress_record["static_anchor"] = anchor_record
             print(json.dumps(progress_record, sort_keys=True), file=sys.stderr, flush=True)
 
         runs = run_matrix(
@@ -464,25 +618,6 @@ def main(argv: list[str] | None = None) -> int:
             status="passed",
         ) for run in runs]
         write_ablation_csv(rows, args.output)
-        if orin_anchor is not None:
-            _, anchor_record = orin_anchor
-            write_json({
-                "result_scope": "agx_orin_engineering_anchor_comparison",
-                "formal_performance_eligible": False,
-                "anchor": anchor_record,
-                "clock_frequency_hz": config.clock_frequency_hz,
-                "variants": [
-                    {
-                        "bits": run.variant.bits,
-                        "cycles": run.result.total_cycles,
-                        "static_anchor_speedup_vs_orin": (
-                            orin_anchor[0] * config.clock_frequency_hz
-                            / run.result.total_cycles
-                        ),
-                    }
-                    for run in runs
-                ],
-            }, args.output.with_suffix(args.output.suffix + ".orin-anchor.json"))
         if quick_scope:
             write_json({
                 "result_scope": "quick_cycle_validation",

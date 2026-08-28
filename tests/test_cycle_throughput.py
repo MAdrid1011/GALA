@@ -37,7 +37,7 @@ def _progress(iteration: int, *, cycles_per_iteration: int = 100) -> CycleProgre
 def test_monitor_stops_only_after_consecutive_iteration_windows() -> None:
     monitor = ThroughputMonitor(
         _config(), stop_when_stable=True,
-        clock_frequency_hz=100, orin_anchor_seconds=20,
+        clock_frequency_hz=100,
     )
     for iteration in range(1, 5):
         report = monitor.observe(_progress(iteration))
@@ -48,7 +48,6 @@ def test_monitor_stops_only_after_consecutive_iteration_windows() -> None:
     assert report["stability"]["status"] == "stable"
     assert report["samples"][-1]["projected_total_cycles"] == pytest.approx(1000)
     assert report["samples"][-1]["projected_asic_seconds"] == pytest.approx(10)
-    assert report["samples"][-1]["static_anchor_speedup_vs_orin"] == pytest.approx(2)
     assert report["formal_performance_eligible"] is False
 
 
@@ -90,35 +89,6 @@ def test_monitor_keeps_exact_result_when_stability_arrives_at_completion() -> No
         ))
     assert report["complete_trace_replay"] is True
     assert report["stability"]["status"] == "stable"
-
-
-def test_monitor_reports_orin_speedup_interval() -> None:
-    monitor = ThroughputMonitor(
-        _config(), clock_frequency_hz=100, orin_anchor_seconds=20,
-        orin_anchor_interval_seconds=(15, 25),
-    )
-    sample = monitor.observe(_progress(1))["samples"][-1]
-    assert sample["static_anchor_speedup_vs_orin"] == pytest.approx(2)
-    assert sample["static_anchor_speedup_vs_orin_interval"] == pytest.approx({
-        "low": 1.5, "high": 2.5,
-    })
-
-
-def test_monitor_scales_full_run_orin_anchor_to_replayed_iterations() -> None:
-    monitor = ThroughputMonitor(
-        _config(), clock_frequency_hz=100, orin_anchor_seconds=200,
-        orin_anchor_iterations=10,
-    )
-    one_iteration = CycleProgress(
-        phase="replay", completed_events=10, total_events=10,
-        completed_iterations=1, total_iterations=1,
-        last_completed_iteration=1, simulated_cycles=1000,
-        elapsed_seconds=1.0,
-    )
-    sample = monitor.observe(one_iteration)["samples"][-1]
-    # The 200-second anchor represents ten iterations, so one replayed
-    # iteration must compare against 20 seconds rather than 200 seconds.
-    assert sample["static_anchor_speedup_vs_orin"] == pytest.approx(2)
 
 
 @pytest.mark.parametrize("field,value", [

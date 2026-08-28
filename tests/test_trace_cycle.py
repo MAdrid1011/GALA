@@ -453,6 +453,7 @@ def test_online_cycle_replay_consumes_exact_semantic_workset_sidecar() -> None:
         relation_seed_fifo_entries=8, candidate_lanes=3,
         cache_instances=1, cache_capacity_per_instance=4,
         cache_directory_banks=1, cache_sector_bytes=64,
+        cache_multicast_destinations=4,
     )
     session = CycleEngine(config, policy="variant:0001").online_session(
         max_events=4,
@@ -465,6 +466,12 @@ def test_online_cycle_replay_consumes_exact_semantic_workset_sidecar() -> None:
     assert result.module_counters["semantic_cache"]["workset_keys"] == 1
     assert result.module_counters["semantic_cache"]["workset_uses"] == 2
     assert result.module_counters["semantic_cache"]["workset_releases"] == 1
+    assert result.module_counters["semantic_cache"]["miss_merges"] == 1
+    assert result.module_counters["semantic_cache"]["multicast_reads"] == 1
+    assert result.event_counts["CACHE_REQUEST"] == 2
+    assert result.event_counts["CACHE_RETURN"] == 2
+    assert session.completed_event_count == session.accepted_event_count
+    assert session.quiescent
 
 
 def test_buffered_virtual_consumer_derives_totals_before_lifecycle() -> None:
@@ -807,6 +814,70 @@ def test_semantic_residency_variant_merges_repeated_state_reads() -> None:
     assert combined.module_counters["semantic_cache"]["memory_requests"] == 1
     assert combined.module_counters["semantic_cache"]["workset_releases"] == 1
     assert combined.module_counters["semantic_cache"]["releases"] == 1
+
+
+def test_semantic_residency_multicasts_real_ready_requests_without_dropping_dependencies() -> None:
+    builder = TraceBuilder()
+    first_request = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_REQUEST), query_id=0,
+        gaussian_id=7, state_version=0, address_token=448, data_bytes=128,
+        resource_class=int(ResourceClass.CACHE),
+    ))
+    first_return = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_RETURN), query_id=0,
+        gaussian_id=7, state_version=0, address_token=448, data_bytes=128,
+        resource_class=int(ResourceClass.CACHE),
+    ), dependencies=[first_request])
+    return_ids: list[int] = []
+    for query_id in range(1, 5):
+        request_id = builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.CACHE_REQUEST), query_id=query_id,
+            gaussian_id=7, state_version=0, address_token=448, data_bytes=128,
+            resource_class=int(ResourceClass.CACHE),
+        ), dependencies=[first_return])
+        return_ids.append(builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.CACHE_RETURN), query_id=query_id,
+            gaussian_id=7, state_version=0, address_token=448, data_bytes=128,
+            resource_class=int(ResourceClass.CACHE),
+        ), dependencies=[request_id]))
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.UPDATE_END), state_version=0,
+        resource_class=int(ResourceClass.UPDATE), field_mask=FIELD_DENSITY,
+    ), dependencies=return_ids)
+    trace = builder.finish()
+    dependencies_before = trace.dependencies.copy()
+    timing = ModuleTiming(
+        latency=1, initiation_interval=1, queue_capacity=16, ports=1, banks=2,
+    )
+    config = CycleConfig(
+        modules={name: timing for name in (
+            "relation_constructor", "fusion_issue", "semantic_cache", "compute_pod",
+            "bidirectional_query", "reconstruction_update", "shared_sram",
+        )},
+        memory=_Memory(), clock_frequency_hz=500_000_000,
+        relation_seed_fifo_entries=8, candidate_lanes=3,
+        cache_instances=1, cache_capacity_per_instance=2,
+        cache_directory_banks=2, cache_sector_bytes=64,
+        cache_multicast_destinations=4,
+    )
+    result = CycleEngine(config, policy="variant:0001").run(
+        trace, validate_input=False,
+    )
+    single_destination = CycleEngine(
+        replace(config, cache_multicast_destinations=1), policy="variant:0001",
+    ).run(trace, validate_input=False)
+    cache = result.module_counters["semantic_cache"]
+    assert cache["directory_misses"] == 1
+    assert cache["directory_hits"] == 1
+    assert cache["multicast_reads"] == 1
+    assert cache["memory_requests"] == 1
+    assert cache["releases"] == 1
+    assert single_destination.module_counters["semantic_cache"]["multicast_reads"] == 0
+    assert cache["busy_cycles"] < single_destination.module_counters["semantic_cache"]["busy_cycles"]
+    assert result.event_counts["CACHE_REQUEST"] == 5
+    assert result.event_counts["CACHE_RETURN"] == 5
+    assert set(result.completion_cycles) == set(range(trace.event_count))
+    assert np.array_equal(trace.dependencies, dependencies_before)
 
 
 def test_query_close_keeps_state_resident_until_update_end() -> None:

@@ -7,6 +7,18 @@ from .validator import (
 )
 from .sink import DeviceTraceSink, NumpyChunkSink
 from .sample import QueryRange, TraceSampleConfig, dependency_closed_query_sample
+from .packetize import (
+    PACKET_DERIVATION_SCHEMA_VERSION,
+    QueryDomain,
+    derive_quick_relation_packets,
+    validate_packet_derivation,
+)
+from .captured_packets import (
+    CAPTURED_PACKET_SAMPLE_SCHEMA_VERSION,
+    CapturedPacketSpec,
+    captured_virtual_packet,
+    complete_captured_packet_sample,
+)
 from .virtual import (
     MASK_WORD_BITS,
     VirtualTracePacket,
@@ -40,6 +52,14 @@ __all__ = [
     "QueryRange",
     "TraceSampleConfig",
     "dependency_closed_query_sample",
+    "PACKET_DERIVATION_SCHEMA_VERSION",
+    "QueryDomain",
+    "derive_quick_relation_packets",
+    "validate_packet_derivation",
+    "CAPTURED_PACKET_SAMPLE_SCHEMA_VERSION",
+    "CapturedPacketSpec",
+    "captured_virtual_packet",
+    "complete_captured_packet_sample",
     "MASK_WORD_BITS",
     "VirtualTracePacket",
     "VirtualTraceProgress",

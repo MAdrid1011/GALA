@@ -16,6 +16,7 @@ def _configuration(impl: str = "External") -> str:
           impl: LPDDR5
           channel_width: 32
           timing: [6400]
+          read_latency: 19
 """
     return (
         f"frontend:\n  impl: {impl}\n  clock_ratio: 1\n"
@@ -31,6 +32,7 @@ def test_native_binding_inspects_lpddr5_configuration_identity(tmp_path: Path) -
         "channels": 2,
         "channel_width_bits": 32,
         "data_rate_mtps": 6400,
+        "read_latency_cycles": 19,
     }
 
 

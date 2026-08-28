@@ -44,6 +44,7 @@ class VirtualCaptureConsumer:
     max_events: int = 65536
     state_record_bytes: int = 128
     relation_candidate_bytes: int = 0
+    relation_query_lanes: int = 8
     inactivity_timeout_seconds: float = 300.0
     progress_interval_seconds: float = 30.0
     expand_for_validation: bool = False
@@ -67,7 +68,11 @@ class VirtualCaptureConsumer:
     _last_report: float = field(default_factory=time.monotonic, init=False)
 
     def __post_init__(self) -> None:
-        if self.max_events <= 0 or self.state_record_bytes <= 0:
+        if (
+            self.max_events <= 0
+            or self.state_record_bytes <= 0
+            or not 0 < self.relation_query_lanes <= 8
+        ):
             raise ValueError("virtual capture consumer limits must be positive")
         if self.inactivity_timeout_seconds <= 0:
             raise ValueError("virtual capture inactivity timeout must be positive")
@@ -78,6 +83,7 @@ class VirtualCaptureConsumer:
             max_events=self.max_events,
             state_record_bytes=self.state_record_bytes,
             relation_candidate_bytes=self.relation_candidate_bytes,
+            relation_query_lanes=self.relation_query_lanes,
         )
 
     def initialize_gaussians(self, count: int) -> None:

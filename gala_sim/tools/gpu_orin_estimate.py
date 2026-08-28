@@ -1,8 +1,9 @@
-"""Build a non-formal, auditable AGX Orin engineering estimate.
+"""Record a non-comparable AGX Orin public-specification extrapolation.
 
 The estimate combines measured local stage weights with explicit hardware
-reference vectors.  It is intentionally separate from formal normalization:
-only a same-suite Orin calibration vector can produce a formal Orin time.
+reference vectors.  It cannot calibrate Orin performance, check ASIC
+plausibility, or produce a speedup.  Only a same-suite Orin calibration vector
+can produce a comparable Orin time.
 """
 
 from __future__ import annotations
@@ -175,15 +176,16 @@ def estimate_normalized(
     return {
         "schema_version": SCHEMA_VERSION,
         "status": "proxy_estimate",
-        "result_scope": "agx_orin_engineering_anchor",
+        "result_scope": "agx_orin_noncomparable_public_spec_extrapolation",
         "formal_performance_eligible": False,
+        "performance_comparison_eligible": False,
         "local_sampling_performance_eligible": normalization.get(
             "local_sampling_performance_eligible", False
         ),
         "method": reference.get("method"),
         "reason": (
-            "public specification proxy with measured local stage weights; "
-            "not an AGX Orin device calibration"
+            "public specifications do not predict end-to-end AGX Orin time; "
+            "this extrapolation is not a calibration, plausibility check, or anchor"
         ),
         "ratios_seconds_per_work": ratios,
         "stages": estimated_stages,
@@ -223,62 +225,6 @@ def estimate_files(
     output_path.parent.mkdir(parents=True, exist_ok=True)
     output_path.write_text(json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     return result
-
-
-def load_proxy_anchor(path: Path | None) -> tuple[float, dict[str, object]] | None:
-    """Load a non-formal Orin proxy for live ASIC diagnostics."""
-
-    if path is None:
-        return None
-    document = json.loads(path.read_text(encoding="utf-8"))
-    if not isinstance(document, dict):
-        raise OrinEstimateError("Orin anchor must be a JSON object")
-    if document.get("status") != "proxy_estimate":
-        raise OrinEstimateError("Orin anchor must have status=proxy_estimate")
-    if document.get("formal_performance_eligible") is not False:
-        raise OrinEstimateError("Orin anchor must be non-formal")
-    total = document.get("total")
-    if not isinstance(total, dict):
-        raise OrinEstimateError("Orin anchor lacks total")
-    try:
-        milliseconds = float(total["estimated_orin_ms"])
-    except (KeyError, TypeError, ValueError) as error:
-        raise OrinEstimateError(
-            "Orin anchor total lacks estimated_orin_ms"
-        ) from error
-    if not math.isfinite(milliseconds) or milliseconds <= 0:
-        raise OrinEstimateError("Orin anchor estimated_orin_ms must be positive")
-    raw_interval = total.get("interval_ms")
-    interval: dict[str, float] | None = None
-    if raw_interval is not None:
-        if not isinstance(raw_interval, Mapping):
-            raise OrinEstimateError("Orin anchor interval_ms must be a mapping")
-        low = _positive(raw_interval.get("low"), "Orin anchor interval low")
-        high = _positive(raw_interval.get("high"), "Orin anchor interval high")
-        if low > milliseconds or milliseconds > high:
-            raise OrinEstimateError("Orin anchor estimate must lie inside interval")
-        interval = {"low": low, "high": high}
-    workload_iterations = document.get("workload_iterations")
-    if workload_iterations is not None:
-        try:
-            workload_iterations = int(workload_iterations)
-        except (TypeError, ValueError) as error:
-            raise OrinEstimateError(
-                "Orin anchor workload_iterations must be an integer"
-            ) from error
-        if workload_iterations <= 0:
-            raise OrinEstimateError(
-                "Orin anchor workload_iterations must be positive"
-            )
-    return milliseconds / 1000.0, {
-        "path": str(path.resolve()),
-        "status": document["status"],
-        "result_scope": document.get("result_scope"),
-        "estimated_orin_ms": milliseconds,
-        "interval_ms": interval,
-        "workload_iterations": workload_iterations,
-        "formal_performance_eligible": False,
-    }
 
 
 def main(argv: list[str] | None = None) -> int:

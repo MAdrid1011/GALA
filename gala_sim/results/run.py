@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from dataclasses import asdict
 from pathlib import Path
 from typing import Any
 
@@ -26,6 +27,10 @@ class RunOutputWriter:
             "total_cycles": result.total_cycles,
             "policy": result.policy,
             "oracle_status": result.oracle_status,
+            "oracle_portfolio": (
+                asdict(result.oracle_portfolio)
+                if result.oracle_portfolio is not None else None
+            ),
             "module_counters": result.module_counters,
             "completion_cycles": {str(key): value for key, value in result.completion_cycles.items()},
         }, self.root / "cycles.json")

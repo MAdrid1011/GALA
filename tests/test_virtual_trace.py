@@ -18,7 +18,13 @@ from gala_sim.trace import (
     VirtualTraceStream,
     compare_virtual_packet_records,
 )
-from gala_sim.clamp.events import event_dtype, dependency_dtype, EVENT_SCHEMA_VERSION
+from gala_sim.clamp.events import (
+    EVENT_SCHEMA_VERSION,
+    PrimitiveKind,
+    decode_relation_packet_flags,
+    dependency_dtype,
+    event_dtype,
+)
 from gala_sim.trace import validate_trace
 
 
@@ -250,6 +256,129 @@ def test_relation_event_expander_preserves_global_ids_and_external_dependencies(
     assert output[2].events["query_id"].tolist() == [1]
     assert expander.next_event_id == 5
     assert expander.next_relation_id == 3
+
+
+def test_relation_packet_metadata_preserves_sparse_lane_positions() -> None:
+    masks = _mask(1, 8)
+    masks[0, 0] = np.uint32((1 << 0) | (1 << 7))
+    source = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=20, query_shape=(1, 8),
+        point_ids=np.asarray([4], dtype=np.int64),
+        point_keys=np.asarray([0], dtype=np.uint64), masks=masks,
+    )
+    packets = tuple(
+        VirtualRelationEventExpander(
+            max_events=1, relation_query_lanes=8,
+        ).expand(source)
+    )
+    relation_rows = np.concatenate([
+        packet.events[
+            packet.events["primitive_kind"] == int(PrimitiveKind.RELATION)
+        ]
+        for packet in packets
+    ])
+
+    assert relation_rows["query_id"].tolist() == [20, 27]
+    assert [
+        decode_relation_packet_flags(int(flags))
+        for flags in relation_rows["flags"]
+    ] == [(0, 0b10000001), (7, 0b10000001)]
+
+
+def test_raster_relation_packet_metadata_does_not_cross_row_boundary() -> None:
+    masks = _mask(1, 8)
+    for local_query in (8, 9, 16):
+        masks[0, local_query // 32] |= np.uint32(1 << (local_query % 32))
+    source = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=100,
+        query_shape=(2, 10), point_ids=np.asarray([4], dtype=np.int64),
+        point_keys=np.asarray([0], dtype=np.uint64), masks=masks,
+    )
+    packets = tuple(
+        VirtualRelationEventExpander(
+            max_events=2, relation_query_lanes=8,
+        ).expand(source)
+    )
+    relation_rows = np.concatenate([
+        packet.events[
+            packet.events["primitive_kind"] == int(PrimitiveKind.RELATION)
+        ]
+        for packet in packets
+    ])
+
+    assert relation_rows["query_id"].tolist() == [108, 109, 110]
+    assert [
+        decode_relation_packet_flags(int(flags))
+        for flags in relation_rows["flags"]
+    ] == [(0, 0b00000011), (1, 0b00000011), (0, 0b00000001)]
+
+
+def test_voxel_relation_packet_metadata_does_not_cross_brick_x_boundary() -> None:
+    masks = _mask(1, 16)
+    for local_query in (6, 7, 8):
+        masks[0, local_query // 32] |= np.uint32(1 << (local_query % 32))
+    source = VirtualTracePacket(
+        iteration_id=1, template_id=2, query_base=100,
+        query_shape=(2, 2, 8), point_ids=np.asarray([4], dtype=np.int64),
+        point_keys=np.asarray([0], dtype=np.uint64), masks=masks,
+    )
+    packets = tuple(
+        VirtualRelationEventExpander(
+            max_events=2, relation_query_lanes=8,
+        ).expand(source)
+    )
+    relation_rows = np.concatenate([
+        packet.events[
+            packet.events["primitive_kind"] == int(PrimitiveKind.RELATION)
+        ]
+        for packet in packets
+    ])
+
+    assert relation_rows["query_id"].tolist() == [106, 107, 108]
+    assert [
+        decode_relation_packet_flags(int(flags))
+        for flags in relation_rows["flags"]
+    ] == [(6, 0b11000000), (7, 0b11000000), (0, 0b00000001)]
+
+
+def test_full_relation_chain_inherits_packet_metadata_without_reduction_key_alias() -> None:
+    masks = _mask(1, 8)
+    masks[0, 0] = np.uint32((1 << 0) | (1 << 7))
+    source = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=20, query_shape=(1, 8),
+        point_ids=np.asarray([4], dtype=np.int64),
+        point_keys=np.asarray([0], dtype=np.uint64), masks=masks,
+        loss_flags=1, backward_confirmed=True,
+    )
+    rows = np.concatenate([
+        packet.events
+        for packet in VirtualQueryEventExpander(
+            max_events=1, relation_query_lanes=8,
+        ).expand(source)
+    ])
+    chain_kinds = {
+        PrimitiveKind.RELATION,
+        PrimitiveKind.CACHE_REQUEST,
+        PrimitiveKind.CACHE_RETURN,
+        PrimitiveKind.FORWARD,
+        PrimitiveKind.ADJOINT,
+        PrimitiveKind.GRADIENT_REDUCTION,
+    }
+    chain_rows = rows[np.isin(
+        rows["primitive_kind"], [int(kind) for kind in chain_kinds]
+    )]
+
+    for relation_id in (0, 1):
+        relation_chain = chain_rows[chain_rows["relation_id"] == relation_id]
+        expected_lane = 0 if relation_id == 0 else 7
+        assert {
+            decode_relation_packet_flags(int(flags))
+            for flags in relation_chain["flags"]
+        } == {(expected_lane, 0b10000001)}
+    gradients = rows[
+        rows["primitive_kind"] == int(PrimitiveKind.GRADIENT_REDUCTION)
+    ]
+    assert gradients["reduction_key"].tolist() == [4, 4]
 
 
 def test_event_stream_validator_rejects_rebased_or_unclosed_packets() -> None:

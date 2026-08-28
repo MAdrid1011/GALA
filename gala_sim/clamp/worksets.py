@@ -11,6 +11,7 @@ from gala_sim.clamp.events import PrimitiveKind
 
 if TYPE_CHECKING:
     from gala_sim.trace.model import Trace
+    from gala_sim.timing.packets import RelationPacketPlan
 
 
 WORKSET_DTYPE = np.dtype([
@@ -32,8 +33,16 @@ class SemanticWorksets:
     _positions: dict[int, int] = field(repr=False)
 
     @classmethod
-    def from_trace(cls, trace: Trace) -> "SemanticWorksets":
+    def from_trace(
+        cls, trace: Trace, packet_plan: "RelationPacketPlan | None" = None,
+    ) -> "SemanticWorksets":
         mask = trace.events["primitive_kind"] == int(PrimitiveKind.CACHE_REQUEST)
+        if packet_plan is not None:
+            event_ids = np.flatnonzero(mask)
+            physical_heads = np.asarray([
+                packet_plan.is_stage_head(int(event_id)) for event_id in event_ids
+            ], dtype=np.bool_)
+            mask[event_ids] = physical_heads
         source = trace.events[mask]
         requests = np.empty(source.size, dtype=WORKSET_DTYPE)
         if source.size == 0:

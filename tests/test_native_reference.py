@@ -13,6 +13,7 @@ from gala_sim.config import load_config
 from gala_sim.identity import canonical_json, sha256_bytes
 from gala_sim.metrics import QualityConfig
 from gala_sim.tools.preflight import ComputeProcess
+from gala_sim.tools.preflight import GpuSample
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -76,6 +77,58 @@ def test_native_reference_records_sampling_failure(tmp_path: Path) -> None:
         ))
     status = (tmp_path / "run" / "status.json").read_text(encoding="utf-8")
     assert '"status": "failed_preflight"' in status
+
+
+def test_native_reference_watchdog_terminates_inactive_process(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    config = load_config(ROOT / "configs/architecture/gala.yaml")
+    freeze = _freeze(tmp_path, config.sha256)
+
+    class Clock:
+        value = 0.0
+
+        def now(self) -> float:
+            return self.value
+
+        def sleep(self, seconds: float) -> None:
+            self.value += seconds
+
+    class Process:
+        pid = 987654321
+
+        def __init__(self, *args: object, **kwargs: object) -> None:
+            self.returncode: int | None = None
+
+        def poll(self) -> int | None:
+            return self.returncode
+
+        def terminate(self) -> None:
+            self.returncode = -15
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        def wait(self, timeout: float | None = None) -> int:
+            return self.returncode if self.returncode is not None else 0
+
+    clock = Clock()
+    monkeypatch.setattr("gala_sim.adapters.native_reference.subprocess.Popen", Process)
+    idle = GpuSample(0.0, 0.0, 0, None, None, None, None)
+    with pytest.raises(NativeReferenceError, match="watchdog_inactivity_timeout"):
+        run_native_reference(
+            config, freeze, {
+                "schema_version": "gala-native-preflight-v1", "status": "passed",
+                "freeze_manifest_sha256": freeze["run_manifest_sha256"],
+            }, tmp_path / "run", sample_fn=lambda: idle,
+            inactivity_timeout_seconds=2.0,
+            monotonic_fn=clock.now, sleep_fn=clock.sleep,
+        )
+    status = (tmp_path / "run" / "status.json").read_text(encoding="utf-8")
+    assert '"status": "failed_preflight"' in status
+    assert '"reason": "watchdog_inactivity_timeout"' in status
+    reference = (tmp_path / "run" / "gpu_reference.json").read_text(encoding="utf-8")
+    assert '"status": "terminated"' in reference
 
 
 def test_quality_uses_frozen_interpreter(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

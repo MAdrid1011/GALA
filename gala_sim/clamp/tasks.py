@@ -30,6 +30,7 @@ class TaskPacket:
     address_token: int
     task_kind: TaskKind
     reduction_domain: ReductionDomain = ReductionDomain.QUERY
+    conflict_query_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if min(self.event_id, self.query_id, self.gaussian_id, self.reduction_key,
@@ -37,10 +38,23 @@ class TaskPacket:
             raise ValueError("task packet identifiers must be non-negative")
         if not isinstance(self.reduction_domain, ReductionDomain):
             raise ValueError("task packet reduction domain is invalid")
+        if any(query_id < 0 for query_id in self.conflict_query_ids):
+            raise ValueError("task packet conflict query IDs must be non-negative")
+        if len(set(self.conflict_query_ids)) != len(self.conflict_query_ids):
+            raise ValueError("task packet conflict query IDs must be unique")
 
     @property
     def conflict_key(self) -> tuple[ReductionDomain, int]:
         return self.reduction_domain, self.reduction_key
+
+    @property
+    def conflict_keys(self) -> frozenset[tuple[ReductionDomain, int]]:
+        if self.reduction_domain is ReductionDomain.QUERY and self.conflict_query_ids:
+            return frozenset(
+                (ReductionDomain.QUERY, query_id)
+                for query_id in self.conflict_query_ids
+            )
+        return frozenset((self.conflict_key,))
 
 
 @dataclass
@@ -140,7 +154,19 @@ class FusionIssueScheduler:
     ) -> IssueDecision:
         """Choose conflict-free candidates without committing issue state."""
 
-        ordered = self.forecast(candidates)
+        return self.select_in_order(
+            self.forecast(candidates), occupied_keys=occupied_keys
+        )
+
+    def select_in_order(
+        self,
+        candidates: Iterable[TaskPacket],
+        *,
+        occupied_keys: set[tuple[ReductionDomain, int]] | None = None,
+    ) -> IssueDecision:
+        """Apply fixed lane, port, and conflict limits to a supplied order."""
+
+        ordered = list(candidates)
         occupied_keys = set(occupied_keys or ())
         accepted: list[TaskPacket] = []
         rejected: list[TaskPacket] = []
@@ -151,11 +177,14 @@ class FusionIssueScheduler:
                 TaskKind.CONSUMER: self.consumer_ports,
                 TaskKind.ADJOINT: self.adjoint_ports,
             }[task.task_kind]
-            if used_ports[task.task_kind] >= limit or task.conflict_key in occupied_keys:
+            if (
+                used_ports[task.task_kind] >= limit
+                or not task.conflict_keys.isdisjoint(occupied_keys)
+            ):
                 rejected.append(task)
                 continue
             accepted.append(task)
-            occupied_keys.add(task.conflict_key)
+            occupied_keys.update(task.conflict_keys)
             used_ports[task.task_kind] += 1
         rejected.extend(ordered[self.candidate_lanes:])
         reason = "conflict_or_port" if rejected else None

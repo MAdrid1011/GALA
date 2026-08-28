@@ -90,7 +90,7 @@
 - 生命周期 sidecar 已增加 `dependency_ids` 与有序 `active_ids`：在线会话优先使用生产端给出的真实前置，`all_active` optimizer commit 按稳定 Gaussian 展开为独立 UPDATE_COMMIT；官方捕获已记录 optimizer/collection begin 的活动快照，backward/gradient terminal 和父子修改依赖仍待 hook 侧补齐。
 - 在线 query 扩展已把每轮真实 GRADIENT_REDUCTION terminal 作为后续 optimizer/collection begin 默认依赖，并将上一 UPDATE_END 作为下一状态版本首个 candidate 的外部屏障；Clone/Split 的 parent 与 child 均生成 SET_MODIFICATION。生产端显式 `dependency_ids` 仍可覆盖默认前沿，用于逐字段对照冻结后的精确拓扑。
 - canonical Ramulator preflight 与中心 raster/voxel 真实依赖闭包 quick 周期已重新执行：`0000` Base ASIC 为 `415477` cycles，`query_oracle` 为 `415554`，`residency_oracle` 为 `406180`，联合 `1111` 为 `406208`。十六项消融在同一配置上全部通过，`1111` 与联合入口一致、事件集合一致；新增 `--parallel-workers 4` 后 16 个独立变体约 2 分钟完成，逐项进度写入 stderr。上述结果固定为 `quick_cycle_validation`，不升级为完整 30k 正式周期。
-- 长周期重放已加入显式开发诊断：按完成事件数或 30 秒墙钟间隔输出运行健康状态，并只在完整连续迭代闭合时采样墙钟吞吐、每事件模拟周期、总周期投影和静态 AGX Orin 锚点加速比区间。默认仍完整运行；只有显式 `--stop-when-throughput-stable` 才能在预热、最小完成比例、连续稳定窗口和多指标跨度同时通过后提前结束。提前结束要求独立空目录，固定 `formal_performance_eligible=false`，不写正式 `cycles.json` 或消融结果。
+- 长周期重放已加入显式开发诊断：按完成事件数或 30 秒墙钟间隔输出运行健康状态，并只在完整连续迭代闭合时采样墙钟吞吐、每事件模拟周期、总周期投影和按配置时钟换算的 ASIC 秒数。默认仍完整运行；只有显式 `--stop-when-throughput-stable` 才能在预热、最小完成比例、连续稳定窗口和多指标跨度同时通过后提前结束。提前结束要求独立空目录，固定 `formal_performance_eligible=false`，不写正式 `cycles.json` 或消融结果。公开规格 extrapolation 已从周期诊断和消融入口移除，不再生成 Orin 锚点或加速比。
 - A/B/C/D 已由周期引擎独立解析，不再把 A 与 C 合并或丢弃 B；`query`、`residency` 和 `full` 别名分别严格映射到 `1010`、`0101` 和 `1111`。C 关闭时融合发射使用全局单发射合同；C 打开时调度器以带查询/高斯目标域的真实归约键执行冲突选择，并只在周期引擎确认端口、Bank 和队列接纳后提交发射状态。中心 raster/voxel 闭包的修复后十六项 quick 矩阵位于 `GALA-runtime/records/r2_gaussian_chest_ablation_mechanism_fix_v1.csv`：Base `0000=415477` cycles，`1000=415558`，`0100=415477`，`0010=415704`，`0001=406180`，`1111=406364`，完整 GALA 相对 Base 为 `1.02243x`。A、B、C 单独位尚未形成目标收益：A 仍缺冻结的真实查询负载计划，B 尚未生成语义工作集，C 尚未使用三个真实有界队首和跨轮历史，因此该矩阵只验证独立开关与冲突合同，不是机制闭环或正式性能结果。
 - C 的三输入队首和成功提交路径已完成并通过反例测试：融合前向、消费者、伴随分别进入有界输入队列，每周期只将三个实际队首交给调度器；被冲突、端口、Bank 或队列拒绝的任务留在原队列，只有真正进入在途状态的任务才更新调度器历史。第二次中心闭包十六项 quick 矩阵位于 `GALA-runtime/records/r2_gaussian_chest_ablation_three_heads_v1.csv`，`0000=415477`、`0010=415458`、`1111=406186` cycles，`1111` 与完整入口一致；该结果仍是 quick validation，C 的跨迭代重叠状态和 A 的真实查询负载规则尚未完成。
 - B 已生成带类型的精确语义工作集：每条真实 `CACHE_REQUEST` 绑定 `uint64 event_id`、`int64 gaussian_id`、状态版本、同键序号、总用途、剩余用途和最后使用标志，不把事件编号或使用数写入 FP32 payload，也不使用平均复用率。`0100` 只输出工作集提示和审计计数，仍走基础存储；`0001` 保留无编译器提示的在线目录、Miss 合并和版本关闭；`0101` 使用精确剩余用途并在最后一次真实读取完成后释放。当前实现仍作用于内存中的有限 trace；正式 30k 路径需要把相同 typed workset 字段接入有界虚拟 trace 包流。
@@ -146,9 +146,9 @@ packet 流，也不能提升正式性能资格。
 `577,268,206` 事件约为 `571,310,937 cycles`、`1.1426 s`（500 MHz），在线回放墙钟约
 `6.18 h`。旧记录把完整 30,000 iteration 的 Orin proxy `3817.435 s` 直接与这一迭代
 ASIC 时间相除，产生的 `3341x`（区间 `2500x--4182x`）是工作量不一致的无效计算，已撤销。
-按同一迭代归一化，Orin proxy 为 `0.12725 s/iteration`（区间 `0.09522--0.15927 s`），
-对应 ASIC/Orin 约 `0.111x`（区间 `0.0833x--0.139x`）。该结果仍是开发投影，记录在仓库外
-`online_throughput_diagnostic.json`，不是完整 trace、正式周期或论文加速比。
+即使按同一迭代归一化，公开规格 extrapolation 得到的 `0.12725 s/iteration` 也没有端到端
+Orin 实测或跨平台缩放依据，不能作为合理性锚点，不能与 ASIC 投影相除，也不能形成方向判断。
+仓库外旧 `online_throughput_diagnostic.json` 中相关字段已作废；当前只保留 ASIC 自身的周期投影。
 
 R²-Gaussian + Chest 已结束正式 GPU 计数器采集。性能分析固定使用前 16 组代表采样、已有 collection 报告和历史可用报告，不再追求 62 组穷举覆盖；这 16 组是本组合的性能采样上限，不再启动第 17--54 组。采样结果明确标注 `representative_gpu_performance_estimate`，保留精确内容覆盖率、按真实出现频次加权覆盖率、外推模式和逐阶段离散度，不能解释为穷举计数或正式 Orin 实测。哈希只记录，不参与任何通过或拒绝判断。
 
@@ -177,11 +177,11 @@ R²-Gaussian 的官方 CUDA 扩展仍没有直接导出完整 CLAMP 事件缓冲
 
 ## 下一步入口条件
 
-在没有 AGX Orin 实机的条件下，已用 16 组本地归一化报告和显式公开规格参考生成非正式规格代理
+在没有 AGX Orin 实机的条件下，曾用 16 组本地归一化报告和显式公开规格参考生成规格 extrapolation
 `GALA-runtime/records/r2_gaussian_chest_agx_orin_proxy_v1.json`：总估算为 `3817.435 s`，
 区间为 `2856.733--4778.137 s`。该记录按阶段和类别保存权重、换算比与不确定性，
-状态为 `proxy_estimate` 且 `formal_performance_eligible=false`；只能用于开发阶段的数量级对照，
-不能证明加速比合理，更不能作为 ASIC 达标门槛。不改变正式归一化的
+状态为 `proxy_estimate` 且 `formal_performance_eligible=false`。公开峰值规格无法预测真实 kernel、访存、
+调度和软件开销，因此该数值不能用于性能比较、数量级检查、方向判断或 ASIC 达标门槛。不改变正式归一化的
 `agx_orin_estimate.status=unavailable`，也不填充正式 `speedup_vs_orin`。
 
 1. 将有界虚拟数据包直接接入跨包 CycleEngine，并在一迭代和 `600:601` 窗口逐字段对照旧完整 trace；通过后运行一次 canonical 30k 虚拟包流的质量、结构、生命周期和资源门。
@@ -190,3 +190,29 @@ R²-Gaussian 的官方 CUDA 扩展仍没有直接导出完整 CLAMP 事件缓冲
 4. AGX Orin 若要形成正式换算，必须在同一校准套件、数据类型和批量范围下取得 Orin 实测向量；在此之前结果块保持 `agx_orin_estimate.status=unavailable`，不得以峰值规格比补值。
 
 当前不报告面积、功耗、能量、能效、正式周期或论文加速比。
+
+## 2026-08-28 完整物理包技术样本诊断
+
+使用真实 CUDA capture 记录中的栅格 tile 0 和体 brick 0 重建了前向、消费者、伴随和梯度均完整的
+物理 `RelationPacket` 快速样本。该样本包含 `505,391` 个事件、`779,583` 条依赖、`83,811`
+条逻辑关系和 `11,698` 个物理关系包，平均每包 `7.16456` 条有效 lane；栅格前向与伴随均为
+`816` 条关系，体前向与伴随均为 `82,995` 条关系。该结果通过结构验证和物理包计划，但仍固定为
+`quick_cycle_validation`、`formal_performance_eligible=false`、`quality_eligible=false`。
+
+当前周期引擎得到 Base ASIC `36,093 cycles`、future-visible Query Oracle `36,091 cycles`
+和 Residency Oracle `36,093 cycles`，对应相对 Base ASIC 的诊断性加速比约为 `1.000055x` 和
+`1.000000x`。Residency Oracle 将语义缓存片外请求从 `11,698` 降到 `217`，但没有缩短端到端
+周期。资源必要下界为 `24,935 cycles`，其中当前限制项是
+`bidirectional_query.issue_ports`；该下界只表示任何实现不能更快，不是可达预测、机制上界或性能
+锚点。
+
+这组三个周期暂不提升为有效 Base/Oracle 结论。硬件合同声明双向查询执行单元包含 64 个查询归约
+Bank、每 Bank 四组部分和、32 条 loss FMA lane 和 8 条伴随重放流水；当前周期引擎却把
+`QUERY_REDUCTION`、`CONSUMER`、`ADJOINT` 和 `GRADIENT_REDUCTION` 共用一个通用 issue port，
+且需要继续核对前向贡献进入查询 Bank、伴随 replay 回到 Pod 的阶段映射。该合同一致性问题会人为
+形成约 `24,935-cycle` 的串行瓶颈，使两类机制失去可优化空间。下一入口是修正或证明上述资源与阶段
+映射，并公平重跑同一 Base、两个 Oracle 和必要下界；确认之前不启动十六项消融。
+
+完整测试当前为 `268 passed, 1 skipped, 2 warnings`。`3341x`、`3495x` 和所有公开规格
+Orin extrapolation 已彻底退出性能判断，不能作为正式结果、静态锚点、数量级检查、方向判断或
+ASIC 达标门槛。Orin 平台结果保持 `unavailable`，直到取得同套件实测向量。

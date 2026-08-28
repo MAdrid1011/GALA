@@ -66,6 +66,22 @@ def test_issue_rejects_same_domain_reduction_conflict() -> None:
     assert len(decision.rejected) == 1
 
 
+def test_issue_rejects_overlap_with_any_query_in_physical_packet() -> None:
+    scheduler = FusionIssueScheduler(
+        candidate_lanes=3, forward_ports=2, consumer_ports=1, adjoint_ports=1,
+    )
+    packet = TaskPacket(
+        0, 1, 1, 1, 1, 0, 1, 0, TaskKind.FORWARD,
+        ReductionDomain.QUERY, (1, 7),
+    )
+    overlaps_lane_seven = _task(1, TaskKind.FORWARD, 7)
+
+    decision = scheduler.issue([packet, overlaps_lane_seven])
+
+    assert decision.accepted == (packet,)
+    assert decision.rejected == (overlaps_lane_seven,)
+
+
 def test_select_is_uncommitted_and_commit_occurs_once() -> None:
     scheduler = FusionIssueScheduler(
         candidate_lanes=3, forward_ports=1, consumer_ports=1, adjoint_ports=1,
