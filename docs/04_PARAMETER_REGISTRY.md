@@ -141,6 +141,7 @@ FMA、EXP、LOG、RCP、SQRT、SRAM、CAM、互连和寄存器流水延迟不写
 | `trace.max_inflight_chunks` | 自动调优后冻结 | chunk | GPU 与 CPU 重叠深度 |
 | `trace-sample.query_ranges` | 命令显式指定 | query range | quick-validation terminal 选择 |
 | `trace-sample.max_events` | 命令显式指定 | event | quick-validation 闭包事件上限 |
+| `trace-sample.max_total_events` | 命令显式指定 | event | quick-validation 单次回放总事件上限 |
 | `trace-sample.max_dependencies` | 命令显式指定 | dependency | quick-validation 中间与输出依赖上限 |
 | `trace-sample.scan_events` | 命令显式指定 | event | CPU/CUDA 顺序扫描块 |
 | `trace-sample.scan_backend` | `auto` | enum | `cpu`、`cuda` 或记录实际回退的 `auto` |

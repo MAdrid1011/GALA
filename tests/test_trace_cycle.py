@@ -23,6 +23,7 @@ from gala_sim.timing.engine import _DependencyIndex
 from gala_sim.timing.memory import Ramulator2Backend, RecordedMemoryBackend
 from gala_sim.config import load_config
 from gala_sim.trace import NumpyChunkSink, TraceReader, TraceWriter, TraceValidationError, validate_trace
+from gala_sim.trace import VirtualTracePacket
 from gala_sim.adapters.r2_gaussian import _push_trace_chunks
 from gala_sim.clamp.events import dependency_dtype, event_dtype
 
@@ -76,6 +77,85 @@ def test_trace_round_trip_and_cycle_result(tmp_path: Path) -> None:
     assert result.total_cycles > 0
     assert result.completion_cycles[3] <= result.total_cycles
     assert result.module_counters["relation_constructor"]["completed"] == 2
+
+
+def test_virtual_cycle_replay_preserves_global_packet_state(tmp_path: Path) -> None:
+    masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
+    masks[0, 0] = 1
+    packets = [
+        VirtualTracePacket(
+            iteration_id=1,
+            template_id=1,
+            query_base=index,
+            query_shape=(1, 1),
+            point_ids=np.asarray([index], dtype=np.int64),
+            point_keys=np.asarray([0], dtype=np.uint64),
+            masks=masks,
+            loss_flags=1,
+        )
+        for index in (0, 1)
+    ]
+    result = CycleEngine(_config()).run_virtual(
+        packets,
+        trace_root=tmp_path / "virtual_replay",
+        max_events=2,
+        max_total_events=64,
+    )
+    assert len(result.completion_cycles) == 20
+    assert result.total_cycles > 0
+    manifest = tmp_path / "virtual_replay" / "chunk_manifest.json"
+    assert manifest.is_file()
+    loaded = TraceReader().read(tmp_path / "virtual_replay", validate=True, mmap_mode="r")
+    assert loaded.events["event_id"].tolist() == list(range(20))
+    assert loaded.metadata["result_scope"] == "quick_cycle_validation"
+    assert loaded.metadata["formal_performance_eligible"] is False
+    assert loaded.metadata["virtual_source_packets"] == 2
+    assert loaded.metadata["virtual_max_events"] == 2
+    assert loaded.metadata["virtual_max_total_events"] == 64
+
+
+def test_virtual_cycle_replay_rejects_unbounded_expansion(tmp_path: Path) -> None:
+    masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
+    masks[0, 0] = 1
+    source = VirtualTracePacket(
+        iteration_id=1,
+        template_id=1,
+        query_base=0,
+        query_shape=(1, 1),
+        point_ids=np.asarray([0], dtype=np.int64),
+        point_keys=np.asarray([0], dtype=np.uint64),
+        masks=masks,
+        loss_flags=1,
+    )
+    with pytest.raises(CycleConfigurationError, match="max_total_events"):
+        CycleEngine(_config()).run_virtual(
+            [source], trace_root=tmp_path / "rejected",
+            max_events=2, max_total_events=9,
+        )
+    assert not (tmp_path / "rejected" / "chunk_manifest.json").exists()
+
+
+def test_virtual_cycle_replay_rejects_reused_output_directory(tmp_path: Path) -> None:
+    root = tmp_path / "reused"
+    root.mkdir()
+    (root / "chunk_manifest.json").write_text("stale\n", encoding="utf-8")
+    masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
+    masks[0, 0] = 1
+    source = VirtualTracePacket(
+        iteration_id=1,
+        template_id=1,
+        query_base=0,
+        query_shape=(1, 1),
+        point_ids=np.asarray([0], dtype=np.int64),
+        point_keys=np.asarray([0], dtype=np.uint64),
+        masks=masks,
+        loss_flags=1,
+    )
+    with pytest.raises(CycleConfigurationError, match="new empty trace_root"):
+        CycleEngine(_config()).run_virtual(
+            [source], trace_root=root, max_events=2, max_total_events=64
+        )
+    assert (root / "chunk_manifest.json").read_text(encoding="utf-8") == "stale\n"
 
 
 def test_formal_cycle_records_but_does_not_gate_on_configuration_hash() -> None:

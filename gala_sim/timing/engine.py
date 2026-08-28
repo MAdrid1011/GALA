@@ -5,16 +5,25 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import dataclass
 import heapq
+from pathlib import Path
 import time
-from typing import Callable
+from typing import Callable, Iterable
 
 import numpy as np
 
 from gala_sim.clamp import (
     FusionIssueScheduler, ReductionDomain, SemanticWorksets, TaskKind, TaskPacket,
 )
-from gala_sim.clamp.events import PrimitiveKind
+from gala_sim.clamp.events import PrimitiveKind, dependency_dtype, event_dtype
 from gala_sim.trace.model import Trace
+from gala_sim.trace.virtual import (
+    VirtualEventPacket,
+    VirtualEventStreamValidator,
+    VirtualQueryEventExpander,
+    VirtualTracePacket,
+)
+from gala_sim.trace.io import TraceReader
+from gala_sim.clamp.builder import ChunkedTraceBuilder
 from gala_sim.trace.validator import validate_trace
 
 from .config import CycleConfig
@@ -985,4 +994,131 @@ class CycleEngine:
             policy=self.policy,
             oracle_status=("heuristic_unproven" if self.policy.endswith("_oracle") else "not_applicable"),
             memory_requests=memory_request_records,
+        )
+
+    def run_virtual(
+        self,
+        packets: Iterable[VirtualTracePacket],
+        *,
+        trace_root: Path,
+        max_events: int,
+        max_total_events: int,
+        validate_input: bool = True,
+        metadata: dict[str, object] | None = None,
+        progress: Callable[[CycleProgress], None] | None = None,
+        progress_interval_events: int | None = None,
+        progress_interval_seconds: float | None = None,
+    ) -> CycleResult:
+        """Run a bounded development replay of virtual work packets.
+
+        The expander and writer are shared for the entire packet stream. Event
+        IDs therefore remain global, while raw columns keep resident memory
+        bounded by ``max_events``. The resulting mmap trace is replayed once,
+        so cache state, dependency readiness, fusion history, memory waiters,
+        and the configured Ramulator backend are never reset at packet edges.
+
+        This is intentionally a quick-validation API. ``max_total_events`` is
+        mandatory in spirit (and has a conservative default) so a full
+        30,000-iteration capture cannot accidentally expand into a multi-GB
+        staging trace. Formal performance runs must use a prevalidated canonical
+        trace and :meth:`run` directly. ``trace_root`` is an explicit durable
+        staging directory and is not removed after a run.
+        """
+        if max_events <= 0:
+            raise ValueError("virtual cycle event batch size must be positive")
+        if max_total_events <= 0:
+            raise ValueError("virtual cycle total event bound must be positive")
+        root = Path(trace_root)
+        existing_outputs = (
+            root / "chunk_manifest.json",
+            root / "metadata.json",
+            root / "events.raw",
+            root / "dependencies.raw",
+            root / "payload.raw",
+            root / ".virtual_chunks",
+        )
+        if any(path.exists() for path in existing_outputs):
+            raise CycleConfigurationError(
+                "virtual quick replay requires a new empty trace_root"
+            )
+        builder = ChunkedTraceBuilder(
+            chunk_events=max_events,
+            chunk_root=root / ".virtual_chunks",
+            stream_only=True,
+        )
+        expander = VirtualQueryEventExpander(max_events=max_events)
+        stream_validator = VirtualEventStreamValidator()
+        source_count = 0
+        expanded_events = 0
+        try:
+            for source in packets:
+                source_count += 1
+                # Reject before the expander allocates query-sized reduction
+                # frontiers.  This is the exact event count of the current
+                # loss/backward chain: candidates + 6 relation stages + 3
+                # query stages.
+                projected_events = (
+                    source.candidate_count
+                    + 6 * source.logical_relation_count
+                    + 3 * source.query_count
+                )
+                if expanded_events + projected_events > max_total_events:
+                    raise CycleConfigurationError(
+                        "virtual quick replay exceeded max_total_events; "
+                        "formal replay requires a prevalidated canonical trace"
+                    )
+                for packet in expander.expand(source):
+                    expanded_events += packet.event_count
+                    stream_validator.accept(packet)
+                    self._append_virtual_event_packet(builder, packet)
+            terminal = VirtualEventPacket(
+                packet_id=stream_validator.next_packet_id,
+                global_event_start=stream_validator.next_event_id,
+                events=np.empty(0, dtype=event_dtype()),
+                dependencies=np.empty(0, dtype=dependency_dtype()),
+                final_packet=True,
+                frontier_complete=True,
+            )
+            stream_validator.accept(terminal)
+            stream_validator.finalize()
+            builder.finish(
+                metadata={
+                    **(metadata or {}),
+                    "result_scope": "quick_cycle_validation",
+                    "formal_performance_eligible": False,
+                    "virtual_source_packets": source_count,
+                    "virtual_max_events": max_events,
+                    "virtual_max_total_events": max_total_events,
+                },
+                materialize=False,
+            )
+        except BaseException:
+            # A partial raw stream must never be mistaken for a replayable
+            # trace: no manifest is written until the global frontier closes.
+            raise
+        trace = TraceReader().read(root, validate=validate_input, mmap_mode="r")
+        return self.run(
+            trace,
+            validate_input=False,
+            progress=progress,
+            progress_interval_events=progress_interval_events,
+            progress_interval_seconds=progress_interval_seconds,
+        )
+
+    @staticmethod
+    def _append_virtual_event_packet(
+        builder: ChunkedTraceBuilder, packet: VirtualEventPacket
+    ) -> None:
+        if packet.global_event_start != builder.next_event_id:
+            raise CycleConfigurationError(
+                "virtual event packet IDs are not contiguous with the cycle stream"
+            )
+        events = np.asarray(packet.events, dtype=packet.events.dtype)
+        counts = events["dependency_count"].astype(np.int64, copy=False)
+        builder.emit_batch(
+            events,
+            dependencies=np.asarray(packet.dependencies),
+            dependency_counts=counts,
+            payload=np.empty(0, dtype=np.dtype("<f4")),
+            payload_counts=np.zeros(events.size, dtype=np.int64),
         )
