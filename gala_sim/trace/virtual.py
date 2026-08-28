@@ -207,22 +207,67 @@ class VirtualTracePacket:
         ``(candidate_index, global_query_id, gaussian_id, point_key)``.
         """
 
+        for batch in self.iter_relation_arrays(max_relations=65536):
+            for relation in zip(*batch, strict=True):
+                yield tuple(int(value) for value in relation)
+
+    def iter_relation_arrays(
+        self, max_relations: int
+    ) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
+        """Yield bounded query-major relation columns without per-relation callbacks."""
+
+        if max_relations <= 0:
+            raise ValueError("virtual trace relation batch size must be positive")
         tiles = np.right_shift(np.asarray(self.point_keys, dtype=np.uint64), 32)
+        order = np.argsort(tiles, kind="stable")
+        sorted_tiles = tiles[order]
+        tile_count = self._tile_count()
+        starts = np.searchsorted(sorted_tiles, np.arange(tile_count), side="left")
+        ends = np.searchsorted(sorted_tiles, np.arange(tile_count), side="right")
+        candidate_parts: list[np.ndarray] = []
+        query_parts: list[np.ndarray] = []
+        buffered = 0
+
+        def flush() -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+            candidates = np.concatenate(candidate_parts).astype(np.int64, copy=False)
+            queries = np.concatenate(query_parts).astype(np.int64, copy=False)
+            return (
+                candidates,
+                queries,
+                np.asarray(self.point_ids[candidates], dtype=np.int64),
+                np.asarray(self.point_keys[candidates], dtype=np.uint64),
+            )
+
         for query_offset in range(self.query_count):
             tile, local_query = self._tile_and_local_query(query_offset)
+            tile_candidates = order[starts[tile]:ends[tile]]
+            if tile_candidates.size == 0:
+                continue
             word_index, bit_index = divmod(local_query, MASK_WORD_BITS)
             bit = np.uint32(1 << bit_index)
-            candidates = np.flatnonzero(
-                (tiles == np.uint64(tile)) & ((self.masks[:, word_index] & bit) != 0)
-            )
-            for candidate in candidates:
-                index = int(candidate)
-                yield (
-                    index,
-                    self.query_base + query_offset,
-                    int(self.point_ids[index]),
-                    int(self.point_keys[index]),
+            selected = tile_candidates[
+                (self.masks[tile_candidates, word_index] & bit) != 0
+            ]
+            selected_offset = 0
+            while selected_offset < selected.size:
+                capacity = max_relations - buffered
+                take = min(capacity, selected.size - selected_offset)
+                part = np.asarray(
+                    selected[selected_offset:selected_offset + take], dtype=np.int64
                 )
+                candidate_parts.append(part)
+                query_parts.append(np.full(
+                    take, self.query_base + query_offset, dtype=np.int64
+                ))
+                buffered += take
+                selected_offset += take
+                if buffered == max_relations:
+                    yield flush()
+                    candidate_parts.clear()
+                    query_parts.clear()
+                    buffered = 0
+        if buffered:
+            yield flush()
 
     def _tile_and_local_query(self, query_offset: int) -> tuple[int, int]:
         if self.template_id == RASTER_TEMPLATE_ID:
@@ -304,14 +349,11 @@ class VirtualTracePacket:
 
         if max_relations <= 0:
             raise ValueError("virtual trace relation batch size must be positive")
-        batch: list[tuple[int, int, int, int]] = []
-        for relation in self.iter_relations():
-            batch.append(relation)
-            if len(batch) == max_relations:
-                yield tuple(batch)
-                batch = []
-        if batch:
-            yield tuple(batch)
+        for columns in self.iter_relation_arrays(max_relations):
+            yield tuple(
+                tuple(int(value) for value in relation)
+                for relation in zip(*columns, strict=True)
+            )
 
     def materialize_relations(self, *, max_relations: int | None = None) -> np.ndarray:
         """Materialize only when explicitly bounded by the caller."""
@@ -319,12 +361,12 @@ class VirtualTracePacket:
         relation_count = self.logical_relation_count
         if max_relations is not None and relation_count > max_relations:
             raise ValueError("virtual trace relation materialization exceeds its bound")
-        rows = np.fromiter(
-            (value for relation in self.iter_relations() for value in relation),
-            dtype=np.int64,
-            count=relation_count * 4,
-        )
-        return rows.reshape((-1, 4))
+        if relation_count == 0:
+            return np.empty((0, 4), dtype=np.int64)
+        parts = [np.column_stack(columns) for columns in self.iter_relation_arrays(
+            max(relation_count, 1)
+        )]
+        return np.concatenate(parts, axis=0).astype(np.int64, copy=False)
 
 
 @dataclass(frozen=True)
@@ -446,57 +488,50 @@ class VirtualRelationEventExpander:
             rows["flags"] = np.any(packet.masks[start:end], axis=1)
             yield self._make_event_packet(rows, np.empty(0, dtype=dependency_dtype()))
 
-        relation_rows: list[tuple[int, int, int, int]] = []
         emitted_relations = 0
-        for candidate, query_id, gaussian_id, point_key in packet.iter_relations():
-            relation_rows.append((candidate, query_id, gaussian_id, point_key))
-            if len(relation_rows) == self.max_events:
-                yield self._relation_packet(
-                    relation_rows, packet, candidate_start, relation_start,
-                    relation_base, emitted_relations,
-                )
-                emitted_relations += len(relation_rows)
-                relation_rows = []
-        if relation_rows:
+        for columns in packet.iter_relation_arrays(self.max_events):
             yield self._relation_packet(
-                relation_rows, packet, candidate_start, relation_start,
+                columns, packet, candidate_start, relation_start,
                 relation_base, emitted_relations,
             )
+            emitted_relations += int(columns[0].size)
 
     def _relation_packet(
         self,
-        relations: list[tuple[int, int, int, int]],
+        relations: tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray],
         source: VirtualTracePacket,
         candidate_start: int,
         relation_start: int,
         relation_base: int,
         emitted_before: int,
     ) -> VirtualEventPacket:
-        rows = np.empty(len(relations), dtype=event_dtype())
+        candidates, query_ids, gaussian_ids, _point_keys = relations
+        relation_count = int(candidates.size)
+        rows = np.empty(relation_count, dtype=event_dtype())
         rows[:] = TraceEvent().as_tuple()
         rows["event_id"] = np.arange(
             relation_start + emitted_before,
-            relation_start + emitted_before + len(relations),
+            relation_start + emitted_before + relation_count,
             dtype=np.uint64,
         )
         rows["iteration_id"] = source.iteration_id
         rows["primitive_kind"] = int(PrimitiveKind.RELATION)
-        rows["query_id"] = np.asarray([item[1] for item in relations], dtype=np.int64)
-        rows["gaussian_id"] = np.asarray([item[2] for item in relations], dtype=np.int64)
+        rows["query_id"] = query_ids
+        rows["gaussian_id"] = gaussian_ids
         rows["state_version"] = source.state_version
         rows["relation_id"] = np.arange(
             relation_base + emitted_before,
-            relation_base + emitted_before + len(relations),
+            relation_base + emitted_before + relation_count,
             dtype=np.int64,
         )
         rows["resource_class"] = int(ResourceClass.RELATION)
         rows["template_id"] = source.template_id
         rows["field_mask"] = source.field_mask
         rows["address_token"] = np.asarray(
-            [item[2] * self.state_record_bytes for item in relations], dtype=np.uint64
+            gaussian_ids * self.state_record_bytes, dtype=np.uint64
         )
         dependencies = np.asarray(
-            [candidate_start + item[0] for item in relations], dtype=dependency_dtype()
+            candidate_start + candidates, dtype=dependency_dtype()
         )
         return self._make_event_packet(rows, dependencies)
 
