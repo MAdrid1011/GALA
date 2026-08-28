@@ -107,6 +107,11 @@
 已接入同一 LPDDR5-6400 Ramulator：离线 `5806 cycles`、在线 `5807 cycles`，事件计数逐项
 一致，周期差 `0.0172%`，在线结束 `pending=0` 且 `quiescent=true`。该短门仍是
 `quick_cycle_validation`，不提升完整 30,000 iteration 结果的正式资格。
+在完整真实栅格 packet 的有界在线探针中，已登记 `12,677,229` 个事件、完成
+`10,565,757` 个事件，最后稳定吞吐约 `37,545 events/s`，模拟周期为 `10,565,765`；
+按已完成前缀投影该栅格 packet 约 `546,081,356 cycles`（500 MHz 下 `1.092 s`），
+相对 Orin proxy 的开发投影约 `3495x`。探针在 `281 s` 主动停止，未写正式周期结果；
+日志期间持续更新，CPU/Ramulator 满载，GPU 空闲属于周期模拟的正常特征。
 
 2026-08-28 已加入 `gala_sim.trace.virtual` 的有界工作缓冲区和全局事件包原型。
 `VirtualTracePacket` 保留官方 raster/voxel 的 point list、point key 和完整 valid mask，

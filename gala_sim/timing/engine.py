@@ -1470,6 +1470,9 @@ class CycleReplaySession:
                 self._drain()
                 self._compact_completed_prefix()
             self.accept_event_packet(event_packet, _drain_after=False)
+            # Large frontier fills can spend substantial wall time registering
+            # rows before the next drain; keep the long-run monitor live.
+            self._report_progress()
         self._backward_frontier = (*self._backward_frontier, *terminal_ids)
 
     def register_semantic_workset_totals(
