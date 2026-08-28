@@ -4,6 +4,8 @@
 
 ## 已通过
 
+- 2026-08-29 生命周期与 lineage 修复后的最小真实双窗口 Base 回放已重新完成：`846,012/846,012` 个事件、`1,289,964` 条依赖，原生 LPDDR5-6400 Ramulator 2 返回 `144,550 cycles`（500 MHz 下 `0.289100 ms`），记录位于仓库外 `GALA-runtime/records/r2_gaussian_chest_median_packets_base_post_lineage_v1/`。该结果只证明最新依赖实现仍能闭合同一 quick trace，不是正式 30,000 iteration 周期，也不是绝对性能锚点。
+
 - 2026-08-29 虚拟集合修改 lineage 依赖已对齐 raw capture：`CLONE` 的 child 修改依赖 parent，`SPLIT` 的 parent 修改等待全部 child 修改完成；collection transaction 仍共享 begin frontier，optimizer commit 仍保持事务内并行。新增 clone/split 顺序回归，全套测试 `297 passed, 1 skipped, 2 warnings`。这只修正事件依赖真实性，不改变顶层硬件资源或性能锚点口径。
 
 - 2026-08-29 在线虚拟生命周期事务依赖已修正：`UPDATE_BEGIN` 只连接 backward/state frontier；同一事务内各个 `UPDATE_COMMIT` 共享 begin 依赖，不再通过前一个 commit 或修改事件链式串行化；`UPDATE_END` 汇合本事务全部 commit/修改事件。新增依赖图回归，定向生命周期测试 4 项通过，全套测试 `296 passed, 1 skipped, 2 warnings`。该修复只消除模拟器人为串行化，不构成绝对性能锚点或硬件加速承诺。
