@@ -1346,7 +1346,9 @@ class CycleReplaySession:
             violations.append("relation_seed_fifo")
         return tuple(violations)
 
-    def accept_event_packet(self, packet: VirtualEventPacket) -> None:
+    def accept_event_packet(
+        self, packet: VirtualEventPacket, *, _drain_after: bool = True
+    ) -> None:
         self._ensure_open()
         if packet.final_packet:
             raise ValueError("final packet is reserved for finish()")
@@ -1413,9 +1415,10 @@ class CycleReplaySession:
             if unresolved == 0:
                 self._push_ready(event_id, 0)
         self._source_packets += 1
-        self._drain()
-        self._compact_completed_prefix()
-        self._report_progress()
+        if _drain_after:
+            self._drain()
+            self._compact_completed_prefix()
+            self._report_progress()
 
     def accept_query_packet(self, packet: VirtualTracePacket) -> None:
         """Expand one point/mask packet lazily into the online consumer."""
@@ -1437,7 +1440,14 @@ class CycleReplaySession:
                     == int(PrimitiveKind.GRADIENT_REDUCTION)
                 ]
             )
-            self.accept_event_packet(event_packet)
+            # A CUDA work-buffer packet is the arrival unit.  Its expanded
+            # event sub-packets must enter the frontier before the scheduler
+            # advances, otherwise each sub-packet edge introduces artificial
+            # serialization that is absent from the equivalent trace replay.
+            self.accept_event_packet(event_packet, _drain_after=False)
+        self._drain()
+        self._compact_completed_prefix()
+        self._report_progress()
         self._backward_frontier = (*self._backward_frontier, *terminal_ids)
 
     def register_semantic_workset_totals(

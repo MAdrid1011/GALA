@@ -97,6 +97,13 @@
 
 ## 当前入口
 
+在线周期入口已修正同一 CUDA work-buffer packet 的事件子包调度边界：
+`CycleReplaySession.accept_query_packet()` 现在先将该 packet 展开的候选、关系、缓存、
+前向、归约、消费者、伴随和梯度事件全部登记到有界 frontier，再推进一次调度器。
+因此不会在同一 packet 的子包之间提前 drain 并人为串行化。新增回归在代表性单 packet 上
+与离线展开回放保持完全相同的事件计数，周期差为最多 1 cycle；多个独立 source packet
+之间仍保留真实到达边界的调度影响，不能未经对照直接当作离线周期等价。
+
 2026-08-28 已加入 `gala_sim.trace.virtual` 的有界工作缓冲区和全局事件包原型。
 `VirtualTracePacket` 保留官方 raster/voxel 的 point list、point key 和完整 valid mask，
 并以稳定的全局 query 顺序惰性枚举真实 relation。`VirtualQueryEventExpander` 现在能

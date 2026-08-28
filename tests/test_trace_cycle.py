@@ -261,6 +261,40 @@ def test_online_cycle_replay_reports_progress() -> None:
     assert progress[-1].completed_events > 0
 
 
+def test_online_query_packet_batches_expanded_subpackets_before_drain(
+    tmp_path: Path,
+) -> None:
+    masks = np.zeros((32, 8), dtype=np.dtype("<u4"))
+    masks[:, 0] = 0b1111
+    source = VirtualTracePacket(
+        iteration_id=1,
+        template_id=1,
+        query_base=0,
+        query_shape=(1, 32),
+        point_ids=np.arange(32, dtype=np.int64),
+        point_keys=np.arange(32, dtype=np.uint64),
+        masks=masks,
+        loss_flags=1,
+        backward_confirmed=True,
+    )
+    offline = CycleEngine(_config()).run_virtual(
+        [source],
+        trace_root=tmp_path / "offline",
+        max_events=64,
+        max_total_events=10000,
+    )
+    session = CycleEngine(_config()).online_session(
+        max_events=64,
+        initial_gaussian_count=32,
+    )
+    session.accept_query_packet(source)
+    session.close_iteration(1)
+    online = session.finish()
+    assert online.event_counts == offline.event_counts
+    assert online.total_cycles - offline.total_cycles <= 1
+    assert session.quiescent
+
+
 def test_online_cycle_replay_rejects_frontier_overflow_before_advancing_ids() -> None:
     rows = np.empty(2, dtype=event_dtype())
     rows[:] = TraceEvent().as_tuple()
