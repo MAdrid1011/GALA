@@ -112,6 +112,15 @@ ready/in-flight 队列、cache/Ramulator waiters、融合调度和关闭版本�
 配置驱动；当前仍缺正式 30k packet 流的逐字段等价、完整生命周期 sidecar 对照和最终资源门，
 因此尚不能提升三万次 trace、Base ASIC、Oracle 或消融结果的资格。
 
+使用中止的真实 CUDA 捕获现场 `.capture_records` 重建局部 packet 后，逐字段比较器已通过两类真实
+对照：栅格 packet 为 `677,229` 个 candidate、`90,769,547` 条 relation，体 packet 为 `13,699`
+个 candidate、`5,179,210` 条 relation；candidate 的类型、序号、Gaussian ID、point key 以及
+relation 的类型、candidate 序号、local query、reserved 字段均为 `0` mismatches。进一步选取
+真实 tile 0 的 `9/816` 栅格记录和 `212/82,995` 体记录接入原生 Ramulator 2 在线回放，得到
+`514,125` cycles，约 `21.7 s` 完成；结束时 pending event、resident completion marker 和
+semantic workset 均为 `0`。这些是局部真实短门，尚不代表完整一迭代或 canonical 30,000 iteration
+packet 流，也不能提升正式性能资格。
+
 R²-Gaussian + Chest 已结束正式 GPU 计数器采集。性能分析固定使用前 16 组代表采样、已有 collection 报告和历史可用报告，不再追求 62 组穷举覆盖；这 16 组是本组合的性能采样上限，不再启动第 17--54 组。采样结果明确标注 `representative_gpu_performance_estimate`，保留精确内容覆盖率、按真实出现频次加权覆盖率、外推模式和逐阶段离散度，不能解释为穷举计数或正式 Orin 实测。哈希只记录，不参与任何通过或拒绝判断。
 
 本轮决策后的入口是：先冻结统一硬件/时序/trace 配置，随后只对质量与完整性执行一次全量 trace 验证，性能迭代使用可配置的代表性依赖闭包，最后运行 Base ASIC 和两个受资源约束 Oracle。16 组采样已经足以支撑该阶段的本地 GPU 性能参数化；增加到 60 多组只会扩大重复采集时间，不改变当前采样估计的定义。
