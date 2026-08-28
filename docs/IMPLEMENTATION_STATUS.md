@@ -103,6 +103,10 @@
 因此不会在同一 packet 的子包之间提前 drain 并人为串行化。新增回归在代表性单 packet 上
 与离线展开回放保持完全相同的事件计数，周期差为最多 1 cycle；多个独立 source packet
 之间仍保留真实到达边界的调度影响，不能未经对照直接当作离线周期等价。
+使用仓库外真实 capture 原始记录重建的栅格 tile 0（9 个候选、816 条关系、256 个 query）
+已接入同一 LPDDR5-6400 Ramulator：离线 `5806 cycles`、在线 `5807 cycles`，事件计数逐项
+一致，周期差 `0.0172%`，在线结束 `pending=0` 且 `quiescent=true`。该短门仍是
+`quick_cycle_validation`，不提升完整 30,000 iteration 结果的正式资格。
 
 2026-08-28 已加入 `gala_sim.trace.virtual` 的有界工作缓冲区和全局事件包原型。
 `VirtualTracePacket` 保留官方 raster/voxel 的 point list、point key 和完整 valid mask，

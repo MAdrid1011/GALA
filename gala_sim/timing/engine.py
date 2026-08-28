@@ -1423,7 +1423,23 @@ class CycleReplaySession:
     def accept_query_packet(self, packet: VirtualTracePacket) -> None:
         """Expand one point/mask packet lazily into the online consumer."""
 
+        self.accept_query_packets((packet,))
+
+    def accept_query_packets(self, packets: Iterable[VirtualTracePacket]) -> None:
+        """Register one capture batch before advancing the online scheduler."""
+
         self._ensure_open()
+        accepted = False
+        for packet in packets:
+            self._accept_query_packet_without_drain(packet)
+            accepted = True
+        if not accepted:
+            return
+        self._drain()
+        self._compact_completed_prefix()
+        self._report_progress()
+
+    def _accept_query_packet_without_drain(self, packet: VirtualTracePacket) -> None:
         self._lifecycle.accept_packet(packet)
         self._query_packets += 1
         terminal_ids: list[int] = []
@@ -1445,9 +1461,6 @@ class CycleReplaySession:
             # advances, otherwise each sub-packet edge introduces artificial
             # serialization that is absent from the equivalent trace replay.
             self.accept_event_packet(event_packet, _drain_after=False)
-        self._drain()
-        self._compact_completed_prefix()
-        self._report_progress()
         self._backward_frontier = (*self._backward_frontier, *terminal_ids)
 
     def register_semantic_workset_totals(
@@ -2117,5 +2130,4 @@ class BufferedVirtualCycleConsumer:
         self.session.register_semantic_workset_totals(totals)
         packets = tuple(self._packets)
         self._packets.clear()
-        for packet in packets:
-            self.session.accept_query_packet(packet)
+        self.session.accept_query_packets(packets)

@@ -266,28 +266,31 @@ def test_online_query_packet_batches_expanded_subpackets_before_drain(
 ) -> None:
     masks = np.zeros((32, 8), dtype=np.dtype("<u4"))
     masks[:, 0] = 0b1111
-    source = VirtualTracePacket(
-        iteration_id=1,
-        template_id=1,
-        query_base=0,
-        query_shape=(1, 32),
-        point_ids=np.arange(32, dtype=np.int64),
-        point_keys=np.arange(32, dtype=np.uint64),
-        masks=masks,
-        loss_flags=1,
-        backward_confirmed=True,
+    sources = tuple(
+        VirtualTracePacket(
+            iteration_id=1,
+            template_id=1,
+            query_base=index * 32,
+            query_shape=(1, 32),
+            point_ids=np.arange(index * 32, (index + 1) * 32, dtype=np.int64),
+            point_keys=np.arange(32, dtype=np.uint64),
+            masks=masks,
+            loss_flags=1,
+            backward_confirmed=True,
+        )
+        for index in range(2)
     )
     offline = CycleEngine(_config()).run_virtual(
-        [source],
+        sources,
         trace_root=tmp_path / "offline",
         max_events=64,
         max_total_events=10000,
     )
     session = CycleEngine(_config()).online_session(
         max_events=64,
-        initial_gaussian_count=32,
+        initial_gaussian_count=64,
     )
-    session.accept_query_packet(source)
+    session.accept_query_packets(sources)
     session.close_iteration(1)
     online = session.finish()
     assert online.event_counts == offline.event_counts
