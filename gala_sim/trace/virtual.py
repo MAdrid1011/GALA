@@ -66,6 +66,8 @@ class VirtualLifecycleRecord:
     child_ids: tuple[int, ...] = ()
     transaction_kind: int = 0
     all_active: bool = False
+    dependency_ids: tuple[int, ...] = ()
+    active_ids: tuple[int, ...] = ()
 
     def __post_init__(self) -> None:
         if self.iteration_id < 0 or self.state_version < 0 or self.field_mask < 0:
@@ -74,6 +76,12 @@ class VirtualLifecycleRecord:
             raise ValueError("virtual lifecycle kind is invalid")
         if any(child < 0 for child in self.child_ids):
             raise ValueError("virtual lifecycle child IDs must be non-negative")
+        if any(dependency < 0 for dependency in self.dependency_ids):
+            raise ValueError("virtual lifecycle dependency IDs must be non-negative")
+        if len(set(self.active_ids)) != len(self.active_ids) or any(
+            active < 0 for active in self.active_ids
+        ):
+            raise ValueError("virtual lifecycle active IDs must be unique and non-negative")
         if self.transaction_kind not in {0, TRANSACTION_COLLECTION, TRANSACTION_OPTIMIZER}:
             raise ValueError("virtual lifecycle transaction kind is invalid")
         if self.all_active and self.kind is not VirtualLifecycleKind.UPDATE_COMMIT:
@@ -213,6 +221,8 @@ class VirtualTraceLifecycleValidator:
                     raise ValueError("virtual optimizer commit is duplicated")
                 if record.gaussian_id >= 0:
                     raise ValueError("all-active optimizer commit cannot name one Gaussian")
+                if record.active_ids and tuple(record.active_ids) != self._open_commit_expected:
+                    raise ValueError("all-active commit snapshot differs from begin snapshot")
                 self._open_commit_all_active = True
                 self.current_optimizer_commits += len(self.active_gaussians or ())
                 return
@@ -1386,6 +1396,7 @@ class VirtualTraceStream:
         consumed_packets = 0
         consumed_relations = 0
         physical_bytes = 0
+        resident_packet_bytes = 0
         peak_packet_bytes = 0
         last_progress = started
         counters_lock = threading.Lock()
@@ -1409,7 +1420,8 @@ class VirtualTraceStream:
             last_progress = now
 
         def produce() -> None:
-            nonlocal produced_packets, produced_relations, physical_bytes, peak_packet_bytes
+            nonlocal produced_packets, produced_relations, physical_bytes
+            nonlocal resident_packet_bytes, peak_packet_bytes
             try:
                 source = self._packets() if callable(self._packets) else self._packets
                 for packet in source:
@@ -1425,11 +1437,13 @@ class VirtualTraceStream:
                             continue
                     if stop.is_set():
                         break
+                    packet_bytes = packet.physical_bytes
                     with counters_lock:
                         produced_packets += 1
                         produced_relations += packet.logical_relation_count
-                        physical_bytes += packet.physical_bytes
-                        peak_packet_bytes = max(peak_packet_bytes, packet.physical_bytes)
+                        physical_bytes += packet_bytes
+                        resident_packet_bytes += packet_bytes
+                        peak_packet_bytes = max(peak_packet_bytes, resident_packet_bytes)
                     report("produce")
                 while not stop.is_set():
                     try:
@@ -1470,7 +1484,10 @@ class VirtualTraceStream:
                 consume(packet)
                 consumed_packets += 1
                 consumed_relations += packet.logical_relation_count
-                peak_packet_bytes = max(peak_packet_bytes, packet.physical_bytes)
+                with counters_lock:
+                    resident_packet_bytes -= packet.physical_bytes
+                    if resident_packet_bytes < 0:
+                        raise RuntimeError("virtual trace resident-byte accounting underflow")
                 report("consume")
         except BaseException as error:
             failure = error

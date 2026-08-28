@@ -318,6 +318,22 @@ def test_stream_bounds_inflight_packets_and_accounts_physical_bytes() -> None:
     assert result.peak_resident_packet_bytes == packets[0].physical_bytes
 
 
+def test_stream_peak_resident_bytes_includes_queue_and_consumer() -> None:
+    packets = []
+    for iteration in range(3):
+        masks = _mask(1, 8)
+        masks[0, 0] = np.uint32(1)
+        packets.append(VirtualTracePacket(
+            iteration_id=iteration, template_id=1, query_base=iteration,
+            query_shape=(1, 1), point_ids=np.asarray([0]),
+            point_keys=np.asarray([0], dtype=np.uint64), masks=masks,
+        ))
+    result = VirtualTraceStream(
+        packets, max_inflight_packets=2, inactivity_timeout_seconds=1.0,
+    ).run(lambda _packet: time.sleep(0.02))
+    assert result.peak_resident_packet_bytes >= 2 * packets[0].physical_bytes
+
+
 def test_stream_stops_when_producer_makes_no_progress() -> None:
     release = threading.Event()
 

@@ -1310,6 +1310,7 @@ class TraceSession:
                 self._iteration, VirtualLifecycleKind.UPDATE_BEGIN,
                 self._state_version, field_mask=field_mask,
                 transaction_kind=UPDATE_BEGIN_OPTIMIZER,
+                active_ids=tuple(self._gaussian_ids),
             ))
             self._audit_increment("update_begin_events")
             if field_mask:
@@ -1317,6 +1318,7 @@ class TraceSession:
                     self._iteration, VirtualLifecycleKind.UPDATE_COMMIT,
                     self._state_version, field_mask=field_mask,
                     transaction_kind=UPDATE_BEGIN_OPTIMIZER, all_active=True,
+                    active_ids=tuple(self._gaussian_ids),
                 ))
                 self._audit_increment("optimizer_updated_gaussians", len(self._gaussian_ids))
             else:
@@ -1528,6 +1530,7 @@ class TraceSession:
             self._iteration, VirtualLifecycleKind.UPDATE_BEGIN,
             self._state_version, field_mask=STATE_FIELD_MASK,
             transaction_kind=UPDATE_BEGIN_COLLECTION,
+            active_ids=tuple(self._gaussian_ids),
         ))
         self._virtual_collection_begin = True
         self._audit_increment("update_begin_events")

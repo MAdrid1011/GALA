@@ -1338,31 +1338,42 @@ class CycleReplaySession:
             VirtualLifecycleKind.CLONE: PrimitiveKind.SET_MODIFICATION,
             VirtualLifecycleKind.SPLIT: PrimitiveKind.SET_MODIFICATION,
         }[record.kind]
-        event_id = self._stream_validator.next_event_id
-        dependency_ids = tuple(self._events)
-        if self._last_lifecycle_event is not None:
-            dependency_ids = (*dependency_ids, self._last_lifecycle_event)
-        row = np.empty(1, dtype=event_dtype())
-        row[:] = TraceEvent().as_tuple()
-        row["event_id"] = event_id
-        row["iteration_id"] = record.iteration_id
-        row["primitive_kind"] = int(primitive)
-        row["gaussian_id"] = record.gaussian_id if record.gaussian_id >= 0 else 0
-        row["state_version"] = record.state_version
-        row["resource_class"] = int(ResourceClass.UPDATE)
-        row["field_mask"] = record.field_mask
-        row["template_id"] = 0
-        row["flags"] = record.transaction_kind
-        row["dependency_begin"] = 0
-        row["dependency_count"] = len(dependency_ids)
-        event_packet = VirtualEventPacket(
-            packet_id=self._stream_validator.next_packet_id,
-            global_event_start=event_id,
-            events=row,
-            dependencies=np.asarray(dependency_ids, dtype=dependency_dtype()),
+        base_dependencies = (
+            tuple(record.dependency_ids)
+            if record.dependency_ids else tuple(self._events)
         )
-        self._last_lifecycle_event = event_id
-        self.accept_event_packet(event_packet)
+        gaussian_ids = (
+            tuple(record.active_ids)
+            if record.kind is VirtualLifecycleKind.UPDATE_COMMIT
+            and record.all_active and record.active_ids
+            else (record.gaussian_id,)
+        )
+        for gaussian_id in gaussian_ids:
+            event_id = self._stream_validator.next_event_id
+            dependency_ids = base_dependencies
+            if self._last_lifecycle_event is not None:
+                dependency_ids = (*dependency_ids, self._last_lifecycle_event)
+            row = np.empty(1, dtype=event_dtype())
+            row[:] = TraceEvent().as_tuple()
+            row["event_id"] = event_id
+            row["iteration_id"] = record.iteration_id
+            row["primitive_kind"] = int(primitive)
+            row["gaussian_id"] = gaussian_id if gaussian_id >= 0 else 0
+            row["state_version"] = record.state_version
+            row["resource_class"] = int(ResourceClass.UPDATE)
+            row["field_mask"] = record.field_mask
+            row["template_id"] = 0
+            row["flags"] = record.transaction_kind
+            row["dependency_begin"] = 0
+            row["dependency_count"] = len(dependency_ids)
+            event_packet = VirtualEventPacket(
+                packet_id=self._stream_validator.next_packet_id,
+                global_event_start=event_id,
+                events=row,
+                dependencies=np.asarray(dependency_ids, dtype=dependency_dtype()),
+            )
+            self._last_lifecycle_event = event_id
+            self.accept_event_packet(event_packet)
 
     def close_iteration(self, iteration_id: int) -> None:
         self._ensure_open()
