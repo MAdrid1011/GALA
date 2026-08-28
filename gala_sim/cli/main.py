@@ -90,6 +90,7 @@ def _parser() -> argparse.ArgumentParser:
                           help="JSON ResourceUsage snapshot")
     ablation.add_argument("--output", type=Path, required=True)
     ablation.add_argument("--quick-validation", action="store_true")
+    ablation.add_argument("--parallel-workers", type=int, default=1)
     return parser
 
 
@@ -285,7 +286,16 @@ def main(argv: list[str] | None = None) -> int:
             })
             print(json.dumps({"cycles": result.total_cycles, "policy": result.policy}, sort_keys=True))
             return 0
-        runs = run_matrix(trace, config)
+        runs = run_matrix(
+            trace,
+            config,
+            progress=lambda run: print(json.dumps({
+                "variant": run.variant.bits,
+                "cycles": run.result.total_cycles,
+                "completed": True,
+            }, sort_keys=True), file=sys.stderr, flush=True),
+            parallel_workers=args.parallel_workers,
+        )
         rows = [AblationRow(
             model=str(trace.metadata.get("model", "unknown")),
             dataset=str(trace.metadata.get("dataset", "unknown")), bits=run.variant.bits,

@@ -648,6 +648,22 @@ def test_ablation_runner_uses_one_validation_for_all_variants(monkeypatch) -> No
     assert runs[-1].result.policy == "variant:1111"
 
 
+def test_ablation_runner_reports_each_completed_variant() -> None:
+    from gala_sim.ablation.runner import run_matrix
+
+    completed: list[str] = []
+    runs = run_matrix(_trace(), _config(), progress=lambda run: completed.append(run.variant.bits))
+    assert len(runs) == 16
+    assert completed == [run.variant.bits for run in runs]
+
+
+def test_ablation_runner_can_parallelize_independent_variants() -> None:
+    from gala_sim.ablation.runner import run_matrix
+
+    runs = run_matrix(_trace(), _config(), parallel_workers=2)
+    assert [run.variant.bits for run in runs] == [f"{value:04b}" for value in range(16)]
+
+
 def test_ablation_replays_recorded_memory_for_each_variant() -> None:
     builder = TraceBuilder()
     builder.emit(TraceEvent(
