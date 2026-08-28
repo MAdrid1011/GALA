@@ -26,7 +26,11 @@ class HardwareModule:
         return self.timing.latency
 
     def bank(self, address_token: int) -> int:
-        return address_token % self.timing.banks
+        # Trace addresses for state records are byte addresses aligned to the
+        # 64-byte SRAM/DRAM sector.  Preserve the raw-token behavior for the
+        # small synthetic logical tokens used by unit fixtures.
+        line = address_token // 64 if address_token >= 64 and address_token % 64 == 0 else address_token
+        return line % self.timing.banks
 
     def complete(self, event_id: int, cycle: int) -> ModuleOutput:
         self.counters.completed += 1
