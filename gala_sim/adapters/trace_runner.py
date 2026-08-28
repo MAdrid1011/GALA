@@ -196,6 +196,15 @@ def main(argv: list[str] | None = None) -> int:
                             "resident_completion_markers": (
                                 online_sinks[0].session.resident_completion_markers
                             ),
+                            "quiescent": online_sinks[0].session.quiescent,
+                        },
+                        "progress": {
+                            "accepted_events": online_sinks[0].session.accepted_event_count,
+                            "completed_events": online_sinks[0].session.completed_event_count,
+                            "simulated_cycles": online_sinks[0].session.simulated_cycles,
+                            "source_packets": online_sinks[0].session.source_packet_count,
+                            "query_packets": online_sinks[0].session.query_packet_count,
+                            "closed_iterations": online_sinks[0].session.closed_iteration_count,
                         },
                         "semantic_workset": {
                             "exact": True,

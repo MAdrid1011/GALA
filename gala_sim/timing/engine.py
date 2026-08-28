@@ -1274,6 +1274,30 @@ class CycleReplaySession:
         return self._stream_validator.next_event_id
 
     @property
+    def accepted_event_count(self) -> int:
+        return self._accepted_events
+
+    @property
+    def completed_event_count(self) -> int:
+        return self._completed_events
+
+    @property
+    def simulated_cycles(self) -> int:
+        return self._cycle
+
+    @property
+    def source_packet_count(self) -> int:
+        return self._source_packets
+
+    @property
+    def query_packet_count(self) -> int:
+        return self._query_packets
+
+    @property
+    def closed_iteration_count(self) -> int:
+        return self._closed_iterations
+
+    @property
     def quiescent(self) -> bool:
         """Whether no online event, queue, memory, or cache work remains."""
 

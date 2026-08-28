@@ -233,6 +233,10 @@ def test_online_cycle_replay_consumes_packets_without_trace_columns() -> None:
     assert session.pending_event_count == 0
     assert session.resident_completion_markers == 0
     assert session.quiescent
+    assert session.accepted_event_count == session.completed_event_count
+    assert session.source_packet_count > 0
+    assert session.query_packet_count == 1
+    assert session.closed_iteration_count == 1
 
 
 def test_online_cycle_replay_reports_progress() -> None:
