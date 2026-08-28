@@ -10,7 +10,9 @@ from typing import Callable
 
 import numpy as np
 
-from gala_sim.clamp import FusionIssueScheduler, TaskKind, TaskPacket
+from gala_sim.clamp import (
+    FusionIssueScheduler, ReductionDomain, TaskKind, TaskPacket,
+)
 from gala_sim.clamp.events import PrimitiveKind
 from gala_sim.trace.model import Trace
 from gala_sim.trace.validator import validate_trace
@@ -35,6 +37,16 @@ from .modules import (
 
 class CycleConfigurationError(RuntimeError):
     pass
+
+
+@dataclass(frozen=True)
+class MechanismSelection:
+    query_load_rules: bool
+    semantic_worksets: bool
+    overlap_guided_issue: bool
+    semantic_residency: bool
+    query_oracle: bool = False
+    residency_oracle: bool = False
 
 
 @dataclass(frozen=True)
@@ -149,6 +161,7 @@ class CycleEngine:
             raise ValueError(f"unknown cycle policy: {policy}")
         self.config = config
         self.policy = policy
+        self.selection = self._selection_for_policy(policy)
         self.issue_scheduler = FusionIssueScheduler(
             candidate_lanes=config.candidate_lanes,
             forward_ports=config.fusion_forward_ports or config.modules["fusion_issue"].ports,
@@ -210,30 +223,21 @@ class CycleEngine:
         return ("fusion_issue", "compute_pod")
 
     def _ordered_candidates(self, trace: Trace, candidates: list[int]) -> list[int]:
-        query_enabled, residency_enabled = self._mechanism_flags()
-        if not query_enabled and not residency_enabled:
-            return candidates
-        if residency_enabled:
-            if query_enabled:
-                base_order = sorted(candidates, key=lambda event_id: (
-                    0 if PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
-                    in {PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN} else 1,
-                    int(trace.events[event_id]["query_id"]),
-                    int(trace.events[event_id]["gaussian_id"]), event_id,
-                ))
-                return self._schedule_fusion(trace, base_order)
-            return sorted(candidates, key=lambda event_id: (
+        base_order = candidates
+        if self.selection.semantic_residency:
+            base_order = sorted(base_order, key=lambda event_id: (
                 0 if PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
                 in {PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN} else 1,
                 int(trace.events[event_id]["gaussian_id"]), event_id,
             ))
-        if query_enabled:
-            base_order = sorted(candidates, key=lambda event_id: (
+        if self.selection.query_load_rules:
+            base_order = sorted(base_order, key=lambda event_id: (
                 int(trace.events[event_id]["query_id"]),
                 int(trace.events[event_id]["relation_id"]), event_id,
             ))
-            return self._schedule_fusion(trace, base_order)
-        return candidates
+        if self.selection.overlap_guided_issue:
+            base_order = self._schedule_fusion(trace, base_order)
+        return base_order
 
     def _schedule_fusion(self, trace: Trace, base_order: list[int]) -> list[int]:
         fusion_ids = [event_id for event_id in base_order if PrimitiveKind(
@@ -242,6 +246,7 @@ class CycleEngine:
             PrimitiveKind.FORWARD, PrimitiveKind.CONSUMER, PrimitiveKind.ADJOINT,
         }]
         packets = [self._task_packet(trace, event_id) for event_id in fusion_ids]
+        self.issue_scheduler.observe_arrival(packets)
         scheduled = [packet.event_id for packet in self.issue_scheduler.forecast(packets)]
         scheduled_iter = iter(scheduled)
         scheduled_set = set(fusion_ids)
@@ -259,34 +264,51 @@ class CycleEngine:
             PrimitiveKind.CONSUMER: TaskKind.CONSUMER,
             PrimitiveKind.ADJOINT: TaskKind.ADJOINT,
         }[kind]
-        relation_id = int(row["relation_id"])
         query_id = int(row["query_id"])
         gaussian_id = int(row["gaussian_id"])
         reduction_key = int(row["reduction_key"])
+        if task_kind is TaskKind.ADJOINT:
+            domain = ReductionDomain.GAUSSIAN
+            semantic_key = gaussian_id
+        else:
+            domain = ReductionDomain.QUERY
+            semantic_key = reduction_key if reduction_key >= 0 else query_id
+        if semantic_key < 0:
+            raise CycleConfigurationError(
+                f"{kind.name} event {event_id} lacks a semantic reduction key"
+            )
         return TaskPacket(
             event_id=event_id,
             query_id=max(query_id, 0),
             gaussian_id=max(gaussian_id, 0),
-            reduction_key=max(reduction_key, relation_id, event_id),
+            reduction_key=semantic_key,
             resource=int(row["resource_class"]),
+            reduction_domain=domain,
             state_version=int(row["state_version"]),
             template_id=int(row["template_id"]),
             address_token=int(row["address_token"]),
             task_kind=task_kind,
         )
 
-    def _mechanism_flags(self) -> tuple[bool, bool]:
-        """Return query-order and semantic-residency flags for this run."""
-        if self.policy in {"base", "variant:0000"}:
-            return False, False
-        if self.policy in {"query", "query_oracle"}:
-            return True, False
-        if self.policy in {"residency", "residency_oracle"}:
-            return False, True
-        if self.policy == "full":
-            return True, True
-        bits = self.policy.removeprefix("variant:")
-        return bits[0] == "1" or bits[2] == "1", bits[3] == "1"
+    @staticmethod
+    def _selection_for_policy(policy: str) -> MechanismSelection:
+        aliases = {
+            "base": "0000",
+            "query": "1010",
+            "residency": "0101",
+            "full": "1111",
+            "query_oracle": "1010",
+            "residency_oracle": "0101",
+        }
+        bits = aliases.get(policy, policy.removeprefix("variant:"))
+        return MechanismSelection(
+            query_load_rules=bits[0] == "1",
+            semantic_worksets=bits[1] == "1",
+            overlap_guided_issue=bits[2] == "1",
+            semantic_residency=bits[3] == "1",
+            query_oracle=policy == "query_oracle",
+            residency_oracle=policy == "residency_oracle",
+        )
 
     def _fusion_port_limit(self, kind: PrimitiveKind) -> tuple[str, int]:
         timing_ports = self.config.modules["fusion_issue"].ports
@@ -451,7 +473,7 @@ class CycleEngine:
         module_inflight = {name: 0 for name in self.modules}
         relation_seed_inflight = 0
         bank_busy: dict[tuple[str, int, int], int] = {}
-        residency_enabled = self._mechanism_flags()[1]
+        residency_enabled = self.selection.semantic_residency
         cache_states = (
             self._residency_states()
             if residency_enabled and self.config.cache_instances is not None
@@ -615,6 +637,19 @@ class CycleEngine:
             issued_modules: dict[str, int] = {}
             ordered_ids = self._ordered_candidates(trace, [item[0] for item in candidates])
             ordered = [(event_id, dict(candidates)[event_id]) for event_id in ordered_ids]
+            fusion_packets: dict[int, TaskPacket] = {}
+            fusion_selected: set[int] = set()
+            if self.selection.overlap_guided_issue:
+                for event_id, stage in ordered:
+                    kind = PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
+                    if stage == 0 and kind in {
+                        PrimitiveKind.FORWARD,
+                        PrimitiveKind.CONSUMER,
+                        PrimitiveKind.ADJOINT,
+                    }:
+                        fusion_packets[event_id] = self._task_packet(trace, event_id)
+                decision = self.issue_scheduler.select(fusion_packets.values())
+                fusion_selected = {task.event_id for task in decision.accepted}
             for event_id, stage in ordered:
                 row = trace.events[event_id]
                 kind = PrimitiveKind(int(row["primitive_kind"]))
@@ -622,16 +657,39 @@ class CycleEngine:
                 module_name = stages[stage]
                 module = self.modules[module_name]
                 timing = module.timing
+                if (
+                    module_name == "fusion_issue" and stage == 0
+                    and self.selection.overlap_guided_issue
+                    and event_id not in fusion_selected
+                ):
+                    module.counters.port_stalls += 1
+                    self._record_stall(
+                        cycle, module_name, "scheduler_conflict_or_port", event_id
+                    )
+                    heapq.heappush(ready, (event_id, stage))
+                    continue
                 if module_name == "fusion_issue" and stage == 0:
-                    if fusion_issued >= self.config.candidate_lanes:
+                    issue_limit = (
+                        self.config.candidate_lanes
+                        if self.selection.overlap_guided_issue else 1
+                    )
+                    if fusion_issued >= issue_limit:
                         module.counters.port_stalls += 1
-                        self._record_stall(cycle, module_name, "candidate_width", event_id)
+                        reason = (
+                            "candidate_width"
+                            if self.selection.overlap_guided_issue
+                            else "base_single_issue"
+                        )
+                        self._record_stall(cycle, module_name, reason, event_id)
                         heapq.heappush(ready, (event_id, stage))
                         continue
                 if not module.accepts_kind(kind):
                     raise CycleConfigurationError(f"{module_name} does not accept {kind.name}")
                 fusion_port_name: str | None = None
-                if module_name == "fusion_issue" and stage == 0:
+                if (
+                    module_name == "fusion_issue" and stage == 0
+                    and self.selection.overlap_guided_issue
+                ):
                     fusion_port_name, fusion_port_limit = self._fusion_port_limit(kind)
                     if fusion_port_issued.get(fusion_port_name, 0) >= fusion_port_limit:
                         module.counters.port_stalls += 1
@@ -778,10 +836,12 @@ class CycleEngine:
                 issued_modules[module_name] = issued_modules.get(module_name, 0) + 1
                 if module_name == "fusion_issue" and stage == 0:
                     fusion_issued += 1
-                    assert fusion_port_name is not None
-                    fusion_port_issued[fusion_port_name] = (
-                        fusion_port_issued.get(fusion_port_name, 0) + 1
-                    )
+                    if self.selection.overlap_guided_issue:
+                        self.issue_scheduler.commit_issued((fusion_packets[event_id],))
+                    if fusion_port_name is not None:
+                        fusion_port_issued[fusion_port_name] = (
+                            fusion_port_issued.get(fusion_port_name, 0) + 1
+                        )
                 progressed = True
             if not progressed:
                 memory_wakeup = (

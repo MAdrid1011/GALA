@@ -9,7 +9,10 @@ from .events import (
     UpdateBeginKind,
 )
 from .builder import ChunkedTraceBuilder, TraceBuilder, TraceChunkManifest
-from .tasks import FusionIssueScheduler, IssueDecision, QueryState, TaskKind, TaskPacket
+from .tasks import (
+    FusionIssueScheduler, IssueDecision, QueryState, ReductionDomain, TaskKind,
+    TaskPacket,
+)
 
 __all__ = [
     "EVENT_SCHEMA_VERSION",
@@ -19,5 +22,6 @@ __all__ = [
     "ResourceClass",
     "TraceEvent",
     "TraceBuilder", "ChunkedTraceBuilder", "TraceChunkManifest",
-    "FusionIssueScheduler", "IssueDecision", "QueryState", "TaskKind", "TaskPacket",
+    "FusionIssueScheduler", "IssueDecision", "QueryState", "ReductionDomain",
+    "TaskKind", "TaskPacket",
 ]

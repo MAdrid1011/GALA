@@ -13,6 +13,11 @@ class TaskKind(IntEnum):
     ADJOINT = 3
 
 
+class ReductionDomain(IntEnum):
+    QUERY = 1
+    GAUSSIAN = 2
+
+
 @dataclass(frozen=True)
 class TaskPacket:
     event_id: int
@@ -24,11 +29,18 @@ class TaskPacket:
     template_id: int
     address_token: int
     task_kind: TaskKind
+    reduction_domain: ReductionDomain = ReductionDomain.QUERY
 
     def __post_init__(self) -> None:
         if min(self.event_id, self.query_id, self.gaussian_id, self.reduction_key,
                self.state_version, self.template_id, self.address_token) < 0:
             raise ValueError("task packet identifiers must be non-negative")
+        if not isinstance(self.reduction_domain, ReductionDomain):
+            raise ValueError("task packet reduction domain is invalid")
+
+    @property
+    def conflict_key(self) -> tuple[ReductionDomain, int]:
+        return self.reduction_domain, self.reduction_key
 
 
 @dataclass
@@ -88,20 +100,46 @@ class FusionIssueScheduler:
     adjoint_ports: int
     states: dict[int, QueryState] = field(default_factory=dict)
     _observed: set[int] = field(default_factory=set, init=False, repr=False)
+    _issued: set[int] = field(default_factory=set, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if min(self.candidate_lanes, self.forward_ports, self.consumer_ports, self.adjoint_ports) <= 0:
             raise ValueError("fusion issue widths must be positive")
 
-    def forecast(self, candidates: Iterable[TaskPacket]) -> list[TaskPacket]:
-        candidates = list(candidates)
+    def observe_arrival(self, candidates: Iterable[TaskPacket]) -> None:
+        """Record each task once when it reaches an issue input queue."""
+
         for task in candidates:
             if task.event_id not in self._observed:
                 self.states.setdefault(task.query_id, QueryState()).observe(task)
                 self._observed.add(task.event_id)
+
+    def forecast(self, candidates: Iterable[TaskPacket]) -> list[TaskPacket]:
+        """Order candidates without mutating scheduler state."""
+
+        candidates = list(candidates)
         return sorted(candidates, key=self._sort_key)
 
-    def issue(self, candidates: Iterable[TaskPacket], *, occupied_keys: set[int] | None = None) -> IssueDecision:
+    def issue(
+        self,
+        candidates: Iterable[TaskPacket],
+        *,
+        occupied_keys: set[tuple[ReductionDomain, int]] | None = None,
+    ) -> IssueDecision:
+        candidates = list(candidates)
+        self.observe_arrival(candidates)
+        decision = self.select(candidates, occupied_keys=occupied_keys)
+        self.commit_issued(decision.accepted)
+        return decision
+
+    def select(
+        self,
+        candidates: Iterable[TaskPacket],
+        *,
+        occupied_keys: set[tuple[ReductionDomain, int]] | None = None,
+    ) -> IssueDecision:
+        """Choose conflict-free candidates without committing issue state."""
+
         ordered = self.forecast(candidates)
         occupied_keys = set(occupied_keys or ())
         accepted: list[TaskPacket] = []
@@ -113,18 +151,24 @@ class FusionIssueScheduler:
                 TaskKind.CONSUMER: self.consumer_ports,
                 TaskKind.ADJOINT: self.adjoint_ports,
             }[task.task_kind]
-            if used_ports[task.task_kind] >= limit or task.reduction_key in occupied_keys:
+            if used_ports[task.task_kind] >= limit or task.conflict_key in occupied_keys:
                 rejected.append(task)
                 continue
             accepted.append(task)
-            occupied_keys.add(task.reduction_key)
+            occupied_keys.add(task.conflict_key)
             used_ports[task.task_kind] += 1
         rejected.extend(ordered[self.candidate_lanes:])
         reason = "conflict_or_port" if rejected else None
         return IssueDecision(tuple(accepted), tuple(rejected), reason)
 
+    def commit_issued(self, tasks: Iterable[TaskPacket]) -> None:
+        for task in tasks:
+            if task.event_id in self._issued:
+                raise ValueError(f"task {task.event_id} was issued more than once")
+            self._issued.add(task.event_id)
+
     def _sort_key(self, task: TaskPacket) -> tuple[int, int, int, int]:
-        forecast = self.states[task.query_id].forecast()
+        forecast = self.states.get(task.query_id, QueryState()).forecast()
         priority = {
             TaskKind.FORWARD: forecast[0],
             TaskKind.CONSUMER: forecast[1],

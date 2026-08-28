@@ -9,6 +9,7 @@ import pytest
 from gala_sim.clamp import (
     ChunkedTraceBuilder,
     PrimitiveKind,
+    ReductionDomain,
     ResourceClass,
     TraceBuilder,
     TraceEvent,
@@ -531,12 +532,22 @@ def test_fusion_issue_uses_independent_forward_consumer_and_adjoint_ports() -> N
         relation_seed_fifo_entries=8, candidate_lanes=3,
         fusion_forward_ports=1, fusion_consumer_ports=1, fusion_adjoint_ports=1,
     )
-    independent = CycleEngine(independent_port_config).run(_fusion_port_trace())
+    independent = CycleEngine(
+        independent_port_config, policy="variant:0010"
+    ).run(_fusion_port_trace())
     independent_fusion_stalls = [
         stall for stall in independent.stalls
         if stall.module == "fusion_issue" and stall.reason == "port"
     ]
     assert not independent_fusion_stalls
+
+    base = CycleEngine(
+        independent_port_config, policy="variant:0000"
+    ).run(_fusion_port_trace())
+    assert any(
+        stall.module == "fusion_issue" and stall.reason == "base_single_issue"
+        for stall in base.stalls
+    )
 
 
 def test_fusion_issue_applies_each_task_class_port_limit() -> None:
@@ -558,10 +569,86 @@ def test_fusion_issue_applies_each_task_class_port_limit() -> None:
         relation_seed_fifo_entries=8, candidate_lanes=3,
         fusion_forward_ports=1, fusion_consumer_ports=1, fusion_adjoint_ports=1,
     )
-    result = CycleEngine(config).run(builder.finish())
+    result = CycleEngine(config, policy="variant:0010").run(builder.finish())
     assert any(
-        stall.module == "fusion_issue" and stall.reason == "port"
+        stall.module == "fusion_issue"
+        and stall.reason == "scheduler_conflict_or_port"
         for stall in result.stalls
+    )
+
+
+@pytest.mark.parametrize("policy,expected", [
+    ("variant:0000", (False, False, False, False)),
+    ("variant:1000", (True, False, False, False)),
+    ("variant:0100", (False, True, False, False)),
+    ("variant:0010", (False, False, True, False)),
+    ("variant:0001", (False, False, False, True)),
+    ("variant:1111", (True, True, True, True)),
+    ("query", (True, False, True, False)),
+    ("residency", (False, True, False, True)),
+])
+def test_cycle_policy_preserves_independent_mechanism_bits(
+    policy: str, expected: tuple[bool, bool, bool, bool],
+) -> None:
+    selection = CycleEngine(_config(), policy=policy).selection
+    assert (
+        selection.query_load_rules,
+        selection.semantic_worksets,
+        selection.overlap_guided_issue,
+        selection.semantic_residency,
+    ) == expected
+
+
+def test_task_packet_uses_semantic_reduction_domain_and_not_event_id() -> None:
+    builder = TraceBuilder()
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.FORWARD), query_id=7,
+        gaussian_id=3, relation_id=11, reduction_key=-1,
+        resource_class=int(ResourceClass.ISSUE),
+    ))
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.ADJOINT), query_id=7,
+        gaussian_id=3, relation_id=11, reduction_key=-1,
+        resource_class=int(ResourceClass.ISSUE),
+    ))
+    trace = builder.finish()
+    forward = CycleEngine._task_packet(trace, 0)
+    adjoint = CycleEngine._task_packet(trace, 1)
+    assert (forward.reduction_domain, forward.reduction_key) == (
+        ReductionDomain.QUERY, 7,
+    )
+    assert (adjoint.reduction_domain, adjoint.reduction_key) == (
+        ReductionDomain.GAUSSIAN, 3,
+    )
+
+
+def test_overlap_issue_rejects_same_query_reduction_in_one_cycle() -> None:
+    builder = TraceBuilder()
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.FORWARD), query_id=0,
+        gaussian_id=0, relation_id=0, reduction_key=0, address_token=0,
+        resource_class=int(ResourceClass.ISSUE),
+    ))
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CONSUMER), query_id=0,
+        gaussian_id=1, consumer_id=0, reduction_key=0, address_token=1,
+        resource_class=int(ResourceClass.ISSUE),
+    ))
+    timing = ModuleTiming(
+        latency=1, initiation_interval=1, queue_capacity=8, ports=3, banks=4,
+    )
+    config = CycleConfig(
+        modules={name: timing for name in (
+            "relation_constructor", "fusion_issue", "semantic_cache", "compute_pod",
+            "bidirectional_query", "reconstruction_update", "shared_sram",
+        )},
+        memory=_Memory(), clock_frequency_hz=500_000_000,
+        relation_seed_fifo_entries=8, candidate_lanes=3,
+        fusion_forward_ports=1, fusion_consumer_ports=1, fusion_adjoint_ports=1,
+    )
+    result = CycleEngine(config, policy="variant:0010").run(builder.finish())
+    assert any(
+        stall.reason == "scheduler_conflict_or_port" for stall in result.stalls
     )
 
 
