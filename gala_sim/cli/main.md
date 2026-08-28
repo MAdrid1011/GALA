@@ -20,6 +20,12 @@
 
 `cycle-replay --throughput-progress` 按完整迭代输出运行健康状态、墙钟事件吞吐、每事件模拟周期、总周期投影和按配置时钟换算的 ASIC 秒数。只有显式增加 `--stop-when-throughput-stable` 才允许稳定窗口提前结束；该路径要求输出目录不存在或为空，只写 `throughput.json`、非正式 manifest 和标明非正式资格的状态记录，不写 `cycles.json`。不带早停选项时始终保留完整重放语义。公开规格 extrapolation 不接入周期诊断，也不生成任何 `speedup_vs_orin` 字段。
 
+`cycle-replay --compute-telemetry` 额外保存每个 ComputePod 事件的依赖就绪、融合发射、查询发射、
+计算发射和完成周期，以及二十簇 active-microcontext 占用的无损区间编码。该开关只采集诊断，不能
+改变周期决策。ComputePod 资源停顿在 `stalls.parquet` 中同时记录首个阻塞资源、Pod、簇、冲突
+周期、已用量、需求量和容量。Oracle portfolio 的 Base、actual 和 future 成员分别保存到
+`oracle_members/`，主目录仍表示胜者。
+
 所有 `cycle-replay` 运行都启用配置化 inactivity watchdog。准备阶段以阶段切换或显著进程 CPU 时间作为推进；正式 replay 阶段只有完成事件数或完成迭代数增长才续时，周期心跳与日志打印本身不续时。连续达到门限后输出固定为 `failed_cycle/watchdog_inactivity_timeout`，不写 `cycles.json`。
 
 ## Internal Helpers

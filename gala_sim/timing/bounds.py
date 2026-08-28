@@ -90,13 +90,17 @@ def _event_service_cycles(
             physical_stage = packet_plan.stage_for_event(int(event_id))
             if physical_stage is None:
                 compute_cycles = engine._service_cycles("compute_pod", row, kind)
-            else:
+            elif kind is PrimitiveKind.FORWARD:
                 compute = engine.modules["compute_pod"]
                 path = compute.path_for(int(row["template_id"]), kind)
                 lane = physical_stage.lanes[
                     physical_stage.event_ids.index(int(event_id))
                 ]
                 compute_cycles = path.packet_completion_offset(lane)
+            else:
+                compute_cycles = engine._physical_service_cycles(
+                    "compute_pod", row, kind, physical_stage,
+                )
             service[int(event_id)] = generic_cycles + compute_cycles
     return service
 
@@ -184,6 +188,8 @@ def _module_components(
 ) -> list[CycleBoundComponent]:
     components: list[CycleBoundComponent] = []
     for module_name, module in engine.modules.items():
+        if module_name == "bidirectional_query" and engine._has_query_resources():
+            continue
         items = _module_work_items(engine, trace, module_name, packet_plan)
         if not items:
             continue
@@ -285,6 +291,106 @@ def _module_components(
                 },
                 limitation="Assumes one issue per bank per cycle and the shortest possible final service.",
             ))
+    return components
+
+
+def _query_components(
+    engine: Any, trace: Trace, packet_plan: RelationPacketPlan,
+) -> list[CycleBoundComponent]:
+    if not engine._has_query_resources():
+        return []
+    banks = engine.config.query_reduction_banks
+    loss_lanes = engine.config.query_loss_fma_lanes
+    replay_lanes = engine.config.query_adjoint_replay_lanes
+    groups = engine.config.query_partial_sum_groups_per_bank
+    assert banks is not None and loss_lanes is not None
+    assert replay_lanes is not None and groups is not None
+    timing = engine.modules["bidirectional_query"].timing
+    kinds = trace.events["primitive_kind"]
+
+    reduction_ids = np.flatnonzero(np.isin(kinds, [
+        int(PrimitiveKind.FORWARD), int(PrimitiveKind.QUERY_REDUCTION),
+    ]))
+    bank_counts = np.bincount(
+        np.asarray(trace.events["query_id"][reduction_ids] % banks, dtype=np.int64),
+        minlength=banks,
+    )
+    busiest_bank = int(np.max(bank_counts, initial=0))
+    components = [CycleBoundComponent(
+        name="bidirectional_query.reduction_banks",
+        category="query_reduction",
+        cycles=_issue_completion_bound(
+            busiest_bank,
+            ports=1,
+            initiation_interval=timing.initiation_interval,
+            minimum_service=timing.latency,
+        ),
+        evidence={
+            "logical_forward_contributions": int(np.count_nonzero(
+                kinds == int(PrimitiveKind.FORWARD)
+            )),
+            "query_completion_events": int(np.count_nonzero(
+                kinds == int(PrimitiveKind.QUERY_REDUCTION)
+            )),
+            "reduction_banks": banks,
+            "partial_sum_groups_per_bank": groups,
+            "busiest_bank_events": busiest_bank,
+        },
+        limitation="Assumes all banks are independently fed and every contribution is ready.",
+    )]
+
+    consumers = int(np.count_nonzero(kinds == int(PrimitiveKind.CONSUMER)))
+    components.append(CycleBoundComponent(
+        name="bidirectional_query.loss_fma_lanes",
+        category="query_loss",
+        cycles=_issue_completion_bound(
+            consumers,
+            ports=1,
+            initiation_interval=timing.initiation_interval,
+            minimum_service=timing.latency,
+        ),
+        evidence={
+            "consumer_events": consumers,
+            "fma_lanes_per_consumer": loss_lanes,
+        },
+        limitation="One consumer occupies the frozen vector loss datapath; dependencies are free.",
+    ))
+
+    replay_counts = np.zeros(replay_lanes, dtype=np.int64)
+    seen_stages: set[int] = set()
+    adjoint_ids = np.flatnonzero(kinds == int(PrimitiveKind.ADJOINT))
+    physical_packets = 0
+    for raw_event_id in adjoint_ids:
+        event_id = int(raw_event_id)
+        physical_stage = packet_plan.stage_for_event(event_id)
+        if physical_stage is None:
+            replay_counts[int(trace.events[event_id]["query_id"]) % replay_lanes] += 1
+            physical_packets += 1
+            continue
+        if physical_stage.stage_id in seen_stages:
+            continue
+        seen_stages.add(physical_stage.stage_id)
+        replay_counts[list(physical_stage.lanes)] += 1
+        physical_packets += 1
+    busiest_replay = int(np.max(replay_counts, initial=0))
+    components.append(CycleBoundComponent(
+        name="bidirectional_query.adjoint_replay_lanes",
+        category="query_adjoint_replay",
+        cycles=_issue_completion_bound(
+            busiest_replay,
+            ports=1,
+            initiation_interval=timing.initiation_interval,
+            minimum_service=timing.latency,
+        ),
+        evidence={
+            "physical_adjoint_packets": physical_packets,
+            "logical_adjoint_lanes": int(adjoint_ids.size),
+            "replay_lanes": replay_lanes,
+            "events_per_replay_lane": replay_counts.tolist(),
+            "busiest_replay_lane_events": busiest_replay,
+        },
+        limitation="Preserves fixed packet lane positions and assumes all replay dependencies are ready.",
+    ))
     return components
 
 
@@ -574,6 +680,7 @@ def analyze_cycle_lower_bounds(
     shared_components.extend(_module_components(engine, trace, packet_plan))
     shared_components.extend(_fusion_components(engine, trace, packet_plan))
     shared_components.extend(_compute_components(engine, trace, packet_plan))
+    shared_components.extend(_query_components(engine, trace, packet_plan))
 
     scenarios: list[ScenarioCycleBound] = []
     for scenario in ("query", "residency", "full"):

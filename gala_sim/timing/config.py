@@ -179,6 +179,19 @@ class CycleConfig:
     config_sha256: str | None = None
     compute_templates: Mapping[int, ComputeTemplateProfile] | None = None
     compute_resource_capacities: Mapping[str, int] | None = None
+    owner_gradient_slots_per_cluster: int | None = None
+    query_reduction_banks: int | None = None
+    query_partial_sum_groups_per_bank: int | None = None
+    query_loss_fma_lanes: int | None = None
+    query_loss_queries_per_cycle: int | None = None
+    query_adjoint_replay_lanes: int | None = None
+    query_replay_queue_entries: int | None = None
+    query_relation_window_entries: int | None = None
+    query_relation_window_entry_bytes: int | None = None
+    query_relation_store_banks: int | None = None
+    query_relation_store_records: int | None = None
+    query_volume_banks: int | None = None
+    query_volume_word_bytes: int | None = None
     memory_peak_bandwidth_bytes_per_second: int | None = None
 
     def __post_init__(self) -> None:
@@ -218,6 +231,45 @@ class CycleConfig:
             if any(not isinstance(name, str) or not name or int(value) <= 0
                    for name, value in self.compute_resource_capacities.items()):
                 raise ValueError("compute resource capacities must be positive")
+        if (
+            self.owner_gradient_slots_per_cluster is not None
+            and self.owner_gradient_slots_per_cluster <= 0
+        ):
+            raise ValueError("owner-gradient slot capacity must be positive")
+        query_values = (
+            self.query_reduction_banks,
+            self.query_partial_sum_groups_per_bank,
+            self.query_loss_fma_lanes,
+            self.query_loss_queries_per_cycle,
+            self.query_adjoint_replay_lanes,
+            self.query_replay_queue_entries,
+            self.query_relation_window_entries,
+            self.query_relation_window_entry_bytes,
+            self.query_relation_store_banks,
+            self.query_relation_store_records,
+            self.query_volume_banks,
+            self.query_volume_word_bytes,
+        )
+        if any(value is not None and value <= 0 for value in query_values):
+            raise ValueError("optional query resource values must be positive")
+        if any(value is None for value in query_values) and any(
+            value is not None for value in query_values
+        ):
+            raise ValueError("query execution resources must be configured together")
+        if (
+            self.query_partial_sum_groups_per_bank is not None
+            and self.query_partial_sum_groups_per_bank
+            < self.modules["bidirectional_query"].latency
+        ):
+            raise ValueError(
+                "query partial-sum groups cannot expose an FP32 feedback hazard"
+            )
+        if (
+            self.query_loss_fma_lanes is not None
+            and self.query_loss_queries_per_cycle is not None
+            and self.query_loss_fma_lanes % self.query_loss_queries_per_cycle
+        ):
+            raise ValueError("query loss FMA lanes must divide into query issue lanes")
         if (
             self.memory_peak_bandwidth_bytes_per_second is not None
             and self.memory_peak_bandwidth_bytes_per_second <= 0
@@ -286,6 +338,8 @@ class CycleConfig:
                    config_sha256=config.sha256,
                    compute_templates=compute_templates,
                    compute_resource_capacities={
+                       "pods": int(config.value("top.num_pods")),
+                       "clusters_per_pod": int(config.value("compute.clusters_per_pod")),
                        "clusters": clusters,
                        "cluster_issue": clusters * int(
                            config.value("compute.cluster_issue_slots_per_cluster")
@@ -299,6 +353,39 @@ class CycleConfig:
                        ),
                        "feedback_lanes": clusters * int(config.value("compute.boundary_selectors_per_cluster")),
                    },
+                   owner_gradient_slots_per_cluster=int(
+                       config.value("compute.owner_gradient_slots_per_cluster")
+                   ),
+                   query_reduction_banks=int(config.value("query.reduction_banks")),
+                   query_partial_sum_groups_per_bank=int(
+                       config.value("query.partial_sum_groups_per_bank")
+                   ),
+                   query_loss_fma_lanes=int(config.value("query.loss_fma_lanes")),
+                   query_loss_queries_per_cycle=int(
+                       config.value("query.loss_queries_per_cycle")
+                   ),
+                   query_adjoint_replay_lanes=int(
+                       config.value("query.adjoint_replay_lanes")
+                   ),
+                   query_replay_queue_entries=int(
+                       config.value("query.replay_queue_entries")
+                   ),
+                   query_relation_window_entries=int(
+                       config.value("query.relation_window_entries")
+                   ),
+                   query_relation_window_entry_bytes=int(
+                       config.value("query.relation_window_entry_bytes")
+                   ),
+                   query_relation_store_banks=int(
+                       config.value("query.relation_store_banks")
+                   ),
+                   query_relation_store_records=int(
+                       config.value("query.relation_store_records")
+                   ),
+                   query_volume_banks=int(config.value("query.query_volume_banks")),
+                   query_volume_word_bytes=int(
+                       config.value("query.query_volume_word_bytes")
+                   ),
                    memory_peak_bandwidth_bytes_per_second=int(
                        config.value("memory.peak_bandwidth_bytes_per_second")
                    ))
@@ -398,14 +485,21 @@ def _resource_usage_from_gala(config: GalaConfig) -> ResourceUsage:
         pods = int(config.value("top.num_pods"))
         clusters_per_pod = int(config.value("compute.clusters_per_pod"))
         clusters = pods * clusters_per_pod
-        active_sram = pods * int(config.value("cache.active_sram_bytes_per_instance"))
-        microcontexts = clusters * int(config.value("compute.microcontext_bytes_per_cluster"))
         regions = {
-            "semantic_cache_active": active_sram,
-            "compute_microcontexts": microcontexts,
+            "active_gaussian": int(config.value("shared_sram.active_gaussian_bytes")),
+            "relation_window": int(config.value("shared_sram.relation_window_bytes")),
+            "query_volume": int(config.value("shared_sram.query_volume_bytes")),
+            "gradient_update": int(config.value("shared_sram.gradient_update_bytes")),
+            "index_graph": int(config.value("shared_sram.index_graph_bytes")),
+            "control_metadata": int(config.value("shared_sram.control_metadata_bytes")),
         }
+        registered_shared_sram = int(config.value("top.shared_sram_bytes"))
+        if sum(regions.values()) != registered_shared_sram:
+            raise ValueError(
+                "registered shared SRAM regions do not exactly close the top-level budget"
+            )
         return ResourceUsage(
-            shared_sram_bytes=sum(regions.values()),
+            shared_sram_bytes=registered_shared_sram,
             pods=pods,
             clusters=clusters,
             fma_lanes=clusters * int(config.value("compute.fma_lanes_per_cluster")),

@@ -96,10 +96,9 @@ def captured_virtual_packet(spec: CapturedPacketSpec) -> VirtualTracePacket:
     }.get(spec.template_id)
     if expected_shape is None:
         raise ValueError(f"unsupported captured packet template {spec.template_id}")
-    if spec.query_shape != expected_shape or spec.tile_id != 0:
+    if spec.query_shape != expected_shape:
         raise ValueError(
-            "captured packet quick samples require one canonical tile/brick rebased "
-            "to tile zero"
+            "captured packet quick samples require one canonical tile/brick shape"
         )
     candidates = _record_array(spec.candidate_records)
     relations = _record_array(spec.relation_records)
@@ -159,13 +158,21 @@ def captured_virtual_packet(spec: CapturedPacketSpec) -> VirtualTracePacket:
         np.bitwise_or.at(masks, (local_candidates, words), bits)
 
     packet_candidates = candidates[selected]
+    packet_point_keys = np.asarray(
+        packet_candidates[:, 3].view(np.uint64), dtype=np.uint64,
+    )
+    # VirtualTracePacket contains one canonical domain.  Preserve the
+    # captured low key while rebasing the selected global tile to local zero.
+    packet_point_keys = np.bitwise_and(
+        packet_point_keys, np.uint64((1 << 32) - 1),
+    )
     return VirtualTracePacket(
         iteration_id=spec.iteration_id,
         template_id=spec.template_id,
         query_base=spec.query_base,
         query_shape=spec.query_shape,
         point_ids=np.asarray(packet_candidates[:, 2], dtype=np.int64),
-        point_keys=np.asarray(packet_candidates[:, 3].view(np.uint64), dtype=np.uint64),
+        point_keys=packet_point_keys,
         masks=masks,
         state_version=spec.state_version,
         field_mask=spec.field_mask,

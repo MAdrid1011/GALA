@@ -103,6 +103,9 @@ def test_query_oracle_uses_future_path_without_dropping_events() -> None:
         )
     trace = builder.finish()
 
+    base = CycleEngine(_config(), policy="base").run(
+        trace, validate_input=False
+    )
     actual = CycleEngine(_config(), policy="query").run(
         trace, validate_input=False
     )
@@ -120,9 +123,33 @@ def test_query_oracle_uses_future_path_without_dropping_events() -> None:
     assert oracle.oracle_portfolio.winner == "future"
     assert [(member.name, member.status, member.total_cycles)
             for member in oracle.oracle_portfolio.members] == [
+        ("base", "passed", base.total_cycles),
         ("actual", "passed", actual.total_cycles),
         ("future", "passed", oracle.total_cycles),
     ]
+    assert oracle.oracle_member_results is not None
+    assert set(oracle.oracle_member_results) == {"base", "actual", "future"}
+    assert oracle.oracle_member_results["actual"].stalls == actual.stalls
+
+
+def test_oracle_portfolio_can_decline_a_harmful_mechanism() -> None:
+    builder = TraceBuilder()
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.QUERY_REDUCTION), query_id=0,
+        reduction_key=0,
+    ))
+    trace = builder.finish()
+
+    result = CycleEngine(_config(), policy="residency_oracle").run(
+        trace, validate_input=False,
+    )
+
+    assert result.oracle_portfolio is not None
+    assert result.oracle_portfolio.winner == "base"
+    assert result.total_cycles == next(
+        member.total_cycles for member in result.oracle_portfolio.members
+        if member.name == "base"
+    )
 
 
 def test_query_oracle_selects_exact_legal_combination_from_bounded_queue() -> None:

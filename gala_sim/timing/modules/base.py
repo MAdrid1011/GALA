@@ -36,6 +36,13 @@ class StallRecord:
     reason: str
     event_ids: tuple[int, ...]
     count: int = 1
+    resource: str | None = None
+    pod: int | None = None
+    cluster: int | None = None
+    resource_cycle: int | None = None
+    resource_in_use: int | None = None
+    resource_demand: int | None = None
+    resource_capacity: int | None = None
 
 
 @dataclass(frozen=True)

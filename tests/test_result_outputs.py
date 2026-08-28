@@ -18,7 +18,7 @@ def test_run_output_writer_emits_machine_readable_cycle_files(tmp_path: Path) ->
         memory=_Memory(), clock_frequency_hz=1, relation_seed_fifo_entries=1,
         candidate_lanes=1,
     )
-    result = CycleEngine(config).run(_trace())
+    result = CycleEngine(config).run(_trace(), collect_compute_telemetry=True)
     writer = RunOutputWriter(tmp_path / "run")
     writer.write_cycles(result)
     writer.write_quality({"status": "not_run"})
@@ -31,4 +31,7 @@ def test_run_output_writer_emits_machine_readable_cycle_files(tmp_path: Path) ->
     assert (tmp_path / "run" / "cycles.json").is_file()
     assert (tmp_path / "run" / "stalls.parquet").is_file()
     assert (tmp_path / "run" / "memory_requests.parquet").is_file()
+    assert (tmp_path / "run" / "compute_event_timing.parquet").is_file()
+    assert (tmp_path / "run" / "compute_cluster_occupancy.parquet").is_file()
+    assert (tmp_path / "run" / "compute_telemetry.json").is_file()
     assert (tmp_path / "run" / "status.json").is_file()

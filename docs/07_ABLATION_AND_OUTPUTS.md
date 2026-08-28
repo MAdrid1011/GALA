@@ -27,13 +27,17 @@
 speedup_vs_base_asic = cycles_0000 / cycles_variant
 ```
 
-平台级结果再报告相对于 AGX Orin 的加速比。
+只有在同一校准套件、数据类型和批量范围下取得 AGX Orin 实测向量后，平台级结果才报告相对于
+AGX Orin 的加速比。
 
 ```text
 speedup_vs_orin = orin_normalized_seconds * clock_hz / cycles_variant
 ```
 
-结果表必须同时包含绝对周期、相对于 Base ASIC 的加速比、本地 GPU 原始时间、AGX Orin 换算时间和相对于 Orin 的加速比。Oracle 结果独立标记，不能与实际机制结果混入同一几何平均。
+结果表必须包含绝对周期、相对于 Base ASIC 的加速比和本地 GPU 原始时间。缺少同套件 Orin 实测
+时，AGX Orin 换算时间和 `speedup_vs_orin` 固定为 `unavailable`，不得用公开规格 extrapolation
+补值，也不得用于锚点、数量级检查、方向判断或达标门槛。Oracle 结果独立标记，不能与实际机制
+结果混入同一几何平均。
 
 ## 4. 输出文件
 
@@ -47,10 +51,12 @@ speedup_vs_orin = orin_normalized_seconds * clock_hz / cycles_variant
 | `memory_requests.parquet` | 每个片外请求的地址、读写、字节数、到达周期和 Ramulator 2 返回周期 |
 | `events.json` | 事件计数、缓存和发射统计 |
 | `quality.json` | CUDA 参考和功能重放的 PSNR、SSIM、LPIPS |
-| `gpu_reference.json` | 本地 GPU 时间、校准项和 Orin 换算 |
+| `gpu_reference.json` | 本地 GPU 时间、校准项，以及可用时的同套件 Orin 实测换算 |
 | `status.json` | 运行状态、失败原因和验收结果 |
 
-活动组合汇总为 `ablation.csv`。表中每行绑定模型、数据集、开关位、绝对周期、两种加速比、质量差异和配置哈希。结果生成器只读取这些机器可读文件，不允许手工填写论文表格。
+活动组合汇总为 `ablation.csv`。表中每行绑定模型、数据集、开关位、绝对周期、相对 Base ASIC
+的加速比、质量差异和配置哈希；Orin 字段只有取得同套件实测时才填写，否则保持 `unavailable`。
+结果生成器只读取这些机器可读文件，不允许手工填写论文表格。
 
 ## 5. 一致性断言
 
@@ -58,5 +64,5 @@ speedup_vs_orin = orin_normalized_seconds * clock_hz / cycles_variant
 - 所有组合的动态有效关系数、数值任务数和更新提交数一致
 - 仅允许调度顺序、缓存事件、停顿原因和周期数变化
 - 相对于 Base ASIC 的加速比统一使用同一任务的 `0000`
-- 相对于 Orin 的加速比统一使用同一任务的分阶段换算时间
+- 相对于 Orin 的加速比仅在同套件 Orin 实测可用时计算，并统一使用同一任务的分阶段换算时间
 - 任一质量越界时，该组合不进入性能汇总

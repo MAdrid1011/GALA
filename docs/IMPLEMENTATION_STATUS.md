@@ -213,6 +213,30 @@ Bank、每 Bank 四组部分和、32 条 loss FMA lane 和 8 条伴随重放流�
 形成约 `24,935-cycle` 的串行瓶颈，使两类机制失去可优化空间。下一入口是修正或证明上述资源与阶段
 映射，并公平重跑同一 Base、两个 Oracle 和必要下界；确认之前不启动十六项消融。
 
-完整测试当前为 `268 passed, 1 skipped, 2 warnings`。`3341x`、`3495x` 和所有公开规格
+上述 `36,093-cycle` 结果已被后续硬件合同修正取代，不能继续作为当前配置下的 Base 或 Oracle
+结果。周期引擎现已分别建模查询归约、loss、伴随重放、query-volume SRAM、关系窗口、关系记录
+SRAM、owner-gradient epoch 槽和 ComputePod 模板资源；共享 SRAM 也改为 active Gaussian、关系
+窗口、query volume、gradient/update、index/graph 和 control metadata 六区账本，总量
+`2,883,584 bytes`。新的 Ramulator 2 native bridge 预检已在四个 Pod、二十个 cluster、八个
+LPDDR5 channel 和该六区资源包络下通过。
+
+真实中位 raster tile 最小样本包含 `356,353` 个事件、`554,381` 条依赖、`59,201` 条逻辑关系和
+`8,202` 个物理关系 packet。最初 Base 在 `cycle 64,324` 停于 `239,195/356,353` 个完成事件；
+诊断证明关系 SRAM 仅使用 `8,202/16,384` 条记录，而 owner-gradient 等待队列中有 `8,124` 个
+已 ready 的伴随 packet，其中 `1,156` 个可复用活动 epoch，但固定队首扫描看不到它们。调度器现按
+权威 C++ 的 owner-gradient 可接受性扫描等待集合，并把“八条 replay lane 暂忙”作为正常反压而非
+非法 packet 宽度。修复后 Base 完整闭合 `356,353/356,353` 个事件，结果为 `70,596 cycles`
+（500 MHz 下 `0.141192 ms`）；该单 tile 结果是 `quick_cycle_validation`，不外推到完整训练，也不与
+Orin 时间相除。可选 ComputePod 遥测同步保存 `177,603` 条事件时序和二十个 cluster 的无损占用
+区间。同一修复版本下，实际 Query 机制为 `70,593 cycles`，相对 Base ASIC 为
+`1.000042x`；future-visible、同资源 Query Oracle 为 `70,546 cycles`，对应 `1.000709x`。
+实际 Residency 机制为 `70,563 cycles`，对应 `1.000468x`；future-visible Residency Oracle
+没有优于 Base，因此 portfolio 保留实际机制为该组最佳已知成员。三者都是相同最小真实 trace 的
+周期比，不外推到完整训练。资源必要下界为 `8,616 cycles`，即只从必要条件看最多仍有 `8.19x`
+未排除空间；该下界假设其余冲突全部消失，不是可达性能、静态锚点或机制上界。当前真实 Oracle
+仅约 `1.0007x`，说明下一技术任务是解释并缩小必要下界与受约束可达调度之间的差距，而不是用
+Orin 外推构造达标数字。
+
+完整测试当前为 `280 passed, 1 skipped, 2 warnings`。`3341x`、`3495x` 和所有公开规格
 Orin extrapolation 已彻底退出性能判断，不能作为正式结果、静态锚点、数量级检查、方向判断或
 ASIC 达标门槛。Orin 平台结果保持 `unavailable`，直到取得同套件实测向量。

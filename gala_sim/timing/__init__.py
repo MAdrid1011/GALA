@@ -12,8 +12,12 @@ from .engine import (
 from .resources import ResourceEnvelope, ResourceUsage
 from .packets import (
     PhysicalPacketStage, RelationPacketPlan, RelationPacketPlanError,
+    RelationWindowDescriptor, RelationWindowPlan,
 )
 from .memory import RecordedMemoryBackend
+from .telemetry import (
+    ComputeClusterOccupancyRun, ComputeEventTiming, ComputeTelemetry,
+)
 from .bounds import (
     CycleBoundComponent, CycleLowerBoundReport, ScenarioCycleBound,
     TargetReachability, analyze_cycle_lower_bounds,
@@ -21,4 +25,8 @@ from .bounds import (
 
 __all__ = ["AsyncMemoryBackend", "ComputePathProfile", "ComputeStage", "ComputeTemplateProfile", "CycleConfig", "ModuleTiming", "MemoryBackend", "CycleEngine", "CycleProgress", "CycleResult",
            "CycleConfigurationError", "CycleReplaySession", "BufferedVirtualCycleConsumer", "OraclePortfolio", "OraclePortfolioMember", "ResourceEnvelope", "ResourceUsage", "RecordedMemoryBackend", "CycleBoundComponent", "CycleLowerBoundReport", "ScenarioCycleBound", "TargetReachability", "analyze_cycle_lower_bounds"]
-__all__ += ["PhysicalPacketStage", "RelationPacketPlan", "RelationPacketPlanError"]
+__all__ += [
+    "PhysicalPacketStage", "RelationPacketPlan", "RelationPacketPlanError",
+    "RelationWindowDescriptor", "RelationWindowPlan",
+]
+__all__ += ["ComputeClusterOccupancyRun", "ComputeEventTiming", "ComputeTelemetry"]

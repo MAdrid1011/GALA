@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Mapping
+from typing import Mapping, Any
 
 import numpy as np
 
@@ -31,6 +31,273 @@ PACKETIZED_KINDS = RELATION_PACKET_STAGE_KINDS | {PrimitiveKind.QUERY_CLOSE}
 
 class RelationPacketPlanError(ValueError):
     """The trace cannot be mapped to legal physical RelationPackets."""
+
+
+@dataclass(frozen=True)
+class RelationWindowDescriptor:
+    """One hardware relation-window scope and its exact reference counts."""
+
+    window_id: int
+    relation_stage_heads: frozenset[int]
+    producer_event_ids: frozenset[int]
+    forward_stage_heads: frozenset[int]
+    consumer_event_ids: frozenset[int]
+    adjoint_event_ids: frozenset[int]
+
+    @property
+    def event_ids(self) -> tuple[int, ...]:
+        return tuple(sorted(
+            self.producer_event_ids
+            | self.forward_stage_heads
+            | self.consumer_event_ids
+            | self.adjoint_event_ids
+        ))
+
+    @property
+    def producer_references(self) -> int:
+        return len(self.producer_event_ids)
+
+    @property
+    def forward_references(self) -> int:
+        return len(self.forward_stage_heads)
+
+    @property
+    def consumer_references(self) -> int:
+        return len(self.consumer_event_ids)
+
+    @property
+    def adjoint_references(self) -> int:
+        return len(self.adjoint_event_ids)
+
+    @property
+    def relation_records(self) -> int:
+        return len(self.relation_stage_heads)
+
+
+@dataclass(frozen=True)
+class RelationWindowPlan:
+    """Policy-independent event-to-window identity from capture metadata."""
+
+    descriptors: tuple[RelationWindowDescriptor, ...]
+    event_to_window: np.ndarray
+
+    def __post_init__(self) -> None:
+        if self.event_to_window.dtype != np.dtype("<i8"):
+            raise ValueError("event-to-window map must use little-endian int64")
+        self.event_to_window.setflags(write=False)
+
+    @classmethod
+    def from_trace(
+        cls, trace: Trace, packet_plan: "RelationPacketPlan",
+    ) -> "RelationWindowPlan | None":
+        """Build quick-sample windows or require an explicit formal sidecar.
+
+        Formal traces may not infer hardware windows from event ordering.  The
+        current captured-packet quick format explicitly declares complete CUDA
+        source packets, each of which is small enough to represent one window.
+        """
+
+        explicit = trace.metadata.get("relation_windows")
+        if explicit is not None:
+            return cls._from_explicit(trace, packet_plan, explicit)
+        sample = trace.metadata.get("trace_sample")
+        if isinstance(sample, Mapping) and sample.get("result_scope") == "quick_cycle_validation":
+            packets = sample.get("packets")
+            if isinstance(packets, list) and packets:
+                return cls._from_quick_packets(trace, packet_plan, packets)
+        if trace.metadata.get("formal_performance_eligible") is True:
+            raise RelationPacketPlanError(
+                "formal cycle trace lacks an explicit relation-window sidecar"
+            )
+        return None
+
+    @classmethod
+    def from_event_packets(
+        cls,
+        packets: tuple[VirtualEventPacket, ...],
+        packet_plan: "RelationPacketPlan",
+        *,
+        window_id: int,
+    ) -> "RelationWindowPlan":
+        event_ids = tuple(
+            int(event_id) for packet in packets for event_id in packet.events["event_id"]
+        )
+        if not event_ids:
+            raise RelationPacketPlanError("relation window has no events")
+        event_base = min(event_ids)
+        event_end = max(event_ids) + 1
+        rows = np.concatenate([packet.events for packet in packets])
+        descriptor = cls._descriptor(
+            window_id, rows, packet_plan,
+            event_ids=event_ids,
+        )
+        event_to_window = np.full(event_end - event_base, -1, dtype=np.dtype("<i8"))
+        event_to_window[np.asarray(event_ids, dtype=np.int64) - event_base] = window_id
+        # Online callers retain the absolute descriptor IDs; the local lookup
+        # array is not used outside construction.
+        return cls((descriptor,), event_to_window)
+
+    @classmethod
+    def _from_quick_packets(
+        cls,
+        trace: Trace,
+        packet_plan: "RelationPacketPlan",
+        raw_packets: list[Any],
+    ) -> "RelationWindowPlan":
+        specs: list[tuple[int, int, int]] = []
+        for index, raw in enumerate(raw_packets):
+            if not isinstance(raw, Mapping):
+                raise RelationPacketPlanError("quick packet metadata is malformed")
+            try:
+                begin = int(raw["query_base"])
+                count = int(raw["query_count"])
+                candidates = int(raw["candidate_count"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise RelationPacketPlanError(
+                    "quick packet lacks query and candidate bounds"
+                ) from error
+            if min(begin, count, candidates) < 0 or count == 0:
+                raise RelationPacketPlanError("quick packet bounds are invalid")
+            specs.append((begin, begin + count, candidates))
+        for left, right, _count in specs:
+            if sum(other_left < right and left < other_right
+                   for other_left, other_right, _ in specs) != 1:
+                raise RelationPacketPlanError("quick packet query ranges overlap")
+
+        mapping = np.full(trace.event_count, -1, dtype=np.dtype("<i8"))
+        query_ids = trace.events["query_id"]
+        for window_id, (begin, end, _candidates) in enumerate(specs):
+            matched = (query_ids >= begin) & (query_ids < end)
+            if np.any(mapping[matched] >= 0):
+                raise RelationPacketPlanError("event belongs to multiple quick windows")
+            mapping[matched] = window_id
+
+        candidate_rows = np.flatnonzero(
+            trace.events["primitive_kind"] == int(PrimitiveKind.RELATION_CANDIDATE)
+        )
+        cursor = 0
+        for window_id, (_begin, _end, count) in enumerate(specs):
+            rows = candidate_rows[cursor:cursor + count]
+            if rows.size != count:
+                raise RelationPacketPlanError("quick packet candidate counts exceed trace")
+            mapping[rows] = window_id
+            cursor += count
+        if cursor != candidate_rows.size:
+            raise RelationPacketPlanError("quick packet candidate counts do not cover trace")
+
+        window_kinds = {
+            PrimitiveKind.RELATION_CANDIDATE, PrimitiveKind.RELATION,
+            PrimitiveKind.QUERY_CLOSE, PrimitiveKind.FORWARD,
+            PrimitiveKind.QUERY_REDUCTION, PrimitiveKind.CONSUMER,
+            PrimitiveKind.ADJOINT, PrimitiveKind.GRADIENT_REDUCTION,
+            PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN,
+        }
+        for event_id, row in enumerate(trace.events):
+            kind = PrimitiveKind(int(row["primitive_kind"]))
+            if kind in window_kinds and mapping[event_id] < 0:
+                raise RelationPacketPlanError(
+                    f"quick relation-window metadata does not cover event {event_id}"
+                )
+            if kind is PrimitiveKind.RELATION:
+                window_id = int(mapping[event_id])
+                for dependency in trace.dependency_ids(row):
+                    dependency_id = int(dependency)
+                    if PrimitiveKind(int(trace.events[dependency_id]["primitive_kind"])) is PrimitiveKind.RELATION_CANDIDATE and int(mapping[dependency_id]) != window_id:
+                        raise RelationPacketPlanError(
+                            "relation and candidate cross quick-window boundaries"
+                        )
+
+        descriptors = tuple(
+            cls._descriptor(
+                window_id,
+                trace.events[mapping == window_id],
+                packet_plan,
+                event_ids=tuple(np.flatnonzero(mapping == window_id).tolist()),
+            )
+            for window_id in range(len(specs))
+        )
+        return cls(descriptors, mapping)
+
+    @classmethod
+    def _from_explicit(
+        cls, trace: Trace, packet_plan: "RelationPacketPlan", raw: Any,
+    ) -> "RelationWindowPlan":
+        if not isinstance(raw, list) or not raw:
+            raise RelationPacketPlanError("relation-window sidecar must be a nonempty list")
+        mapping = np.full(trace.event_count, -1, dtype=np.dtype("<i8"))
+        descriptors: list[RelationWindowDescriptor] = []
+        for expected_id, item in enumerate(raw):
+            if not isinstance(item, Mapping):
+                raise RelationPacketPlanError("relation-window sidecar entry is malformed")
+            try:
+                window_id = int(item["window_id"])
+                begin = int(item["event_begin"])
+                end = int(item["event_end"])
+            except (KeyError, TypeError, ValueError) as error:
+                raise RelationPacketPlanError("relation-window sidecar lacks event bounds") from error
+            if window_id != expected_id or not 0 <= begin < end <= trace.event_count:
+                raise RelationPacketPlanError("relation-window sidecar IDs or bounds are invalid")
+            if np.any(mapping[begin:end] >= 0):
+                raise RelationPacketPlanError("relation-window sidecar event bounds overlap")
+            mapping[begin:end] = window_id
+            event_ids = tuple(range(begin, end))
+            descriptors.append(cls._descriptor(
+                window_id, trace.events[begin:end], packet_plan,
+                event_ids=event_ids,
+            ))
+        return cls(tuple(descriptors), mapping)
+
+    @staticmethod
+    def _descriptor(
+        window_id: int,
+        rows: np.ndarray,
+        packet_plan: "RelationPacketPlan",
+        *,
+        event_ids: tuple[int, ...],
+    ) -> RelationWindowDescriptor:
+        kinds = {
+            event_id: PrimitiveKind(int(row["primitive_kind"]))
+            for event_id, row in zip(event_ids, rows, strict=True)
+        }
+        relation_heads = frozenset(
+            event_id for event_id, kind in kinds.items()
+            if kind is PrimitiveKind.RELATION
+            and packet_plan.is_stage_head(event_id)
+        )
+        return RelationWindowDescriptor(
+            window_id=window_id,
+            relation_stage_heads=relation_heads,
+            producer_event_ids=frozenset(
+                event_id for event_id, kind in kinds.items()
+                if kind in {
+                    PrimitiveKind.RELATION_CANDIDATE,
+                    PrimitiveKind.RELATION,
+                    PrimitiveKind.QUERY_CLOSE,
+                }
+            ),
+            forward_stage_heads=frozenset(
+                event_id for event_id, kind in kinds.items()
+                if kind is PrimitiveKind.FORWARD
+                and (
+                    (stage := packet_plan.stage_for_event(event_id)) is None
+                    or event_id == max(stage.event_ids)
+                )
+            ),
+            consumer_event_ids=frozenset(
+                event_id for event_id, kind in kinds.items()
+                if kind is PrimitiveKind.CONSUMER
+            ),
+            adjoint_event_ids=frozenset(
+                event_id for event_id, kind in kinds.items()
+                if kind is PrimitiveKind.ADJOINT
+            ),
+        )
+
+    def window_for_event(self, event_id: int) -> int | None:
+        if not 0 <= event_id < self.event_to_window.size:
+            return None
+        value = int(self.event_to_window[event_id])
+        return None if value < 0 else value
 
 
 @dataclass(frozen=True)

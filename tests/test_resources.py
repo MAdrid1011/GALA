@@ -39,6 +39,23 @@ def test_resource_envelope_is_derived_from_registered_architecture_values() -> N
     assert envelope.external_channels == 8
 
 
+def test_production_resource_usage_closes_all_six_shared_sram_regions() -> None:
+    config = CycleConfig.from_gala(
+        load_config(ROOT / "configs/architecture/gala.yaml"), _Memory()
+    )
+
+    assert config.resource_usage is not None
+    assert config.resource_usage.shared_sram_bytes == 2_883_584
+    assert config.resource_usage.regions == {
+        "active_gaussian": 512 * 1024,
+        "relation_window": 512 * 1024,
+        "query_volume": 512 * 1024,
+        "gradient_update": 640 * 1024,
+        "index_graph": 256 * 1024,
+        "control_metadata": 384 * 1024,
+    }
+
+
 class _Memory:
     def submit(self, *, address: int, size_bytes: int, is_write: bool, arrival_cycle: int) -> int:
         return arrival_cycle

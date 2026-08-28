@@ -55,6 +55,25 @@ def test_captured_packet_extracts_exact_candidate_major_tile(tmp_path: Path) -> 
     assert not np.any(packet.masks[:, 1:])
 
 
+def test_captured_packet_can_rebase_a_nonzero_tile(tmp_path: Path) -> None:
+    candidates, relations = _write_records(tmp_path)
+    packet = captured_virtual_packet(CapturedPacketSpec(
+        candidates, relations,
+        iteration_id=1,
+        template_id=1,
+        query_base=1000,
+        query_shape=(16, 16),
+        tile_id=1,
+        loss_flags=1,
+    ))
+
+    assert packet.point_ids.tolist() == [6]
+    assert packet.point_keys.tolist() == [0]
+    assert packet.query_base == 1000
+    assert packet.logical_relation_count == 1
+    assert packet.masks[0, 0] == np.uint32(1 << 3)
+
+
 def test_captured_packet_sample_expands_complete_forward_and_backward(
     tmp_path: Path,
 ) -> None:

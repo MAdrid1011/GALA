@@ -45,6 +45,6 @@ LPIPS 的 AlexNet ImageNet trunk checkpoint SHA-256 为 `7be5be791159472b1fbf3c6
 | Oracle | 保留全部资源约束并给出可达上界 |
 | 实际机制 | 相对于 Base ASIC 的收益可解释且不超过 Oracle |
 | 消融 | 十六个组合齐全，`1111` 完全一致 |
-| 平台基线 | 本地原始时间与 Orin 分阶段换算均可追溯 |
+| 平台基线 | 本地原始时间可追溯；Orin 分阶段换算仅在同套件实测可用时验收，否则为 `unavailable` 且不阻塞 ASIC 主线 |
 
 任何质量失败优先于性能结论。Oracle 达不到目标时进入工程优化回路。实际机制超过 Oracle 表明模型或计数错误，必须停止该结果并检查。

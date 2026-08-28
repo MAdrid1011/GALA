@@ -13,6 +13,12 @@
 | `clock.frequency` | 500000000 | Hz | 论文 Implementation |
 | `top.num_pods` | 4 | count | GALA Architecture |
 | `top.shared_sram_bytes` | 2883584 | byte | 2.75 MiB 设计预算 |
+| `shared_sram.active_gaussian_bytes` | 524288 | byte | 四个 Pod 的活动高斯记录 |
+| `shared_sram.relation_window_bytes` | 524288 | byte | 十六 Bank 关系包与关系链 |
+| `shared_sram.query_volume_bytes` | 524288 | byte | 查询结果、梯度、统计与体素 |
+| `shared_sram.gradient_update_bytes` | 655360 | byte | 局部梯度、规范化梯度与更新队列 |
+| `shared_sram.index_graph_bytes` | 262144 | byte | 桶、候选与边 |
+| `shared_sram.control_metadata_bytes` | 393216 | byte | 状态、依赖、任务与窗口元数据 |
 | `relation.seed_fifo_entries` | 必须由设计配置给出 | entry | 关系构造器实现参数 |
 | `issue.query_state_entries` | 2048 | entry | 查询状态 SRAM |
 | `issue.candidate_lanes` | 3 | lane | Forecast、Conflict、Issue 三级结构 |
@@ -39,6 +45,7 @@
 | `compute.relations_per_microcontext` | 8 | query lane | 每个物理微上下文内 RelationPacket 的八个查询 lane，不是八个独立 context |
 | `compute.cluster_issue_slots_per_cluster` | 2 | slot | 二维 interaction 的两条配对算术路径 |
 | `compute.microcontext_bytes_per_cluster` | 6656 | byte | 6.5 KiB 设计值 |
+| `compute.owner_gradient_slots_per_cluster` | 2 | slot | 每个 owner cluster 的并发梯度 epoch |
 | `compute.template_profiles[1].paths.forward` | pack 4，first 17，last 20，2 lane/cycle | cycle | GALA `ffadc13d`: `interaction_2d` |
 | `compute.template_profiles[1].paths.adjoint` | pack 8，first 27，last 34，1 cycle/lane | cycle | GALA `ffadc13d`: `interaction_2d_adjoint` |
 | `compute.template_profiles[2].paths.forward` | pack 8，first 27，last 34，1 lane/cycle | cycle | GALA `ffadc13d`: `interaction_3d` |
@@ -46,8 +53,15 @@
 | `query.reduction_banks` | 64 | bank | 双向查询执行单元 |
 | `query.partial_sum_groups_per_bank` | 4 | group | 交错部分和 |
 | `query.loss_fma_lanes` | 32 | lane | 查询损失单元 |
+| `query.loss_queries_per_cycle` | 16 | query/cycle | 两条 FP32 FMA 对应一个 L1/L2 查询 |
 | `query.adjoint_replay_lanes` | 8 | lane | 伴随重放流水 |
-| `query.relation_window_entries` | 256 | entry | 设计默认值 |
+| `query.replay_queue_entries` | 256 | entry | 伴随重放队列 |
+| `query.relation_window_entries` | 256 | window | 并发关系作用域窗口，不是关系记录数 |
+| `query.relation_window_entry_bytes` | 32 | byte | 窗口基址、计数与三类引用 |
+| `query.relation_store_banks` | 16 | bank | 关系链存储 |
+| `query.relation_store_records` | 16384 | record | 512 KiB / 32 B 关系记录 |
+| `query.query_volume_banks` | 16 | bank | 查询结果与梯度 SRAM |
+| `query.query_volume_word_bytes` | 16 | byte | 查询 SRAM Bank 端口宽度 |
 | `update.inflight_contexts` | 20 | context | 更新控制 FSM |
 | `memory.channels` | 8 | channel | LPDDR5 接口 |
 | `memory.channel_width_bits` | 32 | bit | LPDDR5 接口 |
@@ -68,7 +82,7 @@
 | `issue.query_state_entries` | 2048 | 1024 至 4096 | 查询状态 SRAM 计入 2.75 MiB |
 | `cache.active_records_per_instance` | 1024 | 512 至 2048 | 四个实例总量计入 2.75 MiB |
 | `cache.miss_merge_entries_per_instance` | 32 | 16 至 64 | 端口与等待者存储同时闭合 |
-| `query.relation_window_entries` | 256 | 128 至 512 | 关系记录计入 2.75 MiB |
+| `query.relation_window_entries` | 256 | 128 至 512 | 32 B 窗口表项计入 2.75 MiB；关系记录使用独立 512 KiB 存储 |
 | `relation.seed_fifo_entries` | 待冻结 | 默认值的 0.5 至 2 倍 | 由真实突发深度确定 |
 | `pipeline.register_stages` | 模块配置 | 模块内重定时 | 不改变模块边界和吞吐资源 |
 

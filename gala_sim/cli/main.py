@@ -107,6 +107,7 @@ def _parser() -> argparse.ArgumentParser:
     replay.add_argument("--quick-validation", action="store_true")
     replay.add_argument("--throughput-progress", action="store_true")
     replay.add_argument("--stop-when-throughput-stable", action="store_true")
+    replay.add_argument("--compute-telemetry", action="store_true")
     bounds = commands.add_parser("cycle-bounds")
     bounds.add_argument("--trace", type=Path, required=True)
     bounds.add_argument("--config", type=Path, required=True)
@@ -517,6 +518,7 @@ def main(argv: list[str] | None = None) -> int:
                     progress=cycle_progress,
                     progress_interval_events=monitor_config.report_interval_events,
                     progress_interval_seconds=monitor_config.report_interval_seconds,
+                    collect_compute_telemetry=args.compute_telemetry,
                 )
             except InactivityTimeoutError as error:
                 writer = RunOutputWriter(args.output)

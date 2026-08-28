@@ -51,7 +51,9 @@ class ModelAdapter(Protocol):
 
 `prepare` 解析官方几何和训练配置。`run_reference` 执行作者路径并生成软件基线。`capture_trace` 使用相同输入、种子和迭代数生成动态事件。`replay_reductions` 只改变合法归约次序，用于核对周期调度下的最终质量。
 
-适配器还必须导出模型阶段边界、每阶段 GPU kernel 列表、数据读写字节数和事件计数。这些信息用于本地 GPU 到 AGX Orin 的分阶段换算。
+适配器还必须导出模型阶段边界、每阶段 GPU kernel 列表、数据读写字节数和事件计数。这些信息保留
+本地 GPU 阶段证据；只有另有同套件 AGX Orin 实测向量时才用于分阶段平台换算。缺少该实测时
+Orin 结果为 `unavailable`，不构成模型适配或 ASIC 主线的退出条件。
 
 ## 5. 单组合扩展门
 

@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import heapq
 from dataclasses import replace
 from pathlib import Path
 
+import numpy as np
 import pytest
 
 from gala_sim.clamp import PrimitiveKind, ResourceClass, TraceBuilder, TraceEvent
@@ -16,7 +18,7 @@ from gala_sim.timing import (
     CycleEngine,
     ModuleTiming,
 )
-from gala_sim.timing.modules import ComputePod, CounterBlock
+from gala_sim.timing.modules import ComputePod, CounterBlock, OwnerGradientTracker
 
 
 class _Memory:
@@ -36,6 +38,8 @@ def test_production_compute_profiles_have_audited_path_latencies() -> None:
     config = _production_config()
     assert config.compute_templates is not None
     assert config.compute_resource_capacities == {
+        "pods": 4,
+        "clusters_per_pod": 5,
         "clusters": 20,
         "cluster_issue": 40,
         "fma_groups": 80,
@@ -44,6 +48,17 @@ def test_production_compute_profiles_have_audited_path_latencies() -> None:
         "microcontext_slots": 80,
         "feedback_lanes": 60,
     }
+    assert config.query_reduction_banks == 64
+    assert config.query_partial_sum_groups_per_bank == 4
+    assert config.query_loss_fma_lanes == 32
+    assert config.query_loss_queries_per_cycle == 16
+    assert config.query_adjoint_replay_lanes == 8
+    assert config.query_replay_queue_entries == 256
+    assert config.query_relation_window_entries == 256
+    assert config.query_relation_store_records == 16_384
+    assert config.query_volume_banks == 16
+    assert config.owner_gradient_slots_per_cluster == 2
+    assert CycleEngine(config)._module_issue_ports("bidirectional_query") == 120
     assert config.compute_templates[1].latency_for("forward") == 17
     assert config.compute_templates[1].latency_for("adjoint") == 27
     assert config.compute_templates[2].latency_for("forward") == 27
@@ -76,13 +91,85 @@ def test_production_compute_profile_rejects_unknown_template() -> None:
         )).run(builder.finish())
 
 
-def test_consumer_uses_query_loss_path_without_compute_profile() -> None:
+def test_query_and_compute_paths_follow_bidirectional_hardware_contract() -> None:
+    assert CycleEngine._stages_for(PrimitiveKind.FORWARD) == (
+        "fusion_issue", "compute_pod", "bidirectional_query",
+    )
     assert CycleEngine._stages_for(PrimitiveKind.CONSUMER) == (
         "fusion_issue", "bidirectional_query",
     )
-    assert CycleEngine._stages_for(PrimitiveKind.GRADIENT_REDUCTION) == (
-        "bidirectional_query",
+    assert CycleEngine._stages_for(PrimitiveKind.ADJOINT) == (
+        "fusion_issue", "bidirectional_query", "compute_pod",
     )
+    assert CycleEngine._stages_for(PrimitiveKind.GRADIENT_REDUCTION) == (
+        "compute_pod",
+    )
+
+
+def test_query_reduction_banks_issue_independently_and_serialize_aliases() -> None:
+    def run(query_ids: tuple[int, int]):
+        builder = TraceBuilder()
+        for query_id in query_ids:
+            builder.emit(TraceEvent(
+                primitive_kind=int(PrimitiveKind.QUERY_REDUCTION),
+                query_id=query_id,
+                reduction_key=query_id,
+                resource_class=int(ResourceClass.QUERY),
+            ))
+        config = replace(_production_config(), relation_query_lanes=1)
+        return CycleEngine(config).run(builder.finish(), validate_input=False)
+
+    independent = run((0, 1))
+    aliased = run((0, 64))
+
+    assert independent.completion_cycles[0] == independent.completion_cycles[1]
+    assert aliased.completion_cycles[1] == aliased.completion_cycles[0] + 1
+    assert aliased.module_counters["bidirectional_query"]["bank_conflicts"] > 0
+
+
+def test_query_datapaths_allocate_loss_replay_and_query_volume_ports() -> None:
+    engine = CycleEngine(_production_config())
+    lanes = [0] * engine._module_issue_ports("bidirectional_query")
+    dtype = TraceBuilder().finish().events.dtype
+
+    def row(kind: PrimitiveKind, query_id: int) -> object:
+        value = np.zeros((), dtype=dtype)
+        value["primitive_kind"] = int(kind)
+        value["query_id"] = query_id
+        return value
+
+    consumer = engine._query_resource_allocation(
+        lanes, row(PrimitiveKind.CONSUMER, 3), PrimitiveKind.CONSUMER, None, 0,
+    )
+    assert consumer == (64, 91, 107)
+    for lane in consumer:
+        lanes[lane] = 1
+
+    # A second query can use another loss slot and another SRAM bank.
+    assert engine._query_resource_allocation(
+        lanes, row(PrimitiveKind.CONSUMER, 4), PrimitiveKind.CONSUMER, None, 0,
+    ) == (65, 92, 108)
+    # An adjoint read to query 3 conflicts with the consumer read port, while
+    # the independent write port remains legal in the same cycle.
+    assert engine._query_resource_allocation(
+        lanes, row(PrimitiveKind.ADJOINT, 3), PrimitiveKind.ADJOINT, None, 0,
+    ) is None
+    read_busy_only = [0] * len(lanes)
+    read_busy_only[91] = 1
+    assert engine._query_resource_allocation(
+        read_busy_only, row(PrimitiveKind.QUERY_REDUCTION, 3),
+        PrimitiveKind.QUERY_REDUCTION, None, 0,
+    ) == (3, 107)
+
+    # A full replay packet waits when any of the eight lanes are busy; that is
+    # backpressure, not an invalid packet-width error.
+    replay_busy = [0] * len(lanes)
+    replay_busy[80] = 1
+    packet = type("Packet", (), {"query_base": 0, "lanes": tuple(range(8))})()
+    assert engine._query_resource_allocation(
+        replay_busy, row(PrimitiveKind.ADJOINT, 0),
+        PrimitiveKind.ADJOINT, packet, 0,
+    ) is None
 
 
 def test_compute_pod_reserves_twenty_independent_cluster_issue_slots() -> None:
@@ -116,6 +203,144 @@ def test_compute_pod_reserves_twenty_independent_cluster_issue_slots() -> None:
         for plan in plans for resource, cycle, _ in plan
         if resource.startswith("cluster_issue:") and cycle == 0
     } == set(range(20))
+
+
+def test_ready_selection_finds_reusable_owner_epoch_beyond_fifo_head() -> None:
+    engine = CycleEngine(_production_config())
+    rows = np.empty(258, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = np.arange(258)
+    rows["iteration_id"] = 1
+    rows["primitive_kind"] = int(PrimitiveKind.ADJOINT)
+    rows["state_version"] = 0
+    # All keys target owner cluster zero. The final event reuses the first
+    # active epoch after 255 blocked keys.
+    rows["gaussian_id"] = np.arange(258) * 20
+    rows[257]["gaussian_id"] = rows[0]["gaussian_id"]
+    tracker = OwnerGradientTracker(
+        pods=4, clusters_per_pod=5, slots_per_cluster=2,
+    )
+    tracker.register_rows(rows)
+    tracker.reserve_adjoint((0,))
+    tracker.reserve_adjoint((1,))
+    queue = [(event_id, 2) for event_id in range(2, 258)]
+    heapq.heapify(queue)
+
+    selected = engine._pop_ready_candidates(
+        queue, "compute_pod", row_for=rows.__getitem__,
+        physical_stage_for=lambda _event_id: None,
+        owner_gradients=tracker,
+    )
+
+    assert selected == [(257, 2)]
+    assert len(queue) == 255
+
+
+def test_compute_telemetry_is_exact_and_does_not_change_cycles() -> None:
+    profile = ComputeTemplateProfile(1, {
+        "gradient_reduction": ComputePathProfile((
+            ComputeStage("TRANSFORM", latency=3, fma_groups=1),
+        )),
+    })
+    timing = ModuleTiming(
+        latency=1, initiation_interval=1, queue_capacity=8, ports=1, banks=1,
+    )
+    config = CycleConfig(
+        modules={name: timing for name in (
+            "relation_constructor", "fusion_issue", "semantic_cache",
+            "compute_pod", "bidirectional_query", "reconstruction_update",
+            "shared_sram",
+        )},
+        memory=_Memory(), clock_frequency_hz=1,
+        relation_seed_fifo_entries=1, candidate_lanes=2,
+        compute_templates={1: profile},
+        compute_resource_capacities={
+            "clusters": 1,
+            "cluster_issue": 2,
+            "fma_groups": 1,
+            "transcendental_lanes": 1,
+            "reduction_trees": 1,
+            "microcontext_slots": 2,
+            "feedback_lanes": 1,
+        },
+    )
+    builder = TraceBuilder()
+    for gaussian_id in range(2):
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.GRADIENT_REDUCTION),
+            gaussian_id=gaussian_id, template_id=1,
+            resource_class=int(ResourceClass.COMPUTE),
+        ))
+    trace = builder.finish()
+
+    plain = CycleEngine(config).run(trace, validate_input=False)
+    diagnosed = CycleEngine(config).run(
+        trace, validate_input=False, collect_compute_telemetry=True,
+    )
+
+    assert diagnosed.total_cycles == plain.total_cycles
+    assert diagnosed.completion_cycles == plain.completion_cycles
+    conflict = next(
+        stall for stall in diagnosed.stalls
+        if stall.reason == "compute_resource"
+    )
+    assert (
+        conflict.resource,
+        conflict.pod,
+        conflict.cluster,
+        conflict.resource_cycle,
+        conflict.resource_in_use,
+        conflict.resource_demand,
+        conflict.resource_capacity,
+    ) == ("fma_groups", None, 0, 0, 1, 1, 1)
+    telemetry = diagnosed.compute_telemetry
+    assert telemetry is not None
+    assert telemetry.cluster_count == 1
+    assert len(telemetry.event_timings) == 2
+    assert telemetry.event_timings[0].dependency_ready_cycle == 0
+    assert telemetry.event_timings[0].compute_issue_cycle == 0
+    assert telemetry.event_timings[0].finish_cycle == 3
+    assert all(
+        len(run.active_microcontexts) == telemetry.cluster_count
+        for run in telemetry.cluster_occupancy_runs
+    )
+    assert any(
+        run.active_microcontexts == (2,)
+        for run in telemetry.cluster_occupancy_runs
+    )
+
+
+def test_production_compute_route_stays_in_resident_pod_and_owner_cluster() -> None:
+    engine = CycleEngine(_production_config())
+    compute = engine.modules["compute_pod"]
+    assert isinstance(compute, ComputePod)
+    dtype = TraceBuilder().finish().events.dtype
+    row = np.zeros((), dtype=dtype)
+    row["gaussian_id"] = 7
+    row["template_id"] = 1
+
+    pod, owner = engine._compute_route(row, PrimitiveKind.FORWARD)
+    assert (pod, owner) == (3, None)
+    forward = compute.reservation_plan(
+        1, PrimitiveKind.FORWARD, 0, pod=pod, cluster_hint=owner,
+    )
+    forward_clusters = {
+        int(resource.partition(":")[2])
+        for resource, _cycle, _demand in forward
+        if resource.startswith("cluster_issue:")
+    }
+    assert len(forward_clusters) == 1
+    assert forward_clusters <= set(range(15, 20))
+
+    pod, owner = engine._compute_route(row, PrimitiveKind.GRADIENT_REDUCTION)
+    assert (pod, owner) == (3, 17)
+    gradient = compute.reservation_plan(
+        1, PrimitiveKind.GRADIENT_REDUCTION, 0,
+        pod=pod, cluster_hint=owner,
+    )
+    assert any(
+        resource == "cluster_issue:17" for resource, _cycle, _demand in gradient
+    )
 
 
 def test_compute_pod_tracks_each_stage_resource_window() -> None:

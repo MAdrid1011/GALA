@@ -13,6 +13,9 @@ from .hardware import (
     ReconstructionUpdateUnit,
     SharedSram,
     SemanticCacheState,
+    RelationWindowTracker,
+    QueryReplayTracker,
+    OwnerGradientTracker,
 )
 
 __all__ = [
@@ -20,5 +23,6 @@ __all__ = [
     "EventBatch", "ModuleOutputs", "RelationConstructor", "FusionIssueUnit",
     "CacheBackpressure", "CacheLookup", "SemanticCacheState",
     "GaussianSemanticCache", "ComputePod", "BidirectionalQueryUnit", "ReconstructionUpdateUnit",
-    "SharedSram",
+    "SharedSram", "RelationWindowTracker", "QueryReplayTracker",
+    "OwnerGradientTracker",
 ]

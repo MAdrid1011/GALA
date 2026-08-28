@@ -84,6 +84,43 @@ parameters:
       source: docs/03_HARDWARE_CONTRACT.md:resource-envelope
       scope: hardware
       status: frozen
+  shared_sram:
+    active_gaussian_bytes:
+      value: 524288
+      unit: byte
+      source: GALA design config:shared_sram.active_gaussian
+      scope: hardware
+      status: frozen
+    relation_window_bytes:
+      value: 524288
+      unit: byte
+      source: GALA design config:shared_sram.relation_window
+      scope: hardware
+      status: frozen
+    query_volume_bytes:
+      value: 524288
+      unit: byte
+      source: GALA design config:shared_sram.query_volume
+      scope: hardware
+      status: frozen
+    gradient_update_bytes:
+      value: 655360
+      unit: byte
+      source: GALA design config:shared_sram.gradient_update
+      scope: hardware
+      status: frozen
+    index_graph_bytes:
+      value: 262144
+      unit: byte
+      source: GALA design config:shared_sram.index_graph
+      scope: hardware
+      status: frozen
+    control_metadata_bytes:
+      value: 393216
+      unit: byte
+      source: GALA design config:shared_sram.control_metadata
+      scope: hardware
+      status: frozen
   relation:
     seed_fifo_entries:
       value: 256
@@ -248,6 +285,12 @@ parameters:
       source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
       scope: hardware
       status: frozen
+    owner_gradient_slots_per_cluster:
+      value: 2
+      unit: slot
+      source: GALA design config:pod.owner_gradient_slots_per_cluster
+      scope: hardware
+      status: frozen
     relations_per_microcontext:
       value: 8
       unit: relation_slot
@@ -363,19 +406,61 @@ parameters:
       source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
       scope: hardware
       status: frozen
+    loss_queries_per_cycle:
+      value: 16
+      unit: query_per_cycle
+      source: GALA design config:consumer.l1_l2_queries_per_cycle
+      scope: hardware
+      status: frozen
     adjoint_replay_lanes:
       value: 8
       unit: lane
       source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
       scope: hardware
       status: frozen
-    relation_window_entries:
+    replay_queue_entries:
       value: 256
       unit: entry
+      source: GALA design config:reduction.replay_queue_entries
+      scope: hardware
+      status: frozen
+    relation_window_entries:
+      value: 256
+      unit: window
       source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
       scope: hardware
       status: frozen
       allowed_range: [128, 512]
+    relation_window_entry_bytes:
+      value: 32
+      unit: byte
+      source: GALA design config:on_chip_memory.window_table_entry_bytes
+      scope: hardware
+      status: frozen
+    relation_store_banks:
+      value: 16
+      unit: bank
+      source: GALA design config:frontend.relation_store_banks
+      scope: hardware
+      status: frozen
+    relation_store_records:
+      value: 16384
+      unit: record
+      source: GALA design config:frontend.relation_store_capacity_records
+      scope: hardware
+      status: frozen
+    query_volume_banks:
+      value: 16
+      unit: bank
+      source: GALA design config:shared_sram.query_volume.bank_count
+      scope: hardware
+      status: frozen
+    query_volume_word_bytes:
+      value: 16
+      unit: byte
+      source: GALA design config:shared_sram.query_volume.bank_word_bits
+      scope: hardware
+      status: frozen
   update:
     inflight_contexts:
       value: 20

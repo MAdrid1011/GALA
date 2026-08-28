@@ -11,7 +11,10 @@ from gala_sim.clamp.events import EVENT_SCHEMA_VERSION, dependency_dtype
 from gala_sim.config import load_config
 from gala_sim.timing import (
     BufferedVirtualCycleConsumer, CycleConfig, CycleEngine, RelationPacketPlan,
-    RelationPacketPlanError, analyze_cycle_lower_bounds,
+    RelationPacketPlanError, RelationWindowDescriptor, analyze_cycle_lower_bounds,
+)
+from gala_sim.timing.modules import (
+    OwnerGradientTracker, QueryReplayTracker, RelationWindowTracker,
 )
 from gala_sim.trace import Trace, VirtualQueryEventExpander, VirtualTracePacket
 
@@ -32,7 +35,17 @@ def _virtual_trace(source: VirtualTracePacket, *, query_lanes: int = 8) -> Trace
         np.concatenate(rows),
         np.concatenate(dependencies).astype(dependency_dtype(), copy=False),
         np.empty(0, dtype=np.dtype("<f4")),
-        {"schema_version": EVENT_SCHEMA_VERSION},
+        {
+            "schema_version": EVENT_SCHEMA_VERSION,
+            "trace_sample": {
+                "result_scope": "quick_cycle_validation",
+                "packets": [{
+                    "query_base": source.query_base,
+                    "query_count": source.query_count,
+                    "candidate_count": source.candidate_count,
+                }],
+            },
+        },
     )
 
 
@@ -93,6 +106,160 @@ def test_atomic_virtual_packet_plan_preserves_global_event_ids() -> None:
     )
     assert min(relation_stage.event_ids) >= 100
     assert plan.stage_for_event(relation_stage.event_ids[0]) == relation_stage
+
+
+def test_relation_window_keeps_four_reference_classes_until_final_adjoint() -> None:
+    descriptor = RelationWindowDescriptor(
+        window_id=0,
+        relation_stage_heads=frozenset({1}),
+        producer_event_ids=frozenset({0, 1}),
+        forward_stage_heads=frozenset({2}),
+        consumer_event_ids=frozenset({3}),
+        adjoint_event_ids=frozenset({4}),
+    )
+    tracker = RelationWindowTracker(
+        window_capacity=1, relation_capacity=1, relation_banks=1,
+    )
+    tracker.register(descriptor)
+
+    tracker.issue(0, PrimitiveKind.RELATION_CANDIDATE,
+                  physical_stage_head=True, cycle=0)
+    tracker.issue(1, PrimitiveKind.RELATION,
+                  physical_stage_head=True, cycle=1)
+    for event_id in (0, 1, 2, 3):
+        tracker.complete_event(event_id)
+    assert tracker.snapshot()["relation_windows_live"] == 1
+    assert tracker.snapshot()["relation_records_live"] == 1
+
+    tracker.complete_event(4)
+    assert tracker.snapshot() == {
+        "window_allocations": 1,
+        "window_releases": 1,
+        "window_peak_occupancy": 1,
+        "relation_records_appended": 1,
+        "relation_store_peak_records": 1,
+        "relation_windows_live": 0,
+        "relation_records_live": 0,
+    }
+
+
+def test_relation_window_and_record_store_have_independent_backpressure() -> None:
+    def descriptor(window_id: int, base: int) -> RelationWindowDescriptor:
+        return RelationWindowDescriptor(
+            window_id=window_id,
+            relation_stage_heads=frozenset({base + 1}),
+            producer_event_ids=frozenset({base, base + 1}),
+            forward_stage_heads=frozenset({base + 2}),
+            consumer_event_ids=frozenset({base + 3}),
+            adjoint_event_ids=frozenset({base + 4}),
+        )
+
+    windows = RelationWindowTracker(
+        window_capacity=1, relation_capacity=2, relation_banks=2,
+    )
+    windows.register(descriptor(0, 0))
+    windows.register(descriptor(1, 10))
+    windows.issue(0, PrimitiveKind.RELATION_CANDIDATE,
+                  physical_stage_head=True, cycle=0)
+    assert windows.blocking_reason(
+        10, PrimitiveKind.RELATION_CANDIDATE,
+        physical_stage_head=True, cycle=0,
+    ) == "relation_window_capacity"
+
+    records = RelationWindowTracker(
+        window_capacity=2, relation_capacity=1, relation_banks=2,
+    )
+    records.register(descriptor(0, 0))
+    records.register(descriptor(1, 10))
+    records.issue(0, PrimitiveKind.RELATION_CANDIDATE,
+                  physical_stage_head=True, cycle=0)
+    records.issue(1, PrimitiveKind.RELATION,
+                  physical_stage_head=True, cycle=1)
+    records.issue(10, PrimitiveKind.RELATION_CANDIDATE,
+                  physical_stage_head=True, cycle=1)
+    assert records.blocking_reason(
+        11, PrimitiveKind.RELATION,
+        physical_stage_head=True, cycle=2,
+    ) == "relation_store_capacity"
+
+
+def test_query_replay_queue_releases_only_after_last_adjoint_dispatch() -> None:
+    rows = np.empty(3, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = [0, 1, 2]
+    rows["iteration_id"] = 7
+    rows["query_id"] = 9
+    rows["primitive_kind"] = [
+        int(PrimitiveKind.CONSUMER),
+        int(PrimitiveKind.ADJOINT),
+        int(PrimitiveKind.ADJOINT),
+    ]
+    tracker = QueryReplayTracker(capacity=1)
+    tracker.register_rows(rows)
+
+    tracker.reserve_consumer(0)
+    tracker.dispatch_adjoint((1,))
+    assert tracker.snapshot()["replay_queue_live_entries"] == 1
+    tracker.dispatch_adjoint((2,))
+    assert tracker.snapshot() == {
+        "replay_queue_reservations": 1,
+        "replay_queue_releases": 1,
+        "replay_queue_peak_entries": 1,
+        "replay_queue_live_entries": 0,
+    }
+
+
+def test_owner_gradient_slots_are_partitioned_by_pod_and_owner_cluster() -> None:
+    rows = np.empty(6, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = np.arange(6)
+    rows["iteration_id"] = [1, 1, 1, 2, 2, 2]
+    # Gaussian 1 maps to Pod 1, local owner cluster 1 in both epochs.
+    rows["gaussian_id"] = 1
+    rows["state_version"] = [0, 0, 0, 1, 1, 1]
+    rows["primitive_kind"] = [
+        int(PrimitiveKind.ADJOINT),
+        int(PrimitiveKind.GRADIENT_REDUCTION),
+        int(PrimitiveKind.GRADIENT_REDUCTION),
+        int(PrimitiveKind.ADJOINT),
+        int(PrimitiveKind.GRADIENT_REDUCTION),
+        int(PrimitiveKind.GRADIENT_REDUCTION),
+    ]
+    tracker = OwnerGradientTracker(
+        pods=4, clusters_per_pod=5, slots_per_cluster=2,
+    )
+    tracker.register_rows(rows)
+
+    tracker.reserve_adjoint((0,))
+    tracker.reserve_adjoint((3,))
+    assert tracker.snapshot()["owner_gradient_peak_slots_per_cluster"] == 2
+    deadlock = tracker.deadlock_snapshot(
+        pending_adjoint_event_ids=(0, 3),
+        remaining_dependencies=np.asarray([0, 2, 1, 0, 3, 0]),
+    )
+    assert deadlock["active_by_cluster"] == {
+        6: ((1, 1, 0), (2, 1, 1)),
+    }
+    assert deadlock["pending_adjoint_count"] == 2
+    assert deadlock["active_gradient_reductions"] == (
+        {
+            "key": (1, 1, 0), "cluster": 6, "event_count": 2,
+            "ready_count": 0, "event_sample": ((1, 2), (2, 1)),
+        },
+        {
+            "key": (2, 1, 1), "cluster": 6, "event_count": 2,
+            "ready_count": 1, "event_sample": ((4, 3), (5, 0)),
+        },
+    )
+    tracker.complete_gradient((1, 2))
+    assert tracker.snapshot()["owner_gradient_live_slots"] == 1
+    tracker.complete_gradient((4, 5))
+    assert tracker.snapshot() == {
+        "owner_gradient_slot_reservations": 2,
+        "owner_gradient_slot_releases": 2,
+        "owner_gradient_peak_slots_per_cluster": 2,
+        "owner_gradient_live_slots": 0,
+    }
 
 
 def test_query_close_packets_follow_rows_and_partial_width() -> None:
@@ -158,7 +325,8 @@ def test_offline_cycle_engine_charges_sparse_relation_chain_per_physical_packet(
     assert result.module_counters["relation_constructor"]["accepted"] == 3
     assert result.module_counters["semantic_cache"]["accepted"] == 2
     assert result.module_counters["shared_sram"]["accepted"] == 2
-    assert result.module_counters["compute_pod"]["accepted"] == 2
+    assert result.module_counters["compute_pod"]["accepted"] == 3
+    assert result.module_counters["bidirectional_query"]["accepted"] == 19
     assert len(result.memory_requests) == 0
     assert result.module_counters["semantic_cache"]["memory_requests"] == 1
     forward_ids = trace.events["event_id"][
@@ -183,12 +351,13 @@ def test_online_and_offline_packet_replay_have_exact_cycles_and_completions() ->
     config_path = Path(__file__).parents[1] / "configs/architecture/gala.yaml"
     offline = CycleEngine(CycleConfig.from_gala(
         load_config(config_path), _Memory(),
-    )).run(trace)
+    )).run(trace, collect_compute_telemetry=True)
     session = CycleEngine(CycleConfig.from_gala(
         load_config(config_path), _Memory(),
     )).online_session(
         max_events=2, max_frontier_events=64,
         initial_gaussian_count=5, retain_completion_cycles=True,
+        collect_compute_telemetry=True,
     )
 
     session.accept_query_packet(source)
@@ -198,6 +367,7 @@ def test_online_and_offline_packet_replay_have_exact_cycles_and_completions() ->
     assert online.total_cycles == offline.total_cycles
     assert online.completion_cycles == offline.completion_cycles
     assert online.module_counters == offline.module_counters
+    assert online.compute_telemetry == offline.compute_telemetry
 
 
 def test_semantic_worksets_count_physical_packet_readers_not_logical_lanes() -> None:
