@@ -58,15 +58,21 @@ class Ramulator2Backend:
     _beat_to_group: dict[int, int] = field(default_factory=dict, init=False, repr=False)
     _completed: list[MemoryRequestRecord] = field(default_factory=list, init=False, repr=False)
     _audit: list[MemoryRequestRecord] = field(default_factory=list, init=False, repr=False)
+    _metadata_cache: Mapping[str, Any] | None = field(default=None, init=False, repr=False)
 
     def metadata(self) -> Mapping[str, Any]:
+        if self._metadata_cache is not None:
+            return self._metadata_cache
         try:
             value = self.binding.metadata()
         except AttributeError as error:
             raise MissingMemoryBackend("Ramulator 2 binding lacks metadata()") from error
         if not isinstance(value, Mapping):
             raise MissingMemoryBackend("Ramulator 2 binding metadata is not a mapping")
-        return value
+        # Native metadata is immutable for a binding. Cache it so every memory
+        # request does not re-read configuration files and audit hashes.
+        self._metadata_cache = dict(value)
+        return self._metadata_cache
 
     def submit_async(self, *, address: int, size_bytes: int, is_write: bool,
                      arrival_cycle: int) -> int:

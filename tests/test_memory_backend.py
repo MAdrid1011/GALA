@@ -7,8 +7,10 @@ class _SingleEntryBinding:
     def __init__(self) -> None:
         self.pending: int | None = None
         self.completed: list[int] = []
+        self.metadata_calls = 0
 
     def metadata(self) -> dict[str, object]:
+        self.metadata_calls += 1
         return {
             "implementation": "Ramulator 2", "version": "2.1.0",
             "config_sha256": "c" * 64,
@@ -75,3 +77,12 @@ def test_ramulator_backend_clone_starts_with_independent_state() -> None:
     clone = backend.clone()
     assert clone.current_cycle == 0
     assert clone.audit_records() == ()
+
+
+def test_ramulator_backend_caches_immutable_metadata() -> None:
+    binding = _SingleEntryBinding()
+    backend = Ramulator2Backend(binding)
+    assert backend.metadata()["transaction_bytes"] == 64
+    assert backend.metadata()["transaction_bytes"] == 64
+    backend.submit_async(address=0, size_bytes=64, is_write=False, arrival_cycle=0)
+    assert binding.metadata_calls == 1

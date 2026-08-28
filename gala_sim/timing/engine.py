@@ -5,6 +5,7 @@ from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from collections import defaultdict
 from dataclasses import dataclass
+from functools import lru_cache
 import heapq
 from pathlib import Path
 import time
@@ -215,7 +216,9 @@ class CycleEngine:
             cycle, module, reason, event_ids, previous.count + 1
         )
 
-    def _stages_for(self, kind: PrimitiveKind) -> tuple[str, ...]:
+    @staticmethod
+    @lru_cache(maxsize=None)
+    def _stages_for(kind: PrimitiveKind) -> tuple[str, ...]:
         if kind in {PrimitiveKind.RELATION_CANDIDATE, PrimitiveKind.RELATION, PrimitiveKind.QUERY_CLOSE}:
             return ("relation_constructor",)
         if kind in {PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN}:
@@ -1206,6 +1209,7 @@ class CycleReplaySession:
         self._stream_validator = VirtualEventStreamValidator()
         self._lifecycle = VirtualTraceLifecycleValidator(initial_gaussian_count)
         self._events: dict[int, np.void] = {}
+        self._kinds: dict[int, PrimitiveKind] = {}
         self._dependencies: dict[int, tuple[int, ...]] = {}
         self._remaining: dict[int, int] = {}
         self._dependents: dict[int, list[int]] = defaultdict(list)
@@ -1366,13 +1370,14 @@ class CycleReplaySession:
                         )
                     unresolved += 1
                     self._dependents[dependency].append(event_id)
+            kind = PrimitiveKind(int(row["primitive_kind"]))
             self._events[event_id] = row.copy()
+            self._kinds[event_id] = kind
             self._peak_frontier_events = max(
                 self._peak_frontier_events, len(self._events)
             )
             self._dependencies[event_id] = dependencies
             self._remaining[event_id] = unresolved
-            kind = PrimitiveKind(int(row["primitive_kind"]))
             if kind is PrimitiveKind.CACHE_REQUEST and self.semantic_workset_totals:
                 key = (int(row["gaussian_id"]), int(row["state_version"]))
                 total = self.semantic_workset_totals.get(key)
@@ -1638,7 +1643,7 @@ class CycleReplaySession:
     def _fusion_kind(self, event_id: int, stage: int) -> TaskKind | None:
         if not self.engine.selection.overlap_guided_issue or stage != 0:
             return None
-        kind = PrimitiveKind(int(self._events[event_id]["primitive_kind"]))
+        kind = self._kinds[event_id]
         return {
             PrimitiveKind.FORWARD: TaskKind.FORWARD,
             PrimitiveKind.CONSUMER: TaskKind.CONSUMER,
@@ -1647,7 +1652,7 @@ class CycleReplaySession:
 
     def _task_packet(self, event_id: int) -> TaskPacket:
         row = self._events[event_id]
-        kind = PrimitiveKind(int(row["primitive_kind"]))
+        kind = self._kinds[event_id]
         task_kind = {
             PrimitiveKind.FORWARD: TaskKind.FORWARD,
             PrimitiveKind.CONSUMER: TaskKind.CONSUMER,
@@ -1784,7 +1789,7 @@ class CycleReplaySession:
 
     def _try_issue(self, event_id: int, stage: int, selected: set[int], async_memory: bool) -> bool:
         row = self._events[event_id]
-        kind = PrimitiveKind(int(row["primitive_kind"]))
+        kind = self._kinds[event_id]
         stages = self.engine._stages_for(kind)
         module_name = stages[stage]
         module = self.engine.modules[module_name]
@@ -1934,7 +1939,7 @@ class CycleReplaySession:
         module.complete(event_id, finish)
         self._module_inflight[module_name] -= 1
         row = self._events[event_id]
-        kind = PrimitiveKind(int(row["primitive_kind"]))
+        kind = self._kinds[event_id]
         stages = self.engine._stages_for(kind)
         if (
             kind is PrimitiveKind.RELATION_CANDIDATE
@@ -1996,6 +2001,7 @@ class CycleReplaySession:
             if remaining == 0:
                 self._push_ready(dependent, 0)
         self._events.pop(event_id, None)
+        self._kinds.pop(event_id, None)
         self._dependencies.pop(event_id, None)
         self._remaining.pop(event_id, None)
 
