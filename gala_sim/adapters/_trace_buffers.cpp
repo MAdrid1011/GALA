@@ -89,7 +89,9 @@ torch::Tensor copy_voxel_point_keys(const torch::Tensor& buffer, int64_t count) 
     std::size_t offset = align128(buffer, 0);
     offset = align128(buffer, offset + static_cast<std::size_t>(count) * sizeof(std::uint32_t));
     offset = align128(buffer, offset + static_cast<std::size_t>(count) * sizeof(std::uint32_t));
-    offset = align128(buffer, offset + static_cast<std::size_t>(count) * sizeof(std::uint64_t));
+    // The first uint64 array is the sorted point key consumed by the voxel
+    // mask and relation kernels.  The following uint64 array is unrelated
+    // auxiliary storage and must not be selected here.
     auto needed = offset + static_cast<std::size_t>(count) * sizeof(std::uint64_t);
     if (needed > static_cast<std::size_t>(buffer.numel())) {
         throw std::invalid_argument("voxel binning buffer is smaller than its key layout");
