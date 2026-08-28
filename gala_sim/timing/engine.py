@@ -579,7 +579,10 @@ class CycleEngine:
             push_ready(event_id, stage)
         remaining_events = len(trace.events)
         in_flight: list[tuple[int, int, int, str]] = []
-        module_busy_until = {name: 0 for name in self.modules}
+        module_busy_until = {
+            name: [0] * module.timing.ports
+            for name, module in self.modules.items()
+        }
         fusion_busy_until = {name: 0 for name in ("forward", "consumer", "adjoint")}
         module_inflight = {name: 0 for name in self.modules}
         relation_seed_inflight = 0
@@ -866,11 +869,22 @@ class CycleEngine:
                     self._record_stall(cycle, module_name, "port", event_id)
                     requeue_candidate(event_id, stage)
                     continue
-                busy_until = (
-                    fusion_busy_until[fusion_port_name]
-                    if fusion_port_name is not None
-                    else module_busy_until[module_name]
-                )
+                module_lane: int | None = None
+                if fusion_port_name is not None:
+                    busy_until = fusion_busy_until[fusion_port_name]
+                else:
+                    module_lanes = module_busy_until[module_name]
+                    module_lane = next(
+                        (index for index, value in enumerate(module_lanes)
+                         if value <= cycle),
+                        None,
+                    )
+                    if module_lane is None:
+                        module.counters.queue_stalls += 1
+                        self._record_stall(cycle, module_name, "initiation_interval", event_id)
+                        requeue_candidate(event_id, stage)
+                        continue
+                    busy_until = module_lanes[module_lane]
                 if busy_until > cycle:
                     module.counters.queue_stalls += 1
                     self._record_stall(cycle, module_name, "initiation_interval", event_id)
@@ -1005,7 +1019,10 @@ class CycleEngine:
                 if fusion_port_name is not None:
                     fusion_busy_until[fusion_port_name] = cycle + timing.initiation_interval
                 else:
-                    module_busy_until[module_name] = cycle + timing.initiation_interval
+                    assert module_lane is not None
+                    module_busy_until[module_name][module_lane] = (
+                        cycle + timing.initiation_interval
+                    )
                 bank_busy[bank_key] = cycle
                 module_inflight[module_name] += 1
                 if kind is PrimitiveKind.RELATION_CANDIDATE:
@@ -1028,8 +1045,8 @@ class CycleEngine:
                     if async_memory else None
                 )
                 next_points = [point for point in (in_flight[0][0] if in_flight else None,
-                                                   min((module_busy_until[name] for name in self.modules
-                                                        if module_busy_until[name] > cycle), default=None),
+                                                   min((value for lanes in module_busy_until.values()
+                                                        for value in lanes if value > cycle), default=None),
                                                    min((point for point in fusion_busy_until.values()
                                                         if point > cycle), default=None),
                                                    memory_wakeup)
@@ -1301,7 +1318,10 @@ class CycleReplaySession:
             TaskKind.FORWARD: [], TaskKind.CONSUMER: [], TaskKind.ADJOINT: [],
         }
         self._in_flight: list[tuple[int, int, int, str]] = []
-        self._module_busy_until = {name: 0 for name in engine.modules}
+        self._module_busy_until = {
+            name: [0] * module.timing.ports
+            for name, module in engine.modules.items()
+        }
         self._fusion_busy_until = {name: 0 for name in ("forward", "consumer", "adjoint")}
         self._module_inflight = {name: 0 for name in engine.modules}
         self._relation_seed_inflight = 0
@@ -1884,7 +1904,8 @@ class CycleReplaySession:
                 )
                 next_points = [point for point in (
                     self._in_flight[0][0] if self._in_flight else None,
-                    min((value for value in self._module_busy_until.values() if value > self._cycle), default=None),
+                    min((value for lanes in self._module_busy_until.values()
+                         for value in lanes if value > self._cycle), default=None),
                     min((value for value in self._fusion_busy_until.values() if value > self._cycle), default=None),
                     memory_wakeup,
                 ) if point is not None and point > self._cycle]
@@ -1940,7 +1961,24 @@ class CycleReplaySession:
             self.engine._record_stall(self._cycle, module_name, "port", event_id)
             self._requeue(event_id, stage)
             return False
-        busy_until = self._fusion_busy_until[port_name] if port_name else self._module_busy_until[module_name]
+        module_lane: int | None = None
+        if port_name:
+            busy_until = self._fusion_busy_until[port_name]
+        else:
+            module_lanes = self._module_busy_until[module_name]
+            module_lane = next(
+                (index for index, value in enumerate(module_lanes)
+                 if value <= self._cycle),
+                None,
+            )
+            if module_lane is None:
+                module.counters.queue_stalls += 1
+                self.engine._record_stall(
+                    self._cycle, module_name, "initiation_interval", event_id
+                )
+                self._requeue(event_id, stage)
+                return False
+            busy_until = module_lanes[module_lane]
         if busy_until > self._cycle:
             module.counters.queue_stalls += 1
             self.engine._record_stall(self._cycle, module_name, "initiation_interval", event_id)
@@ -1970,7 +2008,10 @@ class CycleReplaySession:
         if port_name:
             self._fusion_busy_until[port_name] = self._cycle + timing.initiation_interval
         else:
-            self._module_busy_until[module_name] = self._cycle + timing.initiation_interval
+            assert module_lane is not None
+            self._module_busy_until[module_name][module_lane] = (
+                self._cycle + timing.initiation_interval
+            )
         self._bank_busy[bank_key] = self._cycle
         self._module_inflight[module_name] += 1
         if kind is PrimitiveKind.RELATION_CANDIDATE:
