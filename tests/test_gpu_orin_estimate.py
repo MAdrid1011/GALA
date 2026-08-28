@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import pytest
 
+from gala_sim.cli.main import _load_orin_anchor
 from gala_sim.tools.gpu_orin_estimate import OrinEstimateError, estimate_normalized
 
 
@@ -59,3 +60,13 @@ def test_proxy_rejects_non_unit_stage_weights() -> None:
             {"stages": {"forward": {"local_ms": 1, "weights": {"fp32_fma": 0.9}}}},
             _reference(),
         )
+
+
+def test_cli_anchor_loader_requires_nonformal_proxy(tmp_path) -> None:
+    path = tmp_path / "anchor.json"
+    path.write_text(
+        '{"status":"measured_calibration", "formal_performance_eligible":true}',
+        encoding="utf-8",
+    )
+    with pytest.raises(ValueError, match="status=proxy_estimate"):
+        _load_orin_anchor(path)

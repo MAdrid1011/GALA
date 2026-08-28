@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import importlib
 import json
+import math
 from pathlib import Path
 import shlex
 import sys
@@ -91,6 +92,10 @@ def _parser() -> argparse.ArgumentParser:
     ablation.add_argument("--output", type=Path, required=True)
     ablation.add_argument("--quick-validation", action="store_true")
     ablation.add_argument("--parallel-workers", type=int, default=1)
+    ablation.add_argument(
+        "--orin-anchor", type=Path, default=None,
+        help="non-formal static AGX Orin estimate for live speedup diagnostics",
+    )
     return parser
 
 
@@ -145,6 +150,37 @@ def _load_resource_usage(path: Path | None) -> ResourceUsage | None:
         external_channels=int(document["external_channels"]),
         regions={str(key): int(value) for key, value in document["regions"].items()},
     )
+
+
+def _load_orin_anchor(path: Path | None) -> tuple[float, dict[str, object]] | None:
+    """Load a static Orin estimate without treating it as measured calibration."""
+
+    if path is None:
+        return None
+    document = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(document, dict):
+        raise ValueError("Orin anchor must be a JSON object")
+    if document.get("status") != "proxy_estimate":
+        raise ValueError("Orin anchor must have status=proxy_estimate")
+    if document.get("formal_performance_eligible") is not False:
+        raise ValueError("Orin anchor must be non-formal")
+    total = document.get("total")
+    if not isinstance(total, dict):
+        raise ValueError("Orin anchor lacks total")
+    try:
+        milliseconds = float(total["estimated_orin_ms"])
+    except (KeyError, TypeError, ValueError) as error:
+        raise ValueError("Orin anchor total lacks estimated_orin_ms") from error
+    if not math.isfinite(milliseconds) or milliseconds <= 0:
+        raise ValueError("Orin anchor estimated_orin_ms must be positive")
+    return milliseconds / 1000.0, {
+        "path": str(path.resolve()),
+        "status": document["status"],
+        "result_scope": document.get("result_scope"),
+        "estimated_orin_ms": milliseconds,
+        "interval_ms": total.get("interval_ms"),
+        "formal_performance_eligible": False,
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -252,6 +288,11 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.quick_validation and not quick_scope:
             raise ValueError("--quick-validation requires a sampled or windowed trace")
+        orin_anchor = _load_orin_anchor(
+            args.orin_anchor if args.command == "ablation" else None
+        )
+        if orin_anchor is not None and quick_scope:
+            raise ValueError("--orin-anchor cannot be used with quick-validation traces")
         gala_config = load_config(args.config)
         binding = _load_binding(
             args.ramulator_binding, args.ramulator_build_manifest,
@@ -286,16 +327,35 @@ def main(argv: list[str] | None = None) -> int:
             })
             print(json.dumps({"cycles": result.total_cycles, "policy": result.policy}, sort_keys=True))
             return 0
+        base_cycles: int | None = None
+
+        def report_progress(run) -> None:
+            nonlocal base_cycles
+            if run.variant.bits == "0000":
+                base_cycles = run.result.total_cycles
+            if base_cycles is None:
+                raise AssertionError("Base ASIC result must precede ablation progress")
+            progress_record: dict[str, object] = {
+                "variant": run.variant.bits,
+                "cycles": run.result.total_cycles,
+                "speedup_vs_base_asic": base_cycles / run.result.total_cycles,
+                "completed": True,
+            }
+            if orin_anchor is not None:
+                anchor_seconds, anchor_record = orin_anchor
+                progress_record["static_anchor_speedup_vs_orin"] = (
+                    anchor_seconds * config.clock_frequency_hz / run.result.total_cycles
+                )
+                progress_record["static_anchor"] = anchor_record
+            print(json.dumps(progress_record, sort_keys=True), file=sys.stderr, flush=True)
+
         runs = run_matrix(
             trace,
             config,
-            progress=lambda run: print(json.dumps({
-                "variant": run.variant.bits,
-                "cycles": run.result.total_cycles,
-                "completed": True,
-            }, sort_keys=True), file=sys.stderr, flush=True),
+            progress=report_progress,
             parallel_workers=args.parallel_workers,
         )
+        base_cycles = runs[0].result.total_cycles
         rows = [AblationRow(
             model=str(trace.metadata.get("model", "unknown")),
             dataset=str(trace.metadata.get("dataset", "unknown")), bits=run.variant.bits,
@@ -307,6 +367,25 @@ def main(argv: list[str] | None = None) -> int:
             status="passed",
         ) for run in runs]
         write_ablation_csv(rows, args.output)
+        if orin_anchor is not None:
+            _, anchor_record = orin_anchor
+            write_json({
+                "result_scope": "agx_orin_engineering_anchor_comparison",
+                "formal_performance_eligible": False,
+                "anchor": anchor_record,
+                "clock_frequency_hz": config.clock_frequency_hz,
+                "variants": [
+                    {
+                        "bits": run.variant.bits,
+                        "cycles": run.result.total_cycles,
+                        "static_anchor_speedup_vs_orin": (
+                            orin_anchor[0] * config.clock_frequency_hz
+                            / run.result.total_cycles
+                        ),
+                    }
+                    for run in runs
+                ],
+            }, args.output.with_suffix(args.output.suffix + ".orin-anchor.json"))
         if quick_scope:
             write_json({
                 "result_scope": "quick_cycle_validation",
