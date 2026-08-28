@@ -126,7 +126,7 @@ def main(argv: list[str] | None = None) -> int:
         online_sinks: list[BufferedVirtualCycleConsumer] = []
 
         def online_progress(progress) -> None:
-            elapsed = max(progress.elapsed_seconds, 1e-12)
+            elapsed = max(progress.elapsed_seconds, sys.float_info.epsilon)
             print(json.dumps({
                 "phase": progress.phase,
                 "completed_events": progress.completed_events,
