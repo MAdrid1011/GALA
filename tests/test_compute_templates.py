@@ -238,6 +238,34 @@ def test_compute_pod_reserves_twenty_independent_cluster_issue_slots() -> None:
     } == set(range(20))
 
 
+def test_compute_pod_retires_resource_points_without_full_table_scan() -> None:
+    profile = ComputeTemplateProfile(1, {
+        "forward": ComputePathProfile((
+            ComputeStage("TRANSFORM", latency=2, fma_groups=1),
+        )),
+    })
+    pod = ComputePod(
+        "compute_pod",
+        ModuleTiming(latency=1, initiation_interval=1, queue_capacity=16,
+                     ports=1, banks=1),
+        CounterBlock(),
+        template_profiles={1: profile},
+        resource_capacities={
+            "clusters": 1, "cluster_issue": 1, "fma_groups": 1,
+            "microcontext_slots": 1,
+        },
+    )
+    first = pod.reservation_plan(1, PrimitiveKind.FORWARD, 0)
+    assert pod.can_reserve(first, 0)
+    pod.reserve(first)
+    assert not pod.can_reserve(first, 0)
+    assert pod.can_reserve(first, 3)
+    pod._discard_retired(3)
+    assert not pod._resource_use
+    assert not pod._retirement_buckets
+    assert not pod._retirement_cycles
+
+
 def test_ready_selection_finds_reusable_owner_epoch_beyond_fifo_head() -> None:
     engine = CycleEngine(_production_config())
     rows = np.empty(258, dtype=TraceBuilder().finish().events.dtype)

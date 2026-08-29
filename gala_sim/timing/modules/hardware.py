@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum
+import heapq
 
 from gala_sim.clamp.events import PrimitiveKind
 from gala_sim.timing.config import ComputeStage, ComputeTemplateProfile, ModuleTiming
@@ -258,6 +259,12 @@ class ComputePod(HardwareModule):
     template_profiles: dict[int, ComputeTemplateProfile] | None = None
     resource_capacities: dict[str, int] | None = None
     _resource_use: dict[tuple[str, int], int] = field(default_factory=dict, init=False, repr=False)
+    _retirement_buckets: dict[int, set[tuple[str, int]]] = field(
+        default_factory=dict, init=False, repr=False,
+    )
+    _retirement_cycles: list[int] = field(
+        default_factory=list, init=False, repr=False,
+    )
     _next_cluster_by_pod: dict[int, int] = field(default_factory=dict, init=False, repr=False)
 
     def accepts_kind(self, kind: PrimitiveKind) -> bool:
@@ -380,9 +387,14 @@ class ComputePod(HardwareModule):
         return fallback
 
     def _discard_retired(self, cycle: int) -> None:
-        self._resource_use = {
-            key: value for key, value in self._resource_use.items() if key[1] >= cycle
-        }
+        # Reservations are issued in nondecreasing cycle order.  Retire by
+        # point buckets so each resource entry is removed once, instead of
+        # scanning the complete in-flight table on every admission attempt.
+        while self._retirement_cycles and self._retirement_cycles[0] <= cycle:
+            retirement_cycle = heapq.heappop(self._retirement_cycles)
+            keys = self._retirement_buckets.pop(retirement_cycle, ())
+            for key in keys:
+                self._resource_use.pop(key, None)
 
     def _capacity_for(self, resource: str) -> int | None:
         if self.resource_capacities is None:
@@ -428,6 +440,12 @@ class ComputePod(HardwareModule):
         reserved_cluster: int | None = None
         for resource, point, demand in plan:
             key = (resource, point)
+            if key not in self._resource_use:
+                retirement_cycle = point + 1
+                bucket = self._retirement_buckets.setdefault(retirement_cycle, set())
+                if not bucket:
+                    heapq.heappush(self._retirement_cycles, retirement_cycle)
+                bucket.add(key)
             self._resource_use[key] = self._resource_use.get(key, 0) + demand
             if reserved_cluster is None and resource.startswith("cluster_issue:"):
                 reserved_cluster = int(resource.partition(":")[2])
