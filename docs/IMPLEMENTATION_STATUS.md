@@ -7,6 +7,12 @@
 （均相对 CUDA_OPT）。相对 Base ASIC 的派生参考约为 `1.446x`、`1.443x` 和 `2.649x`；
 它们是 `anchor_not_measurement`，不替代同套件实测，也不构成理论上限。
 
+- 2026-08-29 已将 ComputePod 资源占用回收改为按退休周期的堆/桶增量清理（提交
+  `63ba797`）。该软件路径优化不改变事件集合、资源包络或周期结果，完整回归为
+  `320 passed, 1 skipped, 2 warnings`。在完整物理 packet quick trace 上，Pod 内负载感知选路、
+  关系窗口整窗容量预留，以及仅增加 Fusion 前向/伴随端口并开放多头观察的实验均未降低端到端周期，
+  已回退，冻结配置保持不变。
+
 - 2026-08-29 Shared SRAM、关系前端、Query State Bank 和 ComputePod 微上下文计费修正后，
   同一 `846,012` 事件、`1,289,964` 依赖的双窗口 quick trace 已重新闭合。Base 为
   `46,766 cycles`，Full 为 `34,217 cycles`，相对 Base 的实际加速为 `1.366748x`；全部事件、
