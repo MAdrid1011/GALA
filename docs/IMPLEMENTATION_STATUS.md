@@ -15,6 +15,8 @@ CLAMP-CUDA 软件端点为 A0B0/A1B0/A0B1/A1B1 `1.000x/1.254x/1.282x/1.482x`，
 `631,244` 个事件、`933,642` 条依赖、`103,594` 条逻辑关系和 `15,600` 个物理
 RelationPacket。扫描和回放均不设置事件数或依赖数闭包上限；只要完整闭包能在当前分钟级入口
 完成，就不引入截断结果。该样本仍是 `quick_cycle_validation`，不能冒充三万轮正式结果。
+最近一次 `Full` 无上限复验在约 `35.3 s` 墙钟内完成全部事件，结果目录为
+`GALA-runtime/records/r2_gaussian_chest_iter600_601_q177888_pack64_banked_fifo_v2_full_recheck/`。
 
 当前冻结的低成本资源调整为：前向和伴随各两个可选 Fusion 出口，消费者仍为一个出口；消费者
 候选槽空闲时在前向与伴随之间轮转借用，但总候选和总发射宽度仍为三。每个 cluster 的
@@ -22,14 +24,13 @@ owner-gradient 槽由两个增至三个，并将预约点修正为 owner Compute
 由八条增至九条，八 lane RelationPacket 保持不变。上述参数统一用于 Base、实际机制和全部消融，
 没有按变体单独调参。
 
-同一闭包、同一冻结配置的十六项四路并行消融已经全部通过。Base 为 `32,727 cycles`，Query
-为 `20,362 cycles`（`1.607259x`），Residency 为 `31,812 cycles`（`1.028763x`），Full
-和 `1111` 均为 `18,775 cycles`（`1.743116x`）。逐项结果为：`0000=32727`、
-`0001=31812`、`0010=20889`、`0011=19241`、`0100=32727`、`0101=31812`、
-`0110=20889`、`0111=19241`、`1000=32466`、`1001=31590`、`1010=20362`、
-`1011=18782`、`1100=32466`、`1101=31590`、`1110=20362`、`1111=18775`。仓库外
-记录位于
-`GALA-runtime/records/r2_gaussian_chest_iter600_601_q177888_pack64_borrow3slot9_v1_ablation`。
+同一闭包、同一冻结配置的十六项四路并行消融已经全部通过。当前 Banked FIFO 结果为
+Base `32,727 cycles`，Query `19,867 cycles`（`1.647305x`），Residency `31,812 cycles`
+（`1.028763x`），Full 和 `1111` 均为 `18,163 cycles`（`1.801850x`）。逐项结果为：
+`0000=32727`、`0001=31812`、`0010=20608`、`0011=18856`、`0100=32727`、`0101=31812`、
+`0110=20608`、`0111=18856`、`1000=32466`、`1001=31581`、`1010=19867`、`1011=18163`、
+`1100=32466`、`1101=31581`、`1110=19867`、`1111=18163`。仓库外记录位于
+`GALA-runtime/records/r2_gaussian_chest_iter600_601_q177888_pack64_banked_fifo_v1_*`。
 
 必要下界也使用完整 `631,244` 事件闭包。Query 和 Full 均为 `11,514 cycles`，相对 Base 的
 必要条件理论最大加速为 `2.842366x`；Residency 为 `31,330 cycles`，理论最大加速仅
@@ -42,12 +43,12 @@ owner-gradient 槽由两个增至三个，并将预约点修正为 owner Compute
 
 已排除的继续扩容方向包括候选/发射总宽度、FIFO、重放流水、owner-gradient 槽、ComputePod
 接纳能力、microcontext、关系构造、语义缓存端口和内存延迟。当前 Full 的主要剩余时间在依赖
-就绪到 Fusion 发射之间，而不是 Fusion 后端；下一性能任务是减少物理 RelationPacket/Fusion
-工作量或改善跨查询完成顺序，同时保持完整闭包和低成本资源包络。
+就绪到 Fusion 发射之间，而不是 Fusion 后端。闭包必要下界仅保留为诊断信息，不再作为快速回放
+或工程优化的阻塞条件；下一性能任务是减少物理 RelationPacket/Fusion 工作量或改善跨查询完成顺序，
+同时保持完整事件集合和低成本资源包络。
 当前冻结配置校验为 `ready=true`、无 pending 参数，配置 SHA-256 为
 `61ab78bf4f78c05b53dd8fee1b9d60b411720cbcdd641aca162eb57befc0a39b`；完整测试为
-`343 passed, 1 skipped, 2 warnings`。该段的旧周期数字是 Banked FIFO 之前的基线，最新严格
-结果见下方 Banked Fusion FIFO 记录。
+`343 passed, 1 skipped, 2 warnings`。Banked FIFO 的严格结果和十六项矩阵见上方记录。
 
 在提交 `63e848d` 修正 Query future-visible 路径的冻结端口语义后，同一完整闭包的 Query
 portfolio 为 Base `32,727 cycles`、实际 Query `20,362 cycles`、future-visible Query
