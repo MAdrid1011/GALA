@@ -60,8 +60,11 @@ def test_production_compute_profiles_have_audited_path_latencies() -> None:
     assert config.query_relation_window_entries == 256
     assert config.query_relation_store_records == 16_384
     assert config.query_volume_banks == 16
+    assert config.query_relation_store_banks == 16
+    assert config.relation_support_lanes == 8
     assert config.owner_gradient_slots_per_cluster == 2
     assert CycleEngine(config)._module_issue_ports("bidirectional_query") == 312
+    assert CycleEngine(config)._module_issue_ports("relation_constructor") == 24
     assert config.compute_templates[1].latency_for("forward") == 17
     assert config.compute_templates[1].latency_for("adjoint") == 27
     assert config.compute_templates[2].latency_for("forward") == 27
@@ -130,6 +133,31 @@ def test_query_reduction_banks_issue_independently_and_serialize_aliases() -> No
     assert independent.completion_cycles[0] == independent.completion_cycles[1]
     assert aliased.completion_cycles[1] == aliased.completion_cycles[0] + 1
     assert aliased.module_counters["bidirectional_query"]["bank_conflicts"] > 0
+
+
+def test_packet_forward_reserves_only_the_arriving_query_lane() -> None:
+    engine = CycleEngine(_production_config())
+    lanes = [0] * engine._module_issue_ports("bidirectional_query")
+    dtype = TraceBuilder().finish().events.dtype
+    row = np.zeros((), dtype=dtype)
+    row["primitive_kind"] = int(PrimitiveKind.FORWARD)
+    row["query_id"] = 0
+    packet = PhysicalPacketStage(
+        stage_id=0,
+        kind=PrimitiveKind.FORWARD,
+        event_ids=(10, 11),
+        lanes=(0, 1),
+        lane_mask=0b11,
+        query_base=0,
+        relation_packet_id=0,
+    )
+
+    # The second packet lane has not arrived yet and its busy reduction slot
+    # cannot block the first lane from issuing.
+    lanes[1] = 1
+    assert engine._query_resource_allocation(
+        lanes, row, PrimitiveKind.FORWARD, packet, 0,
+    ) == (0,)
 
 
 def test_query_datapaths_allocate_loss_replay_and_query_volume_ports() -> None:
@@ -468,10 +496,10 @@ def test_compute_telemetry_is_exact_and_does_not_change_cycles() -> None:
         len(run.active_microcontexts) == telemetry.cluster_count
         for run in telemetry.cluster_occupancy_runs
     )
-    assert any(
-        run.active_microcontexts == (2,)
+    assert max(
+        run.active_microcontexts[0]
         for run in telemetry.cluster_occupancy_runs
-    )
+    ) == 1
 
 
 def test_production_compute_route_stays_in_resident_pod_and_owner_cluster() -> None:
@@ -535,7 +563,8 @@ def test_compute_pod_tracks_each_stage_resource_window() -> None:
     assert ("transcendental_lanes:0", 9, 2) in plan
     assert ("reduction_trees:0", 12, 1) in plan
     assert ("feedback_lanes:0", 12, 3) in plan
-    assert ("microcontext_slots:0", 15, 1) in plan
+    assert ("microcontext_slots:0", 9, 1) in plan
+    assert ("microcontext_slots:0", 10, 1) not in plan
     assert not pod.can_reserve(
         pod.reservation_plan(2, PrimitiveKind.ADJOINT, 7), 7
     )
@@ -566,3 +595,36 @@ def test_fully_pipelined_fma_releases_issue_resource_before_result() -> None:
     assert ("fma_groups:0", 11, 1) not in first
     assert pod.can_reserve(second, 11)
     assert pod.service_cycles_for(1, PrimitiveKind.FORWARD) == 5
+
+
+def test_microcontext_releases_after_packet_admission_before_result() -> None:
+    profile = ComputeTemplateProfile(1, {
+        "forward": ComputePathProfile((
+            ComputeStage("TRANSFORM", latency=9, fma_groups=1),
+        ), cluster_issue_cycles=2, packet_first_result_latency=9,
+           packet_last_result_offset=10),
+    })
+    pod = ComputePod(
+        "compute_pod",
+        ModuleTiming(latency=1, initiation_interval=1, queue_capacity=8,
+                     ports=1, banks=1), CounterBlock(),
+        template_profiles={1: profile},
+        resource_capacities={
+            "clusters": 1, "cluster_issue": 1, "fma_groups": 2,
+            "transcendental_lanes": 1, "reduction_trees": 1,
+            "microcontext_slots": 1, "feedback_lanes": 1,
+        },
+    )
+    first = pod.reservation_plan(1, PrimitiveKind.FORWARD, 4)
+    pod.reserve(first)
+
+    assert ("microcontext_slots:0", 4, 1) in first
+    assert ("microcontext_slots:0", 5, 1) in first
+    assert ("microcontext_slots:0", 6, 1) not in first
+    assert not pod.can_reserve(
+        pod.reservation_plan(1, PrimitiveKind.FORWARD, 5), 5,
+    )
+    assert pod.can_reserve(
+        pod.reservation_plan(1, PrimitiveKind.FORWARD, 6), 6,
+    )
+    assert profile.paths["forward"].packet_completion_offset(0) == 9

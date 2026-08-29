@@ -366,11 +366,12 @@ class ComputePod(HardwareModule):
                     if demand:
                         plan.append((f"{resource}:{cluster}", point, demand))
                 offset += stage.latency
-            # One physical RelationPacket occupies one microcontext.  Its
-            # logical lane events share that context and never reserve eight
-            # independent slots.
-            context_cycles = path.packet_last_result_offset or offset
-            for point in range(start_cycle, start_cycle + context_cycles):
+            # One physical RelationPacket occupies one microcontext while its
+            # input lanes are admitted.  The downstream pipeline tokens retain
+            # work after admission and do not keep the input context live.
+            for point in range(
+                start_cycle, start_cycle + path.cluster_issue_cycles,
+            ):
                 plan.append((f"microcontext_slots:{cluster}", point, 1))
             candidate = tuple(plan)
             fallback = fallback or candidate
@@ -638,6 +639,20 @@ class RelationWindowTracker:
             "relation_store_peak_records": self.peak_relation_records,
             "relation_windows_live": len(self.live),
             "relation_records_live": self.relation_records_live,
+        }
+
+    def live_reference_snapshot(self) -> dict[int, dict[str, int]]:
+        """Expose per-window live-reference counts for deadlock diagnostics."""
+
+        return {
+            window_id: {
+                "producer": len(state.producer_events),
+                "forward": len(state.forward_events),
+                "consumer": len(state.consumer_events),
+                "adjoint": len(state.adjoint_events),
+                "records": len(state.appended_relation_stages),
+            }
+            for window_id, state in sorted(self.live.items())
         }
 
     def has_append_bank_reservation(self, cycle: int) -> bool:

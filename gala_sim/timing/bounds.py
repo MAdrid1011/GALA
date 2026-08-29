@@ -188,13 +188,28 @@ def _module_work_items(
 
 
 def _module_components(
-    engine: Any, trace: Trace, packet_plan: RelationPacketPlan,
+    engine: Any,
+    trace: Trace,
+    packet_plan: RelationPacketPlan,
+    *,
+    compulsory_cache_writes: bool = False,
 ) -> list[CycleBoundComponent]:
     components: list[CycleBoundComponent] = []
+    compulsory_request_ids = (
+        set(_cache_request_ids(trace, packet_plan, compulsory_only=True))
+        if compulsory_cache_writes else None
+    )
     for module_name, module in engine.modules.items():
         if module_name == "bidirectional_query" and engine._has_query_resources():
             continue
         items = _module_work_items(engine, trace, module_name, packet_plan)
+        if compulsory_request_ids is not None and module_name == "shared_sram":
+            items = [
+                item for item in items
+                if PrimitiveKind(int(trace.events[item[0]]["primitive_kind"]))
+                is not PrimitiveKind.CACHE_REQUEST
+                or item[0] in compulsory_request_ids
+            ]
         if not items:
             continue
         ids = np.asarray([item[0] for item in items], dtype=np.int64)
@@ -215,13 +230,14 @@ def _module_components(
         partition_counts = np.bincount(
             partitions, minlength=engine._module_partition_count(module_name)
         )
-        ports_per_partition = int(
-            engine._module_partition_issue_limit(module_name)
-        )
+        ports_per_partition = np.asarray([
+            engine._module_partition_issue_limit(module_name, partition)
+            for partition in range(partition_counts.size)
+        ], dtype=np.int64)
         port_cycles = max(
             _issue_completion_bound(
                 int(partition_count),
-                ports=ports_per_partition,
+                ports=int(ports_per_partition[partition]),
                 initiation_interval=module.timing.initiation_interval,
                 minimum_service=int(np.min(services[partitions == partition])),
             )
@@ -240,7 +256,7 @@ def _module_components(
                 ),
                 "partitions": int(partition_counts.size),
                 "event_stage_count_per_partition": partition_counts.tolist(),
-                "ports_per_partition": ports_per_partition,
+                "ports_per_partition": ports_per_partition.tolist(),
                 "aggregate_ports": int(engine._module_issue_ports(module_name)),
                 "initiation_interval_cycles": module.timing.initiation_interval,
                 "minimum_service_cycles": int(np.min(services)),
@@ -269,32 +285,95 @@ def _module_components(
                 },
                 limitation="Uses ideal continuous occupancy with no dependency or port bubbles.",
             ))
-            tokens = np.asarray(trace.events["address_token"][ids], dtype=np.uint64)
-            lines = np.where(
-                (tokens >= 64) & (tokens % 64 == 0), tokens // 64, tokens,
-            )
-            bank_counts = np.bincount(
-                np.asarray(
-                    partitions * module.timing.banks
-                    + (lines % module.timing.banks),
-                    dtype=np.int64,
-                ),
-                minlength=partition_counts.size * module.timing.banks,
-            )
-            busiest = int(np.max(bank_counts))
-            bank_cycles = busiest - 1 + int(np.min(services))
-            components.append(CycleBoundComponent(
-                name=f"{module_name}.banks",
-                category="bank_issue",
-                cycles=bank_cycles,
-                evidence={
-                    "partitions": int(partition_counts.size),
-                    "banks_per_partition": module.timing.banks,
-                    "busiest_bank_event_count": busiest,
-                    "minimum_service_cycles": int(np.min(services)),
-                },
-                limitation="Assumes one issue per bank per cycle and the shortest possible final service.",
-            ))
+            if engine._uses_generic_module_bank_limits(module_name):
+                if module_name == "shared_sram":
+                    bank_count = module.timing.banks
+                    read_counts = np.zeros((partition_counts.size, bank_count), dtype=np.int64)
+                    write_counts = np.zeros((partition_counts.size, bank_count), dtype=np.int64)
+                    for index, event_id in enumerate(ids):
+                        row = trace.events[int(event_id)]
+                        bank = engine._shared_sram_bank(row)
+                        kind = PrimitiveKind(int(row["primitive_kind"]))
+                        if engine._shared_sram_direction(kind) == "read":
+                            read_counts[partitions[index], bank] += 1
+                        else:
+                            write_counts[partitions[index], bank] += 1
+                    read_cycles = max(
+                        _issue_completion_bound(
+                            int(count),
+                            ports=engine.config.shared_sram_read_ports_per_bank,
+                            initiation_interval=module.timing.initiation_interval,
+                            minimum_service=int(np.min(services)),
+                        )
+                        for count in read_counts.ravel()
+                        if count
+                    ) if np.any(read_counts) else 0
+                    write_cycles = max(
+                        _issue_completion_bound(
+                            int(count),
+                            ports=engine.config.shared_sram_write_ports_per_bank,
+                            initiation_interval=module.timing.initiation_interval,
+                            minimum_service=int(np.min(services)),
+                        )
+                        for count in write_counts.ravel()
+                        if count
+                    ) if np.any(write_counts) else 0
+                    components.append(CycleBoundComponent(
+                        name=f"{module_name}.banks",
+                        category="bank_issue",
+                        cycles=max(read_cycles, write_cycles),
+                        evidence={
+                            "partitions": int(partition_counts.size),
+                            "banks_per_partition": bank_count,
+                            "read_ports_per_bank": engine.config.shared_sram_read_ports_per_bank,
+                            "write_ports_per_bank": engine.config.shared_sram_write_ports_per_bank,
+                            "read_accesses_per_bank": read_counts.tolist(),
+                            "write_accesses_per_bank": write_counts.tolist(),
+                            "read_cycles": read_cycles,
+                            "write_cycles": write_cycles,
+                        },
+                        limitation="Each physical Bank has independent 1R1W ports; same-address read/write replay and dependency bubbles are outside this necessary bound.",
+                    ))
+                    continue
+                elif (
+                    module_name == "fusion_issue"
+                    and engine.config.fusion_query_state_banks is not None
+                ):
+                    bank_count = engine.config.fusion_query_state_banks
+                    lines = np.asarray(
+                        trace.events["query_id"][ids], dtype=np.int64,
+                    ) // engine.config.relation_query_lanes
+                else:
+                    bank_count = module.timing.banks
+                    tokens = np.asarray(
+                        trace.events["address_token"][ids], dtype=np.uint64,
+                    )
+                    lines = np.where(
+                        (tokens >= 64) & (tokens % 64 == 0),
+                        tokens // 64,
+                        tokens,
+                    )
+                bank_counts = np.bincount(
+                    np.asarray(
+                        partitions * bank_count + (lines % bank_count),
+                        dtype=np.int64,
+                    ),
+                    minlength=partition_counts.size * bank_count,
+                )
+                busiest = int(np.max(bank_counts))
+                bank_cycles = busiest - 1 + int(np.min(services))
+                components.append(CycleBoundComponent(
+                    name=f"{module_name}.banks",
+                    category="bank_issue",
+                    cycles=bank_cycles,
+                    evidence={
+                        "partitions": int(partition_counts.size),
+                        "banks_per_partition": bank_count,
+                        "busiest_bank_event_count": busiest,
+                        "minimum_service_cycles": int(np.min(services)),
+                    },
+                    limitation="Assumes one issue per bank per cycle and the shortest possible final service.",
+                ))
     return components
 
 
@@ -431,24 +510,31 @@ def _query_components(
         seen_stages.add(physical_stage.stage_id)
         replay_counts[list(physical_stage.lanes)] += 1
         physical_packets += 1
+    total_replay_lane_work = int(np.sum(replay_counts, dtype=np.int64))
+    # Replay dispatch is work-conserving: a ready packet can use any free
+    # physical replay lane.  Fixed packet lane positions are useful telemetry
+    # but are not a necessary lower bound on the critical path.
+    replay_work_cycles = _issue_completion_bound(
+        total_replay_lane_work,
+        ports=replay_lanes,
+        initiation_interval=timing.initiation_interval,
+        minimum_service=timing.latency,
+    )
     busiest_replay = int(np.max(replay_counts, initial=0))
     components.append(CycleBoundComponent(
         name="bidirectional_query.adjoint_replay_lanes",
         category="query_adjoint_replay",
-        cycles=_issue_completion_bound(
-            busiest_replay,
-            ports=1,
-            initiation_interval=timing.initiation_interval,
-            minimum_service=timing.latency,
-        ),
+        cycles=replay_work_cycles,
         evidence={
             "physical_adjoint_packets": physical_packets,
             "logical_adjoint_lanes": int(adjoint_ids.size),
             "replay_lanes": replay_lanes,
             "events_per_replay_lane": replay_counts.tolist(),
             "busiest_replay_lane_events": busiest_replay,
+            "total_replay_lane_work": total_replay_lane_work,
+            "work_conserving_lanes": replay_lanes,
         },
-        limitation="Preserves fixed packet lane positions and assumes all replay dependencies are ready.",
+        limitation="Uses total physical replay lane work divided across eight work-conserving lanes; dependencies and packet launch bubbles are free.",
     ))
     return components
 
@@ -556,7 +642,7 @@ def _compute_components(
         count_by_path[path_name] = count_by_path.get(path_name, 0) + 1
         event_demand: dict[str, int] = {
             "cluster_issue": profile.cluster_issue_slots * profile.cluster_issue_cycles,
-            "microcontext_slots": profile.packet_last_result_offset or profile.latency,
+            "microcontext_slots": profile.cluster_issue_cycles,
         }
         for stage in profile.stages:
             for resource, value in engine.modules["compute_pod"]._demands(stage):
@@ -649,20 +735,32 @@ def _memory_components(
 def _cache_request_floor(
     trace: Trace, packet_plan: RelationPacketPlan, *, compulsory_only: bool,
 ) -> tuple[int, int]:
+    request_ids = _cache_request_ids(
+        trace, packet_plan, compulsory_only=compulsory_only,
+    )
+    requests = trace.events[np.asarray(request_ids, dtype=np.int64)]
+    return int(requests.size), int(np.sum(requests["data_bytes"], dtype=np.uint64))
+
+
+def _cache_request_ids(
+    trace: Trace, packet_plan: RelationPacketPlan, *, compulsory_only: bool,
+) -> tuple[int, ...]:
+    """Return cache-request stage heads, optionally limited to miss leaders."""
+
     mask = trace.events["primitive_kind"] == int(PrimitiveKind.CACHE_REQUEST)
     request_ids = np.flatnonzero(mask)
     request_ids = np.asarray([
         int(event_id) for event_id in request_ids
         if packet_plan.is_stage_head(int(event_id))
     ], dtype=np.int64)
-    requests = trace.events[request_ids]
     if not compulsory_only:
-        return int(requests.size), int(np.sum(requests["data_bytes"], dtype=np.uint64))
+        return tuple(int(event_id) for event_id in request_ids)
     first_by_key: dict[tuple[int, int], int] = {}
-    for row in requests:
+    for event_id in request_ids:
+        row = trace.events[int(event_id)]
         key = (int(row["gaussian_id"]), int(row["state_version"]))
-        first_by_key.setdefault(key, int(row["data_bytes"]))
-    return len(first_by_key), sum(first_by_key.values())
+        first_by_key.setdefault(key, int(event_id))
+    return tuple(first_by_key.values())
 
 
 def _capacity_diagnostics(
@@ -830,7 +928,7 @@ def analyze_cycle_lower_bounds(
         / (packet_plan.relation_packet_count * packet_plan.query_lanes)
         if packet_plan.relation_packet_count else 0.0
     )
-    shared_components = [CycleBoundComponent(
+    common_components = [CycleBoundComponent(
         name="trace.dependency_critical_path",
         category="dependency_dag",
         cycles=dependency_cycles,
@@ -843,10 +941,10 @@ def analyze_cycle_lower_bounds(
         },
         limitation="Unlimited hardware resources; preserves every real dependency and event service path.",
     )]
-    shared_components.extend(_module_components(engine, trace, packet_plan))
-    shared_components.extend(_fusion_components(engine, trace, packet_plan))
-    shared_components.extend(_compute_components(engine, trace, packet_plan))
-    shared_components.extend(_query_components(engine, trace, packet_plan))
+    module_components = _module_components(engine, trace, packet_plan)
+    common_components.extend(_fusion_components(engine, trace, packet_plan))
+    common_components.extend(_compute_components(engine, trace, packet_plan))
+    common_components.extend(_query_components(engine, trace, packet_plan))
 
     scenarios: list[ScenarioCycleBound] = []
     for scenario in ("query", "residency", "full"):
@@ -854,8 +952,16 @@ def analyze_cycle_lower_bounds(
         request_count, byte_count = _cache_request_floor(
             trace, packet_plan, compulsory_only=compulsory_only
         )
+        scenario_module_components = (
+            module_components
+            if not compulsory_only
+            else _module_components(
+                engine, trace, packet_plan, compulsory_cache_writes=True,
+            )
+        )
         components = tuple([
-            *shared_components,
+            *common_components,
+            *scenario_module_components,
             *_memory_components(
                 engine,
                 request_count=request_count,

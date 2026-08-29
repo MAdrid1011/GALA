@@ -982,6 +982,50 @@ def test_semantic_residency_variant_merges_repeated_state_reads() -> None:
     assert combined.module_counters["semantic_cache"]["memory_requests"] == 1
     assert combined.module_counters["semantic_cache"]["workset_releases"] == 1
     assert combined.module_counters["semantic_cache"]["releases"] == 1
+    assert combined.module_counters["shared_sram"]["accepted"] == 3
+
+
+def test_shared_sram_replays_same_address_read_against_fill_write() -> None:
+    class _ImmediateMemory:
+        def submit(self, *, address: int, size_bytes: int, is_write: bool,
+                   arrival_cycle: int) -> int:
+            return arrival_cycle
+
+    builder = TraceBuilder()
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_REQUEST), query_id=0,
+        gaussian_id=2, state_version=0, address_token=0, data_bytes=64,
+        resource_class=int(ResourceClass.CACHE),
+    ))
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_RETURN), query_id=1,
+        gaussian_id=3, state_version=0, address_token=0, data_bytes=64,
+        resource_class=int(ResourceClass.CACHE),
+    ))
+    timing = ModuleTiming(
+        latency=1, initiation_interval=1, queue_capacity=8, ports=2, banks=2,
+    )
+    config = CycleConfig(
+        modules={name: timing for name in (
+            "relation_constructor", "fusion_issue", "semantic_cache",
+            "compute_pod", "bidirectional_query", "reconstruction_update",
+            "shared_sram",
+        )},
+        memory=_ImmediateMemory(), clock_frequency_hz=500_000_000,
+        relation_seed_fifo_entries=8, candidate_lanes=3,
+        cache_instances=2,
+        shared_sram_read_ports_per_bank=1,
+        shared_sram_write_ports_per_bank=1,
+    )
+    result = CycleEngine(config, policy="variant:0000").run(
+        builder.finish(), validate_input=False,
+    )
+
+    assert any(
+        stall.module == "shared_sram" and stall.reason == "same_address_replay"
+        for stall in result.stalls
+    )
+    assert result.module_counters["shared_sram"]["bank_conflicts"] >= 1
 
 
 def test_semantic_residency_multicasts_real_ready_requests_without_dropping_dependencies() -> None:
@@ -1040,6 +1084,7 @@ def test_semantic_residency_multicasts_real_ready_requests_without_dropping_depe
     assert cache["multicast_reads"] == 1
     assert cache["memory_requests"] == 1
     assert cache["releases"] == 1
+    assert result.module_counters["shared_sram"]["accepted"] == 6
     assert single_destination.module_counters["semantic_cache"]["multicast_reads"] == 0
     assert cache["busy_cycles"] < single_destination.module_counters["semantic_cache"]["busy_cycles"]
     assert result.event_counts["CACHE_REQUEST"] == 5
@@ -1254,6 +1299,119 @@ def test_fusion_issue_uses_independent_forward_consumer_and_adjoint_ports() -> N
     assert any(
         stall.module == "fusion_issue" and stall.reason == "base_single_issue"
         for stall in base.stalls
+    )
+
+
+def test_fusion_issue_banks_by_physical_query_state_index() -> None:
+    timing = ModuleTiming(
+        latency=1, initiation_interval=1, queue_capacity=8, ports=3, banks=1,
+    )
+    config = CycleConfig(
+        modules={name: timing for name in (
+            "relation_constructor", "fusion_issue", "semantic_cache", "compute_pod",
+            "bidirectional_query", "reconstruction_update", "shared_sram",
+        )},
+        memory=_Memory(), clock_frequency_hz=500_000_000,
+        relation_seed_fifo_entries=8, candidate_lanes=3,
+        relation_query_lanes=1, fusion_query_state_banks=8,
+        fusion_forward_ports=1, fusion_consumer_ports=1, fusion_adjoint_ports=1,
+    )
+
+    grouped_engine = CycleEngine(
+        replace(config, relation_query_lanes=8), policy="variant:0010",
+    )
+    grouped_rows = []
+    for query_id in (0, 7, 8):
+        builder = TraceBuilder()
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.CONSUMER), query_id=query_id,
+        ))
+        grouped_rows.append(builder.finish().events[0])
+    assert [
+        grouped_engine._fusion_query_state_bank(row) for row in grouped_rows
+    ] == [0, 0, 1]
+
+    different_banks = TraceBuilder()
+    different_banks.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.FORWARD), query_id=0,
+        gaussian_id=0, relation_id=0, reduction_key=0, address_token=0,
+        resource_class=int(ResourceClass.ISSUE),
+    ))
+    different_banks.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CONSUMER), query_id=1,
+        consumer_id=1, reduction_key=1, address_token=0,
+        resource_class=int(ResourceClass.ISSUE),
+    ))
+    parallel = CycleEngine(
+        config, policy="variant:0010",
+    ).run(different_banks.finish())
+    assert not any(
+        stall.module == "fusion_issue" and stall.reason == "bank"
+        for stall in parallel.stalls
+    )
+
+    same_bank = TraceBuilder()
+    same_bank.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.FORWARD), query_id=0,
+        gaussian_id=0, relation_id=0, reduction_key=0, address_token=0,
+        resource_class=int(ResourceClass.ISSUE),
+    ))
+    same_bank.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CONSUMER), query_id=8,
+        consumer_id=8, reduction_key=8, address_token=1,
+        resource_class=int(ResourceClass.ISSUE),
+    ))
+    serialized = CycleEngine(
+        config, policy="variant:0010",
+    ).run(same_bank.finish())
+    assert any(
+        stall.module == "fusion_issue" and stall.reason == "bank"
+        for stall in serialized.stalls
+    )
+
+
+def test_relation_constructor_separates_append_banks_and_dynamic_support_lanes() -> None:
+    config = CycleConfig.from_gala(
+        load_config(
+            Path(__file__).parents[1] / "configs/architecture/gala.yaml"
+        ),
+        _Memory(),
+    )
+    engine = CycleEngine(config)
+    dtype = TraceBuilder().finish().events.dtype
+
+    def row(kind: PrimitiveKind, query_id: int, gaussian_id: int = 0):
+        value = np.zeros((), dtype=dtype)
+        value["primitive_kind"] = int(kind)
+        value["query_id"] = query_id
+        value["gaussian_id"] = gaussian_id
+        return value
+
+    assert engine._module_issue_ports("relation_constructor") == 24
+    assert engine._module_partition_count("relation_constructor") == 17
+    assert engine._module_partition_issue_limit("relation_constructor", 0) == 8
+    assert engine._module_partition_issue_limit("relation_constructor", 1) == 1
+    assert engine._module_partition(
+        "relation_constructor", row(PrimitiveKind.RELATION, 8)
+    ) == 2
+    assert engine._module_partition(
+        "relation_constructor", row(PrimitiveKind.RELATION_CANDIDATE, -1, 9)
+    ) == 0
+    candidate = row(PrimitiveKind.RELATION_CANDIDATE, -1, 9)
+    assert list(engine._module_lane_indices(
+        "relation_constructor", candidate,
+    )) == list(range(8))
+
+    builder = TraceBuilder()
+    for gaussian_id in (9, 17):
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.RELATION_CANDIDATE),
+            gaussian_id=gaussian_id,
+        ))
+    result = engine.run(builder.finish())
+    assert result.module_counters["relation_constructor"]["accepted"] == 2
+    assert not any(
+        stall.module == "relation_constructor" for stall in result.stalls
     )
 
 

@@ -912,14 +912,13 @@ class CycleEngine:
             TaskKind.CONSUMER: [],
             TaskKind.ADJOINT: [],
         }
-        fusion = self.modules["fusion_issue"]
         for event_id in event_ids:
             packet = self._task_packet(
                 trace, event_id,
                 packet_plan.stage_for_event(event_id) if packet_plan is not None else None,
             )
             weight = int(future_plan.critical_cycles[event_id])
-            bank = fusion.bank(int(trace.events[event_id]["address_token"]))
+            bank = self._fusion_query_state_bank(trace.events[event_id])
             by_kind[packet.task_kind].append((weight, bank, packet))
         for candidates in by_kind.values():
             candidates.sort(key=lambda item: (-item[0], item[2].event_id))
@@ -1000,6 +999,15 @@ class CycleEngine:
                 self.modules[module_name].timing.ports
                 * self.config.cache_instances
             )
+        if (
+            module_name == "relation_constructor"
+            and self.config.relation_support_lanes is not None
+            and self.config.query_relation_store_banks is not None
+        ):
+            return (
+                self.config.relation_support_lanes
+                + self.config.query_relation_store_banks
+            )
         if module_name == "bidirectional_query" and self._has_query_resources():
             assert self.config.query_reduction_banks is not None
             assert self.config.query_partial_sum_groups_per_bank is not None
@@ -1012,6 +1020,15 @@ class CycleEngine:
                 + self.config.query_loss_queries_per_cycle
                 + self.config.query_adjoint_replay_lanes
                 + 2 * self.config.query_volume_banks
+            )
+        if module_name == "shared_sram":
+            # SharedSRAM is a banked 1R1W array.  ``ModuleTiming.ports`` is a
+            # legacy aggregate fixture value and must not collapse sixteen
+            # independent Banks into two chip-wide ports.
+            banks = self.modules[module_name].timing.banks
+            return banks * (
+                self.config.shared_sram_read_ports_per_bank
+                + self.config.shared_sram_write_ports_per_bank
             )
         return self.modules[module_name].timing.ports
 
@@ -1055,18 +1072,17 @@ class CycleEngine:
             )
             return available[:needed] if len(available) >= needed else None
 
-        query_ids = (
-            tuple(physical_stage.query_base + lane for lane in physical_stage.lanes)
-            if physical_stage is not None else (int(row["query_id"]),)
-        )
-
         def reduction_slot(query_id: int) -> int:
             bank = query_id % banks
             group = (query_id // banks) % groups
             return bank * groups + group
 
         if kind is PrimitiveKind.FORWARD:
-            allocation = tuple({reduction_slot(query_id) for query_id in query_ids})
+            # ComputePod emits packet lanes independently.  By the time a
+            # FORWARD event reaches this stage, only this logical lane is
+            # issuing into the query reduction fabric; reserving every lane
+            # in its source packet would multiply bank occupancy.
+            allocation = (reduction_slot(int(row["query_id"])),)
         elif kind is PrimitiveKind.QUERY_REDUCTION:
             query_id = int(row["query_id"])
             allocation = (
@@ -1084,6 +1100,13 @@ class CycleEngine:
                 volume_write_base + query_id % volume_banks,
             )
         elif kind is PrimitiveKind.ADJOINT:
+            query_ids = (
+                tuple(
+                    physical_stage.query_base + lane
+                    for lane in physical_stage.lanes
+                )
+                if physical_stage is not None else (int(row["query_id"]),)
+            )
             if len(query_ids) > replay_lanes:
                 raise CycleConfigurationError("adjoint packet exceeds replay lanes")
             replay = first_free(replay_base, replay_lanes, len(query_ids))
@@ -1107,16 +1130,49 @@ class CycleEngine:
     def _module_partition_count(self, module_name: str) -> int:
         if module_name == "semantic_cache" and self.config.cache_instances is not None:
             return self.config.cache_instances
+        if (
+            module_name == "relation_constructor"
+            and self.config.relation_support_lanes is not None
+            and self.config.query_relation_store_banks is not None
+        ):
+            return 1 + self.config.query_relation_store_banks
         return 1
 
     def _module_partition(self, module_name: str, row: np.void) -> int:
         if module_name == "semantic_cache" and self.config.cache_instances is not None:
             return self._cache_instance(int(row["gaussian_id"]))
+        if (
+            module_name == "relation_constructor"
+            and self.config.relation_support_lanes is not None
+            and self.config.query_relation_store_banks is not None
+        ):
+            banks = self.config.query_relation_store_banks
+            kind = PrimitiveKind(int(row["primitive_kind"]))
+            if kind is PrimitiveKind.RELATION_CANDIDATE:
+                return 0
+            query_id = int(row["query_id"])
+            if query_id < 0:
+                bank = int(row["address_token"]) % banks
+            else:
+                bank = (query_id // self.config.relation_query_lanes) % banks
+            return 1 + bank
         return 0
 
-    def _module_partition_issue_limit(self, module_name: str) -> int:
+    def _module_partition_issue_limit(
+        self, module_name: str, partition: int | None = None,
+    ) -> int:
         if module_name == "semantic_cache" and self.config.cache_instances is not None:
             return self.modules[module_name].timing.ports
+        if (
+            module_name == "relation_constructor"
+            and self.config.relation_support_lanes is not None
+            and self.config.query_relation_store_banks is not None
+        ):
+            if partition is None:
+                return self._module_issue_ports(module_name)
+            return self.config.relation_support_lanes if partition == 0 else 1
+        if module_name == "shared_sram":
+            return self._module_issue_ports(module_name)
         return self._module_issue_ports(module_name)
 
     def _module_lane_indices(self, module_name: str, row: np.void) -> range:
@@ -1124,15 +1180,110 @@ class CycleEngine:
             ports = self.modules[module_name].timing.ports
             begin = self._module_partition(module_name, row) * ports
             return range(begin, begin + ports)
+        if (
+            module_name == "relation_constructor"
+            and self.config.relation_support_lanes is not None
+            and self.config.query_relation_store_banks is not None
+        ):
+            partition = self._module_partition(module_name, row)
+            if partition == 0:
+                return range(self.config.relation_support_lanes)
+            lane = self.config.relation_support_lanes + partition - 1
+            return range(lane, lane + 1)
+        if module_name == "shared_sram":
+            banks = self.modules[module_name].timing.banks
+            bank = self._shared_sram_bank(row)
+            kind = PrimitiveKind(int(row["primitive_kind"]))
+            if self._shared_sram_direction(kind) == "read":
+                begin = bank * self.config.shared_sram_read_ports_per_bank
+            else:
+                begin = (
+                    banks * self.config.shared_sram_read_ports_per_bank
+                    + bank * self.config.shared_sram_write_ports_per_bank
+                )
+            width = (
+                self.config.shared_sram_read_ports_per_bank
+                if self._shared_sram_direction(kind) == "read"
+                else self.config.shared_sram_write_ports_per_bank
+            )
+            return range(begin, begin + width)
         return range(self._module_issue_ports(module_name))
 
     def _module_bank_partition(
         self, module_name: str, row: np.void,
     ) -> tuple[int, int]:
+        if module_name == "fusion_issue":
+            return 0, self._fusion_query_state_bank(row)
+        if (
+            module_name == "relation_constructor"
+            and self.config.relation_support_lanes is not None
+            and self.config.query_relation_store_banks is not None
+        ):
+            return self._module_partition(module_name, row), 0
+        if module_name == "shared_sram":
+            return self._module_partition(module_name, row), self._shared_sram_bank(row)
         return (
             self._module_partition(module_name, row),
             self.modules[module_name].bank(int(row["address_token"])),
         )
+
+    def _shared_sram_direction(self, kind: PrimitiveKind) -> str:
+        if kind is PrimitiveKind.CACHE_REQUEST:
+            return "write"
+        if kind is PrimitiveKind.CACHE_RETURN:
+            return "read"
+        raise CycleConfigurationError(
+            f"{kind.name} has no SharedSRAM access direction"
+        )
+
+    def _shared_sram_address_key(
+        self, row: np.void, cycle: int,
+    ) -> tuple[int, int]:
+        """Return the cycle-scoped physical address key used for read/write replay."""
+
+        return cycle, int(row["address_token"])
+
+    def _shared_sram_bank(self, row: np.void) -> int:
+        """Map an Active Gaussian record to its physical global SRAM Bank.
+
+        Captured cache addresses are byte addresses of 128-byte records.  The
+        authoritative design stores two 64-byte sectors per record, so using
+        a 64-byte line here would incorrectly force every record onto even
+        Banks.  Small fixture tokens that are not record-aligned retain the
+        generic mapping for backwards-compatible unit tests.
+        """
+
+        banks = self.modules["shared_sram"].timing.banks
+        token = int(row["address_token"])
+        record_bytes = 2 * (self.config.cache_sector_bytes or 1)
+        if (
+            record_bytes > 1
+            and int(row["data_bytes"]) >= record_bytes
+            and token % record_bytes == 0
+        ):
+            return (token // record_bytes) % banks
+        return self.modules["shared_sram"].bank(token)
+
+    def _module_bank_reservation_keys(
+        self, module_name: str, row: np.void, cycle: int,
+    ) -> tuple[tuple[object, ...], ...]:
+        partition, bank = self._module_bank_partition(module_name, row)
+        base = (module_name, cycle, partition, bank)
+        if module_name != "shared_sram":
+            return (base,)
+        direction = self._shared_sram_direction(
+            PrimitiveKind(int(row["primitive_kind"]))
+        )
+        return (base + (direction,),)
+
+    def _fusion_query_state_bank(self, row: np.void) -> int:
+        banks = self.config.fusion_query_state_banks
+        if banks is None:
+            return self.modules["fusion_issue"].bank(int(row["address_token"]))
+        query_id = int(row["query_id"])
+        if query_id < 0:
+            raise CycleConfigurationError("fusion task has no query identity")
+        return (query_id // self.config.relation_query_lanes) % banks
 
     def _ready_scan_window(self, module_name: str) -> int:
         width = max(
@@ -1171,6 +1322,16 @@ class CycleEngine:
         return not (
             (module_name == "compute_pod" and self.config.compute_templates is not None)
             or (module_name == "bidirectional_query" and self._has_query_resources())
+        )
+
+    def _uses_generic_module_bank_limits(self, module_name: str) -> bool:
+        return (
+            self._uses_generic_module_limits(module_name)
+            and not (
+                module_name == "relation_constructor"
+                and self.config.relation_support_lanes is not None
+                and self.config.query_relation_store_banks is not None
+            )
         )
 
     def _is_lane_granular_stage(self, kind: PrimitiveKind, stage: int) -> bool:
@@ -1689,7 +1850,8 @@ class CycleEngine:
             for partition in range(self._module_partition_count(name))
         }
         relation_seed_inflight = 0
-        bank_busy: dict[tuple[str, int, int, int], int] = {}
+        bank_busy: dict[tuple[object, ...], int] = {}
+        shared_sram_address_busy: dict[tuple[int, int], set[str]] = {}
         residency_enabled = self.selection.semantic_residency
         cache_states = (
             self._residency_states()
@@ -1801,6 +1963,10 @@ class CycleEngine:
             bank_busy = {
                 key: value for key, value in bank_busy.items()
                 if key[1] >= cycle
+            }
+            shared_sram_address_busy = {
+                key: value for key, value in shared_sram_address_busy.items()
+                if key[0] >= cycle
             }
             progressed = False
             if async_memory:
@@ -1922,7 +2088,25 @@ class CycleEngine:
                         closed_versions.add(state_version)
                         for state, key in cache_keys_by_version.get(state_version, []):
                             state.close(key)
-                if stage + 1 < len(stages):
+                skip_shared_sram = (
+                    kind is PrimitiveKind.CACHE_REQUEST
+                    and stage == 0
+                    and event_id in cache_event_state
+                    and cache_event_state[event_id][2] is not CacheLookup.MISS
+                )
+                if skip_shared_sram:
+                    # A hit or merged request is already backed by the active
+                    # record (or a leader's pending fill); it must not issue a
+                    # second Active SRAM write.  The semantic-cache stage is a
+                    # physical packet stage, so retire every logical lane;
+                    # only the packet head owns the directory/fill state.
+                    logical_events = (
+                        physical_stage.event_ids
+                        if physical_stage is not None else (event_id,)
+                    )
+                    for logical_event in logical_events:
+                        complete_logical_event(logical_event, finish)
+                elif stage + 1 < len(stages):
                     if event_id in separate_lane_completion:
                         separate_lane_completion.remove(event_id)
                     else:
@@ -2184,7 +2368,9 @@ class CycleEngine:
                         continue
                 elif (
                     issued_modules.get(module_issue_key, 0)
-                    >= self._module_partition_issue_limit(module_name)
+                    >= self._module_partition_issue_limit(
+                        module_name, module_partition,
+                    )
                 ):
                     module.counters.port_stalls += 1
                     self._record_stall(cycle, module_name, "port", event_id)
@@ -2312,9 +2498,33 @@ class CycleEngine:
                     self._record_stall(cycle, module_name, "seed_fifo", event_id)
                     requeue_candidate(event_id, stage)
                     continue
-                bank_partition, bank = self._module_bank_partition(module_name, row)
-                bank_key = (module_name, cycle, bank_partition, bank)
-                if self._uses_generic_module_limits(module_name) and bank_key in bank_busy:
+                bank_keys = self._module_bank_reservation_keys(
+                    module_name, row, cycle,
+                )
+                shared_sram_direction: str | None = None
+                shared_sram_address_key: tuple[int, int] | None = None
+                if module_name == "shared_sram":
+                    shared_sram_direction = self._shared_sram_direction(kind)
+                    shared_sram_address_key = self._shared_sram_address_key(
+                        row, cycle,
+                    )
+                    existing_directions = shared_sram_address_busy.get(
+                        shared_sram_address_key, set(),
+                    )
+                    if any(
+                        direction != shared_sram_direction
+                        for direction in existing_directions
+                    ):
+                        module.counters.bank_conflicts += 1
+                        self._record_stall(
+                            cycle, module_name, "same_address_replay", event_id,
+                        )
+                        requeue_candidate(event_id, stage)
+                        continue
+                if (
+                    self._uses_generic_module_bank_limits(module_name)
+                    and any(key in bank_busy for key in bank_keys)
+                ):
                     module.counters.bank_conflicts += 1
                     self._record_stall(cycle, module_name, "bank", event_id)
                     requeue_candidate(event_id, stage)
@@ -2574,8 +2784,16 @@ class CycleEngine:
                     module_busy_until[module_name][module_lane] = (
                         cycle + timing.initiation_interval
                     )
-                if self._uses_generic_module_limits(module_name):
-                    bank_busy[bank_key] = cycle
+                if self._uses_generic_module_bank_limits(module_name):
+                    for bank_key in bank_keys:
+                        bank_busy[bank_key] = cycle
+                if (
+                    shared_sram_address_key is not None
+                    and shared_sram_direction is not None
+                ):
+                    shared_sram_address_busy.setdefault(
+                        shared_sram_address_key, set(),
+                    ).add(shared_sram_direction)
                 module_inflight[module_issue_key] += 1
                 if kind is PrimitiveKind.RELATION_CANDIDATE:
                     relation_seed_inflight += 1
@@ -2717,6 +2935,12 @@ class CycleEngine:
                         f"{module}:{partition}": len(queue)
                         for (module, partition), queue in ready.items()
                     }
+                    ready_state["fusion_pending"] = len(fusion_pending)
+                    ready_state["fusion_inputs"] = {
+                        task_kind.value: len(queue)
+                        for task_kind, queue in fusion_inputs.items()
+                    }
+                    ready_state["fusion_oracle_inputs"] = len(fusion_oracle_inputs)
                     owner_gradient_state: dict[str, object] = {}
                     if owner_gradients is not None:
                         pending_adjoint_ids: list[int] = []
@@ -2749,9 +2973,22 @@ class CycleEngine:
                         owner_gradient_state["dispatchable_adjoint_sample"] = tuple(
                             dispatchable_adjoint_ids[:16]
                         )
+                    remaining_sample = []
+                    for raw_event_id in np.flatnonzero(dependency_index.remaining):
+                        event_id = int(raw_event_id)
+                        remaining_sample.append((
+                            event_id,
+                            PrimitiveKind(int(trace.events[event_id]["primitive_kind"])).name,
+                            int(dependency_index.remaining[event_id]),
+                        ))
+                        if len(remaining_sample) >= 16:
+                            break
                     raise CycleConfigurationError(
                         f"deadlock at cycle {cycle}, pending={blocked_rows}, "
+                        f"remaining_events={remaining_events}, completed_events={len(completed)}, "
+                        f"remaining_sample={remaining_sample}, "
                         f"ready_state={ready_state}, relation_state={window_state}, "
+                        f"window_references={relation_windows.live_reference_snapshot() if relation_windows is not None else {}}, "
                         f"owner_gradient_state={owner_gradient_state}"
                     )
                 cycle = min(next_points)
@@ -3247,7 +3484,8 @@ class CycleReplaySession:
             for partition in range(engine._module_partition_count(name))
         }
         self._relation_seed_inflight = 0
-        self._bank_busy: dict[tuple[str, int, int, int], int] = {}
+        self._bank_busy: dict[tuple[object, ...], int] = {}
+        self._shared_sram_address_busy: dict[tuple[int, int], set[str]] = {}
         self._cache_states = (
             engine._residency_states()
             if engine.selection.semantic_residency else {}
@@ -4055,6 +4293,11 @@ class CycleReplaySession:
                 key: value for key, value in self._bank_busy.items()
                 if key[1] >= self._cycle
             }
+            self._shared_sram_address_busy = {
+                key: value
+                for key, value in self._shared_sram_address_busy.items()
+                if key[0] >= self._cycle
+            }
             self._report_progress()
             self._cycle_fusion_issued = 0
             self._cycle_fusion_ports: dict[str, int] = {}
@@ -4278,7 +4521,9 @@ class CycleReplaySession:
                 return False
         elif (
             getattr(self, "_cycle_module_issued", {}).get(module_issue_key, 0)
-            >= self.engine._module_partition_issue_limit(module_name)
+            >= self.engine._module_partition_issue_limit(
+                module_name, module_partition,
+            )
         ):
             module.counters.port_stalls += 1
             self.engine._record_stall(self._cycle, module_name, "port", event_id)
@@ -4411,10 +4656,31 @@ class CycleReplaySession:
                     )
                     self._requeue(event_id, stage)
                     return False
-        bank_partition, bank = self.engine._module_bank_partition(module_name, row)
-        bank_key = (module_name, self._cycle, bank_partition, bank)
-        if (self.engine._uses_generic_module_limits(module_name)
-                and bank_key in self._bank_busy):
+        bank_keys = self.engine._module_bank_reservation_keys(
+            module_name, row, self._cycle,
+        )
+        shared_sram_direction: str | None = None
+        shared_sram_address_key: tuple[int, int] | None = None
+        if module_name == "shared_sram":
+            shared_sram_direction = self.engine._shared_sram_direction(kind)
+            shared_sram_address_key = self.engine._shared_sram_address_key(
+                row, self._cycle,
+            )
+            existing_directions = self._shared_sram_address_busy.get(
+                shared_sram_address_key, set(),
+            )
+            if any(
+                direction != shared_sram_direction
+                for direction in existing_directions
+            ):
+                module.counters.bank_conflicts += 1
+                self.engine._record_stall(
+                    self._cycle, module_name, "same_address_replay", event_id,
+                )
+                self._requeue(event_id, stage)
+                return False
+        if (self.engine._uses_generic_module_bank_limits(module_name)
+                and any(key in self._bank_busy for key in bank_keys)):
             module.counters.bank_conflicts += 1
             self.engine._record_stall(self._cycle, module_name, "bank", event_id)
             self._requeue(event_id, stage)
@@ -4488,8 +4754,16 @@ class CycleReplaySession:
             self._module_busy_until[module_name][module_lane] = (
                 self._cycle + timing.initiation_interval
             )
-        if self.engine._uses_generic_module_limits(module_name):
-            self._bank_busy[bank_key] = self._cycle
+        if self.engine._uses_generic_module_bank_limits(module_name):
+            for bank_key in bank_keys:
+                self._bank_busy[bank_key] = self._cycle
+        if (
+            shared_sram_address_key is not None
+            and shared_sram_direction is not None
+        ):
+            self._shared_sram_address_busy.setdefault(
+                shared_sram_address_key, set(),
+            ).add(shared_sram_direction)
         self._module_inflight[module_issue_key] += 1
         if kind is PrimitiveKind.RELATION_CANDIDATE:
             self._relation_seed_inflight += 1
@@ -4728,6 +5002,23 @@ class CycleReplaySession:
                 self._closed_versions.add(version)
                 for state, key in self._cache_keys_by_version.pop(version, []):
                     state.close(key)
+        skip_shared_sram = (
+            kind is PrimitiveKind.CACHE_REQUEST
+            and stage == 0
+            and event_id in self._cache_event_state
+            and self._cache_event_state[event_id][2] is not CacheLookup.MISS
+        )
+        if skip_shared_sram:
+            # Hits and merged requests use the leader's active/pending record;
+            # only a miss leader performs the Active SRAM fill write.  Retire
+            # all logical lanes represented by this physical cache packet.
+            logical_events = (
+                physical_stage.event_ids
+                if physical_stage is not None else (event_id,)
+            )
+            for logical_event in logical_events:
+                self._complete_logical_event(logical_event, finish)
+            return
         if stage + 1 < len(stages):
             if event_id in self._separate_lane_completion:
                 self._separate_lane_completion.remove(event_id)

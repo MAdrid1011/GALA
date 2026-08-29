@@ -85,6 +85,18 @@ parameters:
       scope: hardware
       status: frozen
   shared_sram:
+    read_ports_per_bank:
+      value: 1
+      unit: port
+      source: docs/03_HARDWARE_CONTRACT.md:shared-sram-1r1w
+      scope: hardware
+      status: frozen
+    write_ports_per_bank:
+      value: 1
+      unit: port
+      source: docs/03_HARDWARE_CONTRACT.md:shared-sram-1r1w
+      scope: hardware
+      status: frozen
     active_gaussian_bytes:
       value: 524288
       unit: byte
@@ -129,6 +141,12 @@ parameters:
       scope: hardware
       status: frozen
       allowed_range: [128, 512]
+    support_lanes:
+      value: 8
+      unit: lane
+      source: GALA design config:frontend.seed_enumerator_lanes
+      scope: hardware
+      status: frozen
   issue:
     query_state_entries:
       value: 2048
@@ -137,6 +155,12 @@ parameters:
       scope: hardware
       status: frozen
       allowed_range: [1024, 4096]
+    query_state_banks:
+      value: 8
+      unit: bank
+      source: GALA design config:query_fusion.query_state_banks
+      scope: hardware
+      status: frozen
     candidate_lanes:
       value: 3
       unit: lane

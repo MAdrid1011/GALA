@@ -13,6 +13,8 @@
 | `clock.frequency` | 500000000 | Hz | 论文 Implementation |
 | `top.num_pods` | 4 | count | GALA Architecture |
 | `top.shared_sram_bytes` | 2883584 | byte | 2.75 MiB 设计预算 |
+| `shared_sram.read_ports_per_bank` | 1 | port | 每个 Shared SRAM Bank 的独立读端口（1R1W） |
+| `shared_sram.write_ports_per_bank` | 1 | port | 每个 Shared SRAM Bank 的独立写端口（1R1W） |
 | `shared_sram.active_gaussian_bytes` | 524288 | byte | 四个 Pod 的活动高斯记录 |
 | `shared_sram.relation_window_bytes` | 524288 | byte | 十六 Bank 关系包与关系链 |
 | `shared_sram.query_volume_bytes` | 524288 | byte | 查询结果、梯度、统计与体素 |
@@ -20,12 +22,14 @@
 | `shared_sram.index_graph_bytes` | 262144 | byte | 桶、候选与边 |
 | `shared_sram.control_metadata_bytes` | 393216 | byte | 状态、依赖、任务与窗口元数据 |
 | `relation.seed_fifo_entries` | 必须由设计配置给出 | entry | 关系构造器实现参数 |
+| `relation.support_lanes` | 8 | lane | 八条五级支持域流水，由枚举器动态分配空闲 lane |
 | `issue.query_state_entries` | 2048 | entry | 查询状态 SRAM |
+| `issue.query_state_banks` | 8 | bank | 八路查询状态事件更新 Bank |
 | `issue.candidate_lanes` | 3 | lane | Forecast、Conflict、Issue 三级结构 |
 | `issue.candidate_fifo_entries` | 32 | entry_per_source_fifo | 前向、消费者、伴随三条候选 FIFO 的独立容量 |
-| `issue.forward_ports` | 1 | port | 三输出交叉开关 |
-| `issue.consumer_ports` | 1 | port | 三输出交叉开关 |
-| `issue.adjoint_ports` | 1 | port | 三输出交叉开关 |
+| `issue.forward_ports` | 1 | port | 三输入三输出交叉开关的前向端口；当前每类仅观察一个真实队首 |
+| `issue.consumer_ports` | 1 | port | 三输入三输出交叉开关的消费者端口；当前每类仅观察一个真实队首 |
+| `issue.adjoint_ports` | 1 | port | 三输入三输出交叉开关的伴随端口；当前每类仅观察一个真实队首 |
 | `cache.instances` | 4 | cache | 每 Pod 一个缓存 |
 | `latency.semantic_cache.ports` | 1 | port_per_cache_instance | 每个 Pod 缓存各自独立的目录/Active SRAM 接纳端口，不是四个实例共享的全局端口 |
 | `cache.directory_banks_per_instance` | 4 | bank | 语义驻留目录 |

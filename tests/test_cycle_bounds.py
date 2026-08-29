@@ -8,6 +8,7 @@ from gala_sim.config import load_config
 from gala_sim.clamp.builder import TraceBuilder
 from gala_sim.clamp.events import PrimitiveKind, TraceEvent
 from gala_sim.timing import (
+    ComputePathProfile, ComputeStage, ComputeTemplateProfile,
     CycleConfig, CycleEngine, ModuleTiming, analyze_cycle_lower_bounds,
 )
 
@@ -90,6 +91,26 @@ def test_cycle_bounds_preserve_dependency_resource_and_compulsory_memory_floors(
     assert scenarios["residency"].memory_byte_lower_bound == 128
     assert scenarios["query"].minimum_cycles == 192
     assert scenarios["residency"].minimum_cycles == 128
+    query_sram = next(
+        item for item in scenarios["query"].components
+        if item.name == "shared_sram.banks"
+    )
+    residency_sram = next(
+        item for item in scenarios["residency"].components
+        if item.name == "shared_sram.banks"
+    )
+    assert query_sram.evidence["write_accesses_per_bank"] == [[1, 2]]
+    assert residency_sram.evidence["write_accesses_per_bank"] == [[1, 1]]
+    query_sram_issue = next(
+        item for item in scenarios["query"].components
+        if item.name == "shared_sram.issue_ports"
+    )
+    residency_sram_issue = next(
+        item for item in scenarios["residency"].components
+        if item.name == "shared_sram.issue_ports"
+    )
+    assert query_sram_issue.evidence["physical_stage_count"] == 6
+    assert residency_sram_issue.evidence["physical_stage_count"] == 5
     dependency = next(
         item for item in scenarios["query"].components
         if item.name == "trace.dependency_critical_path"
@@ -135,6 +156,147 @@ def test_query_loss_bound_uses_registered_query_issue_width() -> None:
     )
     assert component.cycles == 5
     assert component.evidence["queries_per_cycle"] == 16
+
+
+def test_fusion_bank_bound_uses_physical_query_state_banks() -> None:
+    builder = TraceBuilder()
+    for query_id in range(64):
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.CONSUMER),
+            query_id=query_id, consumer_id=query_id,
+            address_token=0,
+        ))
+    config = replace(
+        _config(), relation_query_lanes=1, fusion_query_state_banks=8,
+    )
+    report = analyze_cycle_lower_bounds(
+        CycleEngine(config), builder.finish(),
+        base_asic_cycles=100,
+        targets={"query": 2.0, "residency": 2.0, "full": 2.0},
+    )
+    component = next(
+        item for item in report.scenarios[0].components
+        if item.name == "fusion_issue.banks"
+    )
+
+    assert component.cycles == 9
+    assert component.evidence["banks_per_partition"] == 8
+
+
+def test_shared_sram_maps_aligned_records_to_distinct_record_banks() -> None:
+    builder = TraceBuilder()
+    rows = []
+    for gaussian_id in range(3):
+        rows.append(builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.CACHE_REQUEST),
+            gaussian_id=gaussian_id,
+            address_token=gaussian_id * 128,
+            data_bytes=128,
+        )))
+    trace = builder.finish()
+    config = replace(
+        _config(),
+        modules={
+            **_config().modules,
+            "shared_sram": ModuleTiming(
+                latency=2, initiation_interval=1, queue_capacity=8,
+                ports=2, banks=16,
+            ),
+        },
+    )
+    engine = CycleEngine(config)
+    assert [
+        engine._shared_sram_bank(trace.events[event_id]) for event_id in rows
+    ] == [0, 1, 2]
+
+
+def test_shared_sram_read_and_write_ports_are_independent_per_bank() -> None:
+    builder = TraceBuilder()
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_REQUEST),
+        gaussian_id=0, address_token=0, data_bytes=128,
+    ))
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_RETURN),
+        gaussian_id=0, address_token=0, data_bytes=128,
+    ))
+    config = replace(_config(), modules={
+        **_config().modules,
+        "shared_sram": ModuleTiming(
+            latency=2, initiation_interval=1, queue_capacity=8,
+            ports=2, banks=16,
+        ),
+    })
+    result = CycleEngine(config).run(builder.finish(), validate_input=False)
+    assert result.module_counters["shared_sram"]["port_stalls"] == 0
+    assert result.module_counters["shared_sram"]["bank_conflicts"] == 0
+
+
+def test_adjoint_replay_bound_is_work_conserving_across_physical_lanes() -> None:
+    builder = TraceBuilder()
+    for _ in range(8):
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.ADJOINT),
+            query_id=0,
+        ))
+    config = CycleConfig.from_gala(
+        load_config(Path(__file__).parents[1] / "configs/architecture/gala.yaml"),
+        _Memory(),
+    )
+    config = replace(
+        config,
+        relation_query_lanes=1,
+        compute_templates=None,
+        compute_resource_capacities=None,
+    )
+    report = analyze_cycle_lower_bounds(
+        CycleEngine(config), builder.finish(), base_asic_cycles=100,
+        targets={"query": 2.0, "residency": 2.0, "full": 2.0},
+    )
+    component = next(
+        item for item in report.scenarios[0].components
+        if item.name == "bidirectional_query.adjoint_replay_lanes"
+    )
+    assert component.cycles == 4
+    assert component.evidence["total_replay_lane_work"] == 8
+    assert component.evidence["work_conserving_lanes"] == 8
+
+
+def test_compute_microcontext_bound_counts_packet_admission_cycles() -> None:
+    profile = ComputeTemplateProfile(1, {
+        "gradient_reduction": ComputePathProfile((
+            ComputeStage("COMBINE", latency=10, reduction_trees=1),
+        ), cluster_issue_cycles=2, packet_first_result_latency=10,
+           packet_last_result_offset=10),
+    })
+    builder = TraceBuilder()
+    for gaussian_id in range(3):
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.GRADIENT_REDUCTION),
+            gaussian_id=gaussian_id, template_id=1,
+        ))
+    config = replace(
+        _config(), relation_query_lanes=1,
+        compute_templates={1: profile},
+        compute_resource_capacities={
+            "pods": 1, "clusters_per_pod": 1, "clusters": 1,
+            "cluster_issue": 1, "fma_groups": 1,
+            "transcendental_lanes": 1, "reduction_trees": 1,
+            "microcontext_slots": 1, "feedback_lanes": 1,
+        },
+    )
+    report = analyze_cycle_lower_bounds(
+        CycleEngine(config), builder.finish(),
+        base_asic_cycles=100,
+        targets={"query": 2.0, "residency": 2.0, "full": 2.0},
+    )
+    component = next(
+        item for item in report.scenarios[0].components
+        if item.name == "compute_pod.microcontext_slots"
+    )
+
+    assert component.cycles == 6
+    assert component.evidence["total_slot_cycles_or_demands"] == 6
 
 
 def test_semantic_cache_instances_have_independent_ports_and_banks() -> None:

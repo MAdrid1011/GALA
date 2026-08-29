@@ -7,7 +7,29 @@
 （均相对 CUDA_OPT）。相对 Base ASIC 的派生参考约为 `1.446x`、`1.443x` 和 `2.649x`；
 它们是 `anchor_not_measurement`，不替代同套件实测，也不构成理论上限。
 
-- 2026-08-29 阶段门控修复后的同一双窗口 quick trace 四点对照已闭合：Base `125,214 cycles`，
+- 2026-08-29 Shared SRAM、关系前端、Query State Bank 和 ComputePod 微上下文计费修正后，
+  同一 `846,012` 事件、`1,289,964` 依赖的双窗口 quick trace 已重新闭合。Base 为
+  `46,766 cycles`，Full 为 `34,217 cycles`，相对 Base 的实际加速为 `1.366748x`；全部事件、
+  两个关系窗口和 `19,777` 个物理关系 packet 均完成并释放。按最新 Full 静态锚点
+  `2.648560x` 换算，当前 Base 对应目标预算为 `17,657 cycles`，Full 仍需减少 `16,560 cycles`
+  （当前 Full 的 `48.40%`）。该结果是同一代表性真实 trace 的机制诊断，不是正式 30,000
+  iteration 性能结果。
+
+- 当前配置的资源必要下界为 `19,779 cycles`，限制项是 Fusion 前向和伴随各一个真实队首、
+  各一个发射端口；其次为八路伴随重放 `17,568 cycles` 和 ComputePod cluster issue
+  `13,950 cycles`。以当前 `46,766-cycle` Base 计算，Query 和 Residency 静态目标未被必要
+  下界排除，但 Full `17,657-cycle` 目标已被当前一类一队首/一端口合同排除。将 Fusion 前向与
+  伴随端口仅在内存配置中各增至两个，会把静态计数下界
+  降到 `17,568 cycles`，但实际 Full 仍为 `34,217 cycles`，因为三输入调度器仍只观察每类一个
+  真实队首，且当前运行受 ComputePod cluster issue 和查询重放依赖限制。该实验说明单独增加
+  端口没有收益；下一步应先提高现有 Pod 与重放 lane 的工作保持率，再决定是否以多队首调度
+  支持低成本的双端口修改。
+
+- 缓存物理 RelationPacket 的命中或 miss-merge 路径现会完成 packet 的全部逻辑 lane，同时只由
+  packet head 更新一次目录、Active SRAM 和填充状态。该修复消除了 Full 在 `cycle 3337` 留下
+  非 head `CACHE_RETURN` 依赖的死锁。完整回归为 `319 passed, 1 skipped, 2 warnings`。
+
+- 历史阶段门控修复（旧资源计费口径）的同一双窗口 quick trace 四点对照曾闭合：Base `125,214 cycles`，
   编译侧 A（`variant:1000`）`124,878 cycles`，架构侧 C（`variant:0010`）`124,938 cycles`，
   联合 AC（`variant:1010`）`124,633 cycles`，事件集合均为 `846,012/846,012`。相对 Base
   的实际加速依次为 `1.002691x`、`1.002209x` 和 `1.004662x`。停顿计数的主要项仍是
@@ -20,7 +42,7 @@
   相对 Base ASIC 的派生参考为 Query `1.445679x`、Residency `1.443210x`、Full `2.648560x`。
   这些值仍标记为 `anchor_not_measurement`，不参与周期参数拟合，也不冒充可达上限。
 
-- 2026-08-29 周期边界模型已补齐查询损失 16 query/cycle 合同、query-volume SRAM 读写 Bank
+- 历史周期边界模型（旧 Base 口径）曾补齐查询损失 16 query/cycle 合同、query-volume SRAM 读写 Bank
   必要工作量、ComputePod 按 Pod 的资源下界，以及关系窗口/记录存储、回放队列、owner-gradient
   槽位和共享 SRAM 容量诊断。对同一 `846,012` 事件双窗口 quick trace 的静态计算约 16 秒完成，
   资源受限必要下界为 `23,280 cycles`，相对 Base `144,550 cycles` 的乐观最大加速为 `6.209x`。

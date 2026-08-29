@@ -165,8 +165,12 @@ class CycleConfig:
     clock_frequency_hz: int
     relation_seed_fifo_entries: int
     candidate_lanes: int
+    relation_support_lanes: int | None = None
     relation_query_lanes: int = 1
+    shared_sram_read_ports_per_bank: int = 1
+    shared_sram_write_ports_per_bank: int = 1
     query_state_entries: int | None = None
+    fusion_query_state_banks: int | None = None
     candidate_fifo_entries: int | None = None
     cache_instances: int | None = None
     cache_capacity_per_instance: int | None = None
@@ -207,6 +211,11 @@ class CycleConfig:
                 "cycle clock, seed FIFO, candidate lanes, and relation query lanes "
                 "must be positive"
             )
+        if min(
+            self.shared_sram_read_ports_per_bank,
+            self.shared_sram_write_ports_per_bank,
+        ) <= 0:
+            raise ValueError("Shared SRAM read/write ports per bank must be positive")
         optional_cache_values = (
             self.cache_instances, self.cache_capacity_per_instance,
             self.cache_directory_banks, self.cache_sector_bytes,
@@ -219,8 +228,15 @@ class CycleConfig:
         )
         if any(value is not None and value <= 0 for value in optional_fusion_values):
             raise ValueError("optional fusion port values must be positive")
-        if self.query_state_entries is not None and self.query_state_entries <= 0:
-            raise ValueError("query-state table capacity must be positive")
+        if any(
+            value is not None and value <= 0
+            for value in (
+                self.query_state_entries, self.fusion_query_state_banks,
+            )
+        ):
+            raise ValueError("query-state table capacity and banks must be positive")
+        if self.relation_support_lanes is not None and self.relation_support_lanes <= 0:
+            raise ValueError("relation support lane count must be positive")
         if self.candidate_fifo_entries is not None and self.candidate_fifo_entries <= 0:
             raise ValueError("candidate FIFO capacity must be positive")
         if (self.resource_envelope is None) != (self.resource_usage is None):
@@ -328,10 +344,22 @@ class CycleConfig:
         return cls(modules=modules, memory=memory, clock_frequency_hz=frequency,
                    relation_seed_fifo_entries=seed_fifo,
                    candidate_lanes=int(config.value("issue.candidate_lanes")),
+                   relation_support_lanes=int(
+                       config.value("relation.support_lanes")
+                   ),
                    relation_query_lanes=int(
                        config.value("compute.relations_per_microcontext")
                    ),
+                   shared_sram_read_ports_per_bank=int(
+                       config.value("shared_sram.read_ports_per_bank")
+                   ),
+                   shared_sram_write_ports_per_bank=int(
+                       config.value("shared_sram.write_ports_per_bank")
+                   ),
                    query_state_entries=int(config.value("issue.query_state_entries")),
+                   fusion_query_state_banks=int(
+                       config.value("issue.query_state_banks")
+                   ),
                    candidate_fifo_entries=int(
                        config.value("issue.candidate_fifo_entries")
                    ),
