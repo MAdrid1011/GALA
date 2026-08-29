@@ -45,8 +45,38 @@ owner-gradient 槽由两个增至三个，并将预约点修正为 owner Compute
 就绪到 Fusion 发射之间，而不是 Fusion 后端；下一性能任务是减少物理 RelationPacket/Fusion
 工作量或改善跨查询完成顺序，同时保持完整闭包和低成本资源包络。
 当前冻结配置校验为 `ready=true`、无 pending 参数，配置 SHA-256 为
-`aa65899fde49debea2c1829751689173d02f496020c5f0af9a2b4aabe3d1be35`；完整测试为
-`337 passed, 1 skipped, 2 warnings`。
+`61ab78bf4f78c05b53dd8fee1b9d60b411720cbcdd641aca162eb57befc0a39b`；完整测试为
+`343 passed, 1 skipped, 2 warnings`。该段的旧周期数字是 Banked FIFO 之前的基线，最新严格
+结果见下方 Banked Fusion FIFO 记录。
+
+在提交 `63e848d` 修正 Query future-visible 路径的冻结端口语义后，同一完整闭包的 Query
+portfolio 为 Base `32,727 cycles`、实际 Query `20,362 cycles`、future-visible Query
+`19,863 cycles`；未来信息只比实际机制再减少 `499 cycles`。Residency portfolio 为 Base
+`32,727 cycles`、实际 Residency `31,812 cycles`、future-visible Residency
+`31,812 cycles`；未来驻留选择不再增加收益。将 future-visible Query 与实际语义工作集、目录、
+容量、Bank 和 Ramulator 路径联合后得到 `18,213 cycles`，比实际 Full 的 `18,775 cycles`
+再减少 `562 cycles`，相对 Base 为 `1.797012x`，但离静态 Full 派生参考的约
+`12,356-cycle` 预算仍差 `5,857 cycles`。该联合运行保持三候选总宽度、三条独立 32 项 FIFO、
+`2/1/2` Fusion 出口、八个查询状态 Bank、三个 owner-gradient 槽、九条重放流水及冻结内存接口，
+完成全部 `631,244` 个事件；记录位于仓库外
+`GALA-runtime/records/r2_gaussian_chest_iter600_601_q177888_pack64_borrow3slot9_v4_joint_oracle_diagnostic/`。
+它是 best-known 受约束诊断而非已证明的数学上界，现有证据已排除“继续扩大 Query/Residency
+候选搜索”作为补齐 `5,857 cycles` 的主路径，下一项转向所有变体共享的关系、查询重放和
+ComputePod 执行路径。
+
+随后完成的 Banked Fusion FIFO 工程优化保持每个 F/C/A 源共享 32 项容量、总候选宽度 3、
+`2/1/2` 出口和八个查询状态 Bank，只增加每源 `224 B` 的 Bank 队首索引与控制元数据，
+并将 Bank/source 轮转指针限制为真实 Fusion 发射提交后推进。全套回归为 `343 passed, 1 skipped,
+2 warnings`。同一完整 `631,244` 事件闭包的严格完整回放得到 `18,163 cycles`，相对旧 Full
+`18,775 cycles` 少 `612 cycles`，约为 `1.801850x` Base；Fusion 实际记录了 `4,429` 次
+Bank 队首选择，其中 `3,910` 次绕过第二个全局到达项。四路并行的十六项完整闭包消融已通过：
+`0000=32727`、`0001=31812`、`0010=20608`、`0011=18856`、`0100=32727`、`0101=31812`、
+`0110=20608`、`0111=18856`、`1000=32466`、`1001=31581`、`1010=19867`、`1011=18163`、
+`1100=32466`、`1101=31581`、`1110=19867`、`1111=18163`。记录位于仓库外
+`GALA-runtime/records/r2_gaussian_chest_iter600_601_q177888_pack64_banked_fifo_v1_*`；其
+`quick_cycle_validation` 作用域保持不变，配置哈希更新为
+`61ab78bf4f78c05b53dd8fee1b9d60b411720cbcdd641aca162eb57befc0a39b`。距离约 `12,356-cycle`
+静态参考仍差 `5,807 cycles`，因此该优化是已验证的工程收益，不是最终目标达成。
 
 - 2026-08-29 查询调度最小真实跨迭代验证已扩大到每轮四个十六查询物理行。样本包含
   `631,244` 个事件、`933,642` 条依赖、`103,594` 条源 trace 真实逻辑关系和 `15,600`

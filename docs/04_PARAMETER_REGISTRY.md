@@ -27,6 +27,8 @@
 | `issue.query_state_banks` | 8 | bank | 八路查询状态事件更新 Bank |
 | `issue.candidate_lanes` | 3 | lane | Forecast、Conflict、Issue 三级结构 |
 | `issue.candidate_fifo_entries` | 32 | entry_per_source_fifo | 前向、消费者、伴随三条候选 FIFO 的独立容量 |
+| `issue.bank_head_index_bytes` | 224 | byte | 每源共享 FIFO 的八路 Bank 队首索引与轮转控制元数据，计入 control_metadata 区域 |
+| `issue.bank_head_lookahead` | true | bool | 消费者候选槽空闲时允许观察另一查询状态 Bank 的真实队首 |
 | `issue.forward_ports` | 2 | port | 前向可选出口；消费者队列空闲时可借用其候选槽观察第二个真实队首 |
 | `issue.consumer_ports` | 1 | port | 三输入三输出交叉开关的消费者端口；当前每类仅观察一个真实队首 |
 | `issue.adjoint_ports` | 2 | port | 伴随可选出口；消费者队列空闲时与前向轮转借用候选槽 |

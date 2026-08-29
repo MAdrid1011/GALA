@@ -13,6 +13,7 @@ from gala_sim.clamp import (
     ReductionDomain,
     ResourceClass,
     TaskKind,
+    TaskPacket,
     TraceBuilder,
     TraceEvent,
     UpdateBeginKind,
@@ -27,7 +28,11 @@ from gala_sim.timing import (
     CycleProgress,
     ModuleTiming,
 )
-from gala_sim.timing.engine import _DependencyIndex, _ReadyCandidateQueue
+from gala_sim.timing.engine import (
+    _BankedFusionSourceQueue,
+    _DependencyIndex,
+    _ReadyCandidateQueue,
+)
 from gala_sim.timing.modules import OwnerGradientTracker
 from gala_sim.timing.memory import Ramulator2Backend, RecordedMemoryBackend
 from gala_sim.config import load_config
@@ -350,13 +355,23 @@ def test_online_query_packet_batches_expanded_subpackets_before_drain(
         )
         for index in range(2)
     )
-    offline = CycleEngine(_config()).run_virtual(
+    config = replace(
+        _config(),
+        candidate_fifo_entries=32,
+        fusion_query_state_banks=8,
+        fusion_bank_head_lookahead=True,
+        fusion_bank_head_index_bytes=224,
+        fusion_forward_ports=2,
+        fusion_consumer_ports=1,
+        fusion_adjoint_ports=2,
+    )
+    offline = CycleEngine(config).run_virtual(
         sources,
         trace_root=tmp_path / "offline",
         max_events=64,
         max_total_events=10000,
     )
-    session = CycleEngine(_config()).online_session(
+    session = CycleEngine(config).online_session(
         max_events=64,
         initial_gaussian_count=64,
     )
@@ -1318,31 +1333,124 @@ def test_idle_fusion_candidate_slot_borrows_real_fifo_heads_fairly() -> None:
         fusion_adjoint_ports=2,
     )
     engine = CycleEngine(config, policy="variant:0010")
-    inputs = {
-        TaskKind.FORWARD: deque((10, 11, 12)),
-        TaskKind.CONSUMER: deque(),
-        TaskKind.ADJOINT: deque((20, 21, 22)),
-    }
+    def packet(event_id: int, kind: TaskKind) -> TaskPacket:
+        return TaskPacket(
+            event_id=event_id, query_id=event_id, gaussian_id=event_id,
+            reduction_key=event_id, resource=event_id, state_version=0,
+            template_id=0, address_token=event_id, task_kind=kind,
+        )
 
-    first, first_ranks, cursor = engine._pop_fusion_input_candidates(
+    inputs = {
+        kind: _BankedFusionSourceQueue(capacity=32, banks=8)
+        for kind in TaskKind
+    }
+    for event_id, bank in ((10, 0), (11, 1), (12, 2)):
+        inputs[TaskKind.FORWARD].append(
+            packet(event_id, TaskKind.FORWARD), bank=bank,
+        )
+    for event_id, bank in ((20, 0), (21, 1), (22, 2)):
+        inputs[TaskKind.ADJOINT].append(
+            packet(event_id, TaskKind.ADJOINT), bank=bank,
+        )
+
+    first, first_borrowed = engine._peek_fusion_input_candidates(
         inputs, borrow_cursor=0,
     )
-    second, second_ranks, _cursor = engine._pop_fusion_input_candidates(
+    for selected in first:
+        borrow_commit = first_borrowed.get(selected.event_id)
+        inputs[selected.task_kind].commit(
+            selected.event_id,
+            bank_cursor=(borrow_commit[1] if borrow_commit is not None else None),
+        )
+    cursor = next(iter(first_borrowed.values()))[0]
+    second, _second_borrowed = engine._peek_fusion_input_candidates(
         inputs, borrow_cursor=cursor,
     )
 
-    assert first == [10, 20, 11]
-    assert first_ranks == {
-        10: (TaskKind.FORWARD, 0),
-        20: (TaskKind.ADJOINT, 0),
-        11: (TaskKind.FORWARD, 1),
-    }
-    assert second == [12, 21, 22]
-    assert second_ranks == {
-        12: (TaskKind.FORWARD, 0),
-        21: (TaskKind.ADJOINT, 0),
-        22: (TaskKind.ADJOINT, 1),
-    }
+    assert [item.event_id for item in first] == [10, 20, 11]
+    assert [item.event_id for item in second] == [12, 21, 22]
+
+
+def test_banked_fusion_fifo_exposes_only_a_real_head_per_bank() -> None:
+    queue = _BankedFusionSourceQueue(capacity=32, banks=8)
+
+    def packet(event_id: int, query_id: int) -> TaskPacket:
+        return TaskPacket(
+            event_id=event_id, query_id=query_id, gaussian_id=event_id,
+            reduction_key=query_id, resource=event_id, state_version=0,
+            template_id=0, address_token=event_id,
+            task_kind=TaskKind.FORWARD,
+        )
+
+    queue.append(packet(10, 0), bank=0)
+    queue.append(packet(11, 1), bank=0)
+    queue.append(packet(12, 8), bank=1)
+
+    offer = queue.first_compatible_bank_head(
+        (queue.head(),), compatible=CycleEngine._fusion_packets_compatible,
+    )
+
+    assert offer is not None
+    borrowed, bank_cursor = offer
+    assert borrowed.event_id == 12
+    assert bank_cursor == 2
+    assert len(queue) == 3
+    assert queue.head().event_id == 10
+
+
+def test_banked_fusion_fifo_advances_cursor_only_after_issue_commit() -> None:
+    queue = _BankedFusionSourceQueue(capacity=32, banks=8)
+
+    def packet(event_id: int, query_id: int) -> TaskPacket:
+        return TaskPacket(
+            event_id=event_id, query_id=query_id, gaussian_id=event_id,
+            reduction_key=query_id, resource=event_id, state_version=0,
+            template_id=0, address_token=event_id,
+            task_kind=TaskKind.FORWARD,
+        )
+
+    queue.append(packet(10, 0), bank=0)
+    queue.append(packet(11, 8), bank=1)
+    queue.append(packet(12, 16), bank=2)
+
+    first = queue.first_compatible_bank_head(
+        (queue.head(),), compatible=CycleEngine._fusion_packets_compatible,
+    )
+    repeated = queue.first_compatible_bank_head(
+        (queue.head(),), compatible=CycleEngine._fusion_packets_compatible,
+    )
+    assert first is not None and repeated is not None
+    assert first[0].event_id == repeated[0].event_id == 11
+
+    queue.commit(first[0].event_id, bank_cursor=first[1])
+    advanced = queue.first_compatible_bank_head(
+        (queue.head(),), compatible=CycleEngine._fusion_packets_compatible,
+    )
+    assert advanced is not None
+    assert advanced[0].event_id == 12
+
+
+def test_banked_fusion_fifo_capacity_is_shared_across_banks() -> None:
+    queue = _BankedFusionSourceQueue(capacity=32, banks=8)
+    for event_id in range(32):
+        queue.append(TaskPacket(
+            event_id=event_id, query_id=event_id, gaussian_id=event_id,
+            reduction_key=event_id, resource=event_id, state_version=0,
+            template_id=0, address_token=event_id,
+            task_kind=TaskKind.FORWARD,
+        ), bank=event_id % 8)
+
+    with pytest.raises(OverflowError, match="full"):
+        queue.append(TaskPacket(
+            event_id=32, query_id=32, gaussian_id=32, reduction_key=32,
+            resource=32, state_version=0, template_id=0, address_token=32,
+            task_kind=TaskKind.FORWARD,
+        ), bank=0)
+
+    assert len(queue) == 32
+    queue.commit(8)
+    assert len(queue) == 31
+    assert queue.head().event_id == 0
 
 
 def test_owner_gradient_capacity_blocks_compute_not_query_replay() -> None:
@@ -1858,6 +1966,8 @@ def test_loaded_architecture_uses_three_independent_32_entry_candidate_fifos() -
     cycle_config = CycleConfig.from_gala(config, _Memory())
 
     assert cycle_config.candidate_fifo_entries == 32
+    assert cycle_config.fusion_bank_head_lookahead is True
+    assert cycle_config.fusion_bank_head_index_bytes == 224
 
 
 def test_event_driven_engine_replays_large_dependency_chain() -> None:

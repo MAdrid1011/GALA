@@ -145,6 +145,104 @@ class _InFlight:
     module: str
 
 
+class _BankedFusionSourceQueue:
+    """One bounded source FIFO with constant-size query-Bank head indexes.
+
+    The physical storage remains one shared pool per F/C/A source.  The global
+    insertion order supplies the mandatory FIFO head, while the Bank indexes
+    expose at most one additional real head for an otherwise idle candidate
+    lane.  Candidates stay resident until issue commits, so a rejection cannot
+    perturb FIFO or Bank order.
+    """
+
+    def __init__(
+        self, *, capacity: int, banks: int, bank_head_lookahead: bool = True,
+    ) -> None:
+        if min(capacity, banks) <= 0:
+            raise ValueError("banked Fusion FIFO resources must be positive")
+        self.capacity = capacity
+        self.banks = banks
+        self.bank_head_lookahead = bank_head_lookahead
+        self._global: dict[int, tuple[TaskPacket, int]] = {}
+        self._by_bank: tuple[dict[int, None], ...] = tuple(
+            {} for _ in range(banks)
+        )
+        self._bank_cursor = 0
+        self.bank_head_selections = 0
+        self.bank_head_bypasses = 0
+
+    def __len__(self) -> int:
+        return len(self._global)
+
+    def __bool__(self) -> bool:
+        return bool(self._global)
+
+    @property
+    def full(self) -> bool:
+        return len(self) >= self.capacity
+
+    def append(self, packet: TaskPacket, *, bank: int) -> None:
+        if self.full:
+            raise OverflowError("banked Fusion FIFO is full")
+        if packet.event_id in self._global:
+            raise ValueError(f"Fusion task {packet.event_id} entered its FIFO twice")
+        if not 0 <= bank < self.banks:
+            raise ValueError("Fusion task Bank is outside the configured index")
+        self._global[packet.event_id] = (packet, bank)
+        self._by_bank[bank][packet.event_id] = None
+
+    def head(self) -> TaskPacket | None:
+        if not self._global:
+            return None
+        event_id = next(iter(self._global))
+        return self._global[event_id][0]
+
+    def first_compatible_bank_head(
+        self,
+        mandatory: tuple[TaskPacket, ...],
+        *,
+        compatible: Callable[[TaskPacket, tuple[TaskPacket, ...]], bool],
+    ) -> tuple[TaskPacket, int | None] | None:
+        """Select one different-Bank head with an eight-way RR encoder."""
+
+        global_head = self.head()
+        if global_head is None:
+            return None
+        if not self.bank_head_lookahead:
+            second_event = next(iter(tuple(self._global)[1:]), None)
+            if second_event is None:
+                return None
+            packet = self._global[second_event][0]
+            return (packet, None) if compatible(packet, mandatory) else None
+        head_bank = self._global[global_head.event_id][1]
+        for offset in range(self.banks):
+            bank = (self._bank_cursor + offset) % self.banks
+            bank_queue = self._by_bank[bank]
+            if bank == head_bank or not bank_queue:
+                continue
+            event_id = next(iter(bank_queue))
+            packet = self._global[event_id][0]
+            if not compatible(packet, mandatory):
+                continue
+            second_event = next(iter(tuple(self._global)[1:]), None)
+            self.bank_head_selections += 1
+            if event_id != second_event:
+                self.bank_head_bypasses += 1
+            return packet, (bank + 1) % self.banks
+        return None
+
+    def commit(self, event_id: int, *, bank_cursor: int | None = None) -> None:
+        try:
+            _packet, bank = self._global.pop(event_id)
+        except KeyError as error:
+            raise ValueError(
+                f"Fusion task {event_id} is not resident in its source FIFO"
+            ) from error
+        del self._by_bank[bank][event_id]
+        if bank_cursor is not None:
+            self._bank_cursor = bank_cursor
+
+
 class _ReadyCandidateQueue:
     """Heap-index ready work without changing candidate ordering semantics."""
 
@@ -1060,18 +1158,31 @@ class CycleEngine:
             return "adjoint", self.config.fusion_adjoint_ports or timing_ports
         raise CycleConfigurationError(f"invalid fusion task kind: {kind.name}")
 
-    def _pop_fusion_input_candidates(
+    @staticmethod
+    def _fusion_packets_compatible(
+        packet: TaskPacket, others: tuple[TaskPacket, ...],
+    ) -> bool:
+        return all(
+            packet.conflict_keys.isdisjoint(other.conflict_keys)
+            and not (
+                packet.target_resource is not None
+                and packet.target_resource == other.target_resource
+            )
+            for other in others
+        )
+
+    def _peek_fusion_input_candidates(
         self,
-        inputs: Mapping[TaskKind, deque[int]],
+        inputs: Mapping[TaskKind, _BankedFusionSourceQueue],
         *,
         borrow_cursor: int,
-    ) -> tuple[list[int], dict[int, tuple[TaskKind, int]], int]:
-        """Pop real FIFO heads, lending otherwise idle candidate lanes.
+    ) -> tuple[list[TaskPacket], dict[int, tuple[int, int | None]]]:
+        """Peek real FIFO/Bank heads, lending otherwise idle candidate lanes.
 
         Every nonempty source retains one first-look slot.  A remaining slot may
-        inspect another head only when that source has a second physical output
-        port.  The rotating cursor prevents a continuously nonempty Forward or
-        Adjoint FIFO from monopolizing the single commonly idle Consumer slot.
+        inspect a different query-state Bank head only when that source has a
+        second physical output port.  The rotating source and Bank cursors keep
+        the fixed eight-way selection network fair without changing capacity.
         """
 
         source_order = (
@@ -1082,16 +1193,17 @@ class CycleEngine:
             TaskKind.CONSUMER: self.issue_scheduler.consumer_ports,
             TaskKind.ADJOINT: self.issue_scheduler.adjoint_ports,
         }
-        selected: list[int] = []
+        selected: list[TaskPacket] = []
         selected_per_source = {kind: 0 for kind in source_order}
-        pop_ranks: dict[int, tuple[TaskKind, int]] = {}
+        borrowed: dict[int, tuple[int, int | None]] = {}
+        selection_cursor = borrow_cursor
 
         def take(kind: TaskKind) -> None:
-            event_id = inputs[kind].popleft()
-            rank = selected_per_source[kind]
+            packet = inputs[kind].head()
+            if packet is None:
+                return
             selected_per_source[kind] += 1
-            selected.append(event_id)
-            pop_ranks[event_id] = (kind, rank)
+            selected.append(packet)
 
         for kind in source_order:
             if len(selected) >= self.config.candidate_lanes:
@@ -1101,21 +1213,30 @@ class CycleEngine:
 
         borrow_order = (TaskKind.FORWARD, TaskKind.ADJOINT, TaskKind.CONSUMER)
         while len(selected) < self.config.candidate_lanes:
-            chosen_index: int | None = None
+            chosen: tuple[int, TaskKind, TaskPacket] | None = None
             for offset in range(len(borrow_order)):
-                index = (borrow_cursor + offset) % len(borrow_order)
+                index = (selection_cursor + offset) % len(borrow_order)
                 kind = borrow_order[index]
                 if (
-                    inputs[kind]
+                    len(inputs[kind]) > selected_per_source[kind]
                     and selected_per_source[kind] < port_limits[kind]
                 ):
-                    chosen_index = index
-                    break
-            if chosen_index is None:
+                    bank_offer = inputs[kind].first_compatible_bank_head(
+                        tuple(selected),
+                        compatible=self._fusion_packets_compatible,
+                    )
+                    if bank_offer is not None:
+                        packet, bank_cursor = bank_offer
+                        chosen = (index, kind, packet)
+                        break
+            if chosen is None:
                 break
-            take(borrow_order[chosen_index])
-            borrow_cursor = (chosen_index + 1) % len(borrow_order)
-        return selected, pop_ranks, borrow_cursor
+            chosen_index, kind, packet = chosen
+            selected_per_source[kind] += 1
+            selected.append(packet)
+            selection_cursor = (chosen_index + 1) % len(borrow_order)
+            borrowed[packet.event_id] = (selection_cursor, bank_cursor)
+        return selected, borrowed
 
     def _module_issue_ports(self, module_name: str) -> int:
         """Return the actual issue slots represented by a module instance.
@@ -1892,10 +2013,22 @@ class CycleEngine:
             _ReadyCandidateQueue
         )
         fusion_pending: deque[tuple[int, TaskKind]] = deque()
-        fusion_inputs: dict[TaskKind, deque[int]] = {
-            TaskKind.FORWARD: deque(),
-            TaskKind.CONSUMER: deque(),
-            TaskKind.ADJOINT: deque(),
+        fusion_capacity = (
+            self.config.candidate_fifo_entries
+            or self.modules["fusion_issue"].timing.queue_capacity
+        )
+        fusion_banks = (
+            self.config.fusion_query_state_banks
+            or self.modules["fusion_issue"].timing.banks
+        )
+        fusion_inputs: dict[TaskKind, _BankedFusionSourceQueue] = {
+            kind: _BankedFusionSourceQueue(
+                capacity=fusion_capacity, banks=fusion_banks,
+                bank_head_lookahead=(
+                    self.config.fusion_bank_head_lookahead is True
+                ),
+            )
+            for kind in TaskKind
         }
         fusion_oracle_inputs: dict[
             TaskKind, list[tuple[tuple[int, int], int]]
@@ -2022,20 +2155,12 @@ class CycleEngine:
                     (fusion_priority(event_id), event_id),
                 )
             else:
-                popped = fusion_pop_ranks.get(event_id)
-                if popped is None:
-                    fusion_inputs[task_kind].appendleft(event_id)
-                else:
-                    _kind, rank = popped
-                    queue = fusion_inputs[task_kind]
-                    position = next((
-                        index for index, queued_id in enumerate(queue)
-                        if (
-                            (queued := fusion_pop_ranks.get(queued_id)) is None
-                            or queued[1] > rank
-                        )
-                    ), len(queue))
-                    queue.insert(position, event_id)
+                # Actual Fusion candidates are only peeked.  A rejected task
+                # remains in both its global FIFO and Bank-head index.
+                if event_id not in fusion_packets:
+                    raise CycleConfigurationError(
+                        f"Fusion task {event_id} was requeued before FIFO admission"
+                    )
 
         for event_id, stage in initial_ready:
             push_ready(event_id, stage)
@@ -2055,7 +2180,7 @@ class CycleEngine:
             )
         }
         fusion_borrow_cursor = 0
-        fusion_pop_ranks: dict[int, tuple[TaskKind, int]] = {}
+        fusion_borrow_commits: dict[int, tuple[int, int | None]] = {}
         module_inflight = {
             (name, partition): 0
             for name in self.modules
@@ -2404,10 +2529,6 @@ class CycleEngine:
                 next_progress_time = now + progress_interval_seconds
             if self.selection.query_scheduler_enabled:
                 self.issue_scheduler.set_clock(cycle)
-                fusion_capacity = (
-                    self.config.candidate_fifo_entries
-                    or self.modules["fusion_issue"].timing.queue_capacity
-                )
                 blocked_pending: list[tuple[int, TaskKind]] = []
                 pending_count = len(fusion_pending)
                 for _ in range(pending_count):
@@ -2421,21 +2542,28 @@ class CycleEngine:
                             (fusion_priority(event_id), event_id),
                         )
                     else:
-                        if len(fusion_inputs[task_kind]) >= fusion_capacity:
+                        queue = fusion_inputs[task_kind]
+                        if queue.full:
                             blocked_pending.append((event_id, task_kind))
                             continue
-                        fusion_inputs[task_kind].append(event_id)
-                        self.issue_scheduler.observe_arrival((
-                            self._task_packet(
-                                trace, event_id,
-                                packet_plan.stage_for_event(event_id),
-                                consumer_owner_ids=(
-                                    (consumer_credit_owner[event_id],)
-                                    if task_kind is TaskKind.CONSUMER
-                                    and event_id in consumer_credit_owner else ()
-                                ),
+                        packet = self._task_packet(
+                            trace, event_id,
+                            packet_plan.stage_for_event(event_id),
+                            consumer_owner_ids=(
+                                (consumer_credit_owner[event_id],)
+                                if task_kind is TaskKind.CONSUMER
+                                and event_id in consumer_credit_owner else ()
                             ),
-                        ), arrival_cycle=cycle)
+                        )
+                        queue.append(
+                            packet,
+                            bank=self._fusion_query_state_bank(
+                                trace.events[event_id]
+                            ),
+                        )
+                        self.issue_scheduler.observe_arrival(
+                            (packet,), arrival_cycle=cycle,
+                        )
                 fusion_pending.extend(blocked_pending)
                 if fusion_pending:
                     self.modules["fusion_issue"].counters.queue_stalls += 1
@@ -2444,7 +2572,6 @@ class CycleEngine:
                         fusion_pending[0][0],
                     )
             candidates: list[tuple[int, int]] = []
-            fusion_pop_ranks = {}
             for ready_key in tuple(ready):
                 queue = ready[ready_key]
                 module_name, _partition = ready_key
@@ -2483,14 +2610,14 @@ class CycleEngine:
                             heapq.heappush(queue, entry)
                 else:
                     (
-                        fusion_candidate_ids,
-                        fusion_pop_ranks,
-                        fusion_borrow_cursor,
-                    ) = self._pop_fusion_input_candidates(
+                        fusion_candidate_packets,
+                        fusion_borrow_commits,
+                    ) = self._peek_fusion_input_candidates(
                         fusion_inputs, borrow_cursor=fusion_borrow_cursor,
                     )
                     candidates.extend(
-                        (event_id, 0) for event_id in fusion_candidate_ids
+                        (packet.event_id, 0)
+                        for packet in fusion_candidate_packets
                     )
             fusion_issued = 0
             fusion_port_issued: dict[str, int] = {}
@@ -3151,7 +3278,19 @@ class CycleEngine:
                         except ValueError as error:
                             raise CycleConfigurationError(str(error)) from error
                     if self.selection.query_scheduler_enabled:
-                        self.issue_scheduler.commit_issued((fusion_packets[event_id],))
+                        packet = fusion_packets[event_id]
+                        self.issue_scheduler.commit_issued((packet,))
+                        if not self.selection.query_oracle:
+                            borrow_commit = fusion_borrow_commits.get(event_id)
+                            fusion_inputs[packet.task_kind].commit(
+                                event_id,
+                                bank_cursor=(
+                                    borrow_commit[1]
+                                    if borrow_commit is not None else None
+                                ),
+                            )
+                            if borrow_commit is not None:
+                                fusion_borrow_cursor = borrow_commit[0]
                     if fusion_port_name is not None:
                         fusion_port_issued[fusion_port_name] = (
                             fusion_port_issued.get(fusion_port_name, 0) + 1
@@ -3358,6 +3497,12 @@ class CycleEngine:
         module_counters["fusion_issue"].update({
             **self.issue_scheduler.state_table_snapshot(),
             **self.issue_scheduler.history_snapshot(),
+            "bank_head_selections": sum(
+                queue.bank_head_selections for queue in fusion_inputs.values()
+            ),
+            "bank_head_bypasses": sum(
+                queue.bank_head_bypasses for queue in fusion_inputs.values()
+            ),
             "live_forward_count": f_count,
             "live_consumer_count": c_count,
             "live_adjoint_count": a_count,
@@ -3749,10 +3894,22 @@ class CycleReplaySession:
             tuple[str, int], _ReadyCandidateQueue
         ] = defaultdict(_ReadyCandidateQueue)
         self._fusion_pending: deque[tuple[int, TaskKind]] = deque()
-        self._fusion_inputs: dict[TaskKind, deque[int]] = {
-            TaskKind.FORWARD: deque(),
-            TaskKind.CONSUMER: deque(),
-            TaskKind.ADJOINT: deque(),
+        fusion_capacity = (
+            engine.config.candidate_fifo_entries
+            or engine.modules["fusion_issue"].timing.queue_capacity
+        )
+        fusion_banks = (
+            engine.config.fusion_query_state_banks
+            or engine.modules["fusion_issue"].timing.banks
+        )
+        self._fusion_inputs: dict[TaskKind, _BankedFusionSourceQueue] = {
+            kind: _BankedFusionSourceQueue(
+                capacity=fusion_capacity, banks=fusion_banks,
+                bank_head_lookahead=(
+                    engine.config.fusion_bank_head_lookahead is True
+                ),
+            )
+            for kind in TaskKind
         }
         self._in_flight: list[tuple[int, int, int, str]] = []
         self._lane_outputs: list[tuple[int, int, int | None]] = []
@@ -3783,7 +3940,7 @@ class CycleReplaySession:
             )
         }
         self._fusion_borrow_cursor = 0
-        self._fusion_pop_ranks: dict[int, tuple[TaskKind, int]] = {}
+        self._fusion_borrow_commits: dict[int, tuple[int, int | None]] = {}
         self._module_inflight = {
             (name, partition): 0
             for name in engine.modules
@@ -4344,6 +4501,14 @@ class CycleReplaySession:
         counters["fusion_issue"].update({
             **self.engine.issue_scheduler.state_table_snapshot(),
             **self.engine.issue_scheduler.history_snapshot(),
+            "bank_head_selections": sum(
+                queue.bank_head_selections
+                for queue in self._fusion_inputs.values()
+            ),
+            "bank_head_bypasses": sum(
+                queue.bank_head_bypasses
+                for queue in self._fusion_inputs.values()
+            ),
             "live_forward_count": f_count,
             "live_consumer_count": c_count,
             "live_adjoint_count": a_count,
@@ -4512,20 +4677,11 @@ class CycleReplaySession:
             )
             self._ready[(module_name, partition)].push((event_id, stage))
         else:
-            popped = self._fusion_pop_ranks.get(event_id)
-            if popped is None:
-                self._fusion_inputs[task_kind].appendleft(event_id)
-            else:
-                _kind, rank = popped
-                queue = self._fusion_inputs[task_kind]
-                position = next((
-                    index for index, queued_id in enumerate(queue)
-                    if (
-                        (queued := self._fusion_pop_ranks.get(queued_id)) is None
-                        or queued[1] > rank
-                    )
-                ), len(queue))
-                queue.insert(position, event_id)
+            # Actual Fusion candidates remain resident until successful issue.
+            if not self._fusion_inputs[task_kind]:
+                raise CycleConfigurationError(
+                    f"online Fusion task {event_id} lacks a resident source FIFO"
+                )
 
     def _fusion_kind(self, event_id: int, stage: int) -> TaskKind | None:
         if not self.engine.selection.query_scheduler_enabled or stage != 0:
@@ -4643,24 +4799,26 @@ class CycleReplaySession:
                 progressed = True
             if self.engine.selection.query_scheduler_enabled:
                 self.engine.issue_scheduler.set_clock(self._cycle)
-                capacity = (
-                    self.engine.config.candidate_fifo_entries
-                    or self.engine.modules["fusion_issue"].timing.queue_capacity
-                )
                 blocked_pending: list[tuple[int, TaskKind]] = []
                 while self._fusion_pending:
                     event_id, task_kind = self._fusion_pending.popleft()
-                    if len(self._fusion_inputs[task_kind]) >= capacity:
+                    queue = self._fusion_inputs[task_kind]
+                    if queue.full:
                         blocked_pending.append((event_id, task_kind))
                         continue
-                    self._fusion_inputs[task_kind].append(event_id)
+                    packet = self._task_packet(event_id)
+                    queue.append(
+                        packet,
+                        bank=self.engine._fusion_query_state_bank(
+                            self._events[event_id]
+                        ),
+                    )
                     self.engine.issue_scheduler.observe_arrival(
-                        (self._task_packet(event_id),), arrival_cycle=self._cycle,
+                        (packet,), arrival_cycle=self._cycle,
                     )
                 for pending_entry in blocked_pending:
                     self._fusion_pending.append(pending_entry)
             candidates: list[tuple[int, int]] = []
-            self._fusion_pop_ranks = {}
             for ready_key in tuple(self._ready):
                 queue = self._ready[ready_key]
                 module_name, _partition = ready_key
@@ -4675,15 +4833,15 @@ class CycleReplaySession:
                     del self._ready[ready_key]
             if self.engine.selection.query_scheduler_enabled:
                 (
-                    fusion_candidate_ids,
-                    self._fusion_pop_ranks,
-                    self._fusion_borrow_cursor,
-                ) = self.engine._pop_fusion_input_candidates(
+                    fusion_candidate_packets,
+                    self._fusion_borrow_commits,
+                ) = self.engine._peek_fusion_input_candidates(
                     self._fusion_inputs,
                     borrow_cursor=self._fusion_borrow_cursor,
                 )
                 candidates.extend(
-                    (event_id, 0) for event_id in fusion_candidate_ids
+                    (packet.event_id, 0)
+                    for packet in fusion_candidate_packets
                 )
             if candidates:
                 ordered = self._ordered(candidates)
@@ -5195,7 +5353,17 @@ class CycleReplaySession:
                 except ValueError as error:
                     raise CycleConfigurationError(str(error)) from error
             if self.engine.selection.query_scheduler_enabled:
-                self.engine.issue_scheduler.commit_issued((self._task_packet(event_id),))
+                packet = self._task_packet(event_id)
+                self.engine.issue_scheduler.commit_issued((packet,))
+                borrow_commit = self._fusion_borrow_commits.get(event_id)
+                self._fusion_inputs[packet.task_kind].commit(
+                    event_id,
+                    bank_cursor=(
+                        borrow_commit[1] if borrow_commit is not None else None
+                    ),
+                )
+                if borrow_commit is not None:
+                    self._fusion_borrow_cursor = borrow_commit[0]
             if port_name:
                 self._cycle_fusion_ports[port_name] = self._cycle_fusion_ports.get(port_name, 0) + 1
         return True

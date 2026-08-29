@@ -172,6 +172,8 @@ class CycleConfig:
     query_state_entries: int | None = None
     fusion_query_state_banks: int | None = None
     candidate_fifo_entries: int | None = None
+    fusion_bank_head_lookahead: bool | None = None
+    fusion_bank_head_index_bytes: int | None = None
     cache_instances: int | None = None
     cache_capacity_per_instance: int | None = None
     cache_directory_banks: int | None = None
@@ -239,10 +241,34 @@ class CycleConfig:
             raise ValueError("relation support lane count must be positive")
         if self.candidate_fifo_entries is not None and self.candidate_fifo_entries <= 0:
             raise ValueError("candidate FIFO capacity must be positive")
+        if (
+            self.fusion_bank_head_index_bytes is not None
+            and self.fusion_bank_head_index_bytes <= 0
+        ):
+            raise ValueError("Fusion Bank head index metadata must be positive")
+        if (
+            self.fusion_bank_head_lookahead is not None
+            and not isinstance(self.fusion_bank_head_lookahead, bool)
+        ):
+            raise ValueError("Fusion Bank head lookahead must be boolean")
+        if (self.fusion_bank_head_lookahead is True) != (
+            self.fusion_bank_head_index_bytes is not None
+        ):
+            raise ValueError(
+                "Fusion Bank head lookahead and metadata budget must be configured together"
+            )
         if (self.resource_envelope is None) != (self.resource_usage is None):
             raise ValueError("resource envelope and usage must be provided together")
         if self.resource_envelope is not None and self.resource_usage is not None:
             self.resource_envelope.check(self.resource_usage)
+            if (
+                self.fusion_bank_head_index_bytes is not None
+                and self.fusion_bank_head_index_bytes
+                > self.resource_usage.regions.get("control_metadata", 0)
+            ):
+                raise ValueError(
+                    "Fusion Bank head index exceeds control metadata region"
+                )
         if self.compute_templates is not None:
             if not self.compute_templates:
                 raise ValueError("compute template profiles cannot be empty")
@@ -367,6 +393,12 @@ class CycleConfig:
                    ),
                    candidate_fifo_entries=int(
                        config.value("issue.candidate_fifo_entries")
+                   ),
+                   fusion_bank_head_lookahead=config.value(
+                       "issue.bank_head_lookahead"
+                   ),
+                   fusion_bank_head_index_bytes=int(
+                       config.value("issue.bank_head_index_bytes")
                    ),
                    cache_instances=int(config.value("cache.instances")),
                    cache_capacity_per_instance=int(config.value("cache.active_records_per_instance")),

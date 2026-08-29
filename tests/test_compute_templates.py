@@ -66,6 +66,8 @@ def test_production_compute_profiles_have_audited_path_latencies() -> None:
     assert config.fusion_forward_ports == 2
     assert config.fusion_consumer_ports == 1
     assert config.fusion_adjoint_ports == 2
+    assert config.fusion_bank_head_lookahead is True
+    assert config.fusion_bank_head_index_bytes == 224
     assert CycleEngine(config)._module_issue_ports("bidirectional_query") == 121
     assert CycleEngine(config)._module_issue_ports("relation_constructor") == 24
     assert config.compute_templates[1].latency_for("forward") == 17

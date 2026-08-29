@@ -173,6 +173,18 @@ parameters:
       source: GALA design config:query_fusion.issue_candidate_fifo_entries
       scope: hardware
       status: frozen
+    bank_head_index_bytes:
+      value: 224
+      unit: byte
+      source: GALA low-cost banked Fusion FIFO head-index metadata
+      scope: hardware
+      status: frozen
+    bank_head_lookahead:
+      value: true
+      unit: bool
+      source: GALA low-cost banked Fusion FIFO head-index optimization
+      scope: hardware
+      status: frozen
     forward_ports:
       value: 2
       unit: port
