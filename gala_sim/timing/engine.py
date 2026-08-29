@@ -565,44 +565,36 @@ class _DependencyIndex:
         remaining = np.asarray(
             trace.events["dependency_count"], dtype=np.uint32
         ).copy()
+        dependencies = np.asarray(trace.dependencies, dtype=np.uint64)
         reverse_counts = np.zeros(event_count, dtype=np.uint64)
-        if trace.dependencies.size:
-            scan_size = max(progress_interval_events or trace.dependencies.size, 1)
-            next_time = (
-                time.monotonic() + progress_interval_seconds
-                if progress_interval_seconds is not None else None
+        if dependencies.size:
+            # Each dependency slice is already ordered by dependent event and
+            # retains the trace's within-event order.  A stable sort by
+            # dependency ID produces the same reverse-edge order as the old
+            # Python cursor fill, while moving the hot loop into NumPy.
+            dependency_values = dependencies.astype(np.intp, copy=False)
+            dependency_ids, dependency_frequencies = np.unique(
+                dependency_values, return_counts=True,
             )
-            for start in range(0, int(trace.dependencies.size), scan_size):
-                end = min(start + scan_size, int(trace.dependencies.size))
-                np.add.at(reverse_counts, trace.dependencies[start:end], 1)
-                if progress is not None and next_time is not None and time.monotonic() >= next_time:
-                    progress("dependency_count", end, int(trace.dependencies.size))
-                    next_time = time.monotonic() + progress_interval_seconds
+            reverse_counts[dependency_ids] = dependency_frequencies
+            if progress is not None:
+                progress("dependency_count", int(dependencies.size), int(dependencies.size))
         offsets = np.empty(event_count + 1, dtype=np.uint64)
         offsets[0] = 0
         np.cumsum(reverse_counts, out=offsets[1:])
-        dependents = np.empty(trace.dependencies.size, dtype=np.uint64)
-        cursors = offsets[:-1].copy()
-        started_at = time.monotonic()
-        next_time = (
-            started_at + progress_interval_seconds
-            if progress_interval_seconds is not None else None
-        )
-        for row_index, row in enumerate(trace.events, start=1):
-            event_id = int(row["event_id"])
-            for raw_dependency in trace.dependency_ids(row):
-                dependency = int(raw_dependency)
-                position = int(cursors[dependency])
-                dependents[position] = event_id
-                cursors[dependency] += 1
-            if (
-                progress is not None
-                and next_time is not None
-                and time.monotonic() >= next_time
-            ):
-                progress("dependency_fill", row_index, event_count)
-                now = time.monotonic()
-                next_time = now + progress_interval_seconds
+        if dependencies.size:
+            dependency_counts = remaining.astype(np.intp, copy=False)
+            dependent_ids = np.repeat(
+                np.arange(event_count, dtype=np.uint64), dependency_counts,
+            )
+            if dependent_ids.size != dependencies.size:
+                raise CycleConfigurationError(
+                    "dependency counts do not cover the dependency column"
+                )
+            order = np.argsort(dependency_values, kind="stable")
+            dependents = dependent_ids[order]
+        else:
+            dependents = np.empty(0, dtype=np.uint64)
         if progress is not None:
             progress("dependency_fill", event_count, event_count)
         return cls(remaining, offsets, dependents)

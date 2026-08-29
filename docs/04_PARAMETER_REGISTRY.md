@@ -26,7 +26,7 @@
 | `issue.query_state_entries` | 2048 | entry | 查询状态 SRAM |
 | `issue.query_state_banks` | 8 | bank | 八路查询状态事件更新 Bank |
 | `issue.candidate_lanes` | 3 | lane | Forecast、Conflict、Issue 三级结构 |
-| `issue.candidate_fifo_entries` | 32 | entry_per_source_fifo | 前向、消费者、伴随三条候选 FIFO 的独立容量 |
+| `issue.candidate_fifo_entries` | 144 | entry_per_source_fifo | 前向、消费者、伴随三条候选 FIFO 的独立容量；由同一完整 trace 的容量扫描冻结 |
 | `issue.bank_head_index_bytes` | 224 | byte | 每源共享 FIFO 的八路 Bank 队首索引与轮转控制元数据，计入 control_metadata 区域 |
 | `issue.bank_head_lookahead` | true | bool | 消费者候选槽空闲时允许观察另一查询状态 Bank 的真实队首 |
 | `issue.forward_ports` | 2 | port | 前向可选出口；消费者队列空闲时可借用其候选槽观察第二个真实队首 |
@@ -87,6 +87,7 @@
 | 配置路径 | 默认值 | 允许范围 | 约束 |
 | --- | ---: | ---: | --- |
 | `issue.query_state_entries` | 2048 | 1024 至 4096 | 查询状态 SRAM 计入 2.75 MiB |
+| `issue.candidate_fifo_entries` | 144 | 32 至 160 | 每源 FIFO 独立计数；以完整 trace 的周期和队列稳定性共同选择 |
 | `cache.active_records_per_instance` | 1024 | 512 至 2048 | 四个实例总量计入 2.75 MiB |
 | `cache.miss_merge_entries_per_instance` | 32 | 16 至 64 | 端口与等待者存储同时闭合 |
 | `query.relation_window_entries` | 256 | 128 至 512 | 32 B 窗口表项计入 2.75 MiB；关系记录使用独立 512 KiB 存储 |

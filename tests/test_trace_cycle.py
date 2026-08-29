@@ -1961,11 +1961,11 @@ def test_consumer_credit_owner_is_last_query_dependency_not_last_generic_depende
     assert credited[0] in {0, 1}
 
 
-def test_loaded_architecture_uses_three_independent_32_entry_candidate_fifos() -> None:
+def test_loaded_architecture_uses_three_independent_144_entry_candidate_fifos() -> None:
     config = load_config(Path(__file__).parents[1] / "configs/architecture/gala.yaml")
     cycle_config = CycleConfig.from_gala(config, _Memory())
 
-    assert cycle_config.candidate_fifo_entries == 32
+    assert cycle_config.candidate_fifo_entries == 144
     assert cycle_config.fusion_bank_head_lookahead is True
     assert cycle_config.fusion_bank_head_index_bytes == 224
 

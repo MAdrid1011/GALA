@@ -168,7 +168,7 @@ parameters:
       scope: hardware
       status: frozen
     candidate_fifo_entries:
-      value: 32
+      value: 144
       unit: entry_per_source_fifo
       source: GALA design config:query_fusion.issue_candidate_fifo_entries
       scope: hardware
