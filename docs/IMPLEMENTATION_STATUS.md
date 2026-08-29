@@ -21,10 +21,24 @@
   Ramulator 请求到达序列；因此该优化只作为共同生命周期/可闭合性修复，不宣称单机制收益。
   future-visible Query 由关系容量死锁改为完整 `45,728 cycles`，仍不作为可达上界。
 
-- 按最新 Full 静态锚点相对 Base 的派生预算约 `17,635 cycles`，当前 Full 仍多 `14,655 cycles`
-  （`45.38%`）；Query 和 Residency 相对各自预算仍分别多约 `2,163` 与 `10,763` 周期。临时
-  `forward=2/adjoint=2` 多头 Fusion 试验只有 `27 cycles` 收益，经验水位 `9,216` 的公平限制
-  得到 Query `33,336`、Full `34,152`，均未形成共同收益，均已回退，不进入冻结配置。
+- 若仅把最新静态端点相对 Base 的比例机械应用到这个 quick trace，会得到 Query `32,308`、
+  Residency `32,363`、Full `17,635 cycles`。这些数值现在只保留为无验收资格的比例投影：外部
+  规范给出的是完整同套件端到端锚点，没有给出这个双窗口样本的周期分解；该样本也不包含完整
+  30,000 轮训练、更新和集合修改。尤其 Full 投影低于冻结单端口合同的 `19,779-cycle` 资源必要
+  下界，不能被称为该样本的目标预算。临时 `forward=2/adjoint=2` 多头 Fusion 试验只有 `27 cycles`
+  收益，经验水位 `9,216` 的公平限制得到 Query `33,336`、Full `34,152`，均未形成共同收益，
+  均已回退，不进入冻结配置。
+
+- 2026-08-29 对当前 Full 单点增加了 ComputePod 遥测；同一 `846,012` 事件完整闭合并精确复现
+  `32,290 cycles`。前向事件从依赖就绪到 Fusion 发射平均等待 `5,891.90 cycles`，Fusion 到
+  ComputePod 发射平均仅 `3.04 cycles`；伴随事件从依赖就绪到 Fusion 发射平均等待
+  `3,305.54 cycles`，Fusion 到查询重放平均等待 `358.43 cycles`。四个 Pod 的 active-microcontext
+  占用面积为 `112,621/134,140/107,609/134,231`，但各 Pod 至少一个 cluster 活跃的周期为
+  `29,409/29,565/29,443/29,593`，尾部不是由单个闲置 Pod 造成。物理包计划把 `140,520` 个伴随
+  lane 准确合并为 `19,777` 个 ADJOINT stage，其中 `14,719` 个是满八 lane 包；RELATION、FORWARD、
+  ADJOINT 和 GRADIENT_REDUCTION 的物理 stage 数及 lane 分布完全一致。因此权威 C++ 的伴随 lane
+  合并已在 Python 模型中兑现，不能再次计作优化。遥测保存在仓库外
+  `GALA-runtime/records/r2_gaussian_chest_relation_record_reuse_v2_full_telemetry/`。
 
 - 2026-08-29 已将 ComputePod 资源占用回收改为按退休周期的堆/桶增量清理（提交
   `63ba797`）。该软件路径优化不改变事件集合、资源包络或周期结果，完整回归为
@@ -53,11 +67,11 @@
   30,000 iteration 性能结果；差距必须按周期分解继续做共同工程路径优化。
 
 - 合同修正后的当前配置资源必要下界仍为 `19,779 cycles`，限制项是 Fusion 前向和伴随各一个
-  真实队首、各一个发射端口；Query 目标预算约 `32,308 cycles`、Residency 约 `32,363 cycles`
-  尚未被必要下界排除，而 Full 目标预算约 `17,635 cycles` 已被必要下界高出 `2,144 cycles`
-  排除。这个下界假设其余冲突全部消失，不是可达预测、Oracle 或静态锚点。当前实际差距主要
-  集中在 Query replay/Datapath、ComputePod issue、Fusion 队列反压和关系构造端口等待；下一步
-  按分解逐项优化并对 Base、两个 Oracle 和所有消融公平重跑。
+  真实队首、各一个发射端口。该下界证明对 quick trace 机械换算得到的 Full `17,635-cycle`
+  比例投影与冻结资源合同不相容，但不否定完整同套件 `ASIC_A1B1=6.436x` 静态锚点。这个下界
+  假设其余冲突全部消失，不是可达预测、Oracle 或静态锚点。当前实际差距主要集中在 Fusion
+  输入队列、查询重放和 ComputePod issue；下一步按真实遥测分解逐项优化并对 Base、两个 Oracle
+  和所有消融公平重跑，不通过扩大冻结的三候选发射宽度追赶比例投影。
 
 - 缓存物理 RelationPacket 的命中或 miss-merge 路径现会完成 packet 的全部逻辑 lane，同时只由
   packet head 更新一次目录、Active SRAM 和填充状态。该修复消除了 Full 在 `cycle 3337` 留下
