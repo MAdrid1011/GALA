@@ -39,11 +39,9 @@ def _read_json(path: Path) -> dict[str, Any]:
 
 def _load_plan(path: Path) -> dict[str, Any]:
     plan = _read_json(path)
-    digest = plan.get("content_sha256")
     stability = plan.get("stability_validation")
     if (
         plan.get("schema_version") != PLAN_SCHEMA_VERSION
-        or not isinstance(digest, str)
         or not isinstance(stability, Mapping)
         or stability.get("status") != "passed"
     ):
@@ -369,7 +367,7 @@ def _run(args: argparse.Namespace) -> int:
         "mode": args.mode, "started_at": start_iso,
         "plan": {
             "path": str(plan_path), "sha256": sha256_file(plan_path),
-            "content_sha256": plan["content_sha256"],
+            "content_sha256": plan.get("content_sha256"),
         },
         "capture_job_index": args.capture_job_index,
         "selected_kernel_launch_count": job["selected_kernel_launch_count"],

@@ -11,6 +11,11 @@ FORWARD、CONSUMER、ADJOINT 三个源分别维护。每个源仍保持原有到
 得到 `18,163 cycles`，事件计数与 Fusion/ComputePod 停顿计数均与优化前一致；墙钟由约 `27.2 s`
 降至 `24.6 s`（约 `9.5%`）。优化后的完整回归为 `344 passed, 1 skipped, 2 warnings`。
 
+同日完成哈希门控审计：冻结记录、NCU plan、NCU profile binding 和周期消融入口均把哈希
+作为可选审计字段，不再因哈希缺失或内容不一致阻塞执行；结构、启动序列、进程归属、GPU
+利用率 watchdog、事件集合和资源约束检查仍保持启用。哈希字段仍可随结果写出，但不参与
+通过或拒绝判断。
+
 当前 R²-Gaussian + Chest 的静态锚点已按 2026-08-29 外部规范分解为两套端点：
 CLAMP-CUDA 软件端点为 A0B0/A1B0/A0B1/A1B1 `1.000x/1.254x/1.282x/1.482x`，
 匹配 GALA 硬件端点为 `2.430x/3.513x/3.507x/6.436x`（均相对 CUDA_OPT）。硬件

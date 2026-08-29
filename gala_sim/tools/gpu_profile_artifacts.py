@@ -422,10 +422,7 @@ def bind_ncu_profile_to_plan(
 
     reasons: list[str] = []
     plan_hash = plan.get("content_sha256")
-    if (
-        plan.get("schema_version") != "gala-ncu-launch-signature-plan-v5"
-        or not isinstance(plan_hash, str)
-    ):
+    if plan.get("schema_version") != "gala-ncu-launch-signature-plan-v5":
         reasons.append("ncu_plan_identity_invalid")
     stability = plan.get("stability_validation")
     if not isinstance(stability, Mapping) or stability.get("status") != "passed":

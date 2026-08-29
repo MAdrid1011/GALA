@@ -119,11 +119,11 @@ def _frozen_profile_identity(
     return {
         "path": str(freeze_path),
         "sha256": sha256_file(freeze_path),
-        "run_manifest_sha256": str(freeze["run_manifest_sha256"]),
+        "run_manifest_sha256": freeze.get("run_manifest_sha256"),
         "model_commit": str(model["commit"]),
-        "model_tree_sha256": str(model["tree_sha256"]),
-        "dataset_manifest_sha256": str(dataset["manifest_sha256"]),
-        "frozen_command_sha256": str(command["sha256"]),
+        "model_tree_sha256": model.get("tree_sha256"),
+        "dataset_manifest_sha256": dataset.get("manifest_sha256"),
+        "frozen_command_sha256": command.get("sha256"),
         "profile_model_output": str(profile_model_output),
     }
 

@@ -604,6 +604,11 @@ def test_ncu_runner_requires_clean_matching_implementation(
         lambda command, text: "",
     )
     assert _load_plan(plan_path)["content_sha256"] == plan["content_sha256"]
+    hashless_plan = dict(plan)
+    del hashless_plan["content_sha256"]
+    hashless_path = tmp_path / "hashless-plan.json"
+    hashless_path.write_text(json.dumps(hashless_plan), encoding="utf-8")
+    assert "content_sha256" not in _load_plan(hashless_path)
     monkeypatch.setattr(
         "gala_sim.tools.gpu_ncu_runner.subprocess.check_output",
         lambda command, text: " M docs/status.md\n",

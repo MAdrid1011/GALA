@@ -230,7 +230,7 @@ def run_native_reference(
     )
     identity_checks = {
         "config_sha256": config.sha256,
-        "freeze_manifest_sha256": str(freeze["run_manifest_sha256"]),
+        "freeze_manifest_sha256": freeze.get("run_manifest_sha256"),
         "repository_commit": repository_commit,
         "reproduction": {
             "working_directory": working_directory,
@@ -395,7 +395,7 @@ def run_native_reference(
     writer.write_manifest(RunManifest(
         run_id=f"r2_gaussian_chest_native_{int(started)}", status="passed",
         model={"name": "R2-Gaussian", "commit": model_info["commit"]},
-        dataset={"name": "Chest", "manifest_sha256": dataset_info["manifest_sha256"]},
+        dataset={"name": "Chest", "manifest_sha256": dataset_info.get("manifest_sha256")},
         config_sha256=config.sha256, ablation_bits="native-reference", random_seed=0,
         repository_commit=str(repository_info["commit"]), environment=freeze.get("environment", {}),
     ).as_dict())

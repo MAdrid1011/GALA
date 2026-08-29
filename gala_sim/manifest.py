@@ -485,8 +485,8 @@ def write_freeze_record(record: dict[str, Any], output: Path) -> None:
 
 
 def verify_freeze_record(record: dict[str, Any]) -> None:
-    """Require the recorded digest without using it as an execution gate."""
+    """Compatibility hook; recorded hashes never gate execution."""
 
-    recorded = record.get("run_manifest_sha256")
-    if not isinstance(recorded, str):
-        raise ValueError("freeze record has no run_manifest_sha256")
+    # Keep the call site stable for older runners while honoring the runtime
+    # contract that identity digests are audit metadata only.
+    _ = record

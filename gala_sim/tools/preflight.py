@@ -282,7 +282,7 @@ def run_native_preflight(
     argv, working_directory, total_iterations = _validate_native_freeze(config, freeze)
     repository = freeze.get("repository")
     repository_commit = str(repository.get("commit", "")) if isinstance(repository, Mapping) else ""
-    freeze_sha = str(freeze["run_manifest_sha256"])
+    freeze_sha = str(freeze.get("run_manifest_sha256", ""))
     not_applicable = {
         "events_per_second": "not_applicable_native_reference",
         "async_overlap_percent": "not_applicable_native_reference",

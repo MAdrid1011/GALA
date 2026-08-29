@@ -116,8 +116,7 @@ def test_freeze_record_hash_is_recorded_without_content_verification() -> None:
     record["status"] = "running"
     verify_freeze_record(record)
     del record["run_manifest_sha256"]
-    with pytest.raises(ValueError, match="no run_manifest_sha256"):
-        verify_freeze_record(record)
+    verify_freeze_record(record)
 
 
 def test_training_profile_matches_locked_upstream(tmp_path: Path) -> None:
