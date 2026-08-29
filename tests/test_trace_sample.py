@@ -8,7 +8,7 @@ import pytest
 
 from gala_sim.clamp import PrimitiveKind, ResourceClass, TraceBuilder, TraceEvent
 from gala_sim.trace import (
-    QueryPacketSampleConfig, QueryRange, TraceSampleConfig, TraceWriter,
+    QueryPacketSampleConfig, QueryRange, TraceReader, TraceSampleConfig, TraceWriter,
     dependency_closed_query_sample, real_query_packet_sample, validate_trace,
 )
 from gala_sim.trace.sample import _gather_value_batches
@@ -199,14 +199,18 @@ def test_real_query_packet_sample_preserves_supports_and_rebases_history() -> No
     assert report.event_count == 40
     assert relation_rows["query_id"].tolist() == [10, 11, 20, 21]
     assert relation_rows["gaussian_id"].tolist() == [0, 1, 2, 3]
+    assert relation_rows["state_version"].tolist() == [4, 4, 5, 5]
     assert metadata["source_state_versions"] == [4, 5]
-    assert metadata["state_version_normalized_to"] == 0
+    assert metadata["state_versions_preserved"] is True
     assert [packet["source_relation_count"] for packet in metadata["packets"]] == [2, 2]
     assert [packet["query_base"] for packet in metadata["packets"]] == [10, 20]
     assert [packet["query_shape"] for packet in metadata["packets"]] == [[1, 2], [1, 2]]
-    assert metadata["eligible_policies"] == [
-        "base", "query", "query_oracle",
-        "variant:1000", "variant:0010", "variant:1010",
+    assert metadata["eligible_policies"][:6] == [
+        "base", "query", "residency", "full",
+        "query_oracle", "residency_oracle",
+    ]
+    assert metadata["eligible_policies"][6:] == [
+        f"variant:{number:04b}" for number in range(16)
     ]
 
 
@@ -247,6 +251,9 @@ def test_cli_writes_real_query_packet_sample(tmp_path: Path, capsys) -> None:
     assert result["status"] == "passed"
     assert result["logical_relation_events"] == 4
     assert result["formal_performance_eligible"] is False
+    assert TraceReader().read(output).metadata["trace_sample"][
+        "state_versions_preserved"
+    ] is True
 
 
 def test_cli_writes_sample_and_cycle_cli_rejects_implicit_formal_use(

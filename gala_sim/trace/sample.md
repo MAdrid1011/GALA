@@ -12,7 +12,7 @@
 
 `QueryPacketSampleConfig(query_ranges, scan_events, scan_backend, query_lanes, ssim_radius)` 配置连续迭代的查询调度微基准。它不设置依赖闭包上限；`scan_events` 只控制源 trace 扫描块和展开块大小。
 
-`real_query_packet_sample(trace, config, *, source_identity, progress)` 从源 trace 提取每个查询区间的真实 `RELATION`、候选 Gaussian、候选排序键和 consumer 标志，再将每个查询区间重定位到一个物理行并展开完整前向、缓存、归约、consumer、伴随和梯度链。同一迭代可选择多个物理行；输入必须覆盖连续迭代，且各轮的模板、行形状和相对查询位置完全一致。输出固定使用 `gala-query-packet-sample-v1`、`quick_cycle_validation` 和查询调度策略白名单；源状态版本记录在元数据中，周期输入归一化为版本 0，因此不得用于语义驻留、更新、质量或正式性能实验。
+`real_query_packet_sample(trace, config, *, source_identity, progress)` 从源 trace 提取每个查询区间的真实 `RELATION`、候选 Gaussian、候选排序键和 consumer 标志，再将每个查询区间重定位到一个物理行并展开完整前向、缓存、归约、consumer、伴随和梯度链。同一迭代可选择多个物理行；输入必须覆盖连续迭代，且各轮的模板、行形状和相对查询位置完全一致。`gala-query-packet-sample-v2` 保留每轮源状态版本，因此可在 quick scope 内运行两个 Oracle、全部 A/B/C/D 组合、必要下界和十六项消融；旧 v1 的版本零样本继续只允许查询调度策略。两种格式均固定为 `quick_cycle_validation`，不得用于更新、质量或正式性能实验。
 
 ## Internal Helpers
 

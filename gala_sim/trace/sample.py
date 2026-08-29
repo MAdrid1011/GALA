@@ -23,7 +23,11 @@ from .virtual import (
 )
 
 
-QUERY_PACKET_SAMPLE_SCHEMA_VERSION = "gala-query-packet-sample-v1"
+QUERY_PACKET_SAMPLE_SCHEMA_VERSION = "gala-query-packet-sample-v2"
+QUERY_PACKET_SAMPLE_SCHEMA_VERSIONS = frozenset({
+    "gala-query-packet-sample-v1",
+    QUERY_PACKET_SAMPLE_SCHEMA_VERSION,
+})
 
 
 @dataclass(frozen=True)
@@ -233,7 +237,7 @@ def real_query_packet_sample(
             point_ids=point_ids,
             point_keys=point_keys,
             masks=masks,
-            state_version=0,
+            state_version=state_version,
             field_mask=field_mask,
             loss_flags=int(loss_flags[0]),
             ssim_radius=(
@@ -332,8 +336,9 @@ def real_query_packet_sample(
             "quality_eligible": False,
             "selection": "real_relation_supported_query_packets",
             "eligible_policies": [
-                "base", "query", "query_oracle",
-                "variant:1000", "variant:0010", "variant:1010",
+                "base", "query", "residency", "full",
+                "query_oracle", "residency_oracle",
+                *(f"variant:{number:04b}" for number in range(16)),
             ],
             "source_identity": source_identity,
             "source_event_count": trace.event_count,
@@ -342,7 +347,7 @@ def real_query_packet_sample(
                 "initial_gaussian_count"
             ),
             "source_state_versions": source_versions,
-            "state_version_normalized_to": 0,
+            "state_versions_preserved": True,
             "boundary_condition": "prior_selected_packet_completes_before_next_iteration",
             "query_lanes": config.query_lanes,
             "ssim_radius": config.ssim_radius,

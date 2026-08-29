@@ -726,24 +726,6 @@ class CycleEngine:
             # Future visibility is confined to Fusion candidate selection.
             # Reordering unrelated modules changes arbitration outside the
             # mechanism whose upper bound this Oracle is meant to measure.
-        if self.selection.semantic_residency and not self.selection.residency_oracle:
-            cache_kinds = {PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN}
-            cache_positions = [
-                position for position, event_id in enumerate(base_order)
-                if PrimitiveKind(int(trace.events[event_id]["primitive_kind"]))
-                in cache_kinds
-            ]
-            ordered_cache = sorted(
-                (base_order[position] for position in cache_positions),
-                key=lambda event_id: (
-                    int(trace.events[event_id]["gaussian_id"]), event_id,
-                ),
-            )
-            base_order = list(base_order)
-            for position, event_id in zip(
-                cache_positions, ordered_cache, strict=True,
-            ):
-                base_order[position] = event_id
         return base_order
 
     @staticmethod
@@ -4429,23 +4411,6 @@ class CycleReplaySession:
         )
 
     def _ordered(self, candidates: list[tuple[int, int]]) -> list[tuple[int, int]]:
-        if self.engine.selection.semantic_residency:
-            cache_kinds = {PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN}
-            cache_positions = [
-                position for position, item in enumerate(candidates)
-                if self._kinds[item[0]] in cache_kinds
-            ]
-            ordered_cache = sorted(
-                (candidates[position] for position in cache_positions),
-                key=lambda item: (
-                    int(self._events[item[0]]["gaussian_id"]), item[0],
-                ),
-            )
-            candidates = list(candidates)
-            for position, item in zip(
-                cache_positions, ordered_cache, strict=True,
-            ):
-                candidates[position] = item
         return candidates
 
     def _drain(self) -> None:
@@ -5194,7 +5159,7 @@ class CycleReplaySession:
             state, key, _lookup = self._cache_event_state[request_id]
             state.complete_read(key)
             workset = self._workset_by_request.get(request_id)
-            if workset is None or workset[3]:
+            if workset is not None and workset[3]:
                 state.close(key)
             if workset is not None:
                 if workset[3]:

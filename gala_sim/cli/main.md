@@ -10,7 +10,7 @@
 
 `trace-sample --trace <dir> --output <dir> --query-range START:COUNT --max-events N --max-dependencies N --scan-events N --scan-backend cpu|cuda|auto` 从一个或多个 query range 的 consumer/gradient terminal 出发，抽取完整传递依赖闭包。输出保留真实 relation、地址、字节数和依赖，只能用于快速周期验证。
 
-`trace-query-packets --trace <dir> --output <dir> --query-range START:COUNT --query-range START:COUNT --scan-events N --scan-backend cpu|cuda|auto --query-lanes N --ssim-radius N` 为查询调度技术构造连续两轮最小真实关系包。命令保留所选查询的真实 Gaussian 支持域，避开 optimizer 全迭代 barrier 的无关 fan-in，并把状态版本归一化为查询调度微基准。输出只允许 `base`、`query`、`query_oracle`、`variant:1000`、`variant:0010` 和 `variant:1010`，不能运行语义驻留、完整消融或正式性能。
+`trace-query-packets --trace <dir> --output <dir> --query-range START:COUNT --query-range START:COUNT --scan-events N --scan-backend cpu|cuda|auto --query-lanes N --ssim-radius N` 为连续迭代构造最小真实关系包。命令保留所选查询的真实 Gaussian 支持域和源状态版本，避开 optimizer 全迭代 barrier 的无关 fan-in；v2 输出可在 quick scope 内运行两个 Oracle、全部 A/B/C/D 组合、必要下界和十六项消融，但不能用于更新、质量或正式性能。旧 v1 版本零样本仍只允许查询调度策略。
 
 `trace-packetize --trace <quick-dir> --output <new-dir> --query-domain TEMPLATE:BASE:DIMxDIM[xDIM] --query-lanes N` 为旧版 dependency-closed quick trace 派生物理 RelationPacket lane/mask 元数据。命令只允许 quick trace，只修改 packetized event 的 `flags`，写盘前验证其他事件列、依赖和 payload 完全不变，并验证物理包计划；输出不提升正式性能或质量资格。
 

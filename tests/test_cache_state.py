@@ -30,6 +30,19 @@ def test_semantic_cache_refuses_capacity_overflow() -> None:
         cache.request((2, 0), remaining_uses=1)
 
 
+def test_semantic_cache_replaces_oldest_idle_entry_without_workset() -> None:
+    cache = SemanticCacheState.create(capacity=1, directory_banks=1, sector_bytes=64)
+    first = (1, 0)
+    second = (2, 0)
+    assert cache.request(first, remaining_uses=1) is CacheLookup.MISS
+    cache.fill_complete(first, remaining_uses=1)
+    cache.complete_read(first)
+
+    assert cache.request(second, remaining_uses=1) is CacheLookup.MISS
+    assert first not in cache.active
+    assert cache.counters["replacement_evictions"] == 1
+
+
 def test_semantic_cache_consumes_exact_workset_remaining_uses() -> None:
     cache = SemanticCacheState.create(capacity=1, directory_banks=1, sector_bytes=64)
     key = (3, 0)

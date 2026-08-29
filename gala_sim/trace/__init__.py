@@ -8,6 +8,7 @@ from .validator import (
 from .sink import DeviceTraceSink, NumpyChunkSink
 from .sample import (
     QUERY_PACKET_SAMPLE_SCHEMA_VERSION,
+    QUERY_PACKET_SAMPLE_SCHEMA_VERSIONS,
     QueryPacketSampleConfig,
     QueryRange,
     TraceSampleConfig,
@@ -64,6 +65,7 @@ __all__ = [
     "TraceSampleConfig",
     "dependency_closed_query_sample",
     "QUERY_PACKET_SAMPLE_SCHEMA_VERSION",
+    "QUERY_PACKET_SAMPLE_SCHEMA_VERSIONS",
     "real_query_packet_sample",
     "PACKET_DERIVATION_SCHEMA_VERSION",
     "QueryDomain",

@@ -1100,7 +1100,7 @@ def test_semantic_residency_multicasts_real_ready_requests_without_dropping_depe
     assert np.array_equal(trace.dependencies, dependencies_before)
 
 
-def test_semantic_residency_ordering_is_scoped_to_cache_candidates() -> None:
+def test_semantic_residency_preserves_ready_candidate_order() -> None:
     builder = TraceBuilder()
     event_ids = [
         builder.emit(TraceEvent(
@@ -1121,7 +1121,7 @@ def test_semantic_residency_ordering_is_scoped_to_cache_candidates() -> None:
 
     ordered = engine._ordered_candidates(trace, event_ids)
 
-    assert ordered == [event_ids[0], event_ids[3], event_ids[2], event_ids[1], event_ids[4]]
+    assert ordered == event_ids
 
 
 def test_query_close_keeps_state_resident_until_update_end() -> None:

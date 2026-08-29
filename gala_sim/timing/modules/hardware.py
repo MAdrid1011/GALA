@@ -102,7 +102,7 @@ class SemanticCacheState:
         return cls(capacity, directory_banks, sector_bytes, {}, {}, set(), {
             "directory_hits": 0, "directory_misses": 0, "miss_merges": 0,
             "multicast_reads": 0, "fills": 0, "releases": 0,
-            "oracle_evictions": 0,
+            "replacement_evictions": 0, "oracle_evictions": 0,
         })
 
     def request(
@@ -145,6 +145,11 @@ class SemanticCacheState:
                 pending["remaining_uses"] = int(pending["remaining_uses"]) + 1
             self.counters["miss_merges"] += 1
             return CacheLookup.MERGED
+        if (
+            workset_total_uses is None
+            and len(self.active) + len(self.pending) >= self.capacity
+        ):
+            self.evict_oldest_idle()
         if len(self.active) + len(self.pending) >= self.capacity:
             raise CacheBackpressure("semantic cache has no free slot or miss-merge entry")
         self.pending[key] = {
@@ -182,6 +187,19 @@ class SemanticCacheState:
         }
         self.closing_pending.discard(key)
         self.counters["fills"] += 1
+
+    def evict_oldest_idle(self) -> tuple[int, int] | None:
+        """Evict the oldest completed entry when no semantic workset is available."""
+
+        for key, record in self.active.items():
+            if (
+                int(record["active_reads"]) == 0
+                and int(record["remaining_uses"]) == 0
+            ):
+                del self.active[key]
+                self.counters["replacement_evictions"] += 1
+                return key
+        return None
 
     def evict_for_oracle(self, key: tuple[int, int]) -> None:
         """Evict an idle active record without changing its future requests."""

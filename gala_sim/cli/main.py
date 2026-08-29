@@ -33,7 +33,7 @@ from gala_sim.tools.preflight import run_native_preflight
 from gala_sim.adapters.native_reference import run_native_reference
 from gala_sim.trace import (
     CAPTURED_PACKET_SAMPLE_SCHEMA_VERSION, CapturedPacketSpec, QueryDomain,
-    QUERY_PACKET_SAMPLE_SCHEMA_VERSION, QueryPacketSampleConfig, QueryRange,
+    QUERY_PACKET_SAMPLE_SCHEMA_VERSIONS, QueryPacketSampleConfig, QueryRange,
     TraceReader, TraceSampleConfig, TraceValidationConfig, TraceWriter,
     complete_captured_packet_sample, dependency_closed_query_sample,
     derive_quick_relation_packets, real_query_packet_sample,
@@ -413,17 +413,21 @@ def main(argv: list[str] | None = None) -> int:
                 or sample_metadata.get("result_scope") != "quick_cycle_validation"
             ):
                 raise ValueError("sampled trace metadata is malformed")
-            if sample_metadata.get("schema_version") == QUERY_PACKET_SAMPLE_SCHEMA_VERSION:
-                if args.command != "cycle-replay":
-                    raise ValueError(
-                        "query packet samples only support query-scheduler cycle replay"
-                    )
+            if sample_metadata.get("schema_version") in QUERY_PACKET_SAMPLE_SCHEMA_VERSIONS:
                 eligible_policies = sample_metadata.get("eligible_policies")
-                if not isinstance(eligible_policies, list) or args.policy not in {
-                    str(policy) for policy in eligible_policies
-                }:
+                stateful = sample_metadata.get("state_versions_preserved") is True
+                if args.command == "cycle-replay" and (
+                    not isinstance(eligible_policies, list)
+                    or args.policy not in {str(policy) for policy in eligible_policies}
+                ):
                     raise ValueError(
                         "query packet sample policy is outside its declared scope"
+                    )
+                if args.command in {"ablation", "cycle-bounds"} and stateful:
+                    pass
+                elif args.command != "cycle-replay":
+                    raise ValueError(
+                        "only stateful query packet samples support bounds or ablation"
                     )
         if window_metadata is not None and (
             not isinstance(window_metadata, dict)
