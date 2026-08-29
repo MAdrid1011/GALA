@@ -808,6 +808,51 @@ def test_online_cycle_replay_consumes_exact_semantic_workset_sidecar() -> None:
     assert session.quiescent
 
 
+def test_online_residency_retains_cache_return_request_dependency() -> None:
+    masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
+    masks[0, 0] = 1
+    source = VirtualTracePacket(
+        iteration_id=1,
+        template_id=1,
+        query_base=0,
+        query_shape=(1, 1),
+        point_ids=np.asarray([0], dtype=np.int64),
+        point_keys=np.asarray([0], dtype=np.uint64),
+        masks=masks,
+        loss_flags=1,
+        backward_confirmed=True,
+    )
+    config = replace(
+        _config(),
+        cache_instances=1,
+        cache_capacity_per_instance=4,
+        cache_directory_banks=1,
+        cache_sector_bytes=64,
+    )
+    session = CycleEngine(config, policy="variant:0001").online_session(
+        max_events=16,
+        initial_gaussian_count=1,
+        semantic_workset_totals={(0, 0): 1},
+    )
+    drain = session._drain
+    session._drain = lambda *args, **kwargs: None
+
+    session.accept_query_packet(source)
+
+    request = next(
+        event_id for event_id, kind in session._kinds.items()
+        if kind is PrimitiveKind.CACHE_REQUEST
+    )
+    cache_return = next(
+        event_id for event_id, kind in session._kinds.items()
+        if kind is PrimitiveKind.CACHE_RETURN
+    )
+    assert session._dependencies[cache_return] == (request,)
+    session._drain = drain
+    session.close_iteration(1)
+    session.finish()
+
+
 def test_buffered_virtual_consumer_derives_totals_before_lifecycle() -> None:
     masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
     masks[0, 0] = 0b11

@@ -31,6 +31,18 @@ query-pack 调度计划，两次都遍历相同真实关系。在线路径现直
 quiescent。完整回归为 `359 passed, 1 skipped, 2 warnings`。该修改只减少共同模拟器软件工作，
 不改变任何事件、依赖、关系、资源或硬件周期，并公平作用于 Base 和全部消融。
 
+随后对在线事件登记做了同样的共同软件路径优化。完整 Raster 的前 `5,001,891` 个真实事件中，
+`677,229` 个为零依赖、`3,491,588` 个为单依赖，合计占 `83.34%`；高扇入仍集中在真实
+Query Reduction、Query Close 和 Consumer。登记器现在直接读取 packet 的依赖 offset/count 列，
+为零依赖和单依赖使用直接路径，按 packet 批量累计事件类型、接受数和前沿峰值，并利用全局连续
+事件流合同消除每行三次不可能命中的重复 ID 查询。多依赖事件、Consumer 的全部 Query Reduction
+依赖与 credit、生命周期事务依赖，以及 Residency 开启时 Cache Return 的唯一 Cache Request
+依赖均原样保留。相同 cProfile 条件下，新路径在 `25.05 s` 已接受 `2,797,571` 个事件，超过旧
+路径 `30 s` 的 `2,679,556` 个；按这两个保守采样点计算，事件登记率提高约 `25.0%`。不带
+profiler 时 `25.00 s` 接受 `4,704,129` 个事件。Native Ramulator 2 再次精确复现 Raster Base
+`1,344 cycles` 和 Voxel Base `26,739 cycles`，前沿峰值分别仍为 `1,021` 和 `131,035`；
+完整回归为 `360 passed, 1 skipped, 2 warnings`。这些都是模拟器墙钟优化，不是 ASIC 加速比。
+
 当前代码用 Native Ramulator 2 重跑 `631,244` 事件、`933,642` 依赖的跨迭代样本，Base 和
 完整 GALA 分别为 `32,727` 和 `17,148 cycles`，相对 Base 加速仍为 `1.908502x`；墙钟分别为
 约 `39.2 s` 和 `32.0 s`。四路并行十六项消融逐项精确复现既有矩阵，所有变体事件计数相同，

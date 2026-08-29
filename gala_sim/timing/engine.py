@@ -4200,19 +4200,38 @@ class CycleReplaySession:
                 "online resident frontier exceeds max_frontier_events"
             )
         self._stream_validator.accept(packet)
-        module_partitions = self._packet_module_partitions(packet.events)
-        for index, row in enumerate(packet.events):
+        rows = packet.events
+        dependency_column = packet.dependencies
+        dependency_begins = rows["dependency_begin"]
+        dependency_counts = rows["dependency_count"]
+        kind_values = rows["primitive_kind"]
+        module_partitions = self._packet_module_partitions(rows)
+        packet_kind_counts = np.bincount(
+            kind_values.astype(np.intp, copy=False),
+            minlength=max(self._kind_by_value) + 1,
+        )
+        for index, row in enumerate(rows):
             event_id = int(row["event_id"])
+            expected_event_id = packet.global_event_start + index
+            if event_id != expected_event_id:
+                raise CycleConfigurationError(
+                    "online event packet contains noncontiguous event IDs"
+                )
+            dependency_begin = int(dependency_begins[index])
+            dependency_count = int(dependency_counts[index])
+            dependency_end = dependency_begin + dependency_count
             if (
-                event_id in self._events
-                or event_id in self._completed_ids
-                or event_id <= self._completed_through
+                dependency_begin < 0
+                or dependency_end > dependency_column.size
             ):
-                raise CycleConfigurationError(f"duplicate online event {event_id}")
-            dependencies = packet.dependency_ids(index)
+                raise CycleConfigurationError(
+                    f"online event {event_id} has an invalid dependency range"
+                )
             unresolved = 0
-            for raw_dependency in dependencies:
-                dependency = int(raw_dependency)
+            if dependency_count == 0:
+                dependencies = dependency_column[0:0]
+            elif dependency_count == 1:
+                dependency = int(dependency_column[dependency_begin])
                 if dependency >= event_id:
                     raise CycleConfigurationError(
                         f"online event {event_id} has a forward dependency"
@@ -4227,7 +4246,32 @@ class CycleReplaySession:
                         )
                     unresolved += 1
                     self._dependents[dependency].append(event_id)
-            kind = self._kind_by_value[int(row["primitive_kind"])]
+                dependencies = dependency_column[
+                    dependency_begin:dependency_end
+                ]
+            else:
+                dependencies = dependency_column[
+                    dependency_begin:dependency_end
+                ]
+                for raw_dependency in dependencies:
+                    dependency = int(raw_dependency)
+                    if dependency >= event_id:
+                        raise CycleConfigurationError(
+                            f"online event {event_id} has a forward dependency"
+                        )
+                    if (
+                        dependency > self._completed_through
+                        and dependency not in self._completed_ids
+                    ):
+                        if dependency not in self._events:
+                            raise CycleConfigurationError(
+                                "online event "
+                                f"{event_id} references an unknown dependency "
+                                f"{dependency}"
+                            )
+                        unresolved += 1
+                        self._dependents[dependency].append(event_id)
+            kind = self._kind_by_value[int(kind_values[index])]
             # NumPy record scalars retain their source array. Keeping the view
             # avoids copying every 106-byte event while the bounded packet is
             # in the online frontier; dropping the final row releases it.
@@ -4235,16 +4279,14 @@ class CycleReplaySession:
             self._kinds[event_id] = kind
             if self._partitioned_stages_by_kind[kind]:
                 self._module_partitions[event_id] = int(module_partitions[index])
-            self._peak_frontier_events = max(
-                self._peak_frontier_events, len(self._events)
-            )
             if kind in {
-                PrimitiveKind.CACHE_RETURN,
                 PrimitiveKind.UPDATE_BEGIN,
                 PrimitiveKind.UPDATE_COMMIT,
                 PrimitiveKind.UPDATE_END,
                 PrimitiveKind.SET_MODIFICATION,
-            }:
+            } or (
+                kind is PrimitiveKind.CACHE_RETURN and self._cache_states
+            ):
                 self._dependencies[event_id] = tuple(
                     int(dependency) for dependency in dependencies
                 )
@@ -4297,10 +4339,15 @@ class CycleReplaySession:
                 )
                 self._workset_use_count += 1
                 self._workset_seen[key] = ordinal + 1
-            self._event_counts[kind.name] += 1
-            self._accepted_events += 1
             if unresolved == 0:
                 self._push_ready(event_id, 0)
+        for kind_value, count in enumerate(packet_kind_counts):
+            if count:
+                self._event_counts[self._kind_by_value[kind_value].name] += int(count)
+        self._peak_frontier_events = max(
+            self._peak_frontier_events, len(self._events)
+        )
+        self._accepted_events += packet.event_count
         self._source_packets += 1
         if _drain_after:
             self._drain()
