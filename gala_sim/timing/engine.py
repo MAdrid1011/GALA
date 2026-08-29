@@ -1016,7 +1016,6 @@ class CycleEngine:
             assert self.config.query_volume_banks is not None
             return (
                 self.config.query_reduction_banks
-                * self.config.query_partial_sum_groups_per_bank
                 + self.config.query_loss_queries_per_cycle
                 + self.config.query_adjoint_replay_lanes
                 + 2 * self.config.query_volume_banks
@@ -1059,7 +1058,10 @@ class CycleEngine:
             and replay_lanes is not None
             and volume_banks is not None
         )
-        reduction_slots = banks * groups
+        # ``groups`` are active partial entries within one physical bank.  They
+        # provide feedback storage, not independent issue ports; the C++
+        # network accepts at most one input per bank per cycle.
+        reduction_slots = banks
         loss_base = reduction_slots
         replay_base = loss_base + loss_slots
         volume_read_base = replay_base + replay_lanes
@@ -1073,9 +1075,7 @@ class CycleEngine:
             return available[:needed] if len(available) >= needed else None
 
         def reduction_slot(query_id: int) -> int:
-            bank = query_id % banks
-            group = (query_id // banks) % groups
-            return bank * groups + group
+            return query_id & (banks - 1)
 
         if kind is PrimitiveKind.FORWARD:
             # ComputePod emits packet lanes independently.  By the time a

@@ -13,34 +13,32 @@
   关系窗口整窗容量预留，以及仅增加 Fusion 前向/伴随端口并开放多头观察的实验均未降低端到端周期，
   已回退，冻结配置保持不变。
 
-- 2026-08-29 按最新分解锚点在同一中位物理 packet quick trace 上重新完成两类 Oracle。Base 为
-  `46,766 cycles`；Query portfolio 的实际成员为 `33,075 cycles`（相对 Base `1.413938x`），
-  仍比 Chest Query 目标预算 `32,348 cycles` 多 `727 cycles`。其 future-visible 成员在
-  `cycle 23,271` 因关系窗口容量无法释放而死锁，不能作为可达上界。Residency portfolio
-  的实际成员为 `43,185 cycles`、future-visible 成员为 `43,191 cycles`，相对 Base 分别为
-  `1.082922x` 和 `1.082772x`，距离 Residency 目标预算 `32,404 cycles` 仍有 `10,781 cycles`。
-  结果目录分别为仓库外 `GALA-runtime/records/r2_gaussian_chest_median_packets_current_query_oracle_v2/`
-  和 `..._residency_oracle_v2/`；两者均为 `quick_cycle_validation`，不具备正式 30,000 iteration
-  性能资格，也不生成 `speedup_vs_orin`。这组结果确认当前主要差距来自关系窗口、Query datapath/
-  replay queue、Fusion 冲突和 ComputePod issue 的覆盖外停顿，下一步先按共同工程路径优化这些停顿。
+- 2026-08-29 从外部规范仓库 `main` 快进拉取后，修正了 Python 查询归约资源模型：权威 C++ 的
+  `64` 个物理 Bank 每周期各接收一个输入，`partial_sum_groups_per_bank=4` 只表示 Bank 内活动
+  partial entry 容量，不再被展开成 `256` 个发射槽；同时按 `query_tag & (banks - 1)` 固定映射并
+  增加 2 的幂配置校验。定向回归覆盖 `query_tag=0/64` 同 Bank 冲突和 `0/1` 异 Bank 并行，
+  全套测试为 `322 passed, 1 skipped, 2 warnings`。
 
-- 2026-08-29 Shared SRAM、关系前端、Query State Bank 和 ComputePod 微上下文计费修正后，
-  同一 `846,012` 事件、`1,289,964` 依赖的双窗口 quick trace 已重新闭合。Base 为
-  `46,766 cycles`，Full 为 `34,217 cycles`，相对 Base 的实际加速为 `1.366748x`；全部事件、
-  两个关系窗口和 `19,777` 个物理关系 packet 均完成并释放。按最新 Full 静态锚点
-  `2.648560x` 换算，当前 Base 对应目标预算为 `17,657 cycles`，Full 仍需减少 `16,560 cycles`
-  （当前 Full 的 `48.40%`）。该结果是同一代表性真实 trace 的机制诊断，不是正式 30,000
-  iteration 性能结果。
+- 2026-08-29 在同一 `846,012` 事件、`1,289,964` 依赖的中位物理 packet quick trace、同一冻结
+  GALA/Ramulator 配置和资源快照上重跑合同修正后的周期。Base 为 `46,707 cycles`；Query portfolio
+  的实际成员为 `33,246 cycles`（相对 Base `1.404891x`），future-visible 成员在关系窗口容量
+  达到冻结上限后死锁，不能作为已证明上界。Residency portfolio 的实际成员为 `43,126 cycles`
+  （`1.083036x`），future-visible 成员为 `43,132 cycles`；Full 联合入口为 `34,187 cycles`
+  （`1.366221x`）。结果目录位于仓库外 `GALA-runtime/records/r2_gaussian_chest_reduction_bank_contract_v1_*`，
+  全部标记为 `quick_cycle_validation`，不具备正式 30,000 iteration 性能资格，也不生成
+  `speedup_vs_orin`。
 
-- 当前配置的资源必要下界为 `19,779 cycles`，限制项是 Fusion 前向和伴随各一个真实队首、
-  各一个发射端口；其次为八路伴随重放 `17,568 cycles` 和 ComputePod cluster issue
-  `13,950 cycles`。以当前 `46,766-cycle` Base 计算，Query 和 Residency 静态目标未被必要
-  下界排除，但 Full `17,657-cycle` 目标已被当前一类一队首/一端口合同排除。将 Fusion 前向与
-  伴随端口仅在内存配置中各增至两个，会把静态计数下界
-  降到 `17,568 cycles`，但实际 Full 仍为 `34,217 cycles`，因为三输入调度器仍只观察每类一个
-  真实队首，且当前运行受 ComputePod cluster issue 和查询重放依赖限制。该实验说明单独增加
-  端口没有收益；下一步应先提高现有 Pod 与重放 lane 的工作保持率，再决定是否以多队首调度
-  支持低成本的双端口修改。
+- 上述合同修正后的 Full 仍完成全部事件、两个关系窗口和 `19,777` 个物理关系 packet。按最新
+  Full 静态锚点相对 Base 的派生参考 `2.648560x` 换算，`46,707-cycle` Base 对应目标预算约为
+  `17,635 cycles`，实际 Full 仍多 `16,552 cycles`（`48.43%`）。这不是千倍级收益，也不是正式
+  30,000 iteration 性能结果；差距必须按周期分解继续做共同工程路径优化。
+
+- 合同修正后的当前配置资源必要下界仍为 `19,779 cycles`，限制项是 Fusion 前向和伴随各一个
+  真实队首、各一个发射端口；Query 目标预算约 `32,308 cycles`、Residency 约 `32,363 cycles`
+  尚未被必要下界排除，而 Full 目标预算约 `17,635 cycles` 已被必要下界高出 `2,144 cycles`
+  排除。这个下界假设其余冲突全部消失，不是可达预测、Oracle 或静态锚点。当前实际差距主要
+  集中在 Query replay/Datapath、ComputePod issue、Fusion 队列反压和关系构造端口等待；下一步
+  按分解逐项优化并对 Base、两个 Oracle 和所有消融公平重跑。
 
 - 缓存物理 RelationPacket 的命中或 miss-merge 路径现会完成 packet 的全部逻辑 lane，同时只由
   packet head 更新一次目录、Active SRAM 和填充状态。该修复消除了 Full 在 `cycle 3337` 留下

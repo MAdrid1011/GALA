@@ -158,6 +158,33 @@ def test_query_loss_bound_uses_registered_query_issue_width() -> None:
     assert component.evidence["queries_per_cycle"] == 16
 
 
+def test_query_reduction_bound_counts_physical_banks_not_partial_entries() -> None:
+    builder = TraceBuilder()
+    for query_id in (0, 64, 1):
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.QUERY_REDUCTION),
+            query_id=query_id,
+            reduction_key=query_id,
+        ))
+    config = CycleConfig.from_gala(
+        load_config(Path(__file__).parents[1] / "configs/architecture/gala.yaml"),
+        _Memory(),
+    )
+    report = analyze_cycle_lower_bounds(
+        CycleEngine(config), builder.finish(), base_asic_cycles=100,
+        targets={"query": 2.0, "residency": 2.0, "full": 2.0},
+    )
+    component = next(
+        item for item in report.scenarios[0].components
+        if item.name == "bidirectional_query.reduction_banks"
+    )
+
+    assert component.evidence["reduction_banks"] == 64
+    assert component.evidence["partial_sum_groups_per_bank"] == 4
+    assert component.evidence["reduction_issue_ports"] == 64
+    assert component.evidence["busiest_bank_events"] == 2
+
+
 def test_fusion_bank_bound_uses_physical_query_state_banks() -> None:
     builder = TraceBuilder()
     for query_id in range(64):

@@ -279,6 +279,11 @@ class CycleConfig:
         ):
             raise ValueError("query execution resources must be configured together")
         if (
+            self.query_reduction_banks is not None
+            and self.query_reduction_banks & (self.query_reduction_banks - 1)
+        ):
+            raise ValueError("query reduction bank count must be a power of two")
+        if (
             self.query_partial_sum_groups_per_bank is not None
             and self.query_partial_sum_groups_per_bank
             < self.modules["bidirectional_query"].latency

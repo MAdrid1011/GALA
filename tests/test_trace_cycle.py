@@ -393,7 +393,7 @@ def test_online_query_packet_batch_respects_frontier_bound() -> None:
     assert session.quiescent
 
 
-def test_query_reduction_banks_interleave_configured_partial_sum_groups() -> None:
+def test_query_reduction_banks_serialize_same_bank_and_parallelize_distinct_banks() -> None:
     config_path = Path(__file__).parents[1] / "configs/architecture/gala.yaml"
     engine = CycleEngine(CycleConfig.from_gala(
         load_config(config_path), _Memory(),
@@ -403,7 +403,7 @@ def test_query_reduction_banks_interleave_configured_partial_sum_groups() -> Non
         primitive_kind=int(PrimitiveKind.FORWARD), query_id=0,
     ).as_tuple()
     rows[1]["query_id"] = 64
-    rows[2]["query_id"] = 256
+    rows[2]["query_id"] = 1
     lanes = [0] * engine._module_issue_ports("bidirectional_query")
 
     first = engine._query_resource_allocation(
@@ -417,15 +417,19 @@ def test_query_reduction_banks_interleave_configured_partial_sum_groups() -> Non
     )
 
     assert first == (0,)
-    assert second == (1,)
-    assert repeated == first
+    assert second == (0,)
     lanes[first[0]] = engine.modules["bidirectional_query"].timing.latency
     assert engine._query_resource_allocation(
-        lanes, rows[1], PrimitiveKind.FORWARD, None, 1,
-    ) == second
-    assert engine._query_resource_allocation(
-        lanes, rows[2], PrimitiveKind.FORWARD, None, 1,
+        lanes, rows[1], PrimitiveKind.FORWARD, None, 0,
     ) is None
+    assert repeated == (1,)
+    ready_cycle = engine.modules["bidirectional_query"].timing.latency
+    assert engine._query_resource_allocation(
+        lanes, rows[1], PrimitiveKind.FORWARD, None, ready_cycle,
+    ) == (0,)
+    assert engine._query_resource_allocation(
+        lanes, rows[2], PrimitiveKind.FORWARD, None, ready_cycle,
+    ) == (1,)
 
 
 def test_online_cycle_replay_rejects_frontier_overflow_before_advancing_ids() -> None:

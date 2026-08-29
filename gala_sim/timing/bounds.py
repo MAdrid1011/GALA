@@ -396,14 +396,17 @@ def _query_components(
         int(PrimitiveKind.FORWARD), int(PrimitiveKind.QUERY_REDUCTION),
     ]))
     query_ids = np.asarray(trace.events["query_id"][reduction_ids], dtype=np.int64)
-    reduction_slots = (query_ids % banks) * groups + (query_ids // banks) % groups
-    slot_counts = np.bincount(reduction_slots, minlength=banks * groups)
-    busiest_slot = int(np.max(slot_counts, initial=0))
+    # Partial entries are feedback storage inside a physical bank.  They do
+    # not create extra issue ports: the reference network accepts one input
+    # per bank per cycle and maps tags with ``query_tag & (banks - 1)``.
+    reduction_banks = query_ids & (banks - 1)
+    bank_counts = np.bincount(reduction_banks, minlength=banks)
+    busiest_bank = int(np.max(bank_counts, initial=0))
     components = [CycleBoundComponent(
         name="bidirectional_query.reduction_banks",
         category="query_reduction",
         cycles=_issue_completion_bound(
-            busiest_slot,
+            busiest_bank,
             ports=1,
             initiation_interval=timing.initiation_interval,
             minimum_service=timing.latency,
@@ -417,10 +420,10 @@ def _query_components(
             )),
             "reduction_banks": banks,
             "partial_sum_groups_per_bank": groups,
-            "reduction_slots": banks * groups,
-            "busiest_bank_group_events": busiest_slot,
+            "reduction_issue_ports": banks,
+            "busiest_bank_events": busiest_bank,
         },
-        limitation="Assumes all interleaved bank groups are independently fed and every contribution is ready.",
+        limitation="Assumes every contribution is ready; partial entries provide active-key capacity within each bank, not additional issue ports.",
     )]
 
     consumers = int(np.count_nonzero(kinds == int(PrimitiveKind.CONSUMER)))

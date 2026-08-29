@@ -63,7 +63,7 @@ def test_production_compute_profiles_have_audited_path_latencies() -> None:
     assert config.query_relation_store_banks == 16
     assert config.relation_support_lanes == 8
     assert config.owner_gradient_slots_per_cluster == 2
-    assert CycleEngine(config)._module_issue_ports("bidirectional_query") == 312
+    assert CycleEngine(config)._module_issue_ports("bidirectional_query") == 120
     assert CycleEngine(config)._module_issue_ports("relation_constructor") == 24
     assert config.compute_templates[1].latency_for("forward") == 17
     assert config.compute_templates[1].latency_for("adjoint") == 27
@@ -82,6 +82,11 @@ def test_production_compute_profiles_have_audited_path_latencies() -> None:
     )
     assert {raster_adjoint.packet_completion_offset(lane) for lane in range(8)} == {34}
     assert {voxel_adjoint.packet_completion_offset(lane) for lane in range(8)} == {68}
+
+
+def test_query_reduction_bank_count_must_support_bitmask_mapping() -> None:
+    with pytest.raises(ValueError, match="power of two"):
+        replace(_production_config(), query_reduction_banks=63)
 
 
 def test_production_compute_profile_rejects_unknown_template() -> None:
@@ -112,7 +117,7 @@ def test_query_and_compute_paths_follow_bidirectional_hardware_contract() -> Non
     )
 
 
-def test_query_reduction_banks_issue_independently_and_serialize_aliases() -> None:
+def test_query_reduction_banks_issue_independently_and_serialize_same_bank_tags() -> None:
     def run(query_ids: tuple[int, int]):
         builder = TraceBuilder()
         for query_id in query_ids:
@@ -126,9 +131,10 @@ def test_query_reduction_banks_issue_independently_and_serialize_aliases() -> No
         return CycleEngine(config).run(builder.finish(), validate_input=False)
 
     independent = run((0, 1))
-    # Four interleaved partial groups share a bank; query 256 wraps to the
-    # same bank/group slot as query 0.
-    aliased = run((0, 256))
+    # Four active partial entries share a physical bank; query 64 aliases the
+    # same bank as query 0 even though it would have been a distinct legacy
+    # group slot.
+    aliased = run((0, 64))
 
     assert independent.completion_cycles[0] == independent.completion_cycles[1]
     assert aliased.completion_cycles[1] == aliased.completion_cycles[0] + 1
@@ -174,30 +180,30 @@ def test_query_datapaths_allocate_loss_replay_and_query_volume_ports() -> None:
     consumer = engine._query_resource_allocation(
         lanes, row(PrimitiveKind.CONSUMER, 3), PrimitiveKind.CONSUMER, None, 0,
     )
-    assert consumer == (256, 283, 299)
+    assert consumer == (64, 91, 107)
     for lane in consumer:
         lanes[lane] = 1
 
     # A second query can use another loss slot and another SRAM bank.
     assert engine._query_resource_allocation(
         lanes, row(PrimitiveKind.CONSUMER, 4), PrimitiveKind.CONSUMER, None, 0,
-    ) == (257, 284, 300)
+    ) == (65, 92, 108)
     # An adjoint read to query 3 conflicts with the consumer read port, while
     # the independent write port remains legal in the same cycle.
     assert engine._query_resource_allocation(
         lanes, row(PrimitiveKind.ADJOINT, 3), PrimitiveKind.ADJOINT, None, 0,
     ) is None
     read_busy_only = [0] * len(lanes)
-    read_busy_only[283] = 1
+    read_busy_only[91] = 1
     assert engine._query_resource_allocation(
         read_busy_only, row(PrimitiveKind.QUERY_REDUCTION, 3),
         PrimitiveKind.QUERY_REDUCTION, None, 0,
-    ) == (12, 299)
+    ) == (3, 107)
 
     # A full replay packet waits when any of the eight lanes are busy; that is
     # backpressure, not an invalid packet-width error.
     replay_busy = [0] * len(lanes)
-    replay_busy[272] = 1
+    replay_busy[80] = 1
     packet = type("Packet", (), {"query_base": 0, "lanes": tuple(range(8))})()
     assert engine._query_resource_allocation(
         replay_busy, row(PrimitiveKind.ADJOINT, 0),
