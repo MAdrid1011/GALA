@@ -323,6 +323,85 @@ def test_query_stream_schedule_closes_relation_and_window_frontiers() -> None:
 
 
 @pytest.mark.parametrize(
+    ("template_id", "query_shape", "tile_ids", "candidate_bits"),
+    [
+        (
+            1,
+            (3, 18),
+            (0, 0, 1, 1),
+            (
+                (0, 1, 7, 8, 15, 16, 31, 32, 47),
+                (0, 2, 8, 33),
+                (0, 1, 16, 17, 32, 33),
+                (1, 17, 32),
+            ),
+        ),
+        (
+            2,
+            (9, 3, 10),
+            (0, 1, 2, 3),
+            (
+                (0, 1, 7, 8, 15, 64, 72, 136, 471),
+                (0, 1, 7, 8, 15, 16, 23),
+                (0, 1, 8, 9, 64, 65, 465),
+                (0, 1, 8, 9, 16, 17),
+            ),
+        ),
+    ],
+    ids=("raster", "voxel"),
+)
+def test_relation_pack_counts_match_materialized_pack_units(
+    template_id: int,
+    query_shape: tuple[int, ...],
+    tile_ids: tuple[int, ...],
+    candidate_bits: tuple[tuple[int, ...], ...],
+) -> None:
+    mask_words = 8 if template_id == 1 else 16
+    masks = _mask(len(tile_ids), mask_words)
+    for candidate, bits in enumerate(candidate_bits):
+        for bit in bits:
+            masks[candidate, bit // 32] |= (
+                np.uint32(1) << np.uint32(bit % 32)
+            )
+    packet = VirtualTracePacket(
+        iteration_id=1,
+        template_id=template_id,
+        query_base=0,
+        query_shape=query_shape,
+        point_ids=np.arange(len(tile_ids), dtype=np.int64),
+        point_keys=np.left_shift(
+            np.asarray(tile_ids, dtype=np.uint64), np.uint64(32),
+        ),
+        masks=masks,
+    )
+    query_lanes = 4
+    tiles = np.right_shift(packet.point_keys, np.uint64(32))
+    order = np.argsort(tiles, kind="stable")
+    sorted_tiles = tiles[order]
+    tile_domain = np.arange(packet._tile_count())
+    starts = np.searchsorted(sorted_tiles, tile_domain, side="left")
+    ends = np.searchsorted(sorted_tiles, tile_domain, side="right")
+
+    units = tuple(packet._iter_relation_pack_units(
+        order, starts, ends, query_lanes=query_lanes,
+    ))
+    counts = tuple(packet._iter_relation_pack_counts(
+        order, starts, ends, query_lanes=query_lanes,
+    ))
+
+    assert len(counts) == len(units)
+    for (pack_index, relation_count, record_count), (
+        candidates, query_offsets,
+    ) in zip(counts, units, strict=True):
+        pack_indices = packet._query_pack_indices(
+            query_offsets, query_lanes=query_lanes,
+        )
+        assert np.all(pack_indices == pack_index)
+        assert relation_count == candidates.size
+        assert record_count == np.unique(candidates).size
+
+
+@pytest.mark.parametrize(
     ("template_id", "query_shape", "loss_flags", "ssim_radius", "mask_bits"),
     [
         (1, (3, 6), LOSS_SSIM, 1, tuple(

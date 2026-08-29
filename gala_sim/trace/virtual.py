@@ -852,17 +852,11 @@ class VirtualTracePacket:
         ends = np.searchsorted(
             sorted_tiles, np.arange(self._tile_count()), side="right",
         )
-        for candidates, query_offsets in self._iter_relation_pack_units(
+        for pack_index, relation_count, record_count in self._iter_relation_pack_counts(
             order, starts, ends, query_lanes=query_lanes,
         ):
-            pack_indices = self._query_pack_indices(
-                query_offsets, query_lanes=query_lanes,
-            )
-            if not np.all(pack_indices == pack_indices[0]):
-                raise ValueError("one relation unit crosses physical query packs")
-            pack_index = int(pack_indices[0])
-            relation_counts[pack_index] += int(candidates.size)
-            physical_records[pack_index] += int(np.unique(candidates).size)
+            relation_counts[pack_index] += relation_count
+            physical_records[pack_index] += record_count
 
         dependency_packs = tuple(
             self._consumer_dependency_packs(
@@ -1193,6 +1187,51 @@ class VirtualTracePacket:
     ) -> Iterator[tuple[np.ndarray, np.ndarray]]:
         """Yield query-major units that contain complete physical query packs."""
 
+        for tile_candidates, query_offsets, active in self._iter_relation_pack_activity(
+            order, starts, ends, query_lanes=query_lanes,
+        ):
+            lanes, candidate_positions = np.nonzero(active.T)
+            yield (
+                tile_candidates[candidate_positions],
+                query_offsets[lanes].astype(np.int64, copy=False),
+            )
+
+    def _iter_relation_pack_counts(
+        self,
+        order: np.ndarray,
+        starts: np.ndarray,
+        ends: np.ndarray,
+        *,
+        query_lanes: int,
+    ) -> Iterator[tuple[int, int, int]]:
+        """Yield pack index, logical relations, and physical records."""
+
+        fast_extent = int(self.query_shape[-1])
+        fast_packs = (fast_extent + query_lanes - 1) // query_lanes
+        for _tile_candidates, query_offsets, active in self._iter_relation_pack_activity(
+            order, starts, ends, query_lanes=query_lanes,
+        ):
+            first_query = int(query_offsets[0])
+            pack_index = (
+                first_query // fast_extent * fast_packs
+                + first_query % fast_extent // query_lanes
+            )
+            yield (
+                pack_index,
+                int(np.count_nonzero(active)),
+                int(np.count_nonzero(np.any(active, axis=1))),
+            )
+
+    def _iter_relation_pack_activity(
+        self,
+        order: np.ndarray,
+        starts: np.ndarray,
+        ends: np.ndarray,
+        *,
+        query_lanes: int,
+    ) -> Iterator[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+        """Yield candidate rows, pack query offsets, and their active lanes."""
+
         if self.template_id == RASTER_TEMPLATE_ID:
             height, width = self.query_shape
             blocks_x = (width + RASTER_BLOCK[1] - 1) // RASTER_BLOCK[1]
@@ -1225,14 +1264,14 @@ class VirtualTracePacket:
                                 words
                                 >> (local_queries[None, :] % MASK_WORD_BITS)
                             ) & np.uint32(1)
-                            lanes, candidate_positions = np.nonzero(active.T)
-                            if lanes.size:
+                            if np.any(active):
                                 yield (
-                                    tile_candidates[candidate_positions],
-                                    query_y * width
-                                    + tile_x * RASTER_BLOCK[1]
-                                    + pack_start
-                                    + lanes.astype(np.int64, copy=False),
+                                    tile_candidates,
+                                    query_y * width + tile_x * RASTER_BLOCK[1]
+                                    + pack_start + np.arange(
+                                        pack_width, dtype=np.int64,
+                                    ),
+                                    active,
                                 )
             return
 
@@ -1283,17 +1322,19 @@ class VirtualTracePacket:
                                         words
                                         >> (local_queries[None, :] % MASK_WORD_BITS)
                                     ) & np.uint32(1)
-                                    lanes, candidate_positions = np.nonzero(active.T)
-                                    if lanes.size:
+                                    if np.any(active):
                                         yield (
-                                            tile_candidates[candidate_positions],
+                                            tile_candidates,
                                             (
                                                 query_x * voxel_y * voxel_z
                                                 + query_y * voxel_z
                                                 + tile_z * VOXEL_BLOCK[2]
                                                 + pack_start
-                                                + lanes.astype(np.int64, copy=False)
+                                                + np.arange(
+                                                    pack_width, dtype=np.int64,
+                                                )
                                             ),
+                                            active,
                                         )
             return
 
