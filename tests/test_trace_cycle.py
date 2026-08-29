@@ -490,6 +490,58 @@ def test_online_streaming_reuses_schedule_for_capacity_preflight(
     assert session.quiescent
 
 
+def test_online_streaming_cycles_are_transport_chunk_invariant() -> None:
+    candidate_count = 44
+    masks = np.full(
+        (candidate_count, 16),
+        np.uint32(0xFFFF_FFFF),
+        dtype=np.dtype("<u4"),
+    )
+    source = VirtualTracePacket(
+        iteration_id=1,
+        template_id=2,
+        query_base=0,
+        query_shape=(8, 8, 8),
+        point_ids=np.arange(candidate_count, dtype=np.int64),
+        point_keys=np.zeros(candidate_count, dtype=np.uint64),
+        masks=masks,
+        loss_flags=1,
+        backward_confirmed=True,
+    )
+    assert source.logical_expanded_event_count > 131_072
+    config_path = Path(__file__).parents[1] / "configs/architecture/gala.yaml"
+    gala_config = load_config(config_path)
+    results = []
+    max_frontier_events = (
+        int(gala_config.value("trace.chunk_events"))
+        * int(gala_config.value("trace.max_inflight_chunks"))
+    )
+    for max_events in (65_536, 131_072, 2_000_000):
+        config = CycleConfig.from_gala(gala_config, _Memory())
+        session = CycleEngine(config).online_session(
+            max_events=max_events,
+            max_frontier_events=max_frontier_events,
+            initial_gaussian_count=candidate_count,
+            retain_completion_cycles=True,
+        )
+        session.accept_query_packet(source)
+        session.close_iteration(1)
+        result = session.finish()
+        assert session.peak_frontier_events <= max_frontier_events
+        assert session.accepted_event_count == source.logical_expanded_event_count
+        assert session.completed_event_count == source.logical_expanded_event_count
+        assert session.quiescent
+        results.append(result)
+
+    reference = results[0]
+    for result in results[1:]:
+        assert result.total_cycles == reference.total_cycles
+        assert result.event_counts == reference.event_counts
+        assert result.module_counters == reference.module_counters
+        assert result.stalls == reference.stalls
+        assert result.completion_cycles == reference.completion_cycles
+
+
 def test_online_query_packet_rejects_atomic_planning_overflow_before_expansion() -> None:
     masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
     masks[0, 0] = 1

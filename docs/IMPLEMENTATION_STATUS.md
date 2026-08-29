@@ -687,3 +687,24 @@ Full 下界需要修改 RelationPacket 宽度或融合输出组织，不能通�
 
 完整测试现为 `335 passed, 1 skipped, 2 warnings`。AGX Orin 同套件实测仍不可用，所有
 `speedup_vs_orin` 字段继续保持 `unavailable`。
+
+## 2026-08-30 有界在线回放的正式分包等价门
+
+在线周期回放现将各模块的 ready 候选限制在冻结的硬件 `queue_capacity` 内，容量外事件留在
+有序上游等待区；新到达的较早事件可替换硬件可见队列中的较晚事件。离线与在线候选均按全局
+事件 ID 稳定排序。streaming continuation 在任何 transport fragment 发射前完整登记该
+query-pack 的物理 RelationPacket、query replay 和 owner-gradient 元数据，完成事件释放的
+frontier 空位会在同一模拟周期发射前补入后续输入。上述逻辑同时作用于 Base、实际机制和消融，
+不删除事件、依赖、状态版本或资源访问。
+
+使用完整 compact archive 中真实 Voxel tile 0 的 `212` 个 candidate、`80,063` 条 relation、
+`512` 个 query 和 `482,126` 个事件执行原生 Ramulator 2 三档门。固定正式
+`max_frontier_events=8,000,000`，只改变 transport `max_events=65,536/131,072/2,000,000`，
+三档均得到 `26,614 cycles`、`11,542` 个 Ramulator 请求，并且逐事件 completion cycle、事件
+计数、模块计数、stall、内存请求和最终 quiescence 完全一致。定向周期测试为 `83 passed`，全仓
+测试为 `361 passed, 1 skipped, 2 warnings`。
+
+减小 `max_frontier_events` 会显式改变软件输入反压，因此不再作为正式分包等价维度：同一 tile 的
+`131,072` frontier 为 `26,671 cycles`，而冻结的 `8,000,000` frontier 为 `26,614 cycles`。
+文档冻结配置仍由 `trace.chunk_events=4,000,000` 与 `trace.max_inflight_chunks=2` 推导正式
+frontier；不得把更小诊断容量产生的额外周期混入 Base ASIC、Oracle 或十六项消融。

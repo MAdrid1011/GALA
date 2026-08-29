@@ -9,7 +9,7 @@ from functools import lru_cache
 import heapq
 from pathlib import Path
 import time
-from typing import Callable, Iterable, Mapping
+from typing import Callable, Iterable, Iterator, Mapping
 
 import numpy as np
 
@@ -291,11 +291,13 @@ class _FusionPendingQueues:
 
 
 class _ReadyCandidateQueue:
-    """Heap-index ready work without changing candidate ordering semantics."""
+    """Heap-index one bounded hardware input queue plus upstream waiters."""
 
     def __init__(self) -> None:
         self._next_token = 0
         self._candidate_by_token: dict[int, tuple[int, int]] = {}
+        self._waiting: list[tuple[tuple[int, int], int]] = []
+        self._capacity: int | None = None
         self._general: list[tuple[tuple[int, int], int]] = []
         self._replay_consumers: list[tuple[tuple[int, int], int]] = []
         self._simple_by_cluster: dict[
@@ -318,24 +320,49 @@ class _ReadyCandidateQueue:
         self._query_replay: QueryReplayTracker | None = None
 
     def __bool__(self) -> bool:
-        return bool(self._candidate_by_token)
+        return bool(self._candidate_by_token or self._waiting)
 
     def __len__(self) -> int:
-        return len(self._candidate_by_token)
+        return len(self._candidate_by_token) + len(self._waiting)
 
     def __iter__(self):
-        return iter(sorted(self._candidate_by_token.values()))
+        return iter(sorted((
+            *self._candidate_by_token.values(),
+            *(candidate for candidate, _token in self._waiting),
+        )))
 
     def __getitem__(self, index):
-        return sorted(self._candidate_by_token.values())[index]
+        return tuple(self)[index]
 
     def push(self, candidate: tuple[int, int]) -> None:
         token = self._next_token
         self._next_token += 1
+        if (
+            self._configured
+            and self._capacity is not None
+            and len(self._candidate_by_token) >= self._capacity
+        ):
+            worst_token, worst_candidate = max(
+                self._candidate_by_token.items(),
+                key=lambda item: (item[1], item[0]),
+            )
+            if (candidate, token) >= (worst_candidate, worst_token):
+                heapq.heappush(self._waiting, (candidate, token))
+                return
+            self._remove((worst_candidate, worst_token), promote=False)
+            heapq.heappush(self._waiting, (worst_candidate, worst_token))
         self._candidate_by_token[token] = candidate
         if self._configured:
             self._index(token, candidate)
         self._maybe_compact()
+
+    def _promote_waiters(self) -> None:
+        if self._capacity is None:
+            return
+        while self._waiting and len(self._candidate_by_token) < self._capacity:
+            candidate, token = heapq.heappop(self._waiting)
+            self._candidate_by_token[token] = candidate
+            self._index(token, candidate)
 
     def _maybe_compact(self) -> None:
         """Bound lazy-deletion overhead after repeated resource requeues.
@@ -432,6 +459,7 @@ class _ReadyCandidateQueue:
         self,
         module_name: str,
         *,
+        capacity: int | None = None,
         row_for: Callable[[int], np.void],
         physical_stage_for: Callable[[int], PhysicalPacketStage | None],
         owner_gradients: OwnerGradientTracker | None,
@@ -441,17 +469,33 @@ class _ReadyCandidateQueue:
         if self._configured:
             if module_name != self._module_name:
                 raise CycleConfigurationError("ready queue changed module ownership")
+            if capacity is not None and capacity != self._capacity:
+                raise CycleConfigurationError("ready queue changed hardware capacity")
             self._row_for = row_for
             self._kind_for = kind_for
             self._physical_stage_for = physical_stage_for
             return
+        if capacity is None:
+            # Keep direct unit-test construction source-compatible.  The
+            # cycle engine always supplies the module's configured capacity.
+            capacity = max(1, len(self._candidate_by_token))
+        if capacity <= 0:
+            raise ValueError("ready queue capacity must be positive")
         self._configured = True
         self._module_name = module_name
+        self._capacity = capacity
         self._row_for = row_for
         self._kind_for = kind_for
         self._physical_stage_for = physical_stage_for
         self._owner_gradients = owner_gradients
         self._query_replay = query_replay
+        visible = sorted(
+            self._candidate_by_token.items(),
+            key=lambda item: (item[1], item[0]),
+        )
+        for token, candidate in visible[capacity:]:
+            heapq.heappush(self._waiting, (candidate, token))
+            del self._candidate_by_token[token]
         for token, candidate in self._candidate_by_token.items():
             self._index(token, candidate)
 
@@ -508,7 +552,9 @@ class _ReadyCandidateQueue:
             choices.append(complex_entry)
         return min(choices, default=None)
 
-    def _remove(self, entry: tuple[tuple[int, int], int]) -> None:
+    def _remove(
+        self, entry: tuple[tuple[int, int], int], *, promote: bool = True,
+    ) -> None:
         _candidate, token = entry
         location = self._simple_location_by_token.pop(token, None)
         if location is not None:
@@ -531,12 +577,15 @@ class _ReadyCandidateQueue:
             heapq.heappop(self._replay_consumers)
         self._complex_event_ids.pop(token, None)
         del self._candidate_by_token[token]
+        if promote:
+            self._promote_waiters()
 
     def pop_acceptable(
         self,
         width: int,
         module_name: str,
         *,
+        capacity: int | None = None,
         row_for: Callable[[int], np.void],
         kind_for: Callable[[int], PrimitiveKind] | None = None,
         physical_stage_for: Callable[[int], PhysicalPacketStage | None],
@@ -544,14 +593,14 @@ class _ReadyCandidateQueue:
         query_replay: QueryReplayTracker | None,
     ) -> list[tuple[int, int]]:
         self._configure(
-            module_name, row_for=row_for,
+            module_name, capacity=capacity, row_for=row_for,
             kind_for=kind_for,
             physical_stage_for=physical_stage_for,
             owner_gradients=owner_gradients,
             query_replay=query_replay,
         )
         selected: list[tuple[int, int]] = []
-        for _ in range(min(width, len(self))):
+        for _ in range(min(width, len(self._candidate_by_token))):
             entry = self._earliest_acceptable()
             if entry is None:
                 break
@@ -864,7 +913,7 @@ class CycleEngine:
         *,
         future_plan: FutureTracePlan | None = None,
     ) -> list[int]:
-        base_order = candidates
+        base_order = sorted(candidates)
         if self.selection.query_oracle:
             if future_plan is None:
                 raise CycleConfigurationError(
@@ -1639,7 +1688,9 @@ class CycleEngine:
 
         width = self._ready_scan_window(module_name)
         return queue.pop_acceptable(
-            width, module_name, row_for=row_for,
+            width, module_name,
+            capacity=self.modules[module_name].timing.queue_capacity,
+            row_for=row_for,
             physical_stage_for=physical_stage_for, kind_for=kind_for,
             owner_gradients=owner_gradients,
             query_replay=query_replay,
@@ -4591,7 +4642,13 @@ class CycleReplaySession:
             packet, external_dependencies=external_dependencies,
             schedule=schedule,
         )
-        for continuation in continuations:
+        continuation_packets: Iterator[VirtualEventPacket] = iter(())
+        pending_packet: VirtualEventPacket | None = None
+        pending_offset = 0
+        source_exhausted = False
+
+        def begin_continuation(continuation) -> None:
+            nonlocal continuation_packets
             if continuation.window_descriptor is not None:
                 descriptor = continuation.window_descriptor
                 if self._relation_windows is None:
@@ -4633,42 +4690,95 @@ class CycleReplaySession:
                             f"online event {event_id} has duplicate packet metadata"
                         )
                     self._packet_stage_by_event[event_id] = physical_stage
-            for event_packet in continuation.event_packets:
-                rows = event_packet.events
-                if self._query_replay is not None:
-                    try:
-                        self._query_replay.register_rows(rows)
-                    except ValueError as error:
-                        raise CycleConfigurationError(str(error)) from error
-                if self._owner_gradients is not None:
-                    try:
-                        self._owner_gradients.register_rows(rows)
-                    except ValueError as error:
-                        raise CycleConfigurationError(str(error)) from error
-                if (
-                    self.max_frontier_events is not None
-                    and self.pending_event_count + event_packet.event_count
-                    > self.max_frontier_events
-                ):
-                    self._drain(allow_stream_input_wait=True)
-                    self._compact_completed_prefix()
-                    if (
-                        self.pending_event_count + event_packet.event_count
-                        > self.max_frontier_events
-                    ):
-                        raise CycleConfigurationError(
-                            "max_frontier_events cannot hold the open physical "
-                            "packet frontier"
-                        )
-                terminal_ids.extend(
-                    int(event_id) for event_id in rows["event_id"][
-                        rows["primitive_kind"]
-                        == int(PrimitiveKind.GRADIENT_REDUCTION)
-                    ]
+            # Replay and owner ledgers describe one semantic query-pack
+            # operation.  Register the complete operation before any of its
+            # transport fragments can issue, so packet splitting cannot expose
+            # a consumer or adjoint with incomplete future-reference counts.
+            rows = np.concatenate(
+                tuple(item.events for item in continuation.event_packets),
+            )
+            if self._query_replay is not None:
+                try:
+                    self._query_replay.register_rows(rows)
+                except ValueError as error:
+                    raise CycleConfigurationError(str(error)) from error
+            if self._owner_gradients is not None:
+                try:
+                    self._owner_gradients.register_rows(rows)
+                except ValueError as error:
+                    raise CycleConfigurationError(str(error)) from error
+            terminal_ids.extend(
+                int(event_id) for event_id in rows["event_id"][
+                    rows["primitive_kind"]
+                    == int(PrimitiveKind.GRADIENT_REDUCTION)
+                ]
+            )
+            continuation_packets = iter(continuation.event_packets)
+
+        def refill_stream() -> tuple[bool, bool]:
+            """Fill every newly released frontier slot before this cycle issues."""
+
+            nonlocal pending_packet, pending_offset
+            nonlocal source_exhausted
+            admitted = False
+            while True:
+                available = (
+                    None
+                    if self.max_frontier_events is None
+                    else self.max_frontier_events - self.pending_event_count
                 )
-                self.accept_event_packet(event_packet, _drain_after=False)
+                if available is not None and available <= 0:
+                    return source_exhausted, admitted
+                if pending_packet is None:
+                    try:
+                        pending_packet = next(continuation_packets)
+                        pending_offset = 0
+                    except StopIteration:
+                        try:
+                            continuation = next(continuations)
+                        except StopIteration:
+                            source_exhausted = True
+                            return True, admitted
+                        begin_continuation(continuation)
+                        continue
+                remaining = pending_packet.event_count - pending_offset
+                take = remaining if available is None else min(remaining, available)
+                if take <= 0:
+                    return source_exhausted, admitted
+                fragment = self._slice_event_packet(
+                    pending_packet, pending_offset, pending_offset + take,
+                )
+                self.accept_event_packet(fragment, _drain_after=False)
+                admitted = True
+                pending_offset += take
+                if pending_offset == pending_packet.event_count:
+                    pending_packet = None
+                    pending_offset = 0
                 self._report_progress()
+
+        self._drain(stream_refill=refill_stream)
+        self._compact_completed_prefix()
         self._backward_frontier = (*self._backward_frontier, *terminal_ids)
+
+    def _slice_event_packet(
+        self, packet: VirtualEventPacket, start: int, end: int,
+    ) -> VirtualEventPacket:
+        """Repacketize a contiguous row range without changing event semantics."""
+
+        if not 0 <= start < end <= packet.event_count:
+            raise ValueError("virtual event packet slice is invalid")
+        dependency_start = int(packet.events[start]["dependency_begin"])
+        last = packet.events[end - 1]
+        dependency_end = int(last["dependency_begin"] + last["dependency_count"])
+        rows = packet.events[start:end].copy()
+        rows["dependency_begin"] -= dependency_start
+        return VirtualEventPacket(
+            packet_id=self._stream_validator.next_packet_id,
+            global_event_start=int(rows["event_id"][0]),
+            events=rows,
+            dependencies=packet.dependencies[dependency_start:dependency_end],
+            _trusted=True,
+        )
 
     def register_semantic_workset_totals(
         self, totals: Mapping[tuple[int, int], int]
@@ -5114,10 +5224,18 @@ class CycleReplaySession:
         )
 
     def _ordered(self, candidates: list[tuple[int, int]]) -> list[tuple[int, int]]:
-        return candidates
+        return sorted(candidates)
 
-    def _drain(self, *, allow_stream_input_wait: bool = False) -> None:
+    def _drain(
+        self,
+        *,
+        allow_stream_input_wait: bool = False,
+        stream_refill: Callable[[], tuple[bool, bool]] | None = None,
+    ) -> None:
         async_memory = callable(getattr(self.engine.config.memory, "submit_async", None))
+        stream_exhausted = stream_refill is None
+        if stream_refill is not None:
+            stream_exhausted, _admitted = stream_refill()
         while (
             self._ready
             or self._in_flight
@@ -5125,6 +5243,7 @@ class CycleReplaySession:
             or self._lane_outputs
             or self._fusion_pending
             or any(self._fusion_inputs.values())
+            or not stream_exhausted
         ):
             # Bank reservations are scoped to one cycle.  Drop old entries so
             # long packet streams do not retain one dictionary item per cycle.
@@ -5172,6 +5291,9 @@ class CycleReplaySession:
                 else:
                     self._push_ready(event_id, next_stage)
                 progressed = True
+            if stream_refill is not None and not stream_exhausted:
+                stream_exhausted, admitted = stream_refill()
+                progressed = progressed or admitted
             if self.engine.selection.query_scheduler_enabled:
                 self.engine.issue_scheduler.set_clock(self._cycle)
                 for task_kind, pending in self._fusion_pending.queues():
