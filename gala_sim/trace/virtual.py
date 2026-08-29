@@ -1716,22 +1716,38 @@ class VirtualInterleavedQueryEventExpander:
         if self.relation_candidate_bytes < 0:
             raise ValueError("relation candidate bytes must be non-negative")
 
-    def expand(
-        self,
-        source: VirtualTracePacket,
-        *,
-        external_dependencies: tuple[int, ...] = (),
-    ) -> Iterator[VirtualQueryContinuation]:
-        if source.loss_flags == 0:
-            raise ValueError("interleaved expansion requires a loss consumer")
-        if any(value < 0 for value in external_dependencies):
-            raise ValueError("external dependencies must be non-negative")
-        schedule = source.query_stream_schedule(
+    def plan(self, source: VirtualTracePacket) -> VirtualQueryStreamSchedule:
+        """Build the capacity-checked schedule consumed by ``expand``."""
+
+        return source.query_stream_schedule(
             query_lanes=self.relation_query_lanes,
             relation_capacity=self.relation_capacity,
             window_capacity=self.window_capacity,
             continuation_query_packs=self.continuation_query_packs,
         )
+
+    def expand(
+        self,
+        source: VirtualTracePacket,
+        *,
+        external_dependencies: tuple[int, ...] = (),
+        schedule: VirtualQueryStreamSchedule | None = None,
+    ) -> Iterator[VirtualQueryContinuation]:
+        if source.loss_flags == 0:
+            raise ValueError("interleaved expansion requires a loss consumer")
+        if any(value < 0 for value in external_dependencies):
+            raise ValueError("external dependencies must be non-negative")
+        schedule = self.plan(source) if schedule is None else schedule
+        if (
+            schedule.query_lanes != self.relation_query_lanes
+            or schedule.relation_capacity != self.relation_capacity
+            or schedule.window_capacity != self.window_capacity
+            or schedule.continuation_query_packs != self.continuation_query_packs
+            or len(schedule.infos) != source.query_pack_count(
+                query_lanes=self.relation_query_lanes,
+            )
+        ):
+            raise ValueError("query stream schedule does not match the expander")
         candidate_start = self.next_event_id
         cursor = candidate_start + source.candidate_count
         relation_cursor = self.next_relation_id

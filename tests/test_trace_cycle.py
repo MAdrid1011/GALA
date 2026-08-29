@@ -447,6 +447,49 @@ def test_online_streaming_waits_for_window_seal_before_declaring_deadlock() -> N
     assert session.quiescent
 
 
+def test_online_streaming_reuses_schedule_for_capacity_preflight(
+    monkeypatch,
+) -> None:
+    masks = np.zeros((2, 8), dtype=np.dtype("<u4"))
+    for y in range(3):
+        for x in range(8):
+            local_query = y * 16 + x
+            masks[:, local_query // 32] |= np.uint32(1 << (local_query % 32))
+    source = VirtualTracePacket(
+        iteration_id=1,
+        template_id=1,
+        query_base=0,
+        query_shape=(3, 8),
+        point_ids=np.asarray([4, 5], dtype=np.int64),
+        point_keys=np.asarray([0, 0], dtype=np.uint64),
+        masks=masks,
+        loss_flags=2,
+        ssim_radius=1,
+        backward_confirmed=True,
+    )
+
+    def unexpected_wavefront(*_args, **_kwargs):
+        raise AssertionError("streaming replay repeated the capacity scan")
+
+    monkeypatch.setattr(
+        VirtualTracePacket, "relation_store_wavefront", unexpected_wavefront,
+    )
+    config_path = Path(__file__).parents[1] / "configs/architecture/gala.yaml"
+    config = CycleConfig.from_gala(load_config(config_path), _Memory())
+    session = CycleEngine(config).online_session(
+        max_events=64,
+        max_frontier_events=256,
+        initial_gaussian_count=6,
+    )
+
+    session.accept_query_packet(source)
+    session.close_iteration(1)
+    result = session.finish()
+
+    assert result.event_counts["RELATION"] == 48
+    assert session.quiescent
+
+
 def test_online_query_packet_rejects_atomic_planning_overflow_before_expansion() -> None:
     masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
     masks[0, 0] = 1

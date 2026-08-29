@@ -27,6 +27,7 @@ from gala_sim.trace.virtual import (
     VirtualLifecycleRecord,
     VirtualTraceLifecycleValidator,
     VirtualInterleavedQueryEventExpander,
+    VirtualQueryStreamSchedule,
     VirtualQueryEventExpander,
     VirtualTracePacket,
 )
@@ -4374,8 +4375,18 @@ class CycleReplaySession:
                 f"tile has {packet.max_candidates_per_tile} candidates but "
                 f"{ordinal_bits} bits encode at most {1 << ordinal_bits}"
             )
+        expanded_event_count = packet.logical_expanded_event_count
+        use_streaming = self._use_streaming_query_expansion(
+            packet, expanded_event_count,
+        )
+        try:
+            stream_schedule = (
+                self._stream_expander.plan(packet) if use_streaming else None
+            )
+        except ValueError as error:
+            raise CycleConfigurationError(str(error)) from error
         relation_capacity = self.engine.config.query_relation_store_records
-        if relation_capacity is not None:
+        if relation_capacity is not None and not use_streaming:
             wavefront = packet.relation_store_wavefront(
                 query_lanes=self.engine.config.relation_query_lanes,
                 relation_capacity=relation_capacity,
@@ -4387,7 +4398,6 @@ class CycleReplaySession:
                     f"live records at query pack {wavefront.peak_query_pack}, "
                     f"but capacity is {wavefront.relation_capacity}"
                 )
-        expanded_event_count = packet.logical_expanded_event_count
         if (
             not self._streaming_query_expansion
             and
@@ -4406,13 +4416,13 @@ class CycleReplaySession:
             (self._state_barrier_event,)
             if self._state_barrier_event is not None else ()
         )
-        use_streaming = self._use_streaming_query_expansion(
-            packet, expanded_event_count,
-        )
         if use_streaming:
+            if stream_schedule is None:
+                raise CycleConfigurationError("streaming query schedule is missing")
             self._streaming_topology_active = True
             self._accept_streaming_query_packet(
                 packet, external_dependencies=external_dependencies,
+                schedule=stream_schedule,
             )
             return
         event_packets = tuple(self._expander.expand(
@@ -4525,12 +4535,14 @@ class CycleReplaySession:
         packet: VirtualTracePacket,
         *,
         external_dependencies: tuple[int, ...],
+        schedule: VirtualQueryStreamSchedule,
     ) -> None:
         self.engine.issue_scheduler.set_strict_lifecycle()
         self.engine.issue_scheduler.enable_exact_readiness()
         terminal_ids: list[int] = []
         continuations = self._stream_expander.expand(
             packet, external_dependencies=external_dependencies,
+            schedule=schedule,
         )
         for continuation in continuations:
             if continuation.window_descriptor is not None:
