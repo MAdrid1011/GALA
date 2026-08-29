@@ -143,6 +143,36 @@ def test_relation_window_keeps_four_reference_classes_until_final_adjoint() -> N
     }
 
 
+def test_relation_records_reclaim_per_packet_after_its_adjoint_lanes() -> None:
+    descriptor = RelationWindowDescriptor(
+        window_id=0,
+        relation_stage_heads=frozenset({1, 2}),
+        producer_event_ids=frozenset({0, 1, 2}),
+        forward_stage_heads=frozenset({3}),
+        consumer_event_ids=frozenset({4}),
+        adjoint_event_ids=frozenset({5, 6}),
+        relation_record_release_events={1: frozenset({5}), 2: frozenset({6})},
+    )
+    tracker = RelationWindowTracker(
+        window_capacity=1, relation_capacity=2, relation_banks=2,
+    )
+    tracker.register(descriptor)
+    tracker.issue(0, PrimitiveKind.RELATION_CANDIDATE,
+                  physical_stage_head=True, cycle=0)
+    tracker.issue(1, PrimitiveKind.RELATION,
+                  physical_stage_head=True, cycle=1)
+    tracker.issue(2, PrimitiveKind.RELATION,
+                  physical_stage_head=True, cycle=2)
+    for event_id in (0, 1, 2, 3, 4):
+        tracker.complete_event(event_id)
+    tracker.complete_event(5)
+    assert tracker.relation_records_live == 1
+    assert tracker.snapshot()["relation_windows_live"] == 1
+    tracker.complete_event(6)
+    assert tracker.snapshot()["relation_windows_live"] == 0
+    assert tracker.relation_records_live == 0
+
+
 def test_relation_window_full_stage_barrier_waits_for_all_prior_work() -> None:
     descriptor = RelationWindowDescriptor(
         window_id=0,
@@ -221,6 +251,44 @@ def test_relation_window_and_record_store_have_independent_backpressure() -> Non
         11, PrimitiveKind.RELATION,
         physical_stage_head=True, cycle=2,
     ) == "relation_store_capacity"
+
+
+def test_younger_window_preserves_unwritten_older_record_credits() -> None:
+    older = RelationWindowDescriptor(
+        window_id=0,
+        relation_stage_heads=frozenset({1, 2}),
+        producer_event_ids=frozenset({0, 1, 2}),
+        forward_stage_heads=frozenset({3}),
+        consumer_event_ids=frozenset({4}),
+        adjoint_event_ids=frozenset({5, 6}),
+    )
+    younger = RelationWindowDescriptor(
+        window_id=1,
+        relation_stage_heads=frozenset({11, 12}),
+        producer_event_ids=frozenset({10, 11, 12}),
+        forward_stage_heads=frozenset({13}),
+        consumer_event_ids=frozenset({14}),
+        adjoint_event_ids=frozenset({15, 16}),
+    )
+    tracker = RelationWindowTracker(
+        window_capacity=2, relation_capacity=2, relation_banks=2,
+    )
+    tracker.register(older)
+    tracker.register(younger)
+    tracker.issue(0, PrimitiveKind.RELATION_CANDIDATE,
+                  physical_stage_head=True, cycle=0)
+    tracker.issue(10, PrimitiveKind.RELATION_CANDIDATE,
+                  physical_stage_head=True, cycle=0)
+    tracker.issue(1, PrimitiveKind.RELATION,
+                  physical_stage_head=True, cycle=1)
+    assert tracker.blocking_reason(
+        11, PrimitiveKind.RELATION,
+        physical_stage_head=True, cycle=1,
+    ) == "older_window_record_reservation"
+    assert tracker.blocking_reason(
+        2, PrimitiveKind.RELATION,
+        physical_stage_head=True, cycle=2,
+    ) is None
 
 
 def test_query_replay_queue_releases_only_after_last_adjoint_dispatch() -> None:

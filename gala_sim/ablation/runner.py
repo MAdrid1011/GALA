@@ -62,11 +62,14 @@ def run_matrix(
     runs = tuple(completed)
     validate_matrix([run.variant.bits for run in runs])
     full = next(run for run in runs if run.variant.bits == "1111")
-    if full.result.total_cycles != CycleEngine(
-            _run_config(config), policy="variant:1111").run(
-                trace, validate_input=False
-            ).total_cycles:
-        raise AssertionError("full GALA entry and 1111 ablation cycles differ")
+    # ``full`` is a policy alias for the 1111 variant.  Compare the frozen
+    # selections directly instead of launching a redundant seventeenth replay
+    # over the complete trace merely to re-check that alias.
+    if (
+        CycleEngine._selection_for_policy("full")
+        != CycleEngine._selection_for_policy("variant:1111")
+    ):
+        raise AssertionError("full GALA entry and 1111 ablation policies differ")
     event_counts = {tuple(sorted(run.result.event_counts.items())) for run in runs}
     if len(event_counts) != 1:
         raise AssertionError("ablation variants changed the dynamic event set")

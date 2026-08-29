@@ -43,6 +43,10 @@ class RelationWindowDescriptor:
     forward_stage_heads: frozenset[int]
     consumer_event_ids: frozenset[int]
     adjoint_event_ids: frozenset[int]
+    # A relation record is reusable once every logical lane in its paired
+    # adjoint stage has retired.  Empty for hand-authored descriptors that
+    # use the conservative whole-window lifetime.
+    relation_record_release_events: Mapping[int, frozenset[int]] = MappingProxyType({})
 
     @property
     def event_ids(self) -> tuple[int, ...]:
@@ -264,6 +268,21 @@ class RelationWindowPlan:
             if kind is PrimitiveKind.RELATION
             and packet_plan.is_stage_head(event_id)
         )
+        adjoint_by_packet = {
+            stage.relation_packet_id: stage
+            for stage in packet_plan.stages
+            if stage.kind is PrimitiveKind.ADJOINT
+            and stage.relation_packet_id is not None
+        }
+        relation_record_release_events = {
+            relation_stage.head_event_id: frozenset(
+                adjoint_by_packet[relation_stage.relation_packet_id].event_ids
+            )
+            for relation_stage in packet_plan.stages
+            if relation_stage.kind is PrimitiveKind.RELATION
+            and relation_stage.head_event_id in relation_heads
+            and relation_stage.relation_packet_id in adjoint_by_packet
+        }
         return RelationWindowDescriptor(
             window_id=window_id,
             relation_stage_heads=relation_heads,
@@ -290,6 +309,9 @@ class RelationWindowPlan:
             adjoint_event_ids=frozenset(
                 event_id for event_id, kind in kinds.items()
                 if kind is PrimitiveKind.ADJOINT
+            ),
+            relation_record_release_events=MappingProxyType(
+                relation_record_release_events
             ),
         )
 

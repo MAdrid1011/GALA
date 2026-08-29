@@ -480,6 +480,9 @@ class _LiveRelationWindow:
     adjoint_events: set[int]
     relation_stage_heads: frozenset[int]
     appended_relation_stages: set[int] = field(default_factory=set)
+    released_relation_stages: set[int] = field(default_factory=set)
+    relation_release_events: dict[int, set[int]] = field(default_factory=dict)
+    release_stage_by_event: dict[int, int] = field(default_factory=dict)
 
 
 @dataclass
@@ -504,6 +507,24 @@ class RelationWindowTracker:
         if min(self.window_capacity, self.relation_capacity, self.relation_banks) <= 0:
             raise ValueError("relation-window resources must be positive")
 
+    def _older_window_reservation_blocks(
+        self, window_id: int, state: _LiveRelationWindow | None,
+    ) -> bool:
+        if state is None:
+            return False
+        older_states = tuple(
+            older_state for older_id, older_state in self.live.items()
+            if older_id < window_id
+        )
+        if not older_states:
+            return False
+        reserved_records = sum(
+            len(older_state.relation_stage_heads)
+            - len(older_state.appended_relation_stages)
+            for older_state in older_states
+        )
+        return self.relation_records_live + reserved_records >= self.relation_capacity
+
     def register(self, descriptor: RelationWindowDescriptor) -> None:
         if descriptor.window_id in self.descriptors:
             raise ValueError("relation window ID is registered twice")
@@ -514,6 +535,20 @@ class RelationWindowTracker:
             )
         if not descriptor.event_ids:
             raise ValueError("relation window has no reference events")
+        release_map = descriptor.relation_record_release_events
+        if release_map:
+            relation_heads = set(descriptor.relation_stage_heads)
+            if set(release_map) != relation_heads:
+                raise ValueError(
+                    "relation record release map must cover every physical relation stage"
+                )
+            release_events = [
+                event_id for event_ids in release_map.values() for event_id in event_ids
+            ]
+            if len(set(release_events)) != len(release_events):
+                raise ValueError("relation record release event belongs to multiple stages")
+            if not set(release_events) <= set(descriptor.adjoint_event_ids):
+                raise ValueError("relation record release map contains a non-adjoint event")
         for event_id in descriptor.event_ids:
             if event_id in self.event_to_window:
                 raise ValueError("event belongs to multiple relation windows")
@@ -547,6 +582,8 @@ class RelationWindowTracker:
             return None
         if self.relation_records_live >= self.relation_capacity:
             return "relation_store_capacity"
+        if self._older_window_reservation_blocks(window_id, state):
+            return "older_window_record_reservation"
         ordinal = tuple(sorted(descriptor.relation_stage_heads)).index(event_id)
         bank = ordinal % self.relation_banks
         if self._append_bank_cycle.get(bank) == cycle:
@@ -600,6 +637,17 @@ class RelationWindowTracker:
                 set(descriptor.consumer_event_ids),
                 set(descriptor.adjoint_event_ids),
                 descriptor.relation_stage_heads,
+                relation_release_events={
+                    int(stage_head): set(event_ids)
+                    for stage_head, event_ids in
+                    descriptor.relation_record_release_events.items()
+                },
+                release_stage_by_event={
+                    int(event_id): int(stage_head)
+                    for stage_head, event_ids in
+                    descriptor.relation_record_release_events.items()
+                    for event_id in event_ids
+                },
             )
             self.live[window_id] = state
             self.allocated_windows += 1
@@ -638,13 +686,35 @@ class RelationWindowTracker:
         if len(matches) != 1:
             raise ValueError("relation-window event has no unique live reference")
         matches[0].remove(event_id)
+        # Physical relation records have an independent lifetime from the
+        # window table entry.  Reclaim each packet as soon as all of its
+        # adjoint lanes retire; descriptors without this map retain the
+        # historical conservative whole-window lifetime.
+        if matches[0] is state.adjoint_events and state.relation_release_events:
+            stage_head = state.release_stage_by_event.get(event_id)
+            if stage_head is not None:
+                remaining = state.relation_release_events[stage_head]
+                remaining.remove(event_id)
+                if (
+                    not remaining
+                    and stage_head in state.appended_relation_stages
+                    and stage_head not in state.released_relation_stages
+                ):
+                    state.released_relation_stages.add(stage_head)
+                    self.relation_records_live -= 1
+                    if self.relation_records_live < 0:
+                        raise ValueError("relation-store occupancy underflows")
         if any(reference_sets):
             return
         if state.appended_relation_stages != set(state.relation_stage_heads):
             raise ValueError("relation window releases before all records were appended")
-        self.relation_records_live -= len(state.appended_relation_stages)
-        if self.relation_records_live < 0:
-            raise ValueError("relation-store occupancy underflows")
+        if state.relation_release_events:
+            if state.released_relation_stages != state.appended_relation_stages:
+                raise ValueError("relation window releases before all records retired")
+        else:
+            self.relation_records_live -= len(state.appended_relation_stages)
+            if self.relation_records_live < 0:
+                raise ValueError("relation-store occupancy underflows")
         del self.live[window_id]
         self.released_windows += 1
 
