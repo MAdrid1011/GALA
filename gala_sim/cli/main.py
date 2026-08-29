@@ -724,7 +724,10 @@ def main(argv: list[str] | None = None) -> int:
                 psnr_delta_db=None,
                 ssim_delta=None,
                 lpips_delta=None,
-                config_sha256=str(trace.metadata.get("config_sha256", "")),
+                # The replay configuration is authoritative here.  A trace
+                # may carry the hash of the configuration used during capture,
+                # which can differ for a valid post-capture ASIC tuning run.
+                config_sha256=str(config.config_sha256 or ""),
                 status="passed",
                 module_breakdown_path=breakdown_paths[run.variant.bits],
                 run_id=f"{run_prefix}-{run.variant.bits}",
