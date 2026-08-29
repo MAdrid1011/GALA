@@ -250,6 +250,10 @@ class FusionIssueScheduler:
     _released_state_packs: int = field(default=0, init=False, repr=False)
     _pack_to_slot: dict[int, int] = field(default_factory=dict, init=False, repr=False)
     _slot_to_pack: dict[int, int] = field(default_factory=dict, init=False, repr=False)
+    _live_queries_by_pack: dict[int, int] = field(
+        default_factory=dict, init=False, repr=False,
+    )
+    _release_candidates: set[int] = field(default_factory=set, init=False, repr=False)
     _free_slots: list[int] = field(default_factory=list, init=False, repr=False)
     _next_dynamic_slot: int = field(default=0, init=False, repr=False)
     _iteration_id: int | None = field(default=None, init=False, repr=False)
@@ -280,6 +284,8 @@ class FusionIssueScheduler:
     def _reset_slots(self) -> None:
         self._pack_to_slot.clear()
         self._slot_to_pack.clear()
+        self._live_queries_by_pack.clear()
+        self._release_candidates.clear()
         self._free_slots = (
             list(range(self.query_state_entries))
             if self.query_state_entries is not None else []
@@ -334,6 +340,7 @@ class FusionIssueScheduler:
         )
         if len(resolved_history_keys) != len(query_ids):
             raise ValueError("query IDs and history keys must have equal length")
+        self.release_completed()
         for query_id, history_key in zip(
             query_ids, resolved_history_keys, strict=True,
         ):
@@ -345,7 +352,6 @@ class FusionIssueScheduler:
                 if self._state_history_key[query_id] != history_key:
                     raise ValueError("live query changed its history identity")
                 continue
-            self.release_completed()
             logical_pack = query_id // self.query_state_lanes
             if logical_pack not in self._pack_to_slot:
                 if self.query_state_entries is None:
@@ -362,6 +368,9 @@ class FusionIssueScheduler:
                 current_round=self._support_current.get(history_key, 0),
                 previous_round=previous or 0,
                 history_valid=previous is not None,
+            )
+            self._live_queries_by_pack[logical_pack] = (
+                self._live_queries_by_pack.get(logical_pack, 0) + 1
             )
             self._state_history_key[query_id] = history_key
             if previous is not None:
@@ -438,25 +447,31 @@ class FusionIssueScheduler:
         query_ids = tuple(query_ids)
         self.allocate(query_ids)
         for query_id in query_ids:
-            self.states[query_id].mark_generator_closed()
+            state = self.states[query_id]
+            state.mark_generator_closed()
+            self._update_release_candidate(query_id, state)
 
     def reduction_writeback(self, query_ids: Iterable[int]) -> None:
         query_ids = tuple(query_ids)
         self.allocate(query_ids)
         for query_id in query_ids:
-            self.states[query_id].mark_reduction_ready()
+            state = self.states[query_id]
+            state.mark_reduction_ready()
+            self._update_release_candidate(query_id, state)
 
     def forward_retire(self, query_ids: Iterable[int]) -> None:
         for query_id in query_ids:
             state = self.states.get(query_id)
             if state is not None:
                 state.retire_forward()
+                self._update_release_candidate(query_id, state)
 
     def successor_credit(self, query_id: int, count: int = 1) -> bool:
         state = self.states.get(query_id)
         if state is None:
             return False
         state.credit_successor(count)
+        self._update_release_candidate(query_id, state)
         return True
 
     def successor_dispatch(self, query_id: int, count: int = 1) -> bool:
@@ -464,6 +479,7 @@ class FusionIssueScheduler:
         if state is None:
             return False
         state.dispatch_successor(count)
+        self._update_release_candidate(query_id, state)
         return True
 
     def adjoint_retire(self, query_ids: Iterable[int]) -> None:
@@ -471,6 +487,7 @@ class FusionIssueScheduler:
             state = self.states.get(query_id)
             if state is not None:
                 state.retire_adjoint()
+                self._update_release_candidate(query_id, state)
 
     def roll_history(self, query_ids: Iterable[int] | None = None) -> None:
         """Commit this round's observed support counts into previous history."""
@@ -484,25 +501,34 @@ class FusionIssueScheduler:
     def release_completed(self) -> int:
         """Release query entries only after every live counter has drained."""
 
-        releasable = [
-            query_id for query_id, state in self.states.items()
-            if state.releasable
-        ]
-        packs_before = self._active_state_packs()
+        releasable = sorted(
+            query_id for query_id in self._release_candidates
+            if (state := self.states.get(query_id)) is not None and state.releasable
+        )
         for query_id in releasable:
             del self.states[query_id]
             del self._state_history_key[query_id]
-        remaining_packs = {
-            query_id // self.query_state_lanes for query_id in self.states
-        }
-        released_packs = packs_before.difference(remaining_packs)
-        for logical_pack in released_packs:
+            self._release_candidates.discard(query_id)
+            logical_pack = query_id // self.query_state_lanes
+            live_queries = self._live_queries_by_pack[logical_pack] - 1
+            if live_queries < 0:
+                raise ValueError("query-state pack occupancy underflows")
+            if live_queries:
+                self._live_queries_by_pack[logical_pack] = live_queries
+                continue
+            del self._live_queries_by_pack[logical_pack]
             slot = self._pack_to_slot.pop(logical_pack)
             del self._slot_to_pack[slot]
             if self.query_state_entries is not None:
                 heapq.heappush(self._free_slots, slot)
-        self._released_state_packs += len(released_packs)
+            self._released_state_packs += 1
         return len(releasable)
+
+    def _update_release_candidate(self, query_id: int, state: QueryState) -> None:
+        if state.releasable:
+            self._release_candidates.add(query_id)
+        else:
+            self._release_candidates.discard(query_id)
 
     def state_table_snapshot(self) -> dict[str, int]:
         return {

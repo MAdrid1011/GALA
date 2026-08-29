@@ -311,6 +311,7 @@ class _ReadyCandidateQueue:
         self._configured = False
         self._module_name = ""
         self._row_for: Callable[[int], np.void] | None = None
+        self._kind_for: Callable[[int], PrimitiveKind] | None = None
         self._physical_stage_for: Callable[[int], PhysicalPacketStage | None] | None = None
         self._owner_gradients: OwnerGradientTracker | None = None
         self._query_replay: QueryReplayTracker | None = None
@@ -388,7 +389,11 @@ class _ReadyCandidateQueue:
         query_replay = self._query_replay
         event_id, _stage = candidate
         row = self._row_for(event_id)
-        kind = PrimitiveKind(int(row["primitive_kind"]))
+        kind = (
+            self._kind_for(event_id)
+            if self._kind_for is not None
+            else PrimitiveKind(int(row["primitive_kind"]))
+        )
         if (
             query_replay is not None
             and self._module_name == "bidirectional_query"
@@ -430,16 +435,19 @@ class _ReadyCandidateQueue:
         physical_stage_for: Callable[[int], PhysicalPacketStage | None],
         owner_gradients: OwnerGradientTracker | None,
         query_replay: QueryReplayTracker | None,
+        kind_for: Callable[[int], PrimitiveKind] | None = None,
     ) -> None:
         if self._configured:
             if module_name != self._module_name:
                 raise CycleConfigurationError("ready queue changed module ownership")
             self._row_for = row_for
+            self._kind_for = kind_for
             self._physical_stage_for = physical_stage_for
             return
         self._configured = True
         self._module_name = module_name
         self._row_for = row_for
+        self._kind_for = kind_for
         self._physical_stage_for = physical_stage_for
         self._owner_gradients = owner_gradients
         self._query_replay = query_replay
@@ -529,12 +537,14 @@ class _ReadyCandidateQueue:
         module_name: str,
         *,
         row_for: Callable[[int], np.void],
+        kind_for: Callable[[int], PrimitiveKind] | None = None,
         physical_stage_for: Callable[[int], PhysicalPacketStage | None],
         owner_gradients: OwnerGradientTracker | None,
         query_replay: QueryReplayTracker | None,
     ) -> list[tuple[int, int]]:
         self._configure(
             module_name, row_for=row_for,
+            kind_for=kind_for,
             physical_stage_for=physical_stage_for,
             owner_gradients=owner_gradients,
             query_replay=query_replay,
@@ -1478,17 +1488,22 @@ class CycleEngine:
             return self._module_issue_ports(module_name)
         return self._module_issue_ports(module_name)
 
-    def _module_lane_indices(self, module_name: str, row: np.void) -> range:
+    def _module_lane_indices(
+        self, module_name: str, row: np.void, *, partition: int | None = None,
+    ) -> range:
         if module_name == "semantic_cache" and self.config.cache_instances is not None:
             ports = self.modules[module_name].timing.ports
-            begin = self._module_partition(module_name, row) * ports
+            if partition is None:
+                partition = self._module_partition(module_name, row)
+            begin = partition * ports
             return range(begin, begin + ports)
         if (
             module_name == "relation_constructor"
             and self.config.relation_support_lanes is not None
             and self.config.query_relation_store_banks is not None
         ):
-            partition = self._module_partition(module_name, row)
+            if partition is None:
+                partition = self._module_partition(module_name, row)
             if partition == 0:
                 return range(self.config.relation_support_lanes)
             lane = self.config.relation_support_lanes + partition - 1
@@ -1513,7 +1528,7 @@ class CycleEngine:
         return range(self._module_issue_ports(module_name))
 
     def _module_bank_partition(
-        self, module_name: str, row: np.void,
+        self, module_name: str, row: np.void, *, partition: int | None = None,
     ) -> tuple[int, int]:
         if module_name == "fusion_issue":
             return 0, self._fusion_query_state_bank(row)
@@ -1522,11 +1537,15 @@ class CycleEngine:
             and self.config.relation_support_lanes is not None
             and self.config.query_relation_store_banks is not None
         ):
-            return self._module_partition(module_name, row), 0
+            if partition is None:
+                partition = self._module_partition(module_name, row)
+            return partition, 0
         if module_name == "shared_sram":
-            return self._module_partition(module_name, row), self._shared_sram_bank(row)
+            if partition is None:
+                partition = self._module_partition(module_name, row)
+            return partition, self._shared_sram_bank(row)
         return (
-            self._module_partition(module_name, row),
+            partition if partition is not None else self._module_partition(module_name, row),
             self.modules[module_name].bank(int(row["address_token"])),
         )
 
@@ -1568,9 +1587,12 @@ class CycleEngine:
         return self.modules["shared_sram"].bank(token)
 
     def _module_bank_reservation_keys(
-        self, module_name: str, row: np.void, cycle: int,
+        self, module_name: str, row: np.void, cycle: int, *,
+        partition: int | None = None,
     ) -> tuple[tuple[object, ...], ...]:
-        partition, bank = self._module_bank_partition(module_name, row)
+        partition, bank = self._module_bank_partition(
+            module_name, row, partition=partition,
+        )
         base = (module_name, cycle, partition, bank)
         if module_name != "shared_sram":
             return (base,)
@@ -1610,13 +1632,14 @@ class CycleEngine:
         physical_stage_for,
         owner_gradients: OwnerGradientTracker | None,
         query_replay: QueryReplayTracker | None,
+        kind_for: Callable[[int], PrimitiveKind] | None = None,
     ) -> list[tuple[int, int]]:
         """Pop the earliest work whose owner-gradient epoch is acceptable."""
 
         width = self._ready_scan_window(module_name)
         return queue.pop_acceptable(
             width, module_name, row_for=row_for,
-            physical_stage_for=physical_stage_for,
+            physical_stage_for=physical_stage_for, kind_for=kind_for,
             owner_gradients=owner_gradients,
             query_replay=query_replay,
         )
@@ -3950,6 +3973,23 @@ class CycleReplaySession:
         self._lifecycle = VirtualTraceLifecycleValidator(initial_gaussian_count)
         self._events: dict[int, np.void] = {}
         self._kinds: dict[int, PrimitiveKind] = {}
+        self._stages_by_kind = {
+            kind: engine._stages_for(kind) for kind in PrimitiveKind
+        }
+        self._kind_by_value = {int(kind): kind for kind in PrimitiveKind}
+        self._partitioned_stages_by_kind = {
+            kind: tuple(
+                module_name for module_name in stages
+                if engine._module_partition_count(module_name) > 1
+            )
+            for kind, stages in self._stages_by_kind.items()
+        }
+        self._module_partitions: dict[int, int] = {}
+        self._fusion_task_by_kind = {
+            PrimitiveKind.FORWARD: TaskKind.FORWARD,
+            PrimitiveKind.CONSUMER: TaskKind.CONSUMER,
+            PrimitiveKind.ADJOINT: TaskKind.ADJOINT,
+        }
         self._dependencies: dict[int, tuple[int, ...]] = {}
         self._remaining: dict[int, int] = {}
         self._dependents: dict[int, list[int]] = defaultdict(list)
@@ -4159,6 +4199,7 @@ class CycleReplaySession:
                 "online resident frontier exceeds max_frontier_events"
             )
         self._stream_validator.accept(packet)
+        module_partitions = self._packet_module_partitions(packet.events)
         for index, row in enumerate(packet.events):
             event_id = int(row["event_id"])
             if (
@@ -4167,9 +4208,10 @@ class CycleReplaySession:
                 or event_id <= self._completed_through
             ):
                 raise CycleConfigurationError(f"duplicate online event {event_id}")
-            dependencies = tuple(int(value) for value in packet.dependency_ids(index))
+            dependencies = packet.dependency_ids(index)
             unresolved = 0
-            for dependency in dependencies:
+            for raw_dependency in dependencies:
+                dependency = int(raw_dependency)
                 if dependency >= event_id:
                     raise CycleConfigurationError(
                         f"online event {event_id} has a forward dependency"
@@ -4184,13 +4226,27 @@ class CycleReplaySession:
                         )
                     unresolved += 1
                     self._dependents[dependency].append(event_id)
-            kind = PrimitiveKind(int(row["primitive_kind"]))
-            self._events[event_id] = row.copy()
+            kind = self._kind_by_value[int(row["primitive_kind"])]
+            # NumPy record scalars retain their source array. Keeping the view
+            # avoids copying every 106-byte event while the bounded packet is
+            # in the online frontier; dropping the final row releases it.
+            self._events[event_id] = row
             self._kinds[event_id] = kind
+            if self._partitioned_stages_by_kind[kind]:
+                self._module_partitions[event_id] = int(module_partitions[index])
             self._peak_frontier_events = max(
                 self._peak_frontier_events, len(self._events)
             )
-            self._dependencies[event_id] = dependencies
+            if kind in {
+                PrimitiveKind.CACHE_RETURN,
+                PrimitiveKind.UPDATE_BEGIN,
+                PrimitiveKind.UPDATE_COMMIT,
+                PrimitiveKind.UPDATE_END,
+                PrimitiveKind.SET_MODIFICATION,
+            }:
+                self._dependencies[event_id] = tuple(
+                    int(dependency) for dependency in dependencies
+                )
             self._remaining[event_id] = unresolved
             if (
                 kind is PrimitiveKind.CONSUMER
@@ -4249,6 +4305,39 @@ class CycleReplaySession:
             self._drain()
             self._compact_completed_prefix()
             self._report_progress()
+
+    def _packet_module_partitions(self, rows: np.ndarray) -> np.ndarray:
+        """Vectorize immutable event routing for one bounded input packet."""
+
+        partitions = np.zeros(rows.size, dtype=np.uint16)
+        kinds = rows["primitive_kind"]
+        if self.engine._module_partition_count("semantic_cache") > 1:
+            cache_mask = (
+                (kinds == int(PrimitiveKind.CACHE_REQUEST))
+                | (kinds == int(PrimitiveKind.CACHE_RETURN))
+            )
+            partitions[cache_mask] = (
+                rows["gaussian_id"][cache_mask]
+                % int(self.engine.config.cache_instances)
+            ).astype(np.uint16, copy=False)
+        if self.engine._module_partition_count("relation_constructor") > 1:
+            relation_mask = (
+                (kinds == int(PrimitiveKind.RELATION))
+                | (kinds == int(PrimitiveKind.QUERY_CLOSE))
+            )
+            if relation_mask.any():
+                banks = int(self.engine.config.query_relation_store_banks)
+                queries = rows["query_id"][relation_mask]
+                addresses = rows["address_token"][relation_mask]
+                bank = np.where(
+                    queries < 0,
+                    addresses % banks,
+                    (queries // self.engine.config.relation_query_lanes) % banks,
+                )
+                partitions[relation_mask] = (
+                    1 + bank.astype(np.uint16, copy=False)
+                )
+        return partitions
 
     def accept_query_packet(self, packet: VirtualTracePacket) -> None:
         """Expand one point/mask packet lazily into the online consumer."""
@@ -4875,10 +4964,8 @@ class CycleReplaySession:
             event_id = physical_stage.head_event_id
         task_kind = self._fusion_kind(event_id, stage)
         if task_kind is None:
-            module_name = self.engine._stages_for(kind)[stage]
-            partition = self.engine._module_partition(
-                module_name, self._events[event_id]
-            )
+            module_name = self._stages_by_kind[kind][stage]
+            partition = self._module_partition_for(module_name, event_id)
             self._ready[(module_name, partition)].push((event_id, stage))
         else:
             self._fusion_pending.append(event_id, task_kind)
@@ -4892,10 +4979,8 @@ class CycleReplaySession:
             event_id = physical_stage.head_event_id
         task_kind = self._fusion_kind(event_id, stage)
         if task_kind is None:
-            module_name = self.engine._stages_for(kind)[stage]
-            partition = self.engine._module_partition(
-                module_name, self._events[event_id]
-            )
+            module_name = self._stages_by_kind[kind][stage]
+            partition = self._module_partition_for(module_name, event_id)
             self._ready[(module_name, partition)].push((event_id, stage))
         else:
             # Actual Fusion candidates remain resident until successful issue.
@@ -4904,15 +4989,25 @@ class CycleReplaySession:
                     f"online Fusion task {event_id} lacks a resident source FIFO"
                 )
 
+    def _module_partition_for(self, module_name: str, event_id: int) -> int:
+        """Cache immutable event-to-module routing for the online frontier."""
+
+        if self.engine._module_partition_count(module_name) == 1:
+            return 0
+        try:
+            return self._module_partitions[event_id]
+        except KeyError as error:
+            raise CycleConfigurationError(
+                f"online event {event_id} lacks {module_name} routing"
+            ) from error
+
+    def _stages_for_event(self, event_id: int) -> tuple[str, ...]:
+        return self._stages_by_kind[self._kinds[event_id]]
+
     def _fusion_kind(self, event_id: int, stage: int) -> TaskKind | None:
         if not self.engine.selection.query_scheduler_enabled or stage != 0:
             return None
-        kind = self._kinds[event_id]
-        return {
-            PrimitiveKind.FORWARD: TaskKind.FORWARD,
-            PrimitiveKind.CONSUMER: TaskKind.CONSUMER,
-            PrimitiveKind.ADJOINT: TaskKind.ADJOINT,
-        }.get(kind)
+        return self._fusion_task_by_kind.get(self._kinds[event_id])
 
     def _task_packet(self, event_id: int) -> TaskPacket:
         row = self._events[event_id]
@@ -5044,6 +5139,7 @@ class CycleReplaySession:
                 candidates.extend(self.engine._pop_ready_candidates(
                     queue, module_name,
                     row_for=self._events.__getitem__,
+                    kind_for=self._kinds.__getitem__,
                     physical_stage_for=self._packet_stage_by_event.get,
                     owner_gradients=self._owner_gradients,
                     query_replay=self._query_replay,
@@ -5068,7 +5164,7 @@ class CycleReplaySession:
                     event_id: self._task_packet(event_id)
                     for event_id, stage in ordered
                     if self.engine.selection.query_scheduler_enabled and stage == 0
-                    and PrimitiveKind(int(self._events[event_id]["primitive_kind"]))
+                    and self._kinds[event_id]
                     in {PrimitiveKind.FORWARD, PrimitiveKind.CONSUMER, PrimitiveKind.ADJOINT}
                 }
                 selected: set[int] = set()
@@ -5178,7 +5274,7 @@ class CycleReplaySession:
         row = self._events[event_id]
         kind = self._kinds[event_id]
         physical_stage = self._packet_stage_by_event.get(event_id)
-        stages = self.engine._stages_for(kind)
+        stages = self._stages_for_event(event_id)
         module_name = stages[stage]
         module = self.engine.modules[module_name]
         timing = module.timing
@@ -5198,7 +5294,7 @@ class CycleReplaySession:
                 self._in_flight, (completion, event_id, stage, module_name)
             )
             inflight_key = (
-                module_name, self.engine._module_partition(module_name, row)
+                module_name, self._module_partition_for(module_name, event_id)
             )
             self._module_inflight[inflight_key] += 1
             module.counters.accepted += 1
@@ -5222,7 +5318,7 @@ class CycleReplaySession:
         if not module.accepts_kind(kind):
             raise CycleConfigurationError(f"{module_name} does not accept {kind.name}")
         port_name: str | None = None
-        module_partition = self.engine._module_partition(module_name, row)
+        module_partition = self._module_partition_for(module_name, event_id)
         module_issue_key = (module_name, module_partition)
         if module_name == "fusion_issue" and stage == 0 and self.engine.selection.overlap_guided_issue:
             port_name, limit = self.engine._fusion_port_limit(kind)
@@ -5284,7 +5380,9 @@ class CycleReplaySession:
         else:
             module_lanes = self._module_busy_until[module_name]
             module_lane = next(
-                (index for index in self.engine._module_lane_indices(module_name, row)
+                (index for index in self.engine._module_lane_indices(
+                    module_name, row, partition=module_partition,
+                )
                  if module_lanes[index] <= self._cycle),
                 None,
             )
@@ -5410,7 +5508,7 @@ class CycleReplaySession:
                         self._requeue(event_id, stage)
                     return False
         bank_keys = self.engine._module_bank_reservation_keys(
-            module_name, row, self._cycle,
+            module_name, row, self._cycle, partition=module_partition,
         )
         shared_sram_direction: str | None = None
         shared_sram_address_key: tuple[int, int] | None = None
@@ -5693,12 +5791,12 @@ class CycleReplaySession:
         module.complete(event_id, finish)
         row = self._events[event_id]
         inflight_key = (
-            module_name, self.engine._module_partition(module_name, row)
+            module_name, self._module_partition_for(module_name, event_id)
         )
         self._module_inflight[inflight_key] -= 1
         kind = self._kinds[event_id]
         physical_stage = self._packet_stage_by_event.get(event_id)
-        stages = self.engine._stages_for(kind)
+        stages = self._stages_for_event(event_id)
         if (
             self._query_replay is not None
             and module_name == "bidirectional_query"
@@ -5909,6 +6007,7 @@ class CycleReplaySession:
         self._consumer_last_reduction.pop(event_id, None)
         self._events.pop(event_id, None)
         self._kinds.pop(event_id, None)
+        self._module_partitions.pop(event_id, None)
         self._dependencies.pop(event_id, None)
         self._remaining.pop(event_id, None)
         self._packet_stage_by_event.pop(event_id, None)

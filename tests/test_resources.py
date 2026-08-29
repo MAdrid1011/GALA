@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 import pytest
@@ -53,6 +54,28 @@ def test_production_resource_usage_closes_all_six_shared_sram_regions() -> None:
         "gradient_update": 640 * 1024,
         "index_graph": 256 * 1024,
         "control_metadata": 256 * 1024,
+    }
+
+
+def test_checked_in_resource_usage_matches_registered_architecture() -> None:
+    document = json.loads(
+        (ROOT / "configs/architecture/gala-resource-usage.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    config = CycleConfig.from_gala(
+        load_config(ROOT / "configs/architecture/gala.yaml"), _Memory()
+    )
+    usage = config.resource_usage
+    assert usage is not None
+    assert document == {
+        "shared_sram_bytes": usage.shared_sram_bytes,
+        "pods": usage.pods,
+        "clusters": usage.clusters,
+        "fma_lanes": usage.fma_lanes,
+        "transcendental_lanes": usage.transcendental_lanes,
+        "external_channels": usage.external_channels,
+        "regions": usage.regions,
     }
 
 

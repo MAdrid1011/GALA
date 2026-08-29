@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 import heapq
 
+import numpy as np
+
 from gala_sim.clamp.events import PrimitiveKind
 from gala_sim.timing.config import ComputeStage, ComputeTemplateProfile, ModuleTiming
 from gala_sim.timing.packets import RelationWindowDescriptor
@@ -834,6 +836,7 @@ class QueryReplayTracker:
     remaining_adjoint_by_query: dict[tuple[int, int], int] = field(default_factory=dict)
     adjoint_query_by_event: dict[int, tuple[int, int]] = field(default_factory=dict)
     consumer_query_by_event: dict[int, tuple[int, int]] = field(default_factory=dict)
+    consumer_queries: set[tuple[int, int]] = field(default_factory=set)
     ready_queries: set[tuple[int, int]] = field(default_factory=set)
     active_queries: set[tuple[int, int]] = field(default_factory=set)
     peak_entries: int = 0
@@ -846,7 +849,14 @@ class QueryReplayTracker:
 
     def register_rows(self, rows) -> None:
         adjoint_counts: dict[tuple[int, int], int] = {}
-        for row in rows:
+        relevant_rows = rows
+        if isinstance(rows, np.ndarray) and rows.dtype.names is not None:
+            kinds = rows["primitive_kind"]
+            relevant_rows = rows[
+                (kinds == int(PrimitiveKind.ADJOINT))
+                | (kinds == int(PrimitiveKind.CONSUMER))
+            ]
+        for row in relevant_rows:
             kind = PrimitiveKind(int(row["primitive_kind"]))
             event_id = int(row["event_id"])
             query_id = int(row["query_id"])
@@ -859,9 +869,10 @@ class QueryReplayTracker:
             elif kind is PrimitiveKind.CONSUMER:
                 if query_id < 0 or event_id in self.consumer_query_by_event:
                     raise ValueError("consumer replay identity is invalid or duplicated")
-                if query_key in self.consumer_query_by_event.values():
+                if query_key in self.consumer_queries:
                     raise ValueError("query has more than one consumer replay input")
                 self.consumer_query_by_event[event_id] = query_key
+                self.consumer_queries.add(query_key)
         for query_key, count in adjoint_counts.items():
             self.remaining_adjoint_by_query[query_key] = (
                 self.remaining_adjoint_by_query.get(query_key, 0) + count
@@ -1025,7 +1036,14 @@ class OwnerGradientTracker:
         return pod * self.clusters_per_pod + owner
 
     def register_rows(self, rows) -> None:
-        for row in rows:
+        relevant_rows = rows
+        if isinstance(rows, np.ndarray) and rows.dtype.names is not None:
+            kinds = rows["primitive_kind"]
+            relevant_rows = rows[
+                (kinds == int(PrimitiveKind.ADJOINT))
+                | (kinds == int(PrimitiveKind.GRADIENT_REDUCTION))
+            ]
+        for row in relevant_rows:
             kind = PrimitiveKind(int(row["primitive_kind"]))
             if kind not in {
                 PrimitiveKind.ADJOINT, PrimitiveKind.GRADIENT_REDUCTION,

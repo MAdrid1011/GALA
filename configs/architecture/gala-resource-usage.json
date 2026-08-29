@@ -1,0 +1,16 @@
+{
+  "clusters": 20,
+  "external_channels": 8,
+  "fma_lanes": 320,
+  "pods": 4,
+  "regions": {
+    "active_gaussian": 524288,
+    "control_metadata": 262144,
+    "gradient_update": 655360,
+    "index_graph": 262144,
+    "query_volume": 524288,
+    "relation_window": 655360
+  },
+  "shared_sram_bytes": 2883584,
+  "transcendental_lanes": 40
+}
