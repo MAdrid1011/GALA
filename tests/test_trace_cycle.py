@@ -413,6 +413,105 @@ def test_online_query_packet_batch_respects_frontier_bound() -> None:
     assert session.quiescent
 
 
+def test_online_streaming_waits_for_window_seal_before_declaring_deadlock() -> None:
+    masks = np.full((9, 8), np.uint32(0xFFFF_FFFF), dtype=np.dtype("<u4"))
+    source = VirtualTracePacket(
+        iteration_id=1,
+        template_id=1,
+        query_base=0,
+        query_shape=(16, 16),
+        point_ids=np.arange(9, dtype=np.int64),
+        point_keys=np.zeros(9, dtype=np.uint64),
+        masks=masks,
+        loss_flags=2,
+        ssim_radius=1,
+        backward_confirmed=True,
+    )
+    config_path = Path(__file__).parents[1] / "configs/architecture/gala.yaml"
+    config = CycleConfig.from_gala(load_config(config_path), _Memory())
+    session = CycleEngine(config).online_session(
+        max_events=128,
+        max_frontier_events=1024,
+        initial_gaussian_count=9,
+    )
+
+    session.accept_query_packet(source)
+    session.close_iteration(1)
+    result = session.finish()
+
+    assert source.query_pack_count(query_lanes=config.relation_query_lanes) == 32
+    assert session.accepted_event_count == source.logical_expanded_event_count
+    assert session.completed_event_count == source.logical_expanded_event_count
+    assert result.event_counts["RELATION"] == 9 * 256
+    assert session.peak_frontier_events <= 1024
+    assert session.quiescent
+
+
+def test_online_query_packet_rejects_atomic_planning_overflow_before_expansion() -> None:
+    masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
+    masks[0, 0] = 1
+    source = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 1),
+        point_ids=np.asarray([0], dtype=np.int64),
+        point_keys=np.asarray([0], dtype=np.uint64), masks=masks,
+        loss_flags=1, backward_confirmed=True,
+    )
+    session = CycleEngine(_config()).online_session(
+        max_events=4,
+        max_frontier_events=64,
+        max_atomic_packet_events=9,
+        initial_gaussian_count=1,
+    )
+
+    with pytest.raises(CycleConfigurationError, match="capacity-continuation"):
+        session.accept_query_packet(source)
+
+    assert session.accepted_event_count == 0
+    assert session.pending_event_count == 0
+    assert session.global_event_id == 0
+
+
+def test_online_query_packet_rejects_infeasible_relation_store_wavefront() -> None:
+    masks = np.zeros((2, 8), dtype=np.dtype("<u4"))
+    for y in range(3):
+        for x in range(8):
+            local_query = y * 16 + x
+            masks[:, local_query // 32] |= np.uint32(1 << (local_query % 32))
+    source = VirtualTracePacket(
+        iteration_id=1,
+        template_id=1,
+        query_base=0,
+        query_shape=(3, 8),
+        point_ids=np.asarray([4, 5], dtype=np.int64),
+        point_keys=np.asarray([0, 0], dtype=np.uint64),
+        masks=masks,
+        loss_flags=2,
+        ssim_radius=1,
+        backward_confirmed=True,
+    )
+    config_path = Path(__file__).parents[1] / "configs/architecture/gala.yaml"
+    config = replace(
+        CycleConfig.from_gala(load_config(config_path), _Memory()),
+        query_relation_store_records=3,
+        resource_envelope=None,
+        resource_usage=None,
+    )
+    session = CycleEngine(config).online_session(
+        max_events=64,
+        max_frontier_events=256,
+        max_atomic_packet_events=1_000,
+        initial_gaussian_count=6,
+    )
+
+    with pytest.raises(
+        CycleConfigurationError, match="relation_store_capacity_infeasible",
+    ):
+        session.accept_query_packet(source)
+
+    assert session.accepted_event_count == 0
+    assert session.global_event_id == 0
+
+
 def test_query_reduction_banks_serialize_same_bank_and_parallelize_distinct_banks() -> None:
     config_path = Path(__file__).parents[1] / "configs/architecture/gala.yaml"
     engine = CycleEngine(CycleConfig.from_gala(

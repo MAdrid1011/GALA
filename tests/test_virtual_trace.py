@@ -18,6 +18,13 @@ from gala_sim.trace import (
     VirtualTraceStream,
     compare_virtual_packet_records,
 )
+from gala_sim.trace.virtual import (
+    LOSS_SSIM,
+    LOSS_TV,
+    VirtualInterleavedQueryEventExpander,
+    _consumer_dependency_batch,
+    _consumer_offsets,
+)
 from gala_sim.clamp.events import (
     EVENT_SCHEMA_VERSION,
     PrimitiveKind,
@@ -26,6 +33,7 @@ from gala_sim.clamp.events import (
     event_dtype,
 )
 from gala_sim.trace import validate_trace
+from gala_sim.timing.packets import RelationPacketPlan
 
 
 def _mask(candidate_count: int, words: int) -> np.ndarray:
@@ -232,6 +240,224 @@ def test_relation_batches_are_bounded_and_exact() -> None:
         packet.materialize_relations(max_relations=2)
 
 
+def test_relation_store_wavefront_accounts_for_ssim_consumer_frontier() -> None:
+    masks = _mask(2, 8)
+    for y in range(3):
+        for x in range(8):
+            local_query = y * 16 + x
+            masks[:, local_query // 32] |= np.uint32(1 << (local_query % 32))
+    packet = VirtualTracePacket(
+        iteration_id=1,
+        template_id=1,
+        query_base=0,
+        query_shape=(3, 8),
+        point_ids=np.asarray([4, 5], dtype=np.int64),
+        point_keys=np.asarray([0, 0], dtype=np.uint64),
+        masks=masks,
+        loss_flags=LOSS_SSIM,
+        ssim_radius=1,
+        backward_confirmed=True,
+    )
+
+    infeasible = packet.relation_store_wavefront(
+        query_lanes=8, relation_capacity=3,
+    )
+    feasible = packet.relation_store_wavefront(
+        query_lanes=8, relation_capacity=4,
+    )
+
+    assert infeasible.query_pack_count == 3
+    assert infeasible.physical_relation_records == 6
+    assert infeasible.peak_live_records == 4
+    assert infeasible.peak_query_pack == 1
+    assert not infeasible.feasible
+    assert feasible.feasible
+
+
+def test_query_stream_schedule_closes_relation_and_window_frontiers() -> None:
+    masks = _mask(2, 8)
+    for y in range(3):
+        for x in range(8):
+            local_query = y * 16 + x
+            masks[:, local_query // 32] |= np.uint32(1 << (local_query % 32))
+    packet = VirtualTracePacket(
+        iteration_id=1,
+        template_id=1,
+        query_base=0,
+        query_shape=(3, 8),
+        point_ids=np.asarray([4, 5], dtype=np.int64),
+        point_keys=np.asarray([0, 0], dtype=np.uint64),
+        masks=masks,
+        loss_flags=LOSS_SSIM,
+        ssim_radius=1,
+        backward_confirmed=True,
+    )
+
+    schedule = packet.query_stream_schedule(
+        query_lanes=8,
+        relation_capacity=4,
+        window_capacity=2,
+        continuation_query_packs=2,
+    )
+
+    assert [info.relation_count for info in schedule.infos] == [16, 16, 16]
+    assert [info.physical_relation_records for info in schedule.infos] == [2, 2, 2]
+    assert schedule.operations == (
+        ("producer", 0),
+        ("producer", 1),
+        ("backward", 0),
+        ("producer", 2),
+        ("backward", 1),
+        ("backward", 2),
+    )
+    assert schedule.peak_relation_records == 4
+    assert schedule.peak_windows == 2
+
+    with pytest.raises(ValueError, match="relation_store_capacity_infeasible"):
+        packet.query_stream_schedule(
+            query_lanes=8,
+            relation_capacity=3,
+            window_capacity=2,
+            continuation_query_packs=2,
+        )
+
+
+@pytest.mark.parametrize(
+    ("template_id", "query_shape", "loss_flags", "ssim_radius", "mask_bits"),
+    [
+        (1, (3, 6), LOSS_SSIM, 1, tuple(
+            y * 16 + x for y in range(3) for x in range(6)
+        )),
+        (2, (2, 2, 8), LOSS_TV, 0, tuple(
+            x * 64 + y * 8 + z
+            for x in range(2) for y in range(2) for z in range(8)
+        )),
+    ],
+)
+def test_interleaved_query_expander_preserves_full_event_graph(
+    template_id: int,
+    query_shape: tuple[int, ...],
+    loss_flags: int,
+    ssim_radius: int,
+    mask_bits: tuple[int, ...],
+) -> None:
+    mask_words = 8 if template_id == 1 else 16
+    masks = _mask(2, mask_words)
+    for bit in mask_bits:
+        masks[:, bit // 32] |= np.uint32(1 << (bit % 32))
+    source = VirtualTracePacket(
+        iteration_id=1,
+        template_id=template_id,
+        query_base=20,
+        query_shape=query_shape,
+        point_ids=np.asarray([4, 5], dtype=np.int64),
+        point_keys=np.asarray([0, 0], dtype=np.uint64),
+        masks=masks,
+        loss_flags=loss_flags,
+        ssim_radius=ssim_radius,
+        backward_confirmed=True,
+    )
+    reference_packets = tuple(VirtualQueryEventExpander(
+        max_events=7, relation_query_lanes=4,
+    ).expand(source))
+    continuations = tuple(VirtualInterleavedQueryEventExpander(
+        max_events=7,
+        relation_capacity=100,
+        window_capacity=100,
+        continuation_query_packs=2,
+        relation_query_lanes=4,
+    ).expand(source))
+    streamed_packets = tuple(
+        packet for continuation in continuations
+        for packet in continuation.event_packets
+    )
+
+    validator = VirtualEventStreamValidator()
+    for packet in streamed_packets:
+        validator.accept(packet)
+    assert validator.accepted_events == source.logical_expanded_event_count
+
+    reference_rows = np.concatenate([
+        packet.events for packet in reference_packets
+    ])
+    streamed_rows = np.concatenate([
+        packet.events for packet in streamed_packets
+    ])
+
+    def identities(rows: np.ndarray) -> tuple[dict[tuple[int, int], int], dict[int, tuple[int, int]]]:
+        by_identity: dict[tuple[int, int], int] = {}
+        candidate_ordinal = 0
+        for row in rows:
+            kind = PrimitiveKind(int(row["primitive_kind"]))
+            if kind is PrimitiveKind.RELATION_CANDIDATE:
+                identity = (int(kind), candidate_ordinal)
+                candidate_ordinal += 1
+            elif kind in {
+                PrimitiveKind.QUERY_CLOSE,
+                PrimitiveKind.QUERY_REDUCTION,
+                PrimitiveKind.CONSUMER,
+            }:
+                identity = (int(kind), int(row["query_id"]))
+            else:
+                identity = (int(kind), int(row["relation_id"]))
+            assert identity not in by_identity
+            by_identity[identity] = int(row["event_id"])
+        return by_identity, {
+            event_id: identity for identity, event_id in by_identity.items()
+        }
+
+    reference_ids, reference_identity = identities(reference_rows)
+    streamed_ids, streamed_identity = identities(streamed_rows)
+    assert reference_ids.keys() == streamed_ids.keys()
+    ignored_fields = {"event_id", "dependency_begin", "dependency_count"}
+    reference_by_identity = {
+        reference_identity[int(row["event_id"])]: row for row in reference_rows
+    }
+    streamed_by_identity = {
+        streamed_identity[int(row["event_id"])]: row for row in streamed_rows
+    }
+    for identity in reference_ids:
+        reference = reference_by_identity[identity]
+        streamed = streamed_by_identity[identity]
+        for field in event_dtype().names:
+            if field not in ignored_fields:
+                assert int(streamed[field]) == int(reference[field]), (
+                    identity, field,
+                )
+
+    def dependency_graph(
+        packets: tuple,
+        identity_by_event: dict[int, tuple[int, int]],
+    ) -> dict[tuple[int, int], tuple[tuple[int, int], ...]]:
+        return {
+            identity_by_event[int(row["event_id"])]: tuple(
+                identity_by_event[int(dependency)]
+                for dependency in packet.dependency_ids(index)
+            )
+            for packet in packets
+            for index, row in enumerate(packet.events)
+        }
+
+    assert dependency_graph(
+        streamed_packets, streamed_identity,
+    ) == dependency_graph(reference_packets, reference_identity)
+
+    inferred = RelationPacketPlan.from_event_packets(
+        streamed_packets, query_lanes=4,
+    )
+    streamed_stages = tuple(
+        stage for continuation in continuations
+        for stage in continuation.physical_stages
+    )
+    assert [
+        (stage.kind, stage.event_ids, stage.lanes, stage.lane_mask, stage.query_base)
+        for stage in streamed_stages
+    ] == [
+        (stage.kind, stage.event_ids, stage.lanes, stage.lane_mask, stage.query_base)
+        for stage in inferred.stages
+    ]
+
+
 def test_relation_event_expander_preserves_global_ids_and_external_dependencies() -> None:
     masks = _mask(2, 8)
     masks[0, 0] = np.uint32(1)
@@ -436,6 +662,45 @@ def test_query_expander_builds_a_valid_full_query_chain() -> None:
     )
     report = validate_trace(trace)
     assert report.event_count == 26
+
+
+@pytest.mark.parametrize(
+    ("template_id", "query_shape", "loss_flags", "ssim_radius"),
+    [
+        (1, (7, 9), LOSS_SSIM, 2),
+        (2, (3, 4, 5), LOSS_TV, 0),
+    ],
+)
+def test_vectorized_consumer_dependencies_match_scalar_order(
+    template_id: int,
+    query_shape: tuple[int, ...],
+    loss_flags: int,
+    ssim_radius: int,
+) -> None:
+    mask_words = 8 if template_id == 1 else 16
+    source = VirtualTracePacket(
+        iteration_id=1,
+        template_id=template_id,
+        query_base=0,
+        query_shape=query_shape,
+        point_ids=np.empty(0, dtype=np.int64),
+        point_keys=np.empty(0, dtype=np.uint64),
+        masks=np.empty((0, mask_words), dtype=np.dtype("<u4")),
+        loss_flags=loss_flags,
+        ssim_radius=ssim_radius,
+    )
+    reduction_start = 123
+    dependencies, counts = _consumer_dependency_batch(
+        source, 0, source.query_count, reduction_start,
+    )
+    expected_parts = tuple(
+        reduction_start + _consumer_offsets(source, query)
+        for query in range(source.query_count)
+    )
+    expected = np.concatenate(expected_parts)
+
+    assert np.array_equal(dependencies, expected)
+    assert counts.tolist() == [part.size for part in expected_parts]
 
 
 def test_query_expander_carries_external_state_barrier_on_first_candidate() -> None:

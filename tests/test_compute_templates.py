@@ -58,7 +58,9 @@ def test_production_compute_profiles_have_audited_path_latencies() -> None:
     assert config.query_adjoint_replay_lanes == 9
     assert config.query_replay_queue_entries == 256
     assert config.query_relation_window_entries == 256
-    assert config.query_relation_store_records == 16_384
+    assert config.query_relation_store_records == 218_448
+    assert config.query_relation_store_record_bytes == 3
+    assert config.query_relation_candidate_ordinal_bits == 16
     assert config.query_volume_banks == 16
     assert config.query_relation_store_banks == 16
     assert config.relation_support_lanes == 8

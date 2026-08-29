@@ -47,6 +47,7 @@ class RelationWindowDescriptor:
     # adjoint stage has retired.  Empty for hand-authored descriptors that
     # use the conservative whole-window lifetime.
     relation_record_release_events: Mapping[int, frozenset[int]] = MappingProxyType({})
+    sealed: bool = True
 
     @property
     def event_ids(self) -> tuple[int, ...]:

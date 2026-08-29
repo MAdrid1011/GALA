@@ -104,9 +104,9 @@ parameters:
       scope: hardware
       status: frozen
     relation_window_bytes:
-      value: 524288
+      value: 655360
       unit: byte
-      source: GALA design config:shared_sram.relation_window
+      source: docs/03_HARDWARE_CONTRACT.md:compressed-relation-records
       scope: hardware
       status: frozen
     query_volume_bytes:
@@ -128,9 +128,9 @@ parameters:
       scope: hardware
       status: frozen
     control_metadata_bytes:
-      value: 393216
+      value: 262144
       unit: byte
-      source: GALA design config:shared_sram.control_metadata
+      source: docs/03_HARDWARE_CONTRACT.md:compressed-relation-records
       scope: hardware
       status: frozen
   relation:
@@ -486,9 +486,21 @@ parameters:
       scope: hardware
       status: frozen
     relation_store_records:
-      value: 16384
+      value: 218448
       unit: record
-      source: GALA design config:frontend.relation_store_capacity_records
+      source: docs/03_HARDWARE_CONTRACT.md:compressed-relation-records
+      scope: hardware
+      status: frozen
+    relation_store_record_bytes:
+      value: 3
+      unit: byte
+      source: docs/03_HARDWARE_CONTRACT.md:compressed-relation-records
+      scope: hardware
+      status: frozen
+    relation_candidate_ordinal_bits:
+      value: 16
+      unit: bit
+      source: docs/03_HARDWARE_CONTRACT.md:compressed-relation-records
       scope: hardware
       status: frozen
     query_volume_banks:
@@ -640,6 +652,12 @@ parameters:
       scope: workflow
       status: frozen
   trace:
+    continuation_query_packs:
+      value: 8
+      unit: query_pack
+      source: docs/03_HARDWARE_CONTRACT.md:capacity-continuation-windows
+      scope: software
+      status: frozen
     archive_chunk_bytes:
       value: 67108864
       unit: byte

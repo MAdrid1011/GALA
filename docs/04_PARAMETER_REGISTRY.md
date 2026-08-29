@@ -16,11 +16,11 @@
 | `shared_sram.read_ports_per_bank` | 1 | port | 每个 Shared SRAM Bank 的独立读端口（1R1W） |
 | `shared_sram.write_ports_per_bank` | 1 | port | 每个 Shared SRAM Bank 的独立写端口（1R1W） |
 | `shared_sram.active_gaussian_bytes` | 524288 | byte | 四个 Pod 的活动高斯记录 |
-| `shared_sram.relation_window_bytes` | 524288 | byte | 十六 Bank 关系包与关系链 |
+| `shared_sram.relation_window_bytes` | 655360 | byte | 十六 Bank 关系包与 24 bit 关系链 |
 | `shared_sram.query_volume_bytes` | 524288 | byte | 查询结果、梯度、统计与体素 |
 | `shared_sram.gradient_update_bytes` | 655360 | byte | 局部梯度、规范化梯度与更新队列 |
 | `shared_sram.index_graph_bytes` | 262144 | byte | 桶、候选与边 |
-| `shared_sram.control_metadata_bytes` | 393216 | byte | 状态、依赖、任务与窗口元数据 |
+| `shared_sram.control_metadata_bytes` | 262144 | byte | 状态、依赖、任务与窗口元数据 |
 | `relation.seed_fifo_entries` | 必须由设计配置给出 | entry | 关系构造器实现参数 |
 | `relation.support_lanes` | 8 | lane | 八条五级支持域流水，由枚举器动态分配空闲 lane |
 | `issue.query_state_entries` | 2048 | entry | 查询状态 SRAM |
@@ -66,7 +66,9 @@
 | `query.relation_window_entries` | 256 | window | 并发关系作用域窗口，不是关系记录数 |
 | `query.relation_window_entry_bytes` | 32 | byte | 窗口基址、计数与三类引用 |
 | `query.relation_store_banks` | 16 | bank | 关系链存储 |
-| `query.relation_store_records` | 16384 | record | 512 KiB / 32 B 关系记录 |
+| `query.relation_store_record_bytes` | 3 | byte | 16 bit tile candidate ordinal 与 8 bit lane mask |
+| `query.relation_candidate_ordinal_bits` | 16 | bit | 每 tile 最多 65,536 个真实候选，逐 packet 预检 |
+| `query.relation_store_records` | 218448 | record | 16 Bank × floor(40 KiB / 3 B) |
 | `query.query_volume_banks` | 16 | bank | 查询结果与梯度 SRAM |
 | `query.query_volume_word_bytes` | 16 | byte | 查询 SRAM Bank 端口宽度 |
 | `update.inflight_contexts` | 20 | context | 更新控制 FSM |
@@ -90,7 +92,7 @@
 | `issue.candidate_fifo_entries` | 144 | 32 至 160 | 每源 FIFO 独立计数；以完整 trace 的周期和队列稳定性共同选择 |
 | `cache.active_records_per_instance` | 1024 | 512 至 2048 | 四个实例总量计入 2.75 MiB |
 | `cache.miss_merge_entries_per_instance` | 32 | 16 至 64 | 端口与等待者存储同时闭合 |
-| `query.relation_window_entries` | 256 | 128 至 512 | 32 B 窗口表项计入 2.75 MiB；关系记录使用独立 512 KiB 存储 |
+| `query.relation_window_entries` | 256 | 128 至 512 | 32 B 窗口表项计入 2.75 MiB；关系记录使用独立 640 KiB 存储 |
 | `relation.seed_fifo_entries` | 待冻结 | 默认值的 0.5 至 2 倍 | 由真实突发深度确定 |
 | `pipeline.register_stages` | 模块配置 | 模块内重定时 | 不改变模块边界和吞吐资源 |
 
@@ -159,6 +161,7 @@ FMA、EXP、LOG、RCP、SQRT、SRAM、CAM、互连和寄存器流水延迟不写
 | `preflight.measure_iterations` | 50 | iteration | 预测总运行时间 |
 | `preflight.inactivity_timeout_seconds` | 300 | second | 官方长任务无 GPU、日志或进程 CPU 推进时的终止门限 |
 | `trace.chunk_events` | 自动调优后冻结 | event | 设备 trace chunk 容量 |
+| `trace.continuation_query_packs` | 8 | query_pack | 连续八个物理 query-pack 共用一个容量 continuation；不改变事件集合 |
 | `trace.archive_chunk_bytes` | 67108864 | byte | 紧凑 packet 归档单个压缩块的未压缩数组字节上限；单个超大 packet 可独占一块并超过该值 |
 | `trace.inactivity_timeout_seconds` | 300 | second | 虚拟 trace 数据包或日志无推进时的终止门限 |
 | `trace.progress_interval_seconds` | 30 | second | 虚拟 trace 结构化吞吐日志的最长间隔 |

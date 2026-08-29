@@ -22,6 +22,7 @@ from gala_sim.timing import (
 from gala_sim.timing.memory import NativeRamulator2Binding, Ramulator2Backend
 from gala_sim.timing.resources import ResourceUsage
 from gala_sim.tools.cycle_preflight import run_cycle_preflight, write_cycle_preflight
+from gala_sim.tools.relation_capacity import run_relation_capacity_preflight
 from gala_sim.tools.cycle_throughput import (
     ThroughputConverged, ThroughputDiagnosticConfig, ThroughputMonitor,
     require_empty_diagnostic_output,
@@ -55,6 +56,10 @@ def _parser() -> argparse.ArgumentParser:
     preflight.add_argument("--ramulator-config", type=Path, default=None)
     preflight.add_argument("--resource-usage", type=Path, default=None,
                            help="JSON ResourceUsage snapshot")
+    relation_capacity = commands.add_parser("relation-capacity-preflight")
+    relation_capacity.add_argument("--archive", type=Path, required=True)
+    relation_capacity.add_argument("--config", type=Path, required=True)
+    relation_capacity.add_argument("--output", type=Path, required=True)
     native = commands.add_parser("native-preflight")
     native.add_argument("--config", type=Path, required=True)
     native.add_argument("--freeze", type=Path, required=True)
@@ -241,6 +246,20 @@ def main(argv: list[str] | None = None) -> int:
             write_cycle_preflight(report, args.output)
             print(json.dumps(report.as_dict(), sort_keys=True))
             return 0 if report.status == "passed" else 2
+        if args.command == "relation-capacity-preflight":
+            config = load_config(args.config)
+            report = run_relation_capacity_preflight(
+                args.archive,
+                config,
+                progress=lambda item: print(
+                    json.dumps({"phase": "relation_capacity", **item}, sort_keys=True),
+                    file=sys.stderr,
+                    flush=True,
+                ),
+            )
+            write_json(report, args.output)
+            print(json.dumps(report, sort_keys=True))
+            return 0 if report["status"] == "passed" else 2
         if args.command == "native-preflight":
             config = load_config(args.config)
             freeze = json.loads(args.freeze.read_text(encoding="utf-8"))

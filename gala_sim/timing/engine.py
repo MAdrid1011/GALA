@@ -26,6 +26,7 @@ from gala_sim.trace.virtual import (
     VirtualLifecycleKind,
     VirtualLifecycleRecord,
     VirtualTraceLifecycleValidator,
+    VirtualInterleavedQueryEventExpander,
     VirtualQueryEventExpander,
     VirtualTracePacket,
 )
@@ -36,7 +37,12 @@ from gala_sim.trace.validator import validate_trace
 from .config import CycleConfig, ModuleTiming
 from .memory import MemoryRequestRecord
 from .oracle import FutureTracePlan
-from .packets import PhysicalPacketStage, RelationPacketPlan, RelationWindowPlan
+from .packets import (
+    PhysicalPacketStage,
+    RelationPacketPlan,
+    RelationWindowDescriptor,
+    RelationWindowPlan,
+)
 from .telemetry import ComputeTelemetry, ComputeTelemetryCollector
 from .modules import (
     BidirectionalQueryUnit,
@@ -950,6 +956,8 @@ class CycleEngine:
         row: np.void,
         kind: PrimitiveKind,
         adjoint_relation_ids: set[int],
+        *,
+        all_relations_have_adjoint: bool = False,
     ) -> None:
         """Commit one logical relation/query lifecycle event to live F/C/A."""
 
@@ -964,7 +972,10 @@ class CycleEngine:
                 self.issue_scheduler.relation_accept(
                     (query_id,),
                     adjoint_query_ids=(
-                        (query_id,) if relation_id in adjoint_relation_ids else ()
+                        (query_id,)
+                        if all_relations_have_adjoint
+                        or relation_id in adjoint_relation_ids
+                        else ()
                     ),
                     iteration_id=int(row["iteration_id"]),
                     history_keys=(self._query_history_key(row),),
@@ -3709,6 +3720,7 @@ class CycleEngine:
         *,
         max_events: int,
         max_frontier_events: int | None = None,
+        max_atomic_packet_events: int | None = None,
         initial_gaussian_count: int = 0,
         semantic_workset_totals: Mapping[tuple[int, int], int] | None = None,
         retain_completion_cycles: bool = False,
@@ -3727,6 +3739,7 @@ class CycleEngine:
             self,
             max_events=max_events,
             max_frontier_events=max_frontier_events,
+            max_atomic_packet_events=max_atomic_packet_events,
             initial_gaussian_count=initial_gaussian_count,
             semantic_workset_totals=semantic_workset_totals,
             retain_completion_cycles=retain_completion_cycles,
@@ -3881,6 +3894,7 @@ class CycleReplaySession:
         *,
         max_events: int,
         max_frontier_events: int | None = None,
+        max_atomic_packet_events: int | None = None,
         initial_gaussian_count: int = 0,
         semantic_workset_totals: Mapping[tuple[int, int], int] | None = None,
         retain_completion_cycles: bool = False,
@@ -3892,6 +3906,8 @@ class CycleReplaySession:
             raise ValueError("online virtual event batch size must be positive")
         if max_frontier_events is not None and max_frontier_events <= 0:
             raise ValueError("online resident frontier bound must be positive")
+        if max_atomic_packet_events is not None and max_atomic_packet_events <= 0:
+            raise ValueError("online atomic packet event bound must be positive")
         if initial_gaussian_count < 0:
             raise ValueError("initial Gaussian count must be non-negative")
         if progress_interval_seconds is not None and progress_interval_seconds <= 0:
@@ -3901,6 +3917,7 @@ class CycleReplaySession:
         self.engine._query_history_bases.clear()
         self.max_events = max_events
         self.max_frontier_events = max_frontier_events
+        self.max_atomic_packet_events = max_atomic_packet_events
         self.retain_completion_cycles = retain_completion_cycles
         self.semantic_workset_totals = dict(semantic_workset_totals or {})
         if any(key[0] < 0 or key[1] < 0 or value <= 0
@@ -3908,6 +3925,23 @@ class CycleReplaySession:
             raise ValueError("semantic workset totals must use positive keyed counts")
         self.progress = progress
         self.progress_interval_seconds = progress_interval_seconds
+        streaming_resources = (
+            engine.config.query_relation_store_records,
+            engine.config.query_relation_window_entries,
+            engine.config.trace_continuation_query_packs,
+        )
+        self._streaming_query_expansion = all(
+            value is not None for value in streaming_resources
+        )
+        self._streaming_topology_active = False
+        if self._streaming_query_expansion:
+            self._stream_expander = VirtualInterleavedQueryEventExpander(
+                max_events=max_events,
+                relation_capacity=int(streaming_resources[0]),
+                window_capacity=int(streaming_resources[1]),
+                continuation_query_packs=int(streaming_resources[2]),
+                relation_query_lanes=engine.config.relation_query_lanes,
+            )
         self._expander = VirtualQueryEventExpander(
             max_events=max_events,
             relation_query_lanes=engine.config.relation_query_lanes,
@@ -3949,6 +3983,9 @@ class CycleReplaySession:
         self._packet_stage_by_event: dict[int, PhysicalPacketStage] = {}
         self._packet_ready_members: dict[int, set[int]] = defaultdict(set)
         self._packet_ready_stages: set[tuple[int, int]] = set()
+        self._relation_stage_blocked: dict[
+            int, dict[tuple[int, int], None]
+        ] = defaultdict(dict)
         self._adjoint_relation_ids: set[int] = set()
         self._consumer_credit_owner: dict[int, int] = {}
         self._completed_reduction_owner: dict[int, tuple[int, int]] = {}
@@ -4104,6 +4141,8 @@ class CycleReplaySession:
             violations.append("replay_queue")
         if self._owner_gradients is not None and self._owner_gradients.active_by_cluster:
             violations.append("owner_gradient_slots")
+        if self._relation_stage_blocked:
+            violations.append("relation_stage_blocked")
         return tuple(violations)
 
     def accept_event_packet(
@@ -4236,6 +4275,41 @@ class CycleReplaySession:
         self._report_progress()
 
     def _accept_query_packet_without_drain(self, packet: VirtualTracePacket) -> None:
+        ordinal_bits = self.engine.config.query_relation_candidate_ordinal_bits
+        if (
+            ordinal_bits is not None
+            and packet.max_candidates_per_tile > 1 << ordinal_bits
+        ):
+            raise CycleConfigurationError(
+                "relation_candidate_ordinal_overflow: "
+                f"tile has {packet.max_candidates_per_tile} candidates but "
+                f"{ordinal_bits} bits encode at most {1 << ordinal_bits}"
+            )
+        relation_capacity = self.engine.config.query_relation_store_records
+        if relation_capacity is not None:
+            wavefront = packet.relation_store_wavefront(
+                query_lanes=self.engine.config.relation_query_lanes,
+                relation_capacity=relation_capacity,
+            )
+            if not wavefront.feasible:
+                raise CycleConfigurationError(
+                    "relation_store_capacity_infeasible: "
+                    f"{wavefront.topology} needs {wavefront.peak_live_records} "
+                    f"live records at query pack {wavefront.peak_query_pack}, "
+                    f"but capacity is {wavefront.relation_capacity}"
+                )
+        expanded_event_count = packet.logical_expanded_event_count
+        if (
+            not self._streaming_query_expansion
+            and
+            self.max_atomic_packet_events is not None
+            and expanded_event_count > self.max_atomic_packet_events
+        ):
+            raise CycleConfigurationError(
+                "online query packet needs capacity-continuation expansion: "
+                f"{expanded_event_count} logical events exceed the "
+                f"{self.max_atomic_packet_events} event atomic planning bound"
+            )
         self._lifecycle.accept_packet(packet)
         self._query_packets += 1
         terminal_ids: list[int] = []
@@ -4243,6 +4317,15 @@ class CycleReplaySession:
             (self._state_barrier_event,)
             if self._state_barrier_event is not None else ()
         )
+        use_streaming = self._use_streaming_query_expansion(
+            packet, expanded_event_count,
+        )
+        if use_streaming:
+            self._streaming_topology_active = True
+            self._accept_streaming_query_packet(
+                packet, external_dependencies=external_dependencies,
+            )
+            return
         event_packets = tuple(self._expander.expand(
             packet, external_dependencies=external_dependencies
         ))
@@ -4261,13 +4344,6 @@ class CycleReplaySession:
         ):
             self.engine.issue_scheduler.set_strict_lifecycle()
             self.engine.issue_scheduler.enable_exact_readiness()
-        self._adjoint_relation_ids.update(
-            int(row["relation_id"])
-            for row in expanded_rows[
-                expanded_rows["primitive_kind"] == int(PrimitiveKind.ADJOINT)
-            ]
-            if int(row["relation_id"]) >= 0
-        )
         packet_plan = RelationPacketPlan.from_event_packets(
             event_packets,
             query_lanes=self.engine.config.relation_query_lanes,
@@ -4331,6 +4407,119 @@ class CycleReplaySession:
             # Large frontier fills can spend substantial wall time registering
             # rows before the next drain; keep the long-run monitor live.
             self._report_progress()
+        self._backward_frontier = (*self._backward_frontier, *terminal_ids)
+
+    def _use_streaming_query_expansion(
+        self, packet: VirtualTracePacket, expanded_event_count: int,
+    ) -> bool:
+        """Use interleaving only when the source cannot fit as one frontier.
+
+        Small one-pack fixtures retain the historical atomic path, which keeps
+        completion-ID diagnostics directly comparable.  Any multi-pack source
+        or source larger than the configured resident frontier uses the
+        capacity-continuation topology required by the canonical workload.
+        """
+
+        if not self._streaming_query_expansion:
+            return False
+        if packet.query_pack_count(
+            query_lanes=self.engine.config.relation_query_lanes,
+        ) > 1:
+            return True
+        return (
+            self.max_frontier_events is not None
+            and expanded_event_count > self.max_frontier_events
+        )
+
+    def _accept_streaming_query_packet(
+        self,
+        packet: VirtualTracePacket,
+        *,
+        external_dependencies: tuple[int, ...],
+    ) -> None:
+        self.engine.issue_scheduler.set_strict_lifecycle()
+        self.engine.issue_scheduler.enable_exact_readiness()
+        terminal_ids: list[int] = []
+        continuations = self._stream_expander.expand(
+            packet, external_dependencies=external_dependencies,
+        )
+        for continuation in continuations:
+            if continuation.window_descriptor is not None:
+                descriptor = continuation.window_descriptor
+                if self._relation_windows is None:
+                    raise CycleConfigurationError(
+                        "streaming query expansion requires relation-window resources"
+                    )
+                try:
+                    self._relation_windows.register_fragment(
+                        RelationWindowDescriptor(
+                            window_id=descriptor.window_id,
+                            relation_stage_heads=descriptor.relation_stage_heads,
+                            producer_event_ids=descriptor.producer_event_ids,
+                            forward_stage_heads=descriptor.forward_stage_heads,
+                            consumer_event_ids=descriptor.consumer_event_ids,
+                            adjoint_event_ids=descriptor.adjoint_event_ids,
+                            relation_record_release_events=(
+                                descriptor.relation_record_release_events
+                            ),
+                            sealed=descriptor.sealed,
+                        )
+                    )
+                except ValueError as error:
+                    raise CycleConfigurationError(str(error)) from error
+                if descriptor.sealed:
+                    self._wake_relation_stage_candidates(descriptor.window_id)
+            for raw_stage in continuation.physical_stages:
+                physical_stage = PhysicalPacketStage(
+                    stage_id=raw_stage.event_ids[0],
+                    kind=raw_stage.kind,
+                    event_ids=raw_stage.event_ids,
+                    lanes=raw_stage.lanes,
+                    lane_mask=raw_stage.lane_mask,
+                    query_base=raw_stage.query_base,
+                    relation_packet_id=raw_stage.relation_packet_id,
+                )
+                for event_id in physical_stage.event_ids:
+                    if event_id in self._packet_stage_by_event:
+                        raise CycleConfigurationError(
+                            f"online event {event_id} has duplicate packet metadata"
+                        )
+                    self._packet_stage_by_event[event_id] = physical_stage
+            for event_packet in continuation.event_packets:
+                rows = event_packet.events
+                if self._query_replay is not None:
+                    try:
+                        self._query_replay.register_rows(rows)
+                    except ValueError as error:
+                        raise CycleConfigurationError(str(error)) from error
+                if self._owner_gradients is not None:
+                    try:
+                        self._owner_gradients.register_rows(rows)
+                    except ValueError as error:
+                        raise CycleConfigurationError(str(error)) from error
+                if (
+                    self.max_frontier_events is not None
+                    and self.pending_event_count + event_packet.event_count
+                    > self.max_frontier_events
+                ):
+                    self._drain(allow_stream_input_wait=True)
+                    self._compact_completed_prefix()
+                    if (
+                        self.pending_event_count + event_packet.event_count
+                        > self.max_frontier_events
+                    ):
+                        raise CycleConfigurationError(
+                            "max_frontier_events cannot hold the open physical "
+                            "packet frontier"
+                        )
+                terminal_ids.extend(
+                    int(event_id) for event_id in rows["event_id"][
+                        rows["primitive_kind"]
+                        == int(PrimitiveKind.GRADIENT_REDUCTION)
+                    ]
+                )
+                self.accept_event_packet(event_packet, _drain_after=False)
+                self._report_progress()
         self._backward_frontier = (*self._backward_frontier, *terminal_ids)
 
     def register_semantic_workset_totals(
@@ -4773,7 +4962,7 @@ class CycleReplaySession:
     def _ordered(self, candidates: list[tuple[int, int]]) -> list[tuple[int, int]]:
         return candidates
 
-    def _drain(self) -> None:
+    def _drain(self, *, allow_stream_input_wait: bool = False) -> None:
         async_memory = callable(getattr(self.engine.config.memory, "submit_async", None))
         while (
             self._ready
@@ -4845,6 +5034,9 @@ class CycleReplaySession:
                         self.engine.issue_scheduler.observe_arrival(
                             (packet,), arrival_cycle=self._cycle,
                         )
+            stage_blocked_before = sum(
+                len(events) for events in self._relation_stage_blocked.values()
+            )
             candidates: list[tuple[int, int]] = []
             for ready_key in tuple(self._ready):
                 queue = self._ready[ready_key]
@@ -4930,6 +5122,16 @@ class CycleReplaySession:
                     ):
                         progressed = True
             if not progressed:
+                stage_blocked_after = sum(
+                    len(events)
+                    for events in self._relation_stage_blocked.values()
+                )
+                if stage_blocked_after > stage_blocked_before:
+                    # Moving a stage-gated candidate out of the bounded ready
+                    # scan is scheduler bookkeeping, not a hardware cycle.
+                    # Scan again immediately so an eligible later stage can
+                    # reach the head and eventually wake the deferred work.
+                    continue
                 memory_wakeup = (
                     self.engine.config.memory.next_wakeup()  # type: ignore[attr-defined]
                     if async_memory else None
@@ -4949,6 +5151,14 @@ class CycleReplaySession:
                     ):
                         self._cycle += 1
                         continue
+                    if allow_stream_input_wait:
+                        # A capacity continuation can expose an adjoint whose
+                        # consumer (or a later window fragment) has not been
+                        # admitted yet.  Return control to the stream producer
+                        # rather than treating missing future input as a
+                        # hardware deadlock.  The outer packet/session drain
+                        # remains strict once the producer is exhausted.
+                        break
                     if self._ready or self._memory_waiters:
                         raise CycleConfigurationError("deadlock in online cycle replay")
                     break
@@ -5189,7 +5399,15 @@ class CycleReplaySession:
                     self.engine._record_stall(
                         self._cycle, "bidirectional_query", stage_reason, event_id,
                     )
-                    self._requeue(event_id, stage)
+                    if self._streaming_topology_active:
+                        window_id = self._relation_windows.event_to_window.get(event_id)
+                        if window_id is None:
+                            raise CycleConfigurationError(
+                                "stage-gated event has no relation-window identity"
+                            )
+                        self._relation_stage_blocked[window_id][(event_id, stage)] = None
+                    else:
+                        self._requeue(event_id, stage)
                     return False
         bank_keys = self.engine._module_bank_reservation_keys(
             module_name, row, self._cycle,
@@ -5619,6 +5837,7 @@ class CycleReplaySession:
         kind = self._kinds[event_id]
         self.engine._update_query_state_for_completion(
             row, kind, self._adjoint_relation_ids,
+            all_relations_have_adjoint=True,
         )
         if kind is PrimitiveKind.QUERY_REDUCTION:
             self._completed_reduction_owner[event_id] = (
@@ -5630,10 +5849,30 @@ class CycleReplaySession:
             self._relation_windows is not None
             and event_id in self._relation_windows.event_to_window
         ):
+            window_id = self._relation_windows.event_to_window[event_id]
+            live_before = self._relation_windows.live.get(window_id)
+            forward_before = bool(
+                live_before is not None and live_before.forward_events
+            )
+            consumer_before = bool(
+                live_before is not None and live_before.consumer_events
+            )
             try:
                 self._relation_windows.complete_event(event_id)
             except ValueError as error:
                 raise CycleConfigurationError(str(error)) from error
+            live_after = self._relation_windows.live.get(window_id)
+            forward_after = bool(
+                live_after is not None and live_after.forward_events
+            )
+            consumer_after = bool(
+                live_after is not None and live_after.consumer_events
+            )
+            if (
+                forward_before and not forward_after
+                or consumer_before and not consumer_after
+            ):
+                self._wake_relation_stage_candidates(window_id)
         self._completed_events += 1
         self._last_completion_cycle = max(self._last_completion_cycle, finish)
         if self.retain_completion_cycles:
@@ -5655,6 +5894,14 @@ class CycleReplaySession:
                 self._push_ready(dependent, 0)
         if not retain:
             self._drop_event(event_id)
+
+    def _wake_relation_stage_candidates(self, window_id: int) -> None:
+        blocked = self._relation_stage_blocked.pop(window_id, None)
+        if blocked is None:
+            return
+        for event_id, stage in blocked:
+            if event_id in self._events:
+                self._requeue(event_id, stage)
 
     def _drop_event(self, event_id: int) -> None:
         self._consumer_credit_owner.pop(event_id, None)

@@ -29,6 +29,7 @@ from .captured_packets import (
 )
 from .virtual import (
     MASK_WORD_BITS,
+    RelationStoreWavefront,
     VirtualTracePacket,
     VirtualTraceProgress,
     VirtualTraceRun,
@@ -37,6 +38,7 @@ from .virtual import (
     VirtualRelationEventExpander,
     VirtualEventStreamValidator,
     VirtualQueryEventExpander,
+    VirtualInterleavedQueryEventExpander,
     VirtualLifecycleKind,
     VirtualLifecycleRecord,
     VirtualIterationLedger,
@@ -76,6 +78,7 @@ __all__ = [
     "captured_virtual_packet",
     "complete_captured_packet_sample",
     "MASK_WORD_BITS",
+    "RelationStoreWavefront",
     "VirtualTracePacket",
     "VirtualTraceProgress",
     "VirtualTraceRun",
@@ -84,6 +87,7 @@ __all__ = [
     "VirtualRelationEventExpander",
     "VirtualEventStreamValidator",
     "VirtualQueryEventExpander",
+    "VirtualInterleavedQueryEventExpander",
     "VirtualLifecycleKind",
     "VirtualLifecycleRecord",
     "VirtualIterationLedger",

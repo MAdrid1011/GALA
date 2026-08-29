@@ -141,6 +141,8 @@ def test_relation_window_keeps_four_reference_classes_until_final_adjoint() -> N
         "relation_windows_live": 0,
         "relation_records_live": 0,
     }
+    assert tracker.descriptors == {}
+    assert tracker.event_to_window == {}
 
 
 def test_relation_records_reclaim_per_packet_after_its_adjoint_lanes() -> None:
@@ -315,6 +317,9 @@ def test_query_replay_queue_releases_only_after_last_adjoint_dispatch() -> None:
         "replay_queue_peak_entries": 1,
         "replay_queue_live_entries": 0,
     }
+    assert tracker.consumer_query_by_event == {}
+    assert tracker.adjoint_query_by_event == {}
+    assert tracker.remaining_adjoint_by_query == {}
 
 
 def test_stage_gated_replay_reserves_capacity_only_when_adjoint_starts() -> None:
@@ -351,6 +356,24 @@ def test_stage_gated_replay_reserves_capacity_only_when_adjoint_starts() -> None
         "replay_queue_peak_entries": 1,
         "replay_queue_live_entries": 0,
     }
+
+
+def test_stage_gated_replay_blocks_adjoint_until_consumer_is_ready() -> None:
+    rows = np.empty(2, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = [0, 1]
+    rows["iteration_id"] = 7
+    rows["query_id"] = 9
+    rows["primitive_kind"] = [
+        int(PrimitiveKind.CONSUMER),
+        int(PrimitiveKind.ADJOINT),
+    ]
+    tracker = QueryReplayTracker(capacity=1, stage_gated=True)
+    tracker.register_rows(rows)
+
+    assert tracker.blocks_adjoint((1,))
+    tracker.reserve_consumer(0)
+    assert not tracker.blocks_adjoint((1,))
 
 
 def test_base_replay_waits_for_every_consumer_in_the_window() -> None:

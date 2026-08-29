@@ -198,6 +198,9 @@ class CycleConfig:
     query_relation_window_entry_bytes: int | None = None
     query_relation_store_banks: int | None = None
     query_relation_store_records: int | None = None
+    query_relation_store_record_bytes: int | None = None
+    query_relation_candidate_ordinal_bits: int | None = None
+    trace_continuation_query_packs: int | None = None
     query_volume_banks: int | None = None
     query_volume_word_bytes: int | None = None
     memory_peak_bandwidth_bytes_per_second: int | None = None
@@ -295,6 +298,8 @@ class CycleConfig:
             self.query_relation_window_entry_bytes,
             self.query_relation_store_banks,
             self.query_relation_store_records,
+            self.query_relation_store_record_bytes,
+            self.query_relation_candidate_ordinal_bits,
             self.query_volume_banks,
             self.query_volume_word_bytes,
         )
@@ -304,6 +309,29 @@ class CycleConfig:
             value is not None for value in query_values
         ):
             raise ValueError("query execution resources must be configured together")
+        if (
+            self.query_relation_store_banks is not None
+            and self.query_relation_store_records is not None
+            and self.query_relation_store_record_bytes is not None
+            and self.resource_usage is not None
+        ):
+            relation_bytes = self.resource_usage.regions.get("relation_window")
+            if relation_bytes is None:
+                raise ValueError("relation-store resource region is missing")
+            bytes_per_bank = relation_bytes // self.query_relation_store_banks
+            derived_records = (
+                self.query_relation_store_banks
+                * (bytes_per_bank // self.query_relation_store_record_bytes)
+            )
+            if derived_records != self.query_relation_store_records:
+                raise ValueError(
+                    "relation-store records disagree with bytes, banks, and record width"
+                )
+        if (
+            self.trace_continuation_query_packs is not None
+            and self.trace_continuation_query_packs <= 0
+        ):
+            raise ValueError("trace continuation query-pack count must be positive")
         if (
             self.query_reduction_banks is not None
             and self.query_reduction_banks & (self.query_reduction_banks - 1)
@@ -456,6 +484,15 @@ class CycleConfig:
                    ),
                    query_relation_store_records=int(
                        config.value("query.relation_store_records")
+                   ),
+                   query_relation_store_record_bytes=int(
+                       config.value("query.relation_store_record_bytes")
+                   ),
+                   query_relation_candidate_ordinal_bits=int(
+                       config.value("query.relation_candidate_ordinal_bits")
+                   ),
+                   trace_continuation_query_packs=int(
+                       config.value("trace.continuation_query_packs")
                    ),
                    query_volume_banks=int(config.value("query.query_volume_banks")),
                    query_volume_word_bytes=int(

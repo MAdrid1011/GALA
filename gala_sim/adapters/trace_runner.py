@@ -159,6 +159,7 @@ def main(argv: list[str] | None = None) -> int:
                 CycleEngine(cycle_config, policy=args.online_cycle_policy).online_session(
                     max_events=chunk_events,
                     max_frontier_events=max_frontier_events,
+                    max_atomic_packet_events=max_frontier_events,
                     initial_gaussian_count=initial_gaussian_count,
                     progress=online_progress,
                     progress_interval_seconds=progress_interval_seconds,

@@ -496,7 +496,8 @@ class _LiveRelationWindow:
     forward_events: set[int]
     consumer_events: set[int]
     adjoint_events: set[int]
-    relation_stage_heads: frozenset[int]
+    relation_stage_heads: set[int]
+    sealed: bool = True
     appended_relation_stages: set[int] = field(default_factory=set)
     released_relation_stages: set[int] = field(default_factory=set)
     relation_release_events: dict[int, set[int]] = field(default_factory=dict)
@@ -544,8 +545,11 @@ class RelationWindowTracker:
         return self.relation_records_live + reserved_records >= self.relation_capacity
 
     def register(self, descriptor: RelationWindowDescriptor) -> None:
-        if descriptor.window_id in self.descriptors:
-            raise ValueError("relation window ID is registered twice")
+        self.register_fragment(descriptor)
+
+    def register_fragment(self, descriptor: RelationWindowDescriptor) -> None:
+        """Register one future-reference fragment of a streamed window."""
+
         if descriptor.relation_records > self.relation_capacity:
             raise ValueError(
                 "relation window exceeds the physical relation-store capacity; "
@@ -567,11 +571,63 @@ class RelationWindowTracker:
                 raise ValueError("relation record release event belongs to multiple stages")
             if not set(release_events) <= set(descriptor.adjoint_event_ids):
                 raise ValueError("relation record release map contains a non-adjoint event")
+        previous = self.descriptors.get(descriptor.window_id)
+        if previous is not None and previous.sealed:
+            raise ValueError("sealed relation window receives another fragment")
         for event_id in descriptor.event_ids:
             if event_id in self.event_to_window:
                 raise ValueError("event belongs to multiple relation windows")
             self.event_to_window[event_id] = descriptor.window_id
-        self.descriptors[descriptor.window_id] = descriptor
+        if previous is None:
+            merged = descriptor
+        else:
+            merged_release = dict(previous.relation_record_release_events)
+            if set(merged_release).intersection(release_map):
+                raise ValueError("relation window fragment repeats a relation stage")
+            merged_release.update(release_map)
+            merged = RelationWindowDescriptor(
+                window_id=descriptor.window_id,
+                relation_stage_heads=(
+                    previous.relation_stage_heads | descriptor.relation_stage_heads
+                ),
+                producer_event_ids=(
+                    previous.producer_event_ids | descriptor.producer_event_ids
+                ),
+                forward_stage_heads=(
+                    previous.forward_stage_heads | descriptor.forward_stage_heads
+                ),
+                consumer_event_ids=(
+                    previous.consumer_event_ids | descriptor.consumer_event_ids
+                ),
+                adjoint_event_ids=(
+                    previous.adjoint_event_ids | descriptor.adjoint_event_ids
+                ),
+                relation_record_release_events=merged_release,
+                sealed=descriptor.sealed,
+            )
+            if merged.relation_records > self.relation_capacity:
+                raise ValueError(
+                    "relation window exceeds the physical relation-store capacity; "
+                    "capture must provide capacity-continuation windows"
+                )
+        self.descriptors[descriptor.window_id] = merged
+        state = self.live.get(descriptor.window_id)
+        if state is not None:
+            state.producer_events.update(descriptor.producer_event_ids)
+            state.forward_events.update(descriptor.forward_stage_heads)
+            state.consumer_events.update(descriptor.consumer_event_ids)
+            state.adjoint_events.update(descriptor.adjoint_event_ids)
+            state.relation_stage_heads.update(descriptor.relation_stage_heads)
+            state.relation_release_events.update({
+                int(stage_head): set(event_ids)
+                for stage_head, event_ids in release_map.items()
+            })
+            state.release_stage_by_event.update({
+                int(event_id): int(stage_head)
+                for stage_head, event_ids in release_map.items()
+                for event_id in event_ids
+            })
+            state.sealed = descriptor.sealed
 
     def blocking_reason(
         self,
@@ -621,6 +677,8 @@ class RelationWindowTracker:
         state = self.live.get(window_id)
         if state is None:
             raise ValueError("relation-window task became ready without a live window")
+        if not state.sealed:
+            return "base_window_unsealed"
         if kind is PrimitiveKind.CONSUMER and state.forward_events:
             return "base_forward_stage"
         if kind is PrimitiveKind.ADJOINT and state.forward_events:
@@ -652,7 +710,8 @@ class RelationWindowTracker:
                 set(descriptor.forward_stage_heads),
                 set(descriptor.consumer_event_ids),
                 set(descriptor.adjoint_event_ids),
-                descriptor.relation_stage_heads,
+                set(descriptor.relation_stage_heads),
+                descriptor.sealed,
                 relation_release_events={
                     int(stage_head): set(event_ids)
                     for stage_head, event_ids in
@@ -720,7 +779,7 @@ class RelationWindowTracker:
                     self.relation_records_live -= 1
                     if self.relation_records_live < 0:
                         raise ValueError("relation-store occupancy underflows")
-        if any(reference_sets):
+        if any(reference_sets) or not state.sealed:
             return
         if state.appended_relation_stages != set(state.relation_stage_heads):
             raise ValueError("relation window releases before all records were appended")
@@ -732,6 +791,9 @@ class RelationWindowTracker:
             if self.relation_records_live < 0:
                 raise ValueError("relation-store occupancy underflows")
         del self.live[window_id]
+        descriptor = self.descriptors.pop(window_id)
+        for reference_event in descriptor.event_ids:
+            self.event_to_window.pop(reference_event, None)
         self.released_windows += 1
 
     def snapshot(self) -> dict[str, int]:
@@ -801,9 +863,9 @@ class QueryReplayTracker:
                     raise ValueError("query has more than one consumer replay input")
                 self.consumer_query_by_event[event_id] = query_key
         for query_key, count in adjoint_counts.items():
-            if query_key in self.remaining_adjoint_by_query:
-                raise ValueError("query replay relations are registered twice")
-            self.remaining_adjoint_by_query[query_key] = count
+            self.remaining_adjoint_by_query[query_key] = (
+                self.remaining_adjoint_by_query.get(query_key, 0) + count
+            )
 
     def blocks_consumer(self, event_id: int) -> bool:
         query_key = self.consumer_query_by_event.get(event_id)
@@ -825,7 +887,7 @@ class QueryReplayTracker:
         )
 
     def reserve_consumer(self, event_id: int) -> None:
-        query_key = self.consumer_query_by_event.get(event_id)
+        query_key = self.consumer_query_by_event.pop(event_id, None)
         if query_key is None or self.remaining_adjoint_by_query.get(query_key, 0) == 0:
             return
         if self.stage_gated:
@@ -857,7 +919,17 @@ class QueryReplayTracker:
         if not self.stage_gated:
             return False
         query_keys = self._adjoint_query_keys(event_ids)
-        needed = sum(query_key not in self.active_queries for query_key in query_keys)
+        new_keys = tuple(
+            query_key for query_key in query_keys
+            if query_key not in self.active_queries
+        )
+        # A stage-gated replay may expose an adjoint before its consumer has
+        # reserved the query-volume entry.  Keep that physical packet in the
+        # ready queue until the consumer is actually ready; reserve_adjoint()
+        # treats this as an invariant rather than a recoverable stall.
+        if any(query_key not in self.ready_queries for query_key in new_keys):
+            return True
+        needed = len(new_keys)
         return len(self.active_queries) + needed > self.capacity
 
     def reserve_adjoint(self, event_ids: tuple[int, ...]) -> None:
@@ -881,7 +953,7 @@ class QueryReplayTracker:
     def dispatch_adjoint(self, event_ids: tuple[int, ...]) -> None:
         completed_queries: set[tuple[int, int]] = set()
         for event_id in event_ids:
-            query_key = self.adjoint_query_by_event.get(event_id)
+            query_key = self.adjoint_query_by_event.pop(event_id, None)
             if query_key is None:
                 raise ValueError("adjoint dispatch has no registered replay entry")
             if query_key not in self.active_queries:
@@ -895,6 +967,7 @@ class QueryReplayTracker:
         for query_key in completed_queries:
             self.active_queries.remove(query_key)
             self.ready_queries.discard(query_key)
+            del self.remaining_adjoint_by_query[query_key]
             self.releases += 1
 
     def snapshot(self) -> dict[str, int]:
@@ -921,6 +994,7 @@ class OwnerGradientTracker:
     key_by_gradient_event: dict[int, tuple[int, int, int]] = field(default_factory=dict)
     relation_by_adjoint_event: dict[int, int] = field(default_factory=dict)
     relation_by_gradient_event: dict[int, int] = field(default_factory=dict)
+    adjoint_event_by_relation: dict[int, int] = field(default_factory=dict)
     gradient_event_by_relation: dict[int, int] = field(default_factory=dict)
     key_by_relation: dict[int, tuple[int, int, int]] = field(default_factory=dict)
     active_by_cluster: dict[int, set[tuple[int, int, int]]] = field(
@@ -970,6 +1044,9 @@ class OwnerGradientTracker:
                     raise ValueError("owner-gradient adjoint event is registered twice")
                 self.key_by_adjoint_event[event_id] = key
                 self.relation_by_adjoint_event[event_id] = relation_id
+                if relation_id in self.adjoint_event_by_relation:
+                    raise ValueError("owner-gradient relation has duplicate adjoints")
+                self.adjoint_event_by_relation[relation_id] = event_id
             else:
                 if event_id in self.key_by_gradient_event:
                     raise ValueError("owner-gradient reduction event is registered twice")
@@ -1075,13 +1152,19 @@ class OwnerGradientTracker:
     def complete_gradient(self, event_ids: tuple[int, ...]) -> None:
         completed: set[tuple[int, tuple[int, int, int]]] = set()
         for event_id in event_ids:
-            key = self.key_by_gradient_event.get(event_id)
+            key = self.key_by_gradient_event.pop(event_id, None)
             if key is None:
                 raise ValueError("gradient reduction lacks an owner-gradient identity")
             cluster = self._cluster(key)
             if key not in self.active_by_cluster.get(cluster, set()):
                 raise ValueError("gradient reduction has no reserved owner-gradient slot")
-            relation_id = self.relation_by_gradient_event[event_id]
+            relation_id = self.relation_by_gradient_event.pop(event_id)
+            adjoint_event = self.adjoint_event_by_relation.pop(relation_id, None)
+            if adjoint_event is not None:
+                self.key_by_adjoint_event.pop(adjoint_event, None)
+                self.relation_by_adjoint_event.pop(adjoint_event, None)
+            self.gradient_event_by_relation.pop(relation_id, None)
+            self.key_by_relation.pop(relation_id, None)
             relations = self.active_relations_by_key[key]
             if relation_id not in relations:
                 raise ValueError("gradient reduction has no in-flight adjoint relation")

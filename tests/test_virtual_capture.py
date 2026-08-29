@@ -14,6 +14,7 @@ from gala_sim.trace import (
     VirtualLifecycleRecord,
     VirtualTracePacket,
 )
+from gala_sim.tools.relation_capacity import run_relation_capacity_preflight
 
 
 class _ArrayRef:
@@ -134,6 +135,57 @@ def test_virtual_packet_archive_failed_formal_gate_keeps_writer_open(tmp_path: P
     manifest = writer.finish()
     assert manifest["complete_30k"] is False
     assert manifest["formal_performance_eligible"] is False
+
+
+def test_relation_capacity_preflight_reports_exact_topology_failure(tmp_path: Path) -> None:
+    archive_root = tmp_path / "archive"
+    writer = VirtualPacketArchiveWriter(archive_root, max_chunk_bytes=1024)
+    writer.initialize_gaussians(2)
+    masks = np.zeros((2, 8), dtype=np.dtype("<u4"))
+    for y in range(3):
+        for x in range(8):
+            local_query = y * 16 + x
+            masks[:, local_query // 32] |= np.uint32(1 << (local_query % 32))
+    writer.append_packet(VirtualTracePacket(
+        iteration_id=1,
+        template_id=1,
+        query_base=0,
+        query_shape=(3, 8),
+        point_ids=np.asarray([0, 1], dtype=np.int64),
+        point_keys=np.asarray([0, 0], dtype=np.uint64),
+        masks=masks,
+        loss_flags=2,
+        ssim_radius=1,
+        backward_confirmed=True,
+    ))
+    writer.close_iteration(1)
+    writer.finish()
+
+    class _Config:
+        sha256 = "recorded-not-gated"
+
+        @staticmethod
+        def require_ready() -> None:
+            return None
+
+        @staticmethod
+        def value(path: str) -> int:
+            return {
+                "compute.relations_per_microcontext": 8,
+                "query.relation_store_records": 3,
+                "query.relation_candidate_ordinal_bits": 16,
+            }[path]
+
+    report = run_relation_capacity_preflight(archive_root, _Config())
+
+    assert report["status"] == "failed_preflight"
+    assert report["reason"] == "relation_store_capacity_infeasible"
+    assert report["configuration_sha256_recorded_only"] == "recorded-not-gated"
+    assert report["packets"][0]["peak_live_records"] == 4
+    assert report["packets"][0]["capacity_deficit_records"] == 1
+    assert report["topology_scope"] == (
+        "exact_for_declared_topology_not_global_lower_bound"
+    )
 
 
 def test_virtual_consumer_closes_event_and_lifecycle_frontiers(tmp_path: Path) -> None:
