@@ -27,9 +27,9 @@
 | `issue.query_state_banks` | 8 | bank | 八路查询状态事件更新 Bank |
 | `issue.candidate_lanes` | 3 | lane | Forecast、Conflict、Issue 三级结构 |
 | `issue.candidate_fifo_entries` | 32 | entry_per_source_fifo | 前向、消费者、伴随三条候选 FIFO 的独立容量 |
-| `issue.forward_ports` | 1 | port | 三输入三输出交叉开关的前向端口；当前每类仅观察一个真实队首 |
+| `issue.forward_ports` | 2 | port | 前向可选出口；消费者队列空闲时可借用其候选槽观察第二个真实队首 |
 | `issue.consumer_ports` | 1 | port | 三输入三输出交叉开关的消费者端口；当前每类仅观察一个真实队首 |
-| `issue.adjoint_ports` | 1 | port | 三输入三输出交叉开关的伴随端口；当前每类仅观察一个真实队首 |
+| `issue.adjoint_ports` | 2 | port | 伴随可选出口；消费者队列空闲时与前向轮转借用候选槽 |
 | `cache.instances` | 4 | cache | 每 Pod 一个缓存 |
 | `latency.semantic_cache.ports` | 1 | port_per_cache_instance | 每个 Pod 缓存各自独立的目录/Active SRAM 接纳端口，不是四个实例共享的全局端口 |
 | `cache.directory_banks_per_instance` | 4 | bank | 语义驻留目录 |
@@ -50,7 +50,7 @@
 | `compute.relations_per_microcontext` | 8 | query lane | 每个物理微上下文内 RelationPacket 的八个查询 lane，不是八个独立 context |
 | `compute.cluster_issue_slots_per_cluster` | 2 | slot | 二维 interaction 的两条配对算术路径 |
 | `compute.microcontext_bytes_per_cluster` | 6656 | byte | 6.5 KiB 设计值 |
-| `compute.owner_gradient_slots_per_cluster` | 2 | slot | 每个 owner cluster 的并发梯度 epoch |
+| `compute.owner_gradient_slots_per_cluster` | 3 | slot | 每个 owner cluster 的并发梯度 epoch；只在 owner ComputePod 接纳时预约 |
 | `compute.template_profiles[1].paths.forward` | pack 4，first 17，last 20，2 lane/cycle | cycle | GALA `ffadc13d`: `interaction_2d` |
 | `compute.template_profiles[1].paths.adjoint` | pack 8，first 27，last 34，1 cycle/lane | cycle | GALA `ffadc13d`: `interaction_2d_adjoint` |
 | `compute.template_profiles[2].paths.forward` | pack 8，first 27，last 34，1 lane/cycle | cycle | GALA `ffadc13d`: `interaction_3d` |
@@ -59,7 +59,7 @@
 | `query.partial_sum_groups_per_bank` | 4 | group | 交错部分和 |
 | `query.loss_fma_lanes` | 32 | lane | 查询损失单元 |
 | `query.loss_queries_per_cycle` | 16 | query/cycle | 两条 FP32 FMA 对应一个 L1/L2 查询 |
-| `query.adjoint_replay_lanes` | 8 | lane | 伴随重放流水 |
+| `query.adjoint_replay_lanes` | 9 | lane | 八 lane RelationPacket 上的工作保持伴随重放流水 |
 | `query.replay_queue_entries` | 256 | entry | 伴随重放队列 |
 | `query.relation_window_entries` | 256 | window | 并发关系作用域窗口，不是关系记录数 |
 | `query.relation_window_entry_bytes` | 32 | byte | 窗口基址、计数与三类引用 |

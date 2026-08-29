@@ -537,7 +537,10 @@ def _query_components(
             "total_replay_lane_work": total_replay_lane_work,
             "work_conserving_lanes": replay_lanes,
         },
-        limitation="Uses total physical replay lane work divided across eight work-conserving lanes; dependencies and packet launch bubbles are free.",
+        limitation=(
+            "Uses total physical replay lane work divided across the configured "
+            "work-conserving lanes; dependencies and packet launch bubbles are free."
+        ),
     ))
     return components
 

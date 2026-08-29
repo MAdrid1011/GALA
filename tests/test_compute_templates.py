@@ -55,15 +55,18 @@ def test_production_compute_profiles_have_audited_path_latencies() -> None:
     assert config.query_partial_sum_groups_per_bank == 4
     assert config.query_loss_fma_lanes == 32
     assert config.query_loss_queries_per_cycle == 16
-    assert config.query_adjoint_replay_lanes == 8
+    assert config.query_adjoint_replay_lanes == 9
     assert config.query_replay_queue_entries == 256
     assert config.query_relation_window_entries == 256
     assert config.query_relation_store_records == 16_384
     assert config.query_volume_banks == 16
     assert config.query_relation_store_banks == 16
     assert config.relation_support_lanes == 8
-    assert config.owner_gradient_slots_per_cluster == 2
-    assert CycleEngine(config)._module_issue_ports("bidirectional_query") == 120
+    assert config.owner_gradient_slots_per_cluster == 3
+    assert config.fusion_forward_ports == 2
+    assert config.fusion_consumer_ports == 1
+    assert config.fusion_adjoint_ports == 2
+    assert CycleEngine(config)._module_issue_ports("bidirectional_query") == 121
     assert CycleEngine(config)._module_issue_ports("relation_constructor") == 24
     assert config.compute_templates[1].latency_for("forward") == 17
     assert config.compute_templates[1].latency_for("adjoint") == 27
@@ -180,31 +183,36 @@ def test_query_datapaths_allocate_loss_replay_and_query_volume_ports() -> None:
     consumer = engine._query_resource_allocation(
         lanes, row(PrimitiveKind.CONSUMER, 3), PrimitiveKind.CONSUMER, None, 0,
     )
-    assert consumer == (64, 91, 107)
+    assert consumer == (64, 92, 108)
     for lane in consumer:
         lanes[lane] = 1
 
     # A second query can use another loss slot and another SRAM bank.
     assert engine._query_resource_allocation(
         lanes, row(PrimitiveKind.CONSUMER, 4), PrimitiveKind.CONSUMER, None, 0,
-    ) == (65, 92, 108)
+    ) == (65, 93, 109)
     # An adjoint read to query 3 conflicts with the consumer read port, while
     # the independent write port remains legal in the same cycle.
     assert engine._query_resource_allocation(
         lanes, row(PrimitiveKind.ADJOINT, 3), PrimitiveKind.ADJOINT, None, 0,
     ) is None
     read_busy_only = [0] * len(lanes)
-    read_busy_only[91] = 1
+    read_busy_only[92] = 1
     assert engine._query_resource_allocation(
         read_busy_only, row(PrimitiveKind.QUERY_REDUCTION, 3),
         PrimitiveKind.QUERY_REDUCTION, None, 0,
-    ) == (3, 107)
+    ) == (3, 108)
 
-    # A full replay packet waits when any of the eight lanes are busy; that is
-    # backpressure, not an invalid packet-width error.
+    # The ninth work-conserving lane lets one full eight-lane packet bypass a
+    # busy replay lane.  Two busy lanes leave insufficient packet capacity.
     replay_busy = [0] * len(lanes)
     replay_busy[80] = 1
     packet = type("Packet", (), {"query_base": 0, "lanes": tuple(range(8))})()
+    assert engine._query_resource_allocation(
+        replay_busy, row(PrimitiveKind.ADJOINT, 0),
+        PrimitiveKind.ADJOINT, packet, 0,
+    ) == (*range(81, 89), *range(89, 97))
+    replay_busy[81] = 1
     assert engine._query_resource_allocation(
         replay_busy, row(PrimitiveKind.ADJOINT, 0),
         PrimitiveKind.ADJOINT, packet, 0,

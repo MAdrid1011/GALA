@@ -342,7 +342,7 @@ def test_adjoint_replay_bound_is_work_conserving_across_physical_lanes() -> None
     )
     assert component.cycles == 4
     assert component.evidence["total_replay_lane_work"] == 8
-    assert component.evidence["work_conserving_lanes"] == 8
+    assert component.evidence["work_conserving_lanes"] == 9
 
 
 def test_compute_microcontext_bound_counts_packet_admission_cycles() -> None:

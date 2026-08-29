@@ -255,7 +255,7 @@ class _ReadyCandidateQueue:
             return
         if (
             owner_gradients is None
-            or self._module_name not in {"bidirectional_query", "compute_pod"}
+            or self._module_name != "compute_pod"
             or kind is not PrimitiveKind.ADJOINT
         ):
             heapq.heappush(self._general, (candidate, token))
@@ -1006,6 +1006,63 @@ class CycleEngine:
         if kind is PrimitiveKind.ADJOINT:
             return "adjoint", self.config.fusion_adjoint_ports or timing_ports
         raise CycleConfigurationError(f"invalid fusion task kind: {kind.name}")
+
+    def _pop_fusion_input_candidates(
+        self,
+        inputs: Mapping[TaskKind, deque[int]],
+        *,
+        borrow_cursor: int,
+    ) -> tuple[list[int], dict[int, tuple[TaskKind, int]], int]:
+        """Pop real FIFO heads, lending otherwise idle candidate lanes.
+
+        Every nonempty source retains one first-look slot.  A remaining slot may
+        inspect another head only when that source has a second physical output
+        port.  The rotating cursor prevents a continuously nonempty Forward or
+        Adjoint FIFO from monopolizing the single commonly idle Consumer slot.
+        """
+
+        source_order = (
+            TaskKind.FORWARD, TaskKind.CONSUMER, TaskKind.ADJOINT,
+        )
+        port_limits = {
+            TaskKind.FORWARD: self.issue_scheduler.forward_ports,
+            TaskKind.CONSUMER: self.issue_scheduler.consumer_ports,
+            TaskKind.ADJOINT: self.issue_scheduler.adjoint_ports,
+        }
+        selected: list[int] = []
+        selected_per_source = {kind: 0 for kind in source_order}
+        pop_ranks: dict[int, tuple[TaskKind, int]] = {}
+
+        def take(kind: TaskKind) -> None:
+            event_id = inputs[kind].popleft()
+            rank = selected_per_source[kind]
+            selected_per_source[kind] += 1
+            selected.append(event_id)
+            pop_ranks[event_id] = (kind, rank)
+
+        for kind in source_order:
+            if len(selected) >= self.config.candidate_lanes:
+                break
+            if inputs[kind]:
+                take(kind)
+
+        borrow_order = (TaskKind.FORWARD, TaskKind.ADJOINT, TaskKind.CONSUMER)
+        while len(selected) < self.config.candidate_lanes:
+            chosen_index: int | None = None
+            for offset in range(len(borrow_order)):
+                index = (borrow_cursor + offset) % len(borrow_order)
+                kind = borrow_order[index]
+                if (
+                    inputs[kind]
+                    and selected_per_source[kind] < port_limits[kind]
+                ):
+                    chosen_index = index
+                    break
+            if chosen_index is None:
+                break
+            take(borrow_order[chosen_index])
+            borrow_cursor = (chosen_index + 1) % len(borrow_order)
+        return selected, pop_ranks, borrow_cursor
 
     def _module_issue_ports(self, module_name: str) -> int:
         """Return the actual issue slots represented by a module instance.
@@ -1912,7 +1969,20 @@ class CycleEngine:
                     (fusion_priority(event_id), event_id),
                 )
             else:
-                fusion_inputs[task_kind].appendleft(event_id)
+                popped = fusion_pop_ranks.get(event_id)
+                if popped is None:
+                    fusion_inputs[task_kind].appendleft(event_id)
+                else:
+                    _kind, rank = popped
+                    queue = fusion_inputs[task_kind]
+                    position = next((
+                        index for index, queued_id in enumerate(queue)
+                        if (
+                            (queued := fusion_pop_ranks.get(queued_id)) is None
+                            or queued[1] > rank
+                        )
+                    ), len(queue))
+                    queue.insert(position, event_id)
 
         for event_id, stage in initial_ready:
             push_ready(event_id, stage)
@@ -1924,7 +1994,15 @@ class CycleEngine:
             name: [0] * self._module_issue_ports(name)
             for name in self.modules
         }
-        fusion_busy_until = {name: 0 for name in ("forward", "consumer", "adjoint")}
+        fusion_busy_until = {
+            name: [0] * limit for name, limit in (
+                ("forward", self.issue_scheduler.forward_ports),
+                ("consumer", self.issue_scheduler.consumer_ports),
+                ("adjoint", self.issue_scheduler.adjoint_ports),
+            )
+        }
+        fusion_borrow_cursor = 0
+        fusion_pop_ranks: dict[int, tuple[TaskKind, int]] = {}
         module_inflight = {
             (name, partition): 0
             for name in self.modules
@@ -2313,6 +2391,7 @@ class CycleEngine:
                         fusion_pending[0][0],
                     )
             candidates: list[tuple[int, int]] = []
+            fusion_pop_ranks = {}
             for ready_key in tuple(ready):
                 queue = ready[ready_key]
                 module_name, _partition = ready_key
@@ -2349,11 +2428,16 @@ class CycleEngine:
                         for entry in retained:
                             heapq.heappush(queue, entry)
                 else:
-                    for task_kind in (
-                        TaskKind.FORWARD, TaskKind.CONSUMER, TaskKind.ADJOINT,
-                    ):
-                        if fusion_inputs[task_kind]:
-                            candidates.append((fusion_inputs[task_kind].popleft(), 0))
+                    (
+                        fusion_candidate_ids,
+                        fusion_pop_ranks,
+                        fusion_borrow_cursor,
+                    ) = self._pop_fusion_input_candidates(
+                        fusion_inputs, borrow_cursor=fusion_borrow_cursor,
+                    )
+                    candidates.extend(
+                        (event_id, 0) for event_id in fusion_candidate_ids
+                    )
             fusion_issued = 0
             fusion_port_issued: dict[str, int] = {}
             issued_modules: dict[tuple[str, int], int] = {}
@@ -2485,9 +2569,19 @@ class CycleEngine:
                     requeue_candidate(event_id, stage)
                     continue
                 module_lane: int | None = None
+                fusion_port_lane: int | None = None
                 query_allocation: tuple[int, ...] = ()
                 if fusion_port_name is not None:
-                    busy_until = fusion_busy_until[fusion_port_name]
+                    fusion_port_lane = next((
+                        index for index, point in enumerate(
+                            fusion_busy_until[fusion_port_name]
+                        )
+                        if point <= cycle
+                    ), None)
+                    busy_until = (
+                        cycle if fusion_port_lane is not None
+                        else min(fusion_busy_until[fusion_port_name])
+                    )
                 elif module_name == "bidirectional_query" and self._has_query_resources():
                     module_lanes = module_busy_until[module_name]
                     allocation = self._query_resource_allocation(
@@ -2538,7 +2632,7 @@ class CycleEngine:
                 if (
                     owner_gradients is not None
                     and kind is PrimitiveKind.ADJOINT
-                    and module_name in {"bidirectional_query", "compute_pod"}
+                    and module_name == "compute_pod"
                 ):
                     owner_event_ids = (
                         physical_stage.event_ids
@@ -2903,7 +2997,10 @@ class CycleEngine:
                 if completion is not None:
                     heapq.heappush(in_flight, (completion, event_id, stage, module_name))
                 if fusion_port_name is not None:
-                    fusion_busy_until[fusion_port_name] = cycle + timing.initiation_interval
+                    assert fusion_port_lane is not None
+                    fusion_busy_until[fusion_port_name][fusion_port_lane] = (
+                        cycle + timing.initiation_interval
+                    )
                 elif query_allocation:
                     for lane in query_allocation:
                         module_busy_until[module_name][lane] = (
@@ -2963,7 +3060,7 @@ class CycleEngine:
                 if (
                     owner_gradients is not None
                     and kind is PrimitiveKind.ADJOINT
-                    and module_name in {"bidirectional_query", "compute_pod"}
+                    and module_name == "compute_pod"
                 ):
                     try:
                         owner_gradients.reserve_adjoint(
@@ -3014,8 +3111,8 @@ class CycleEngine:
                 next_points = [point for point in (in_flight[0][0] if in_flight else None,
                                                    min((value for lanes in module_busy_until.values()
                                                         for value in lanes if value > cycle), default=None),
-                    min((point for point in fusion_busy_until.values()
-                                                        if point > cycle), default=None),
+                    min((point for lanes in fusion_busy_until.values()
+                         for point in lanes if point > cycle), default=None),
                                                    lane_outputs[0][0] if lane_outputs else None,
                                                    memory_wakeup)
                                if point is not None and point > cycle]
@@ -3624,7 +3721,15 @@ class CycleReplaySession:
             name: [0] * engine._module_issue_ports(name)
             for name in engine.modules
         }
-        self._fusion_busy_until = {name: 0 for name in ("forward", "consumer", "adjoint")}
+        self._fusion_busy_until = {
+            name: [0] * limit for name, limit in (
+                ("forward", engine.issue_scheduler.forward_ports),
+                ("consumer", engine.issue_scheduler.consumer_ports),
+                ("adjoint", engine.issue_scheduler.adjoint_ports),
+            )
+        }
+        self._fusion_borrow_cursor = 0
+        self._fusion_pop_ranks: dict[int, tuple[TaskKind, int]] = {}
         self._module_inflight = {
             (name, partition): 0
             for name in engine.modules
@@ -4353,7 +4458,20 @@ class CycleReplaySession:
             )
             self._ready[(module_name, partition)].push((event_id, stage))
         else:
-            self._fusion_inputs[task_kind].appendleft(event_id)
+            popped = self._fusion_pop_ranks.get(event_id)
+            if popped is None:
+                self._fusion_inputs[task_kind].appendleft(event_id)
+            else:
+                _kind, rank = popped
+                queue = self._fusion_inputs[task_kind]
+                position = next((
+                    index for index, queued_id in enumerate(queue)
+                    if (
+                        (queued := self._fusion_pop_ranks.get(queued_id)) is None
+                        or queued[1] > rank
+                    )
+                ), len(queue))
+                queue.insert(position, event_id)
 
     def _fusion_kind(self, event_id: int, stage: int) -> TaskKind | None:
         if not self.engine.selection.query_scheduler_enabled or stage != 0:
@@ -4373,6 +4491,7 @@ class CycleReplaySession:
             PrimitiveKind.CONSUMER: TaskKind.CONSUMER,
             PrimitiveKind.ADJOINT: TaskKind.ADJOINT,
         }[kind]
+        physical_stage = self._packet_stage_by_event.get(event_id)
         query_id = max(int(row["query_id"]), 0)
         gaussian_id = max(int(row["gaussian_id"]), 0)
         reduction_key = int(row["reduction_key"])
@@ -4404,8 +4523,7 @@ class CycleReplaySession:
                     for member in physical_stage.event_ids
                 )
                 if task_kind in {TaskKind.FORWARD, TaskKind.ADJOINT}
-                and (physical_stage := self._packet_stage_by_event.get(event_id))
-                is not None
+                and physical_stage is not None
                 else ()
             ),
         )
@@ -4488,6 +4606,7 @@ class CycleReplaySession:
                 for pending_entry in blocked_pending:
                     self._fusion_pending.append(pending_entry)
             candidates: list[tuple[int, int]] = []
+            self._fusion_pop_ranks = {}
             for ready_key in tuple(self._ready):
                 queue = self._ready[ready_key]
                 module_name, _partition = ready_key
@@ -4501,9 +4620,17 @@ class CycleReplaySession:
                 if not queue:
                     del self._ready[ready_key]
             if self.engine.selection.query_scheduler_enabled:
-                for task_kind in (TaskKind.FORWARD, TaskKind.CONSUMER, TaskKind.ADJOINT):
-                    if self._fusion_inputs[task_kind]:
-                        candidates.append((self._fusion_inputs[task_kind].popleft(), 0))
+                (
+                    fusion_candidate_ids,
+                    self._fusion_pop_ranks,
+                    self._fusion_borrow_cursor,
+                ) = self.engine._pop_fusion_input_candidates(
+                    self._fusion_inputs,
+                    borrow_cursor=self._fusion_borrow_cursor,
+                )
+                candidates.extend(
+                    (event_id, 0) for event_id in fusion_candidate_ids
+                )
             if candidates:
                 ordered = self._ordered(candidates)
                 fusion_packets = {
@@ -4572,7 +4699,8 @@ class CycleReplaySession:
                     self._in_flight[0][0] if self._in_flight else None,
                     min((value for lanes in self._module_busy_until.values()
                          for value in lanes if value > self._cycle), default=None),
-                    min((value for value in self._fusion_busy_until.values() if value > self._cycle), default=None),
+                    min((value for lanes in self._fusion_busy_until.values()
+                         for value in lanes if value > self._cycle), default=None),
                     self._lane_outputs[0][0] if self._lane_outputs else None,
                     memory_wakeup,
                 ) if point is not None and point > self._cycle]
@@ -4666,9 +4794,19 @@ class CycleReplaySession:
             self._requeue(event_id, stage)
             return False
         module_lane: int | None = None
+        fusion_port_lane: int | None = None
         query_allocation: tuple[int, ...] = ()
         if port_name:
-            busy_until = self._fusion_busy_until[port_name]
+            fusion_port_lane = next((
+                index for index, point in enumerate(
+                    self._fusion_busy_until[port_name]
+                )
+                if point <= self._cycle
+            ), None)
+            busy_until = (
+                self._cycle if fusion_port_lane is not None
+                else min(self._fusion_busy_until[port_name])
+            )
         elif module_name == "bidirectional_query" and self.engine._has_query_resources():
             module_lanes = self._module_busy_until[module_name]
             allocation = self.engine._query_resource_allocation(
@@ -4723,7 +4861,7 @@ class CycleReplaySession:
         if (
             self._owner_gradients is not None
             and kind is PrimitiveKind.ADJOINT
-            and module_name in {"bidirectional_query", "compute_pod"}
+            and module_name == "compute_pod"
         ):
             owner_event_ids = (
                 physical_stage.event_ids
@@ -4901,7 +5039,10 @@ class CycleReplaySession:
                 )
             self._separate_lane_completion.add(event_id)
         if port_name:
-            self._fusion_busy_until[port_name] = self._cycle + timing.initiation_interval
+            assert fusion_port_lane is not None
+            self._fusion_busy_until[port_name][fusion_port_lane] = (
+                self._cycle + timing.initiation_interval
+            )
         elif query_allocation:
             for lane in query_allocation:
                 self._module_busy_until[module_name][lane] = (
@@ -4961,7 +5102,7 @@ class CycleReplaySession:
         if (
             self._owner_gradients is not None
             and kind is PrimitiveKind.ADJOINT
-            and module_name in {"bidirectional_query", "compute_pod"}
+            and module_name == "compute_pod"
         ):
             try:
                 self._owner_gradients.reserve_adjoint(

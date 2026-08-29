@@ -31,9 +31,9 @@ A_hat(q) = A(q) + max(Rp(q) - Rs(q), 0)
 
 三级流水按以下顺序执行。
 
-1. Forecast 读取前向、局部消费者和伴随三个队首，以编译器规则对 `F_hat(q)`、`C(q)` 和 `A_hat(q)` 排序。
+1. Forecast 为前向、局部消费者和伴随各保留一个队首观察槽；消费者队列为空时，其观察槽在前向与伴随之间轮转借用，读取对应 FIFO 的第二个真实队首，并以编译器规则对 `F_hat(q)`、`C(q)` 和 `A_hat(q)` 排序。
 2. Conflict 锁存 `q`、归约键 `k` 和目标资源 `r`，检查状态更新、归约键、后继依赖、SRAM Bank 和执行端口冲突，形成兼容掩码。
-3. Issue 以兼容掩码驱动三输入三输出交叉开关，将任务写入前向、局部消费者和伴随端口寄存器。
+3. Issue 以兼容掩码驱动总宽度仍为三的发射交叉开关。前向和伴随各提供两个可选出口，局部消费者提供一个；借用只在消费者候选槽空闲时发生，单周期总发射数仍不超过三。
 
 任一候选未就绪、发生冲突或输出端口阻塞时保留在原队列。周期模型必须记录预测等待、冲突屏蔽、端口阻塞和成功融合发射次数。
 
@@ -57,7 +57,7 @@ FMA 被组织为四个四路算术组。三个边界选择器在前一组输出�
 
 输入微上下文保存关系的操作数、模板位置和目标键，直到 packet 的全部输入 lane 被计算流水接纳；随后流水 token 持有中间值并允许输入微上下文复用，不要求等待最后一个结果退休。上下文满时向上游反压。模板切换、反馈依赖、超越函数占用和归约树冲突均进入周期模型。
 
-每个 owner cluster 包含两个 owner-gradient 槽。槽以完整 Gaussian epoch 身份区分，但只保存已经发射且尚未由 gradient-completion 接收的物理伴随 relation packet；同一 packet 经过查询重放和 Pod 两个阶段时只预约一次。配对的物理梯度归约 packet 完成后递减在途 relation 引用，最后一个在途引用完成即释放槽。尚未发射的未来 relation 不得预占或延长槽生命周期，同一 Gaussian epoch 后续可以重新预约已释放的槽。释放语义对应 GALA 设计实现 `5c5f6631:src/gaussian_pod.cpp` 的 owner partial acknowledgement。
+每个 owner cluster 包含三个 owner-gradient 槽。槽以完整 Gaussian epoch 身份区分，但只保存已经由 owner ComputePod 接纳且尚未由 gradient-completion 接收的物理伴随 relation packet；查询重放开始时不得提前预约，同一 packet 进入 Pod 后只预约一次。配对的物理梯度归约 packet 完成后递减在途 relation 引用，最后一个在途引用完成即释放槽。尚未发射的未来 relation 不得预占或延长槽生命周期，同一 Gaussian epoch 后续可以重新预约已释放的槽。释放语义对应 GALA 设计实现 `5c5f6631:src/gaussian_pod.cpp` 的 owner partial acknowledgement。
 
 ## 6. 双向查询执行单元
 
@@ -65,7 +65,7 @@ FMA 被组织为四个四路算术组。三个边界选择器在前一组输出�
 
 查询损失单元使用三十二条 FP32 FMA 执行模型规定的点式、局部图像和体数据损失。点式 L1/L2 路径每个查询占用两条 FMA，因此每周期最多接纳十六个查询。消费者的查询集合由真实依赖决定。依赖未满足或查询结果不可读时不得启动。
 
-伴随路径包含八条重放流水和 256 项重放队列。每条流水读取前向保留的关系链，将查询梯度与关系配对，并按驻留所有者 Pod 和该高斯的 owner cluster 把梯度贡献送回 Pod 归约。关系窗口表包含 256 个 32 B 作用域表项；关系记录另存于 512 KiB、十六 Bank 的关系链 SRAM。窗口的前向、消费者和伴随引用均清零后才能释放，窗口表项数不得误作单窗口关系数。
+伴随路径包含九条工作保持重放流水和 256 项重放队列。每条流水读取前向保留的关系链，将查询梯度与关系配对，并按驻留所有者 Pod 和该高斯的 owner cluster 把梯度贡献送回 Pod 归约；八 lane RelationPacket 保持不变，空闲的第九条流水可接纳另一就绪 packet 的 lane。关系窗口表包含 256 个 32 B 作用域表项；关系记录另存于 512 KiB、十六 Bank 的关系链 SRAM。窗口的前向、消费者和伴随引用均清零后才能释放，窗口表项数不得误作单窗口关系数。
 
 查询结果与梯度位于 512 KiB、十六 Bank、每 Bank 128 bit 端口的 query-volume SRAM。归约写回、消费者读取和伴随梯度读取必须按真实查询地址竞争 Bank 端口。关系链 SRAM 的记录按物理 RelationPacket 独立回收：一个 packet 的全部伴随 lane 完成后即可释放该 packet 记录；关系窗口表项仍须等待 producer、forward、consumer 和 adjoint 四类引用全部清零。
 

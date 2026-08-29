@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from collections import deque
 from dataclasses import replace
 from pathlib import Path
 
@@ -26,7 +27,8 @@ from gala_sim.timing import (
     CycleProgress,
     ModuleTiming,
 )
-from gala_sim.timing.engine import _DependencyIndex
+from gala_sim.timing.engine import _DependencyIndex, _ReadyCandidateQueue
+from gala_sim.timing.modules import OwnerGradientTracker
 from gala_sim.timing.memory import Ramulator2Backend, RecordedMemoryBackend
 from gala_sim.config import load_config
 from gala_sim.trace import (
@@ -1307,6 +1309,73 @@ def test_fusion_issue_uses_independent_forward_consumer_and_adjoint_ports() -> N
         stall.module == "fusion_issue" and stall.reason == "base_single_issue"
         for stall in base.stalls
     )
+
+
+def test_idle_fusion_candidate_slot_borrows_real_fifo_heads_fairly() -> None:
+    config = replace(
+        _config(), candidate_lanes=3,
+        fusion_forward_ports=2, fusion_consumer_ports=1,
+        fusion_adjoint_ports=2,
+    )
+    engine = CycleEngine(config, policy="variant:0010")
+    inputs = {
+        TaskKind.FORWARD: deque((10, 11, 12)),
+        TaskKind.CONSUMER: deque(),
+        TaskKind.ADJOINT: deque((20, 21, 22)),
+    }
+
+    first, first_ranks, cursor = engine._pop_fusion_input_candidates(
+        inputs, borrow_cursor=0,
+    )
+    second, second_ranks, _cursor = engine._pop_fusion_input_candidates(
+        inputs, borrow_cursor=cursor,
+    )
+
+    assert first == [10, 20, 11]
+    assert first_ranks == {
+        10: (TaskKind.FORWARD, 0),
+        20: (TaskKind.ADJOINT, 0),
+        11: (TaskKind.FORWARD, 1),
+    }
+    assert second == [12, 21, 22]
+    assert second_ranks == {
+        12: (TaskKind.FORWARD, 0),
+        21: (TaskKind.ADJOINT, 0),
+        22: (TaskKind.ADJOINT, 1),
+    }
+
+
+def test_owner_gradient_capacity_blocks_compute_not_query_replay() -> None:
+    rows = np.empty(4, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = np.arange(4)
+    rows["iteration_id"] = [1, 1, 2, 2]
+    rows["gaussian_id"] = 0
+    rows["state_version"] = [0, 0, 1, 1]
+    rows["relation_id"] = [10, 10, 20, 20]
+    rows["primitive_kind"] = [
+        int(PrimitiveKind.ADJOINT),
+        int(PrimitiveKind.GRADIENT_REDUCTION),
+        int(PrimitiveKind.ADJOINT),
+        int(PrimitiveKind.GRADIENT_REDUCTION),
+    ]
+    tracker = OwnerGradientTracker(
+        pods=1, clusters_per_pod=1, slots_per_cluster=1,
+    )
+    tracker.register_rows(rows)
+    tracker.reserve_adjoint((0,))
+
+    def pop(module_name: str) -> list[tuple[int, int]]:
+        queue = _ReadyCandidateQueue()
+        queue.push((2, 0))
+        return queue.pop_acceptable(
+            1, module_name, row_for=rows.__getitem__,
+            physical_stage_for=lambda _event_id: None,
+            owner_gradients=tracker, query_replay=None,
+        )
+
+    assert pop("bidirectional_query") == [(2, 0)]
+    assert pop("compute_pod") == []
 
 
 def test_fusion_issue_banks_by_physical_query_state_index() -> None:

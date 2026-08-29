@@ -174,9 +174,9 @@ parameters:
       scope: hardware
       status: frozen
     forward_ports:
-      value: 1
+      value: 2
       unit: port
-      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      source: GALA low-cost candidate-slot borrowing optimization
       scope: hardware
       status: frozen
     consumer_ports:
@@ -186,9 +186,9 @@ parameters:
       scope: hardware
       status: frozen
     adjoint_ports:
-      value: 1
+      value: 2
       unit: port
-      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      source: GALA low-cost candidate-slot borrowing optimization
       scope: hardware
       status: frozen
   cache:
@@ -316,9 +316,9 @@ parameters:
       scope: hardware
       status: frozen
     owner_gradient_slots_per_cluster:
-      value: 2
+      value: 3
       unit: slot
-      source: GALA design config:pod.owner_gradient_slots_per_cluster
+      source: GALA low-cost owner-gradient overlap optimization
       scope: hardware
       status: frozen
     relations_per_microcontext:
@@ -443,9 +443,9 @@ parameters:
       scope: hardware
       status: frozen
     adjoint_replay_lanes:
-      value: 8
+      value: 9
       unit: lane
-      source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
+      source: GALA low-cost replay lower-bound optimization
       scope: hardware
       status: frozen
     replay_queue_entries:
