@@ -179,7 +179,8 @@ class _BankedFusionSourceQueue:
 
     @property
     def full(self) -> bool:
-        return len(self) >= self.capacity
+        # Avoid a Python ``__len__`` dispatch in the hot pending-drain loop.
+        return len(self._global) >= self.capacity
 
     def append(self, packet: TaskPacket, *, bank: int) -> None:
         if self.full:
@@ -2530,6 +2531,7 @@ class CycleEngine:
             if self.selection.query_scheduler_enabled:
                 self.issue_scheduler.set_clock(cycle)
                 blocked_pending: list[tuple[int, TaskKind]] = []
+                pending_full: dict[TaskKind, bool] = {}
                 pending_count = len(fusion_pending)
                 for _ in range(pending_count):
                     event_id, task_kind = fusion_pending.popleft()
@@ -2543,7 +2545,11 @@ class CycleEngine:
                         )
                     else:
                         queue = fusion_inputs[task_kind]
+                        if pending_full.get(task_kind, False):
+                            blocked_pending.append((event_id, task_kind))
+                            continue
                         if queue.full:
+                            pending_full[task_kind] = True
                             blocked_pending.append((event_id, task_kind))
                             continue
                         packet = self._task_packet(
@@ -4800,10 +4806,15 @@ class CycleReplaySession:
             if self.engine.selection.query_scheduler_enabled:
                 self.engine.issue_scheduler.set_clock(self._cycle)
                 blocked_pending: list[tuple[int, TaskKind]] = []
+                pending_full: dict[TaskKind, bool] = {}
                 while self._fusion_pending:
                     event_id, task_kind = self._fusion_pending.popleft()
                     queue = self._fusion_inputs[task_kind]
+                    if pending_full.get(task_kind, False):
+                        blocked_pending.append((event_id, task_kind))
+                        continue
                     if queue.full:
+                        pending_full[task_kind] = True
                         blocked_pending.append((event_id, task_kind))
                         continue
                     packet = self._task_packet(event_id)
