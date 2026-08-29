@@ -17,6 +17,20 @@ Full/`1111` 为 `17,148 cycles`（`1.908502x`）。所有变体保持 `631,244` 
 语义或事件集合。144 配置加载检查为 `ready=true`，当前配置 SHA-256 为
 `f342ef47a3b7e9e8c1be4946a8b94a8bf46665033656313df61e83644eccf89a`。
 
+同日完成当前 144 配置的两个受资源约束 Oracle 回放。查询 Oracle 的 Base、实际机制和
+future-visible 成员分别为 `32,727`、`30,875` 和 `27,214 cycles`，portfolio 选择
+future-visible 成员，相对 Base 为 `1.202580x`；Residency 的三个成员为 `32,727`、
+`31,812` 和 `31,812 cycles`，portfolio 选择实际成员，相对 Base 为 `1.028763x`。两次
+回放均完整处理 `631,244` 个事件和 `933,642` 条依赖，结果状态为 `passed`，但作用域仍是
+`quick_cycle_validation`，因此 `formal_performance_eligible=false`。按本记录约定，查询的
+机制可覆盖周期为 `5,513`、不可覆盖周期为 `27,214`；Residency 的机制可覆盖周期为
+`915`、不可覆盖周期为 `31,812`。对应的机器可读分解分别位于
+`GALA-runtime/records/r2_gaussian_chest_iter600_601_q177888_pack64_fifo144_v1_query_oracle/oracle_scope.json`
+和
+`GALA-runtime/records/r2_gaussian_chest_iter600_601_q177888_pack64_fifo144_v1_residency_oracle/oracle_scope.json`。
+静态锚点派生目标只作为诊断字段记录，不再作为快速回放的完成门槛；Residency 目标在该样本
+上已被必要下界排除，Query 目标仍未被必要下界排除。
+
 ## 最新运行时优化
 
 2026-08-29 将离线 `CycleEngine` 和在线 `CycleReplaySession` 的 Fusion 待入队缓冲按
