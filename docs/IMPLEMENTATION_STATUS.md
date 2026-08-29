@@ -13,6 +13,17 @@
   关系窗口整窗容量预留，以及仅增加 Fusion 前向/伴随端口并开放多头观察的实验均未降低端到端周期，
   已回退，冻结配置保持不变。
 
+- 2026-08-29 按最新分解锚点在同一中位物理 packet quick trace 上重新完成两类 Oracle。Base 为
+  `46,766 cycles`；Query portfolio 的实际成员为 `33,075 cycles`（相对 Base `1.413938x`），
+  仍比 Chest Query 目标预算 `32,348 cycles` 多 `727 cycles`。其 future-visible 成员在
+  `cycle 23,271` 因关系窗口容量无法释放而死锁，不能作为可达上界。Residency portfolio
+  的实际成员为 `43,185 cycles`、future-visible 成员为 `43,191 cycles`，相对 Base 分别为
+  `1.082922x` 和 `1.082772x`，距离 Residency 目标预算 `32,404 cycles` 仍有 `10,781 cycles`。
+  结果目录分别为仓库外 `GALA-runtime/records/r2_gaussian_chest_median_packets_current_query_oracle_v2/`
+  和 `..._residency_oracle_v2/`；两者均为 `quick_cycle_validation`，不具备正式 30,000 iteration
+  性能资格，也不生成 `speedup_vs_orin`。这组结果确认当前主要差距来自关系窗口、Query datapath/
+  replay queue、Fusion 冲突和 ComputePod issue 的覆盖外停顿，下一步先按共同工程路径优化这些停顿。
+
 - 2026-08-29 Shared SRAM、关系前端、Query State Bank 和 ComputePod 微上下文计费修正后，
   同一 `846,012` 事件、`1,289,964` 依赖的双窗口 quick trace 已重新闭合。Base 为
   `46,766 cycles`，Full 为 `34,217 cycles`，相对 Base 的实际加速为 `1.366748x`；全部事件、
