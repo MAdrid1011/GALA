@@ -202,13 +202,13 @@ def test_relation_window_full_stage_barrier_waits_for_all_prior_work() -> None:
     tracker.complete_event(3)
     assert tracker.full_stage_blocking_reason(4, PrimitiveKind.CONSUMER) is None
 
-    # Once the complete forward stage retires, adjoint replay can drain behind
-    # each consumer; waiting for every consumer would exceed a bounded replay
-    # queue for larger windows.
     assert tracker.full_stage_blocking_reason(
         6, PrimitiveKind.ADJOINT,
-    ) is None
+    ) == "base_consumer_stage"
     tracker.complete_event(4)
+    assert tracker.full_stage_blocking_reason(
+        6, PrimitiveKind.ADJOINT,
+    ) == "base_consumer_stage"
     tracker.complete_event(5)
     assert tracker.full_stage_blocking_reason(6, PrimitiveKind.ADJOINT) is None
 
@@ -315,6 +315,64 @@ def test_query_replay_queue_releases_only_after_last_adjoint_dispatch() -> None:
         "replay_queue_peak_entries": 1,
         "replay_queue_live_entries": 0,
     }
+
+
+def test_stage_gated_replay_reserves_capacity_only_when_adjoint_starts() -> None:
+    rows = np.empty(4, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = [0, 1, 2, 3]
+    rows["iteration_id"] = 7
+    rows["query_id"] = [9, 10, 9, 10]
+    rows["primitive_kind"] = [
+        int(PrimitiveKind.CONSUMER),
+        int(PrimitiveKind.CONSUMER),
+        int(PrimitiveKind.ADJOINT),
+        int(PrimitiveKind.ADJOINT),
+    ]
+    tracker = QueryReplayTracker(capacity=1, stage_gated=True)
+    tracker.register_rows(rows)
+
+    assert not tracker.blocks_consumer(0)
+    assert not tracker.blocks_consumer(1)
+    tracker.reserve_consumer(0)
+    tracker.reserve_consumer(1)
+    assert tracker.snapshot()["replay_queue_live_entries"] == 0
+
+    assert not tracker.blocks_adjoint((2,))
+    tracker.reserve_adjoint((2,))
+    assert tracker.blocks_adjoint((3,))
+    tracker.dispatch_adjoint((2,))
+    assert not tracker.blocks_adjoint((3,))
+    tracker.reserve_adjoint((3,))
+    tracker.dispatch_adjoint((3,))
+    assert tracker.snapshot() == {
+        "replay_queue_reservations": 2,
+        "replay_queue_releases": 2,
+        "replay_queue_peak_entries": 1,
+        "replay_queue_live_entries": 0,
+    }
+
+
+def test_base_replay_waits_for_every_consumer_in_the_window() -> None:
+    masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
+    masks[0, 0] = np.uint32((1 << 0) | (1 << 7))
+    trace = _virtual_trace(VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=20, query_shape=(1, 8),
+        point_ids=np.asarray([4], dtype=np.int64),
+        point_keys=np.asarray([0], dtype=np.uint64), masks=masks,
+        loss_flags=1, backward_confirmed=True,
+    ))
+    config_path = Path(__file__).parents[1] / "configs/architecture/gala.yaml"
+    result = CycleEngine(CycleConfig.from_gala(
+        load_config(config_path), _Memory(),
+    ), policy="base").run(trace)
+    kinds = trace.events["primitive_kind"]
+    consumer_ids = np.flatnonzero(kinds == int(PrimitiveKind.CONSUMER))
+    adjoint_ids = np.flatnonzero(kinds == int(PrimitiveKind.ADJOINT))
+
+    assert min(result.completion_cycles[int(event_id)] for event_id in adjoint_ids) > max(
+        result.completion_cycles[int(event_id)] for event_id in consumer_ids
+    )
 
 
 def test_owner_gradient_slots_are_partitioned_by_pod_and_owner_cluster() -> None:

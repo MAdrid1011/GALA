@@ -606,11 +606,9 @@ class RelationWindowTracker:
         if kind is PrimitiveKind.CONSUMER and state.forward_events:
             return "base_forward_stage"
         if kind is PrimitiveKind.ADJOINT and state.forward_events:
-            # Base still waits for the complete forward stage, but adjoints
-            # may drain behind each completed consumer.  Requiring every
-            # consumer first can deadlock when a window has more consumers
-            # than replay-queue entries.
             return "base_forward_stage"
+        if kind is PrimitiveKind.ADJOINT and state.consumer_events:
+            return "base_consumer_stage"
         return None
 
     def issue(
@@ -752,9 +750,11 @@ class QueryReplayTracker:
     """Consumer-input and adjoint-replay occupancy shared by both replay paths."""
 
     capacity: int
+    stage_gated: bool = False
     remaining_adjoint_by_query: dict[tuple[int, int], int] = field(default_factory=dict)
     adjoint_query_by_event: dict[int, tuple[int, int]] = field(default_factory=dict)
     consumer_query_by_event: dict[int, tuple[int, int]] = field(default_factory=dict)
+    ready_queries: set[tuple[int, int]] = field(default_factory=set)
     active_queries: set[tuple[int, int]] = field(default_factory=set)
     peak_entries: int = 0
     reservations: int = 0
@@ -790,6 +790,8 @@ class QueryReplayTracker:
     def blocks_consumer(self, event_id: int) -> bool:
         query_key = self.consumer_query_by_event.get(event_id)
         return bool(
+            not self.stage_gated
+            and
             query_key is not None
             and self.remaining_adjoint_by_query.get(query_key, 0) > 0
             and query_key not in self.active_queries
@@ -808,12 +810,54 @@ class QueryReplayTracker:
         query_key = self.consumer_query_by_event.get(event_id)
         if query_key is None or self.remaining_adjoint_by_query.get(query_key, 0) == 0:
             return
+        if self.stage_gated:
+            if query_key in self.ready_queries:
+                raise ValueError("consumer replay input is reserved twice")
+            self.ready_queries.add(query_key)
+            return
         if query_key in self.active_queries:
             raise ValueError("consumer replay input is reserved twice")
         if len(self.active_queries) >= self.capacity:
             raise ValueError("consumer replay input commits without queue capacity")
         self.active_queries.add(query_key)
         self.reservations += 1
+        self.peak_entries = max(self.peak_entries, len(self.active_queries))
+
+    def _adjoint_query_keys(
+        self, event_ids: tuple[int, ...],
+    ) -> tuple[tuple[int, int], ...]:
+        keys: list[tuple[int, int]] = []
+        for event_id in event_ids:
+            query_key = self.adjoint_query_by_event.get(event_id)
+            if query_key is None:
+                raise ValueError("adjoint dispatch has no registered replay entry")
+            if query_key not in keys:
+                keys.append(query_key)
+        return tuple(keys)
+
+    def blocks_adjoint(self, event_ids: tuple[int, ...]) -> bool:
+        if not self.stage_gated:
+            return False
+        query_keys = self._adjoint_query_keys(event_ids)
+        needed = sum(query_key not in self.active_queries for query_key in query_keys)
+        return len(self.active_queries) + needed > self.capacity
+
+    def reserve_adjoint(self, event_ids: tuple[int, ...]) -> None:
+        query_keys = self._adjoint_query_keys(event_ids)
+        if not self.stage_gated:
+            if any(query_key not in self.active_queries for query_key in query_keys):
+                raise ValueError("adjoint dispatch has no active replay input")
+            return
+        new_keys = tuple(
+            query_key for query_key in query_keys
+            if query_key not in self.active_queries
+        )
+        if any(query_key not in self.ready_queries for query_key in new_keys):
+            raise ValueError("adjoint replay input is not consumer-ready")
+        if len(self.active_queries) + len(new_keys) > self.capacity:
+            raise ValueError("adjoint replay input commits without queue capacity")
+        self.active_queries.update(new_keys)
+        self.reservations += len(new_keys)
         self.peak_entries = max(self.peak_entries, len(self.active_queries))
 
     def dispatch_adjoint(self, event_ids: tuple[int, ...]) -> None:
@@ -832,6 +876,7 @@ class QueryReplayTracker:
                 completed_queries.add(query_key)
         for query_key in completed_queries:
             self.active_queries.remove(query_key)
+            self.ready_queries.discard(query_key)
             self.releases += 1
 
     def snapshot(self) -> dict[str, int]:

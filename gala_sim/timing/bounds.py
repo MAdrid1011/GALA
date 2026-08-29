@@ -615,6 +615,47 @@ def _fusion_components(
     return components
 
 
+def _stage_gated_fusion_component(
+    engine: Any, trace: Trace, packet_plan: RelationPacketPlan,
+) -> CycleBoundComponent | None:
+    """Bound A/C-disabled execution by its one-task global issue contract."""
+
+    items = _module_work_items(engine, trace, "fusion_issue", packet_plan)
+    if not items:
+        return None
+    timing = engine.modules["fusion_issue"].timing
+    cycles = _issue_completion_bound(
+        len(items), ports=1,
+        initiation_interval=timing.initiation_interval,
+        minimum_service=timing.latency,
+    )
+    physical_by_kind: dict[str, int] = {}
+    logical_by_kind: dict[str, int] = {}
+    for event_id, physical_stage in items:
+        name = PrimitiveKind(int(trace.events[event_id]["primitive_kind"])).name
+        physical_by_kind[name] = physical_by_kind.get(name, 0) + 1
+        logical_by_kind[name] = logical_by_kind.get(name, 0) + (
+            len(physical_stage.event_ids) if physical_stage is not None else 1
+        )
+    return CycleBoundComponent(
+        name="fusion_issue.base_single_issue",
+        category="stage_gated_fusion_issue",
+        cycles=cycles,
+        evidence={
+            "physical_task_count": len(items),
+            "physical_tasks_by_kind": dict(sorted(physical_by_kind.items())),
+            "logical_events_by_kind": dict(sorted(logical_by_kind.items())),
+            "global_issue_ports": 1,
+            "initiation_interval": timing.initiation_interval,
+            "minimum_service_cycles": timing.latency,
+        },
+        limitation=(
+            "Applies only when A/C are disabled and all Fusion task classes "
+            "share the frozen one-task-per-cycle arrival-order issue contract."
+        ),
+    )
+
+
 def _compute_components(
     engine: Any, trace: Trace, packet_plan: RelationPacketPlan,
 ) -> list[CycleBoundComponent]:
@@ -962,9 +1003,14 @@ def analyze_cycle_lower_bounds(
                 engine, trace, packet_plan, compulsory_cache_writes=True,
             )
         )
+        stage_gated_component = (
+            _stage_gated_fusion_component(engine, trace, packet_plan)
+            if scenario == "residency" else None
+        )
         components = tuple([
             *common_components,
             *scenario_module_components,
+            *((stage_gated_component,) if stage_gated_component is not None else ()),
             *_memory_components(
                 engine,
                 request_count=request_count,

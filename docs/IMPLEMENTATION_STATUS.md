@@ -2,10 +2,31 @@
 
 本文件记录 `docs/10_IMPLEMENTATION_WORKFLOW.md` 的当前入口和证据，不替代正式实验结果。
 
-当前 R²-Gaussian + Chest 的静态锚点已按 2026-08-29 外部规范更新：匹配硬件端点
-`ASIC_A0B0=2.430x`、`ASIC_A1B0=3.513x`、`ASIC_A0B1=3.507x`、`ASIC_A1B1=6.436x`
-（均相对 CUDA_OPT）。相对 Base ASIC 的派生参考约为 `1.446x`、`1.443x` 和 `2.649x`；
-它们是 `anchor_not_measurement`，不替代同套件实测，也不构成理论上限。
+当前 R²-Gaussian + Chest 的静态锚点已按 2026-08-29 外部规范分解为两套端点：
+CLAMP-CUDA 软件端点为 A0B0/A1B0/A0B1/A1B1 `1.000x/1.254x/1.282x/1.482x`，
+匹配 GALA 硬件端点为 `2.430x/3.513x/3.507x/6.436x`（均相对 CUDA_OPT）。硬件
+端点已经包含匹配的编译元数据与体系结构支持，不能再乘软件端点。硬件端点相对 Base ASIC
+的派生参考约为 `1.446x`、`1.443x` 和 `2.649x`；它们是 `anchor_not_measurement`，
+不替代同套件实测，也不构成当前 quick trace 的理论上限或硬周期目标。
+
+- 2026-08-29 修正 Base 的阶段隔离：A1 关闭时，消费者梯度先写已有 query-volume SRAM，
+  不提前占用 256 项 query replay queue；只有当前关系窗口的全部前向和消费者完成后，物理
+  ADJOINT packet 才预约相关 query 并进入重放。离线与在线执行器使用同一合同。修复前 Base
+  错误允许少量消费者/伴随重叠；修复后同一 `846,012` 事件、`1,289,964` 依赖 quick trace
+  的 Base 为 `46,743 cycles`，Residency 为 `43,162 cycles`，相对 Base 为 `1.082966x`，
+  两者均只增加 `36 cycles`。这证明隔离错误真实存在但不是当前性能缺口的主因。权威 C++
+  当前按 relation window 发出 full-stage completion，但尚未完整体现文字规范要求的“全部消费者
+  完成后才开始伴随”，因此保留为后续 C++ 对拍缺口，不能把这 36 cycles 宣称为性能优化。
+
+- 修复后的必要下界分析计入 C 关闭时 Fusion 的冻结全局单发射合同。Residency trace 含
+  `19,777` 个物理 FORWARD、`768` 个 CONSUMER 和 `19,777` 个物理 ADJOINT 任务，共
+  `40,322` 个 Fusion 任务；latency `3`、II `1` 给出 `40,324-cycle` 必要下界。相对修复后
+  Base，Residency 的理论最大加速仅为 `46,743/40,324=1.159186x`，所以完整 Chest 锚点派生的
+  `1.443210x` 在这个双窗口 quick trace 上已被资源合同排除。报告位于仓库外
+  `GALA-runtime/records/r2_gaussian_chest_strict_stage_gate_v1_bounds/`，明确标记为
+  `quick_cycle_validation`；Query 和 Full 的共同必要下界为 `19,779 cycles`，分别对应乐观
+  最大加速 `2.363264x`，但这不是可达调度预测。完整回归为
+  `327 passed, 1 skipped, 2 warnings`。
 
 - 2026-08-29 已将关系窗口记录生命周期改为物理 packet 级回收：每条 RelationPacket 的全部伴随
   lane 完成后立即释放对应关系记录，窗口表项仍保持 producer/forward/consumer/adjoint 四类引用
@@ -13,16 +34,17 @@
   信用，防止 future-visible 调度挤占老窗口的最后记录而死锁。该修改不改变事件集合、依赖、关系
   packet 数、关系存储容量或片外通道；新增生命周期和信用预留回归后定向测试为 `106 passed`。
 
-- 同一 `846,012` 事件、`1,289,964` 依赖真实双窗口 quick trace 的新结果为：Base `46,707 cycles`，
-  Query 实际机制 `34,471 cycles`（相对 Base `1.355x`），Residency 实际机制 `43,126 cycles`
-  （`1.083x`），Full `32,290 cycles`（`1.446x`）。关系存储容量停顿分别由旧 Base 的约 `8.28M`
+- 同一 `846,012` 事件、`1,289,964` 依赖真实双窗口 quick trace 的当前结果为：Base `46,743 cycles`，
+  Query 实际机制 `34,471 cycles`（相对 Base `1.356x`），Residency 实际机制从修复前的
+  `43,126 cycles` 变为 `43,162 cycles`（`1.083x`），Full `32,290 cycles`（`1.448x`）。关系
+  存储容量停顿分别由旧 Base 的约 `8.28M`
   降至 `6.12M`，Full 降至约 `4.51M`；Full 较合同修正后的 `34,187 cycles` 减少 `1,897` 周期。
   Query 端到端反而比旧 portfolio 的 `33,246 cycles` 多 `1,225` 周期，原因是提前追加改变了
   Ramulator 请求到达序列；因此该优化只作为共同生命周期/可闭合性修复，不宣称单机制收益。
   future-visible Query 由关系容量死锁改为完整 `45,728 cycles`，仍不作为可达上界。
 
-- 若仅把最新静态端点相对 Base 的比例机械应用到这个 quick trace，会得到 Query `32,308`、
-  Residency `32,363`、Full `17,635 cycles`。这些数值现在只保留为无验收资格的比例投影：外部
+- 若仅把最新静态端点相对 Base 的比例机械应用到这个 quick trace，会得到 Query `32,333`、
+  Residency `32,388`、Full `17,648 cycles`。这些数值现在只保留为无验收资格的比例投影：外部
   规范给出的是完整同套件端到端锚点，没有给出这个双窗口样本的周期分解；该样本也不包含完整
   30,000 轮训练、更新和集合修改。尤其 Full 投影低于冻结单端口合同的 `19,779-cycle` 资源必要
   下界，不能被称为该样本的目标预算。临时 `forward=2/adjoint=2` 多头 Fusion 试验只有 `27 cycles`

@@ -133,6 +133,62 @@ def test_cycle_bounds_only_rule_out_targets_proven_below_a_necessary_floor() -> 
     assert reachability["full"].maximum_coverable_cycles == 272
 
 
+def test_residency_bound_includes_global_stage_gated_fusion_issue() -> None:
+    builder = TraceBuilder()
+    for kind in (
+        PrimitiveKind.FORWARD,
+        PrimitiveKind.FORWARD,
+        PrimitiveKind.CONSUMER,
+        PrimitiveKind.ADJOINT,
+    ):
+        builder.emit(TraceEvent(primitive_kind=int(kind), query_id=0))
+    path = ComputePathProfile(
+        (ComputeStage("COMBINE", latency=1),),
+        cluster_issue_cycles=1,
+        packet_first_result_latency=1,
+        packet_last_result_offset=1,
+    )
+    config = replace(
+        _config(),
+        compute_templates={
+            0: ComputeTemplateProfile(0, {"forward": path, "adjoint": path}),
+        },
+        compute_resource_capacities={
+            "pods": 1,
+            "clusters_per_pod": 1,
+            "clusters": 1,
+            "cluster_issue": 1,
+            "fma_groups": 1,
+            "transcendental_lanes": 1,
+            "reduction_trees": 1,
+            "microcontext_slots": 1,
+            "feedback_lanes": 1,
+        },
+    )
+    report = analyze_cycle_lower_bounds(
+        CycleEngine(config, policy="base"),
+        builder.finish(),
+        base_asic_cycles=100,
+        targets={"query": 2.0, "residency": 2.0, "full": 2.0},
+    )
+    scenarios = {item.scenario: item for item in report.scenarios}
+    component = next(
+        item for item in scenarios["residency"].components
+        if item.name == "fusion_issue.base_single_issue"
+    )
+
+    assert component.cycles == 5
+    assert component.evidence["physical_task_count"] == 4
+    assert component.evidence["physical_tasks_by_kind"] == {
+        "ADJOINT": 1, "CONSUMER": 1, "FORWARD": 2,
+    }
+    assert all(
+        item.name != "fusion_issue.base_single_issue"
+        for scenario in (scenarios["query"], scenarios["full"])
+        for item in scenario.components
+    )
+
+
 def test_query_loss_bound_uses_registered_query_issue_width() -> None:
     builder = TraceBuilder()
     for query_id in range(17):

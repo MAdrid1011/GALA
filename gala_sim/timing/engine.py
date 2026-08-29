@@ -1460,7 +1460,13 @@ class CycleEngine:
 
     def _new_query_replay_tracker(self) -> QueryReplayTracker | None:
         capacity = self.config.query_replay_queue_entries
-        return None if capacity is None else QueryReplayTracker(int(capacity))
+        return None if capacity is None else QueryReplayTracker(
+            int(capacity),
+            stage_gated=(
+                not self.selection.query_load_rules
+                and not self.selection.query_oracle
+            ),
+        )
 
     def _new_owner_gradient_tracker(self) -> OwnerGradientTracker | None:
         slots = self.config.owner_gradient_slots_per_cluster
@@ -2456,6 +2462,28 @@ class CycleEngine:
                     )
                     requeue_candidate(event_id, stage)
                     continue
+                if (
+                    query_replay is not None
+                    and module_name == "bidirectional_query"
+                    and kind is PrimitiveKind.ADJOINT
+                ):
+                    replay_event_ids = (
+                        physical_stage.event_ids
+                        if physical_stage is not None else (event_id,)
+                    )
+                    try:
+                        replay_blocked = query_replay.blocks_adjoint(
+                            replay_event_ids
+                        )
+                    except ValueError as error:
+                        raise CycleConfigurationError(str(error)) from error
+                    if replay_blocked:
+                        module.counters.queue_stalls += 1
+                        self._record_stall(
+                            cycle, module_name, "replay_queue_capacity", event_id
+                        )
+                        requeue_candidate(event_id, stage)
+                        continue
                 if relation_windows is not None and stage == 0:
                     physical_head = (
                         physical_stage is None
@@ -2816,6 +2844,18 @@ class CycleEngine:
                 ):
                     try:
                         query_replay.reserve_consumer(event_id)
+                    except ValueError as error:
+                        raise CycleConfigurationError(str(error)) from error
+                if (
+                    query_replay is not None
+                    and module_name == "bidirectional_query"
+                    and kind is PrimitiveKind.ADJOINT
+                ):
+                    try:
+                        query_replay.reserve_adjoint(
+                            physical_stage.event_ids
+                            if physical_stage is not None else (event_id,)
+                        )
                     except ValueError as error:
                         raise CycleConfigurationError(str(error)) from error
                 if (
@@ -4613,6 +4653,28 @@ class CycleReplaySession:
             )
             self._requeue(event_id, stage)
             return False
+        if (
+            self._query_replay is not None
+            and module_name == "bidirectional_query"
+            and kind is PrimitiveKind.ADJOINT
+        ):
+            replay_event_ids = (
+                physical_stage.event_ids
+                if physical_stage is not None else (event_id,)
+            )
+            try:
+                replay_blocked = self._query_replay.blocks_adjoint(
+                    replay_event_ids
+                )
+            except ValueError as error:
+                raise CycleConfigurationError(str(error)) from error
+            if replay_blocked:
+                module.counters.queue_stalls += 1
+                self.engine._record_stall(
+                    self._cycle, module_name, "replay_queue_capacity", event_id
+                )
+                self._requeue(event_id, stage)
+                return False
         if kind is PrimitiveKind.RELATION_CANDIDATE and self._relation_seed_inflight >= self.engine.config.relation_seed_fifo_entries:
             module.counters.queue_stalls += 1
             self.engine._record_stall(self._cycle, module_name, "seed_fifo", event_id)
@@ -4786,6 +4848,18 @@ class CycleReplaySession:
         ):
             try:
                 self._query_replay.reserve_consumer(event_id)
+            except ValueError as error:
+                raise CycleConfigurationError(str(error)) from error
+        if (
+            self._query_replay is not None
+            and module_name == "bidirectional_query"
+            and kind is PrimitiveKind.ADJOINT
+        ):
+            try:
+                self._query_replay.reserve_adjoint(
+                    physical_stage.event_ids
+                    if physical_stage is not None else (event_id,)
+                )
             except ValueError as error:
                 raise CycleConfigurationError(str(error)) from error
         if (
