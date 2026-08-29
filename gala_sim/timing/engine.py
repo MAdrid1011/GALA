@@ -919,22 +919,19 @@ class CycleEngine:
         event_ids: Iterable[int],
         future_plan: FutureTracePlan,
         packet_plan: RelationPacketPlan | None = None,
+        consumer_owner_for_event: Mapping[int, int] | None = None,
     ) -> tuple[int, ...]:
-        """Exactly maximize future weight for the frozen three-port issue contract."""
+        """Maximize future weight for the frozen three-candidate contract."""
 
         if (
             self.config.candidate_lanes != 3
-            or any(
-                self._fusion_port_limit(kind)[1] != 1
-                for kind in (
-                    PrimitiveKind.FORWARD,
-                    PrimitiveKind.CONSUMER,
-                    PrimitiveKind.ADJOINT,
-                )
-            )
+            or self.config.fusion_consumer_ports != 1
+            or self.config.fusion_forward_ports not in {1, 2}
+            or self.config.fusion_adjoint_ports not in {1, 2}
         ):
             raise CycleConfigurationError(
-                "query Oracle requires the frozen three-candidate, one-port-per-class contract"
+                "query Oracle requires the frozen three-candidate contract with "
+                "one consumer port and one or two forward/adjoint ports"
             )
         by_kind: dict[TaskKind, list[tuple[int, int, TaskPacket]]] = {
             TaskKind.FORWARD: [],
@@ -945,6 +942,11 @@ class CycleEngine:
             packet = self._task_packet(
                 trace, event_id,
                 packet_plan.stage_for_event(event_id) if packet_plan is not None else None,
+                consumer_owner_ids=(
+                    (consumer_owner_for_event[event_id],)
+                    if consumer_owner_for_event is not None
+                    and event_id in consumer_owner_for_event else ()
+                ),
             )
             weight = int(future_plan.critical_cycles[event_id])
             bank = self._fusion_query_state_bank(trace.events[event_id])
@@ -952,49 +954,100 @@ class CycleEngine:
         for candidates in by_kind.values():
             candidates.sort(key=lambda item: (-item[0], item[2].event_id))
 
-        kinds = sorted(by_kind, key=lambda kind: len(by_kind[kind]))
+        source_limits = {
+            TaskKind.FORWARD: 1,
+            TaskKind.CONSUMER: 1,
+            TaskKind.ADJOINT: 1,
+        }
+        if not by_kind[TaskKind.CONSUMER]:
+            source_limits[TaskKind.CONSUMER] = 0
+            source_limits[TaskKind.FORWARD] = self.config.fusion_forward_ports
+            source_limits[TaskKind.ADJOINT] = self.config.fusion_adjoint_ports
+
+        candidates = sorted(
+            (
+                (weight, bank, packet)
+                for kind_candidates in by_kind.values()
+                for weight, bank, packet in kind_candidates
+            ),
+            key=lambda item: (-item[0], item[2].event_id),
+        )
         best_score = -1
         best_ids: tuple[int, ...] = ()
-        empty: tuple[int, int, TaskPacket | None] = (0, -1, None)
-        first_options = [empty, *by_kind[kinds[0]]]
-        second_options = [empty, *by_kind[kinds[1]]]
-        third_options = by_kind[kinds[2]]
-        for first in first_options:
-            for second in second_options:
-                selected_packets = tuple(
-                    option[2] for option in (first, second) if option[2] is not None
+
+        def search(
+            index: int,
+            score: int,
+            selected: tuple[int, ...],
+            used_sources: dict[TaskKind, int],
+            occupied_keys: frozenset[tuple[ReductionDomain, int]],
+            occupied_targets: frozenset[int],
+            occupied_banks: frozenset[int],
+        ) -> None:
+            nonlocal best_score, best_ids
+            if score > best_score:
+                best_score = score
+                best_ids = selected
+            remaining_slots = self.config.candidate_lanes - len(selected)
+            if remaining_slots == 0 or index == len(candidates):
+                return
+            optimistic = score + sum(
+                weight for weight, _bank, _packet in
+                candidates[index:index + remaining_slots]
+            )
+            if optimistic <= best_score:
+                return
+
+            weight, bank, packet = candidates[index]
+            tracked_states = (
+                self.issue_scheduler.states.get(query_id)
+                for query_id in packet.readiness_query_ids
+            )
+            exact_ready = (
+                not self.issue_scheduler.enforce_exact_readiness
+                or all(
+                    state is not None
+                    and state.exact_ready(packet.task_kind)
+                    for state in tracked_states
                 )
-                conflict_keys: set[tuple[ReductionDomain, int]] = set()
-                conflict_free = True
-                for packet in selected_packets:
-                    if not packet.conflict_keys.isdisjoint(conflict_keys):
-                        conflict_free = False
-                        break
-                    conflict_keys.update(packet.conflict_keys)
-                banks = {
-                    option[1] for option in (first, second) if option[2] is not None
-                }
-                if not conflict_free or len(banks) != len(selected_packets):
-                    continue
-                third = empty
-                for option in third_options:
-                    packet = option[2]
-                    assert packet is not None
-                    if packet.conflict_keys.isdisjoint(conflict_keys) and option[1] not in banks:
-                        third = option
-                        break
-                options = (first, second, third)
-                ids = tuple(
-                    option[2].event_id
-                    for option in options if option[2] is not None
+            )
+            target = packet.target_resource
+            if (
+                exact_ready
+                and used_sources[packet.task_kind]
+                < source_limits[packet.task_kind]
+                and packet.conflict_keys.isdisjoint(occupied_keys)
+                and bank not in occupied_banks
+                and (target is None or target not in occupied_targets)
+            ):
+                next_sources = dict(used_sources)
+                next_sources[packet.task_kind] += 1
+                search(
+                    index + 1,
+                    score + weight,
+                    (*selected, packet.event_id),
+                    next_sources,
+                    occupied_keys.union(packet.conflict_keys),
+                    (
+                        occupied_targets
+                        if target is None else occupied_targets.union((target,))
+                    ),
+                    occupied_banks.union((bank,)),
                 )
-                score = sum(option[0] for option in options)
-                stable_ids = tuple(sorted(ids))
-                if score > best_score or (
-                    score == best_score and stable_ids < tuple(sorted(best_ids))
-                ):
-                    best_score = score
-                    best_ids = ids
+            search(
+                index + 1, score, selected, used_sources,
+                occupied_keys, occupied_targets, occupied_banks,
+            )
+
+        search(
+            0,
+            0,
+            (),
+            {kind: 0 for kind in TaskKind},
+            frozenset(),
+            frozenset(),
+            frozenset(),
+        )
         return best_ids
 
     def _fusion_port_limit(self, kind: PrimitiveKind) -> tuple[str, int]:
@@ -2416,6 +2469,7 @@ class CycleEngine:
                         ),
                         future_plan,
                         packet_plan,
+                        consumer_credit_owner,
                     ))
                     for queue in fusion_oracle_inputs.values():
                         retained: list[tuple[tuple[int, int], int]] = []

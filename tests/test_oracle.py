@@ -181,6 +181,94 @@ def test_query_oracle_selects_exact_legal_combination_from_bounded_queue() -> No
     assert set(selected) == {forward_ids[0], consumer}
 
 
+def test_query_oracle_borrows_idle_consumer_slot_under_frozen_port_limits() -> None:
+    builder = TraceBuilder()
+    forward_ids = [
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.FORWARD), query_id=query_id,
+            gaussian_id=query_id, reduction_key=query_id,
+            address_token=query_id,
+        ))
+        for query_id in range(3)
+    ]
+    adjoint = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.ADJOINT), query_id=7,
+        gaussian_id=7, reduction_key=7, address_token=7,
+    ))
+    trace = builder.finish()
+    critical = np.asarray([100, 90, 80, 70], dtype=np.uint64)
+    critical.setflags(write=False)
+    future = FutureTracePlan(critical, {}, {})
+    config = replace(
+        _config(), fusion_forward_ports=2, fusion_adjoint_ports=2,
+    )
+    engine = CycleEngine(config, policy="query_oracle")
+
+    selected = engine._select_query_oracle_candidates(
+        trace, (*forward_ids, adjoint), future,
+    )
+
+    assert selected == (forward_ids[0], forward_ids[1], adjoint)
+
+
+def test_query_oracle_keeps_consumer_candidate_slot_when_nonempty() -> None:
+    builder = TraceBuilder()
+    first_forward = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.FORWARD), query_id=0,
+        gaussian_id=0, reduction_key=0, address_token=0,
+    ))
+    second_forward = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.FORWARD), query_id=1,
+        gaussian_id=1, reduction_key=1, address_token=1,
+    ))
+    consumer = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CONSUMER), query_id=2,
+        gaussian_id=2, reduction_key=2, address_token=2,
+    ))
+    trace = builder.finish()
+    critical = np.asarray([100, 90, 1], dtype=np.uint64)
+    critical.setflags(write=False)
+    future = FutureTracePlan(critical, {}, {})
+    config = replace(
+        _config(), fusion_forward_ports=2, fusion_adjoint_ports=2,
+    )
+    engine = CycleEngine(config, policy="query_oracle")
+
+    selected = engine._select_query_oracle_candidates(
+        trace, (first_forward, second_forward, consumer), future,
+    )
+
+    assert selected == (first_forward, consumer)
+
+
+def test_query_oracle_uses_runtime_consumer_credit_owner_for_readiness() -> None:
+    builder = TraceBuilder()
+    consumer = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CONSUMER), query_id=9,
+        gaussian_id=9, reduction_key=9, address_token=9,
+    ))
+    trace = builder.finish()
+    critical = np.asarray([10], dtype=np.uint64)
+    critical.setflags(write=False)
+    future = FutureTracePlan(critical, {}, {})
+    engine = CycleEngine(_config(), policy="query_oracle")
+    engine.issue_scheduler.enable_exact_readiness()
+    engine.issue_scheduler.allocate((1, 2))
+    ready = engine.issue_scheduler.states[1]
+    ready.generator_closed = True
+    ready.reduction_ready = True
+    ready.consumer_count = 1
+    blocked = engine.issue_scheduler.states[2]
+    blocked.consumer_count = 1
+
+    selected = engine._select_query_oracle_candidates(
+        trace, (consumer,), future,
+        consumer_owner_for_event={consumer: 1},
+    )
+
+    assert selected == (consumer,)
+
+
 def test_query_oracle_does_not_reorder_non_fusion_modules() -> None:
     builder = TraceBuilder()
     first = builder.emit(TraceEvent(
