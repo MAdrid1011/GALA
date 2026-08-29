@@ -244,6 +244,45 @@ class _BankedFusionSourceQueue:
             self._bank_cursor = bank_cursor
 
 
+class _FusionPendingQueues:
+    """Pending Fusion admissions partitioned by source kind.
+
+    Admissions from different source FIFOs are independent.  Keeping one
+    deque per source preserves each FIFO's arrival order while avoiding a
+    full scan of blocked entries from another source on every cycle.
+    """
+
+    def __init__(self) -> None:
+        self._queues: dict[TaskKind, deque[int]] = {
+            task_kind: deque() for task_kind in TaskKind
+        }
+        self._count = 0
+
+    def append(self, event_id: int, task_kind: TaskKind) -> None:
+        self._queues[task_kind].append(event_id)
+        self._count += 1
+
+    def popleft(self, task_kind: TaskKind) -> int:
+        event_id = self._queues[task_kind].popleft()
+        self._count -= 1
+        return event_id
+
+    def queues(self):
+        return self._queues.items()
+
+    def first_event_id(self) -> int | None:
+        for queue in self._queues.values():
+            if queue:
+                return queue[0]
+        return None
+
+    def __bool__(self) -> bool:
+        return self._count != 0
+
+    def __len__(self) -> int:
+        return self._count
+
+
 class _ReadyCandidateQueue:
     """Heap-index ready work without changing candidate ordering semantics."""
 
@@ -2013,7 +2052,7 @@ class CycleEngine:
         ready: dict[tuple[str, int], _ReadyCandidateQueue] = defaultdict(
             _ReadyCandidateQueue
         )
-        fusion_pending: deque[tuple[int, TaskKind]] = deque()
+        fusion_pending = _FusionPendingQueues()
         fusion_capacity = (
             self.config.candidate_fifo_entries
             or self.modules["fusion_issue"].timing.queue_capacity
@@ -2136,7 +2175,7 @@ class CycleEngine:
                 )
                 ready[(module_name, partition)].push((event_id, stage))
             else:
-                fusion_pending.append((event_id, task_kind))
+                fusion_pending.append(event_id, task_kind)
 
         def requeue_candidate(event_id: int, stage: int) -> None:
             physical_stage = packet_plan.stage_for_event(event_id)
@@ -2530,52 +2569,47 @@ class CycleEngine:
                 next_progress_time = now + progress_interval_seconds
             if self.selection.query_scheduler_enabled:
                 self.issue_scheduler.set_clock(cycle)
-                blocked_pending: list[tuple[int, TaskKind]] = []
-                pending_full: dict[TaskKind, bool] = {}
-                pending_count = len(fusion_pending)
-                for _ in range(pending_count):
-                    event_id, task_kind = fusion_pending.popleft()
+                for task_kind, pending in fusion_pending.queues():
                     if self.selection.query_oracle:
-                        if len(fusion_oracle_inputs[task_kind]) >= fusion_capacity:
-                            blocked_pending.append((event_id, task_kind))
-                            continue
-                        heapq.heappush(
-                            fusion_oracle_inputs[task_kind],
-                            (fusion_priority(event_id), event_id),
-                        )
+                        oracle_queue = fusion_oracle_inputs[task_kind]
+                        while pending and len(oracle_queue) < fusion_capacity:
+                            event_id = fusion_pending.popleft(task_kind)
+                            heapq.heappush(
+                                oracle_queue,
+                                (fusion_priority(event_id), event_id),
+                            )
                     else:
                         queue = fusion_inputs[task_kind]
-                        if pending_full.get(task_kind, False):
-                            blocked_pending.append((event_id, task_kind))
-                            continue
-                        if queue.full:
-                            pending_full[task_kind] = True
-                            blocked_pending.append((event_id, task_kind))
-                            continue
-                        packet = self._task_packet(
-                            trace, event_id,
-                            packet_plan.stage_for_event(event_id),
-                            consumer_owner_ids=(
-                                (consumer_credit_owner[event_id],)
-                                if task_kind is TaskKind.CONSUMER
-                                and event_id in consumer_credit_owner else ()
-                            ),
-                        )
-                        queue.append(
-                            packet,
-                            bank=self._fusion_query_state_bank(
-                                trace.events[event_id]
-                            ),
-                        )
-                        self.issue_scheduler.observe_arrival(
-                            (packet,), arrival_cycle=cycle,
-                        )
-                fusion_pending.extend(blocked_pending)
+                        while pending and not queue.full:
+                            event_id = fusion_pending.popleft(task_kind)
+                            packet = self._task_packet(
+                                trace, event_id,
+                                packet_plan.stage_for_event(event_id),
+                                consumer_owner_ids=(
+                                    (consumer_credit_owner[event_id],)
+                                    if task_kind is TaskKind.CONSUMER
+                                    and event_id in consumer_credit_owner else ()
+                                ),
+                            )
+                            queue.append(
+                                packet,
+                                bank=self._fusion_query_state_bank(
+                                    trace.events[event_id]
+                                ),
+                            )
+                            self.issue_scheduler.observe_arrival(
+                                (packet,), arrival_cycle=cycle,
+                            )
                 if fusion_pending:
                     self.modules["fusion_issue"].counters.queue_stalls += 1
+                    first_pending = fusion_pending.first_event_id()
+                    if first_pending is None:
+                        raise CycleConfigurationError(
+                            "Fusion pending queue count is inconsistent"
+                        )
                     self._record_stall(
                         cycle, "fusion_issue", "input_queue_capacity",
-                        fusion_pending[0][0],
+                        first_pending,
                     )
             candidates: list[tuple[int, int]] = []
             for ready_key in tuple(ready):
@@ -3899,7 +3933,7 @@ class CycleReplaySession:
         self._ready: dict[
             tuple[str, int], _ReadyCandidateQueue
         ] = defaultdict(_ReadyCandidateQueue)
-        self._fusion_pending: deque[tuple[int, TaskKind]] = deque()
+        self._fusion_pending = _FusionPendingQueues()
         fusion_capacity = (
             engine.config.candidate_fifo_entries
             or engine.modules["fusion_issue"].timing.queue_capacity
@@ -4666,7 +4700,7 @@ class CycleReplaySession:
             )
             self._ready[(module_name, partition)].push((event_id, stage))
         else:
-            self._fusion_pending.append((event_id, task_kind))
+            self._fusion_pending.append(event_id, task_kind)
 
     def _requeue(self, event_id: int, stage: int) -> None:
         physical_stage = self._packet_stage_by_event.get(event_id)
@@ -4805,30 +4839,20 @@ class CycleReplaySession:
                 progressed = True
             if self.engine.selection.query_scheduler_enabled:
                 self.engine.issue_scheduler.set_clock(self._cycle)
-                blocked_pending: list[tuple[int, TaskKind]] = []
-                pending_full: dict[TaskKind, bool] = {}
-                while self._fusion_pending:
-                    event_id, task_kind = self._fusion_pending.popleft()
+                for task_kind, pending in self._fusion_pending.queues():
                     queue = self._fusion_inputs[task_kind]
-                    if pending_full.get(task_kind, False):
-                        blocked_pending.append((event_id, task_kind))
-                        continue
-                    if queue.full:
-                        pending_full[task_kind] = True
-                        blocked_pending.append((event_id, task_kind))
-                        continue
-                    packet = self._task_packet(event_id)
-                    queue.append(
-                        packet,
-                        bank=self.engine._fusion_query_state_bank(
-                            self._events[event_id]
-                        ),
-                    )
-                    self.engine.issue_scheduler.observe_arrival(
-                        (packet,), arrival_cycle=self._cycle,
-                    )
-                for pending_entry in blocked_pending:
-                    self._fusion_pending.append(pending_entry)
+                    while pending and not queue.full:
+                        event_id = self._fusion_pending.popleft(task_kind)
+                        packet = self._task_packet(event_id)
+                        queue.append(
+                            packet,
+                            bank=self.engine._fusion_query_state_bank(
+                                self._events[event_id]
+                            ),
+                        )
+                        self.engine.issue_scheduler.observe_arrival(
+                            (packet,), arrival_cycle=self._cycle,
+                        )
             candidates: list[tuple[int, int]] = []
             for ready_key in tuple(self._ready):
                 queue = self._ready[ready_key]

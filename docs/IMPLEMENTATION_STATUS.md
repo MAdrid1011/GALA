@@ -2,6 +2,15 @@
 
 本文件记录 `docs/10_IMPLEMENTATION_WORKFLOW.md` 的当前入口和证据，不替代正式实验结果。
 
+## 最新运行时优化
+
+2026-08-29 将离线 `CycleEngine` 和在线 `CycleReplaySession` 的 Fusion 待入队缓冲按
+FORWARD、CONSUMER、ADJOINT 三个源分别维护。每个源仍保持原有到达顺序和 32 项有界 FIFO，
+但某个源满时不再扫描其他源的阻塞条目；该修改只优化模拟器软件路径，不改变硬件队列、
+事件集合、调度选择或周期语义。同一 `631,244` 事件完整 trace 和同一逐请求内存返回表复验
+得到 `18,163 cycles`，事件计数与 Fusion/ComputePod 停顿计数均与优化前一致；墙钟由约 `27.2 s`
+降至 `24.6 s`（约 `9.5%`）。优化后的完整回归为 `344 passed, 1 skipped, 2 warnings`。
+
 当前 R²-Gaussian + Chest 的静态锚点已按 2026-08-29 外部规范分解为两套端点：
 CLAMP-CUDA 软件端点为 A0B0/A1B0/A0B1/A1B1 `1.000x/1.254x/1.282x/1.482x`，
 匹配 GALA 硬件端点为 `2.430x/3.513x/3.507x/6.436x`（均相对 CUDA_OPT）。硬件
