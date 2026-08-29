@@ -560,6 +560,49 @@ class CycleEngine:
         self._stalls: list[_StallAccumulator] = []
         self._stall_index: dict[tuple[object, ...], int] = {}
         self._stall_cycle: int | None = None
+        self._query_history_bases: dict[tuple[int, int], int] = {}
+
+    def _register_query_history_base(
+        self, iteration_id: int, template_id: int, query_base: int,
+    ) -> None:
+        if min(iteration_id, template_id, query_base) < 0:
+            raise CycleConfigurationError("query history domain is negative")
+        domain = (int(iteration_id), int(template_id))
+        previous = self._query_history_bases.get(domain)
+        if previous is None or query_base < previous:
+            self._query_history_bases[domain] = int(query_base)
+
+    def _register_query_history_plan(
+        self, trace: Trace, packet_plan: RelationPacketPlan,
+    ) -> None:
+        self._query_history_bases.clear()
+        for stage in packet_plan.stages:
+            event_index = stage.head_event_id - packet_plan.event_id_base
+            if not 0 <= event_index < trace.event_count:
+                raise CycleConfigurationError(
+                    "physical query packet is outside its trace"
+                )
+            row = trace.events[event_index]
+            if int(row["query_id"]) < 0:
+                continue
+            self._register_query_history_base(
+                int(row["iteration_id"]), int(row["template_id"]),
+                stage.query_base,
+            )
+
+    def _query_history_key(self, row: np.void) -> tuple[int, int]:
+        query_id = int(row["query_id"])
+        template_id = int(row["template_id"])
+        domain = (int(row["iteration_id"]), template_id)
+        query_base = self._query_history_bases.get(domain)
+        if query_base is None:
+            raise CycleConfigurationError(
+                "query history domain was not registered before lifecycle replay"
+            )
+        local_query_id = query_id - query_base
+        if local_query_id < 0:
+            raise CycleConfigurationError("query precedes its history domain base")
+        return template_id, local_query_id
 
     def _record_stall(
         self,
@@ -812,6 +855,7 @@ class CycleEngine:
                         (query_id,) if relation_id in adjoint_relation_ids else ()
                     ),
                     iteration_id=int(row["iteration_id"]),
+                    history_keys=(self._query_history_key(row),),
                 )
             elif kind is PrimitiveKind.QUERY_CLOSE:
                 self.issue_scheduler.producer_close((query_id,))
@@ -1558,6 +1602,7 @@ class CycleEngine:
                 trace, query_lanes=self.config.relation_query_lanes,
             ),
         )
+        self._register_query_history_plan(trace, packet_plan)
         self.issue_scheduler.reset()
         trace_kinds = set(
             np.unique(trace.events["primitive_kind"]).astype(int).tolist()
@@ -1703,11 +1748,50 @@ class CycleEngine:
             if self.selection.residency_oracle else {}
         )
 
+        sample_metadata = trace.metadata.get("trace_sample")
+        boundary_conditioned_iterations = bool(
+            isinstance(sample_metadata, dict)
+            and sample_metadata.get("boundary_condition")
+            == "prior_selected_packet_completes_before_next_iteration"
+        )
+        boundary_iteration_ids = np.array([], dtype=np.uint32)
+        boundary_iteration_remaining: dict[int, int] = {}
+        boundary_iteration_position = 0
+        boundary_deferred_ready: dict[int, list[tuple[int, int]]] = defaultdict(list)
+        if boundary_conditioned_iterations:
+            raw_ids, raw_counts = np.unique(
+                trace.events["iteration_id"], return_counts=True,
+            )
+            boundary_iteration_ids = raw_ids.astype(np.uint32, copy=False)
+            if boundary_iteration_ids.size < 2 or bool((
+                np.diff(boundary_iteration_ids.astype(np.int64)) != 1
+            ).any()):
+                raise CycleConfigurationError(
+                    "query packet boundary requires consecutive iterations"
+                )
+            boundary_iteration_remaining = {
+                int(iteration_id): int(count)
+                for iteration_id, count in zip(
+                    boundary_iteration_ids, raw_counts, strict=True,
+                )
+            }
+
         def build_ready() -> list[tuple[int, int]]:
-            return [
+            roots = [
                 (int(event_id), 0)
                 for event_id in np.flatnonzero(dependency_index.remaining == 0)
             ]
+            if not boundary_conditioned_iterations:
+                return roots
+            first_iteration = int(boundary_iteration_ids[0])
+            initial: list[tuple[int, int]] = []
+            for item in roots:
+                iteration_id = int(trace.events[item[0]]["iteration_id"])
+                if iteration_id == first_iteration:
+                    initial.append(item)
+                else:
+                    boundary_deferred_ready[iteration_id].append(item)
+            return initial
 
         initial_ready = run_phase(
             "ready_queue", build_ready, total_iterations=int(iteration_ids.size)
@@ -1906,6 +1990,7 @@ class CycleEngine:
             nonlocal last_completed_iteration, last_completed_iteration_events
             nonlocal last_completed_iteration_cycles
             nonlocal last_completed_iteration_elapsed_seconds
+            nonlocal boundary_iteration_position
             if event_id in completed:
                 raise CycleConfigurationError(f"event {event_id} completed twice")
             completed[event_id] = finish
@@ -1971,6 +2056,27 @@ class CycleEngine:
                     )
                 if remaining == 1:
                     push_ready(dependent, 0)
+            if boundary_conditioned_iterations:
+                iteration_id = int(row["iteration_id"])
+                boundary_remaining = boundary_iteration_remaining[iteration_id] - 1
+                boundary_iteration_remaining[iteration_id] = boundary_remaining
+                if boundary_remaining == 0:
+                    expected = int(
+                        boundary_iteration_ids[boundary_iteration_position]
+                    )
+                    if iteration_id != expected:
+                        raise CycleConfigurationError(
+                            "query packet iterations completed out of order"
+                        )
+                    boundary_iteration_position += 1
+                    if boundary_iteration_position < boundary_iteration_ids.size:
+                        next_iteration = int(
+                            boundary_iteration_ids[boundary_iteration_position]
+                        )
+                        for ready_event, ready_stage in boundary_deferred_ready.pop(
+                            next_iteration, ()
+                        ):
+                            push_ready(ready_event, ready_stage)
 
         while remaining_events or in_flight or lane_outputs:
             # Bank reservations are scoped to one cycle.  Drop old entries so
@@ -3118,6 +3224,7 @@ class CycleEngine:
         f_count, c_count, a_count = self.issue_scheduler.live_counter_totals()
         module_counters["fusion_issue"].update({
             **self.issue_scheduler.state_table_snapshot(),
+            **self.issue_scheduler.history_snapshot(),
             "live_forward_count": f_count,
             "live_consumer_count": c_count,
             "live_adjoint_count": a_count,
@@ -3481,6 +3588,7 @@ class CycleReplaySession:
             raise ValueError("online progress interval must be positive")
         self.engine = engine
         self.engine.issue_scheduler.reset()
+        self.engine._query_history_bases.clear()
         self.max_events = max_events
         self.max_frontier_events = max_frontier_events
         self.retain_completion_cycles = retain_completion_cycles
@@ -3782,6 +3890,11 @@ class CycleReplaySession:
         """Register one capture batch before advancing the online scheduler."""
 
         self._ensure_open()
+        packets = tuple(packets)
+        for packet in packets:
+            self.engine._register_query_history_base(
+                packet.iteration_id, packet.template_id, packet.query_base,
+            )
         accepted = False
         for packet in packets:
             self._accept_query_packet_without_drain(packet)
@@ -4089,6 +4202,7 @@ class CycleReplaySession:
         )
         counters["fusion_issue"].update({
             **self.engine.issue_scheduler.state_table_snapshot(),
+            **self.engine.issue_scheduler.history_snapshot(),
             "live_forward_count": f_count,
             "live_consumer_count": c_count,
             "live_adjoint_count": a_count,

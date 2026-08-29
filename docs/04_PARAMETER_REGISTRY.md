@@ -174,6 +174,11 @@ FMA、EXP、LOG、RCP、SQRT、SRAM、CAM、互连和寄存器流水延迟不写
 | `trace-sample.max_dependencies` | 命令显式指定 | dependency | quick-validation 中间与输出依赖上限 |
 | `trace-sample.scan_events` | 命令显式指定 | event | CPU/CUDA 顺序扫描块 |
 | `trace-sample.scan_backend` | `auto` | enum | `cpu`、`cuda` 或记录实际回退的 `auto` |
+| `trace-query-packets.query_ranges` | 命令显式指定 | query range | 连续迭代中布局一致的一组或多组真实查询区间 |
+| `trace-query-packets.scan_events` | 命令显式指定 | event | 源 trace 扫描块和虚拟展开块，不是闭包上限 |
+| `trace-query-packets.scan_backend` | `auto` | enum | `cpu`、`cuda` 或记录实际回退的 `auto` |
+| `trace-query-packets.query_lanes` | `8` | lane | 与冻结 RelationPacket 发射宽度一致 |
+| `trace-query-packets.ssim_radius` | `5` | query | 栅格 consumer 的冻结 SSIM 邻域半径；体查询固定为 0 |
 | `trace-validate.scan_events` | trace capture chunk | event | 全量流式 validator 顺序扫描块 |
 | `trace-validate.index_directory` | source trace directory | path | 全量 validator 的临时紧凑索引目录；不改变检查集合 |
 

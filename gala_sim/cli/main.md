@@ -10,6 +10,8 @@
 
 `trace-sample --trace <dir> --output <dir> --query-range START:COUNT --max-events N --max-dependencies N --scan-events N --scan-backend cpu|cuda|auto` 从一个或多个 query range 的 consumer/gradient terminal 出发，抽取完整传递依赖闭包。输出保留真实 relation、地址、字节数和依赖，只能用于快速周期验证。
 
+`trace-query-packets --trace <dir> --output <dir> --query-range START:COUNT --query-range START:COUNT --scan-events N --scan-backend cpu|cuda|auto --query-lanes N --ssim-radius N` 为查询调度技术构造连续两轮最小真实关系包。命令保留所选查询的真实 Gaussian 支持域，避开 optimizer 全迭代 barrier 的无关 fan-in，并把状态版本归一化为查询调度微基准。输出只允许 `base`、`query`、`query_oracle`、`variant:1000`、`variant:0010` 和 `variant:1010`，不能运行语义驻留、完整消融或正式性能。
+
 `trace-packetize --trace <quick-dir> --output <new-dir> --query-domain TEMPLATE:BASE:DIMxDIM[xDIM] --query-lanes N` 为旧版 dependency-closed quick trace 派生物理 RelationPacket lane/mask 元数据。命令只允许 quick trace，只修改 packetized event 的 `flags`，写盘前验证其他事件列、依赖和 payload 完全不变，并验证物理包计划；输出不提升正式性能或质量资格。
 
 `trace-captured-packets --manifest <json> --output <dir> --max-events N --query-lanes N --initial-gaussian-count N` 从 CUDA 捕获器保存的 candidate-major 四列记录抽取 manifest 指定的 canonical tile/brick，重建原始 sparse mask，并完整展开前向、查询消费者、伴随和梯度链。输出前执行结构验证和物理包计划验证，结果固定为 quick validation，不作为正式性能或质量结果。

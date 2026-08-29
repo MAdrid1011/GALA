@@ -10,6 +10,10 @@
 
 `dependency_closed_query_sample(trace, config, *, source_identity, progress)` 选择区间内的 consumer 和 gradient terminal，递归加入全部真实前置依赖，重排 event/dependency/payload offset，并返回通过结构校验的独立 `Trace`。超过显式事件或依赖上限、区间为空或 CUDA 后端不可用时抛出 `ValueError` 或 `RuntimeError`。
 
+`QueryPacketSampleConfig(query_ranges, scan_events, scan_backend, query_lanes, ssim_radius)` 配置连续迭代的查询调度微基准。它不设置依赖闭包上限；`scan_events` 只控制源 trace 扫描块和展开块大小。
+
+`real_query_packet_sample(trace, config, *, source_identity, progress)` 从源 trace 提取每个查询区间的真实 `RELATION`、候选 Gaussian、候选排序键和 consumer 标志，再将每个查询区间重定位到一个物理行并展开完整前向、缓存、归约、consumer、伴随和梯度链。同一迭代可选择多个物理行；输入必须覆盖连续迭代，且各轮的模板、行形状和相对查询位置完全一致。输出固定使用 `gala-query-packet-sample-v1`、`quick_cycle_validation` 和查询调度策略白名单；源状态版本记录在元数据中，周期输入归一化为版本 0，因此不得用于语义驻留、更新、质量或正式性能实验。
+
 ## Internal Helpers
 
-CPU 后端使用 NumPy 大块扫描；CUDA 后端将连续 raw event bytes 交给 v9 decoder 的 terminal-mask kernel。闭包阶段保留原始 ID 集合，最终使用排序索引把依赖映射到样本内 dense event ID。mmap 页在每个扫描块后回收。
+CPU 后端使用 NumPy 大块扫描；CUDA 后端将连续 raw event bytes 交给 v9 decoder 的通用双 primitive/query-range mask。依赖闭包阶段保留原始 ID 集合，最终使用排序索引把依赖映射到样本内 dense event ID。真实查询关系包路径只读取关系的单一候选依赖，并以源候选 event ID 合并 mask，不遍历 optimizer 的全迭代 fan-in。mmap 页在每个扫描块后回收。

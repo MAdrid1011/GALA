@@ -33,9 +33,11 @@ from gala_sim.tools.preflight import run_native_preflight
 from gala_sim.adapters.native_reference import run_native_reference
 from gala_sim.trace import (
     CAPTURED_PACKET_SAMPLE_SCHEMA_VERSION, CapturedPacketSpec, QueryDomain,
-    QueryRange, TraceReader, TraceSampleConfig, TraceValidationConfig, TraceWriter,
+    QUERY_PACKET_SAMPLE_SCHEMA_VERSION, QueryPacketSampleConfig, QueryRange,
+    TraceReader, TraceSampleConfig, TraceValidationConfig, TraceWriter,
     complete_captured_packet_sample, dependency_closed_query_sample,
-    derive_quick_relation_packets, validate_packet_derivation, validate_trace,
+    derive_quick_relation_packets, real_query_packet_sample,
+    validate_packet_derivation, validate_trace,
 )
 
 
@@ -79,6 +81,19 @@ def _parser() -> argparse.ArgumentParser:
     sample.add_argument(
         "--scan-backend", choices=("auto", "cpu", "cuda"), default="auto",
     )
+    query_packets = commands.add_parser("trace-query-packets")
+    query_packets.add_argument("--trace", type=Path, required=True)
+    query_packets.add_argument("--output", type=Path, required=True)
+    query_packets.add_argument(
+        "--query-range", action="append", required=True, type=_query_range,
+        help="consecutive-iteration START:COUNT range; may be repeated",
+    )
+    query_packets.add_argument("--scan-events", type=int, required=True)
+    query_packets.add_argument(
+        "--scan-backend", choices=("auto", "cpu", "cuda"), default="auto",
+    )
+    query_packets.add_argument("--query-lanes", type=int, required=True)
+    query_packets.add_argument("--ssim-radius", type=int, default=0)
     packetize = commands.add_parser("trace-packetize")
     packetize.add_argument("--trace", type=Path, required=True)
     packetize.add_argument("--output", type=Path, required=True)
@@ -325,6 +340,44 @@ def main(argv: list[str] | None = None) -> int:
                 "status": "passed",
             }, sort_keys=True))
             return 0
+        if args.command == "trace-query-packets":
+            if args.output.exists() and any(args.output.iterdir()):
+                raise ValueError("query packet output directory must be empty")
+            manifest_path = args.trace / "chunk_manifest.json"
+            if not manifest_path.is_file():
+                manifest_path = args.trace / "metadata.json"
+            packet_trace = real_query_packet_sample(
+                trace,
+                QueryPacketSampleConfig(
+                    query_ranges=tuple(args.query_range),
+                    scan_events=args.scan_events,
+                    scan_backend=args.scan_backend,
+                    query_lanes=args.query_lanes,
+                    ssim_radius=args.ssim_radius,
+                ),
+                source_identity=sha256_file(manifest_path),
+                progress=lambda stage, current, total: print(json.dumps({
+                    "stage": stage, "current": current, "total": total,
+                }, sort_keys=True), file=sys.stderr, flush=True),
+            )
+            plan = RelationPacketPlan.from_trace(
+                packet_trace, query_lanes=args.query_lanes,
+            )
+            TraceWriter().write(packet_trace, args.output, validate=False)
+            packet_metadata = packet_trace.metadata["trace_sample"]
+            print(json.dumps({
+                "events": packet_trace.event_count,
+                "dependencies": int(packet_trace.dependencies.size),
+                "logical_relation_events": int(sum(
+                    int(packet["source_relation_count"])
+                    for packet in packet_metadata["packets"]
+                )),
+                "physical_relation_packets": plan.relation_packet_count,
+                "formal_performance_eligible": False,
+                "source_identity": packet_metadata["source_identity"],
+                "status": "passed",
+            }, sort_keys=True))
+            return 0
         if args.command == "trace-packetize":
             if args.trace.resolve() == args.output.resolve():
                 raise ValueError("packetized output must differ from its source trace")
@@ -360,6 +413,18 @@ def main(argv: list[str] | None = None) -> int:
                 or sample_metadata.get("result_scope") != "quick_cycle_validation"
             ):
                 raise ValueError("sampled trace metadata is malformed")
+            if sample_metadata.get("schema_version") == QUERY_PACKET_SAMPLE_SCHEMA_VERSION:
+                if args.command != "cycle-replay":
+                    raise ValueError(
+                        "query packet samples only support query-scheduler cycle replay"
+                    )
+                eligible_policies = sample_metadata.get("eligible_policies")
+                if not isinstance(eligible_policies, list) or args.policy not in {
+                    str(policy) for policy in eligible_policies
+                }:
+                    raise ValueError(
+                        "query packet sample policy is outside its declared scope"
+                    )
         if window_metadata is not None and (
             not isinstance(window_metadata, dict)
             or window_metadata.get("schema_version") != "gala-iteration-window-v1"

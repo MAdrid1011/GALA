@@ -8,6 +8,9 @@ import heapq
 from typing import Iterable
 
 
+HistoryQueryKey = tuple[int, int]
+
+
 class TaskKind(IntEnum):
     FORWARD = 1
     CONSUMER = 2
@@ -250,8 +253,19 @@ class FusionIssueScheduler:
     _free_slots: list[int] = field(default_factory=list, init=False, repr=False)
     _next_dynamic_slot: int = field(default=0, init=False, repr=False)
     _iteration_id: int | None = field(default=None, init=False, repr=False)
-    _support_current: dict[int, int] = field(default_factory=dict, init=False, repr=False)
-    _support_previous: dict[int, int] = field(default_factory=dict, init=False, repr=False)
+    _state_history_key: dict[int, HistoryQueryKey] = field(
+        default_factory=dict, init=False, repr=False,
+    )
+    _support_current: dict[HistoryQueryKey, int] = field(
+        default_factory=dict, init=False, repr=False,
+    )
+    _support_previous: dict[HistoryQueryKey, int] = field(
+        default_factory=dict, init=False, repr=False,
+    )
+    _history_restored_queries: int = field(default=0, init=False, repr=False)
+    _load_rule_evaluations: int = field(default=0, init=False, repr=False)
+    _load_rule_selection_changes: int = field(default=0, init=False, repr=False)
+    _history_candidate_evaluations: int = field(default=0, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if min(self.candidate_lanes, self.forward_ports, self.consumer_ports,
@@ -284,8 +298,13 @@ class FusionIssueScheduler:
         self._peak_state_packs = 0
         self._released_state_packs = 0
         self._iteration_id = None
+        self._state_history_key.clear()
         self._support_current.clear()
         self._support_previous.clear()
+        self._history_restored_queries = 0
+        self._load_rule_evaluations = 0
+        self._load_rule_selection_changes = 0
+        self._history_candidate_evaluations = 0
         self._reset_slots()
 
     def set_clock(self, cycle: int) -> None:
@@ -299,11 +318,32 @@ class FusionIssueScheduler:
     def set_strict_lifecycle(self, enabled: bool = True) -> None:
         self.strict_lifecycle = bool(enabled)
 
-    def allocate(self, query_ids: Iterable[int]) -> None:
-        for query_id in query_ids:
+    def allocate(
+        self,
+        query_ids: Iterable[int],
+        *,
+        history_keys: Iterable[HistoryQueryKey] | None = None,
+    ) -> None:
+        query_ids = tuple(query_ids)
+        resolved_history_keys = (
+            tuple(
+                self._state_history_key.get(query_id, (0, query_id))
+                for query_id in query_ids
+            )
+            if history_keys is None else tuple(history_keys)
+        )
+        if len(resolved_history_keys) != len(query_ids):
+            raise ValueError("query IDs and history keys must have equal length")
+        for query_id, history_key in zip(
+            query_ids, resolved_history_keys, strict=True,
+        ):
             if query_id < 0:
                 raise ValueError("query ID must be non-negative")
+            if len(history_key) != 2 or min(history_key) < 0:
+                raise ValueError("query history key must be a non-negative pair")
             if query_id in self.states:
+                if self._state_history_key[query_id] != history_key:
+                    raise ValueError("live query changed its history identity")
                 continue
             self.release_completed()
             logical_pack = query_id // self.query_state_lanes
@@ -317,12 +357,15 @@ class FusionIssueScheduler:
                     slot = heapq.heappop(self._free_slots)
                 self._pack_to_slot[logical_pack] = slot
                 self._slot_to_pack[slot] = logical_pack
-            previous = self._support_previous.get(query_id)
+            previous = self._support_previous.get(history_key)
             self.states[query_id] = QueryState(
-                current_round=self._support_current.get(query_id, 0),
+                current_round=self._support_current.get(history_key, 0),
                 previous_round=previous or 0,
                 history_valid=previous is not None,
             )
+            self._state_history_key[query_id] = history_key
+            if previous is not None:
+                self._history_restored_queries += 1
             self._peak_state_packs = max(
                 self._peak_state_packs, len(self._pack_to_slot),
             )
@@ -347,19 +390,26 @@ class FusionIssueScheduler:
         adjoint_query_ids: Iterable[int] = (),
         support_delta: int = 1,
         iteration_id: int | None = None,
+        history_keys: Iterable[HistoryQueryKey] | None = None,
     ) -> None:
         if iteration_id is not None:
             self.begin_iteration(iteration_id)
         query_ids = tuple(query_ids)
         adjoint_ids = set(adjoint_query_ids)
-        self.allocate(query_ids)
-        for query_id in query_ids:
+        resolved_history_keys = (
+            tuple((0, query_id) for query_id in query_ids)
+            if history_keys is None else tuple(history_keys)
+        )
+        self.allocate(query_ids, history_keys=resolved_history_keys)
+        for query_id, history_key in zip(
+            query_ids, resolved_history_keys, strict=True,
+        ):
             self.states[query_id].accept_relation(
                 needs_adjoint=query_id in adjoint_ids,
                 support_delta=support_delta,
             )
-            self._support_current[query_id] = (
-                self._support_current.get(query_id, 0) + support_delta
+            self._support_current[history_key] = (
+                self._support_current.get(history_key, 0) + support_delta
             )
 
     def begin_iteration(self, iteration_id: int) -> None:
@@ -441,6 +491,7 @@ class FusionIssueScheduler:
         packs_before = self._active_state_packs()
         for query_id in releasable:
             del self.states[query_id]
+            del self._state_history_key[query_id]
         remaining_packs = {
             query_id // self.query_state_lanes for query_id in self.states
         }
@@ -459,6 +510,14 @@ class FusionIssueScheduler:
             "query_state_entries_peak": self._peak_state_packs,
             "query_state_entries_released": self._released_state_packs,
             "query_state_lanes_live": len(self.states),
+        }
+
+    def history_snapshot(self) -> dict[str, int]:
+        return {
+            "query_history_restored": self._history_restored_queries,
+            "query_history_candidate_evaluations": self._history_candidate_evaluations,
+            "query_load_rule_evaluations": self._load_rule_evaluations,
+            "query_load_rule_selection_changes": self._load_rule_selection_changes,
         }
 
     def observe_arrival(
@@ -564,10 +623,35 @@ class FusionIssueScheduler:
         """Choose ready conflict-free FIFO heads without committing state."""
 
         candidates = list(candidates)
-        ordered = self.forecast(candidates) if use_load_rules else candidates
-        return self.select_in_order(
+        if not use_load_rules:
+            return self.select_in_order(
+                candidates,
+                occupied_keys=occupied_keys,
+                occupied_targets=occupied_targets,
+            )
+        self._load_rule_evaluations += 1
+        self._history_candidate_evaluations += sum(
+            any(
+                (state := self.states.get(query_id)) is not None
+                and state.history_valid
+                for query_id in task.query_lane_ids
+            )
+            for task in candidates
+        )
+        ordered = self.forecast(candidates)
+        baseline = self.select_in_order(
+            candidates,
+            occupied_keys=occupied_keys,
+            occupied_targets=occupied_targets,
+        )
+        selected = self.select_in_order(
             ordered, occupied_keys=occupied_keys, occupied_targets=occupied_targets,
         )
+        if tuple(task.event_id for task in selected.accepted) != tuple(
+            task.event_id for task in baseline.accepted
+        ):
+            self._load_rule_selection_changes += 1
+        return selected
 
     def select_in_order(
         self,

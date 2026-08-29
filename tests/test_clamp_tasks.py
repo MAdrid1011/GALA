@@ -51,8 +51,13 @@ def test_query_history_survives_release_and_changes_next_iteration_priority() ->
     )
     scheduler.set_strict_lifecycle()
     for _ in range(3):
-        scheduler.relation_accept((1,), iteration_id=0)
-    scheduler.relation_accept((2,), iteration_id=0, adjoint_query_ids=(2,))
+        scheduler.relation_accept(
+            (1,), iteration_id=0, history_keys=((1, 0),),
+        )
+    scheduler.relation_accept(
+        (2,), iteration_id=0, adjoint_query_ids=(2,),
+        history_keys=((1, 1),),
+    )
     scheduler.producer_close((1, 2))
     scheduler.reduction_writeback((1, 2))
     scheduler.forward_retire((1, 1, 1, 2))
@@ -60,28 +65,35 @@ def test_query_history_survives_release_and_changes_next_iteration_priority() ->
     assert scheduler.release_completed() == 2
 
     scheduler.relation_accept(
-        (1, 2), iteration_id=1, adjoint_query_ids=(2,),
+        (101, 102), iteration_id=1, adjoint_query_ids=(102,),
+        history_keys=((1, 0), (1, 1)),
     )
-    scheduler.producer_close((2,))
-    scheduler.reduction_writeback((2,))
-    scheduler.forward_retire((2,))
+    scheduler.producer_close((102,))
+    scheduler.reduction_writeback((102,))
+    scheduler.forward_retire((102,))
     high_previous_load = TaskPacket(
-        0, 1, 1, 1, 1, 0, 1, 0, TaskKind.FORWARD,
+        0, 101, 1, 101, 1, 0, 1, 0, TaskKind.FORWARD,
         target_resource=9,
     )
     stable_load = TaskPacket(
-        1, 2, 2, 2, 1, 0, 1, 1, TaskKind.ADJOINT,
+        1, 102, 2, 102, 1, 0, 1, 1, TaskKind.ADJOINT,
         target_resource=9,
     )
 
-    assert scheduler.states[1].forecast()[0] == 3
-    assert scheduler.states[1].exact_remaining(TaskKind.FORWARD) == 1
+    assert scheduler.states[101].forecast()[0] == 3
+    assert scheduler.states[101].exact_remaining(TaskKind.FORWARD) == 1
     assert scheduler.select(
         (high_previous_load, stable_load), use_load_rules=False,
     ).accepted == (high_previous_load,)
     assert scheduler.select(
         (high_previous_load, stable_load), use_load_rules=True,
     ).accepted == (stable_load,)
+    assert scheduler.history_snapshot() == {
+        "query_history_restored": 2,
+        "query_history_candidate_evaluations": 2,
+        "query_load_rule_evaluations": 1,
+        "query_load_rule_selection_changes": 1,
+    }
 
 
 def test_forecast_is_pure_and_issue_uses_typed_conflict_keys() -> None:

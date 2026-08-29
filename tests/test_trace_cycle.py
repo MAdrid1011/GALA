@@ -29,7 +29,10 @@ from gala_sim.timing import (
 from gala_sim.timing.engine import _DependencyIndex
 from gala_sim.timing.memory import Ramulator2Backend, RecordedMemoryBackend
 from gala_sim.config import load_config
-from gala_sim.trace import NumpyChunkSink, TraceReader, TraceWriter, TraceValidationError, validate_trace
+from gala_sim.trace import (
+    NumpyChunkSink, Trace, TraceReader, TraceWriter, TraceValidationError,
+    validate_trace,
+)
 from gala_sim.trace import (
     VirtualPacketArchiveReader,
     VirtualPacketArchiveWriter,
@@ -1492,6 +1495,97 @@ def test_online_query_load_rules_drain_pending_fifo_heads() -> None:
     assert result.event_counts["CONSUMER"] == 1
     assert result.event_counts["ADJOINT"] == 1
     assert session.quiescent
+
+
+def test_online_query_history_uses_template_local_identity_across_iterations() -> None:
+    engine = CycleEngine(_config(), policy="variant:1000")
+    session = engine.online_session(max_events=16, initial_gaussian_count=1)
+
+    for iteration, iteration_query_base in ((1, 0), (2, 2)):
+        packets = []
+        for template_id, query_base, query_shape, mask_words in (
+            (1, iteration_query_base, (1, 1), 8),
+            (2, iteration_query_base + 1, (1, 1, 1), 16),
+        ):
+            masks = np.zeros((1, mask_words), dtype=np.dtype("<u4"))
+            masks[0, 0] = 1
+            packets.append(VirtualTracePacket(
+                iteration_id=iteration, template_id=template_id,
+                query_base=query_base, query_shape=query_shape,
+                point_ids=np.asarray([0], dtype=np.int64),
+                point_keys=np.asarray([0], dtype=np.uint64), masks=masks,
+                loss_flags=1, backward_confirmed=True,
+            ))
+        session.accept_query_packets(packets)
+        session.close_iteration(iteration)
+
+    result = session.finish()
+
+    assert result.module_counters["fusion_issue"]["query_history_restored"] == 2
+    assert (
+        result.module_counters["fusion_issue"]
+        ["query_history_candidate_evaluations"]
+    ) > 0
+    assert session.quiescent
+
+
+def test_offline_query_packet_boundary_releases_iterations_in_order() -> None:
+    expander = VirtualQueryEventExpander(max_events=16)
+    row_parts = []
+    dependency_parts = []
+    dependency_offset = 0
+    packet_metadata = []
+    for iteration, query_base in ((1, 10), (2, 20)):
+        masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
+        masks[0, 0] = 1
+        packet = VirtualTracePacket(
+            iteration_id=iteration,
+            template_id=1,
+            query_base=query_base,
+            query_shape=(1, 1),
+            point_ids=np.asarray([0], dtype=np.int64),
+            point_keys=np.asarray([0], dtype=np.uint64),
+            masks=masks,
+            loss_flags=1,
+            backward_confirmed=True,
+        )
+        for event_packet in expander.expand(packet):
+            rows = event_packet.events.copy()
+            rows["dependency_begin"] += dependency_offset
+            row_parts.append(rows)
+            dependency_parts.append(event_packet.dependencies)
+            dependency_offset += event_packet.dependencies.size
+        packet_metadata.append({
+            "query_base": query_base,
+            "query_count": 1,
+            "candidate_count": 1,
+        })
+    trace = Trace(
+        np.concatenate(row_parts),
+        np.concatenate(dependency_parts),
+        np.empty(0, dtype=np.dtype("<f4")),
+        {
+            "schema_version": "gala-clamp-events-v2",
+            "initial_gaussian_count": 1,
+            "trace_sample": {
+                "schema_version": "gala-query-packet-sample-v1",
+                "result_scope": "quick_cycle_validation",
+                "formal_performance_eligible": False,
+                "quality_eligible": False,
+                "boundary_condition": (
+                    "prior_selected_packet_completes_before_next_iteration"
+                ),
+                "packets": packet_metadata,
+            },
+        },
+    )
+
+    config_path = Path(__file__).parents[1] / "configs/architecture/gala.yaml"
+    config = CycleConfig.from_gala(load_config(config_path), _Memory())
+    result = CycleEngine(config, policy="variant:1000").run(trace)
+
+    assert result.event_counts["GRADIENT_REDUCTION"] == 2
+    assert result.module_counters["fusion_issue"]["query_history_restored"] == 1
 
 
 def test_fusion_issue_applies_each_task_class_port_limit() -> None:

@@ -6,7 +6,14 @@ from .validator import (
     TraceValidationConfig, TraceValidationError, TraceValidationReport, validate_trace,
 )
 from .sink import DeviceTraceSink, NumpyChunkSink
-from .sample import QueryRange, TraceSampleConfig, dependency_closed_query_sample
+from .sample import (
+    QUERY_PACKET_SAMPLE_SCHEMA_VERSION,
+    QueryPacketSampleConfig,
+    QueryRange,
+    TraceSampleConfig,
+    dependency_closed_query_sample,
+    real_query_packet_sample,
+)
 from .packetize import (
     PACKET_DERIVATION_SCHEMA_VERSION,
     QueryDomain,
@@ -53,8 +60,11 @@ __all__ = [
     "DeviceTraceSink",
     "NumpyChunkSink",
     "QueryRange",
+    "QueryPacketSampleConfig",
     "TraceSampleConfig",
     "dependency_closed_query_sample",
+    "QUERY_PACKET_SAMPLE_SCHEMA_VERSION",
+    "real_query_packet_sample",
     "PACKET_DERIVATION_SCHEMA_VERSION",
     "QueryDomain",
     "derive_quick_relation_packets",
