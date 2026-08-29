@@ -678,24 +678,83 @@ def main(argv: list[str] | None = None) -> int:
             parallel_workers=args.parallel_workers,
         )
         base_cycles = runs[0].result.total_cycles
-        rows = [AblationRow(
-            model=str(trace.metadata.get("model", "unknown")),
-            dataset=str(trace.metadata.get("dataset", "unknown")), bits=run.variant.bits,
-            cycles=run.result.total_cycles,
-            speedup_vs_base_asic=runs[0].result.total_cycles / run.result.total_cycles,
-            local_gpu_seconds=None, orin_seconds=None, speedup_vs_orin=None,
-            psnr_delta_db=None, ssim_delta=None, lpips_delta=None,
-            config_sha256=str(trace.metadata.get("config_sha256", "")),
-            status="passed",
-        ) for run in runs]
-        write_ablation_csv(rows, args.output)
-        if quick_scope:
+        model = str(trace.metadata.get("model", "unknown"))
+        dataset = str(trace.metadata.get("dataset", "unknown"))
+        source_identity = str(
+            sample_metadata.get("source_identity", "trace")
+            if isinstance(sample_metadata, dict) else "trace"
+        )
+        run_prefix = f"{model}-{dataset}-{source_identity[:12]}"
+        breakdown_root = args.output.parent / f"{args.output.name}.modules"
+        breakdown_paths: dict[str, str] = {}
+        rows: list[AblationRow] = []
+        for run in runs:
+            breakdown_path = breakdown_root / f"{run.variant.bits}.json"
+            stall_counts: dict[str, int] = {}
+            for stall in run.result.stalls:
+                stall_counts[stall.module] = stall_counts.get(stall.module, 0) + stall.count
             write_json({
-                "result_scope": "quick_cycle_validation",
-                "formal_performance_eligible": False,
-                "trace_sample": sample_metadata,
-                "trace_window": window_metadata,
-            }, args.output.with_suffix(args.output.suffix + ".manifest.json"))
+                "schema_version": "gala-ablation-module-breakdown-v1",
+                "result_scope": "quick_cycle_validation" if quick_scope else "formal_performance",
+                "formal_performance_eligible": not quick_scope,
+                "bits": run.variant.bits,
+                "run_id": f"{run_prefix}-{run.variant.bits}",
+                "policy": run.result.policy,
+                "total_cycles": run.result.total_cycles,
+                "module_counters": run.result.module_counters,
+                "module_busy_cycles": {
+                    name: int(counters.get("busy_cycles", 0))
+                    for name, counters in run.result.module_counters.items()
+                },
+                "stall_counts_by_module": stall_counts,
+                "event_counts": run.result.event_counts,
+            }, breakdown_path)
+            breakdown_paths[run.variant.bits] = str(
+                breakdown_path.relative_to(args.output.parent)
+            )
+            rows.append(AblationRow(
+                model=model,
+                dataset=dataset,
+                bits=run.variant.bits,
+                cycles=run.result.total_cycles,
+                speedup_vs_base_asic=base_cycles / run.result.total_cycles,
+                local_gpu_seconds=None,
+                orin_seconds=None,
+                speedup_vs_orin=None,
+                psnr_delta_db=None,
+                ssim_delta=None,
+                lpips_delta=None,
+                config_sha256=str(trace.metadata.get("config_sha256", "")),
+                status="passed",
+                module_breakdown_path=breakdown_paths[run.variant.bits],
+                run_id=f"{run_prefix}-{run.variant.bits}",
+            ))
+        write_ablation_csv(rows, args.output)
+        write_json({
+            "schema_version": "gala-ablation-manifest-v1",
+            "result_scope": "quick_cycle_validation" if quick_scope else "formal_performance",
+            "formal_performance_eligible": not quick_scope,
+            "trace_sample": sample_metadata,
+            "trace_window": window_metadata,
+            "hash_validation": "disabled_by_user_request",
+            "module_breakdown_directory": str(
+                breakdown_root.relative_to(args.output.parent)
+            ),
+            "module_breakdown_paths": breakdown_paths,
+            "full_alias": {
+                "policy": "full",
+                "variant_bits": "1111",
+                "run_id": f"{run_prefix}-1111",
+                "cycles": next(
+                    run.result.total_cycles for run in runs
+                    if run.variant.bits == "1111"
+                ),
+                "selection_contract_equal": (
+                    CycleEngine._selection_for_policy("full")
+                    == CycleEngine._selection_for_policy("variant:1111")
+                ),
+            },
+        }, args.output.with_suffix(args.output.suffix + ".manifest.json"))
         print(json.dumps({"variants": len(runs), "status": "passed"}, sort_keys=True))
         return 0
     except (OSError, KeyError, TypeError, ValueError, RuntimeError) as error:

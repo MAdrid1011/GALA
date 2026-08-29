@@ -25,6 +25,8 @@ class AblationRow:
     lpips_delta: float | None
     config_sha256: str
     status: str
+    module_breakdown_path: str | None = None
+    run_id: str | None = None
 
 
 def validate_full_variant(base_cycles: int, full_cycles: int, entry_bits: str,

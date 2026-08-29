@@ -41,3 +41,18 @@ def test_ablation_output_does_not_gate_on_recorded_configuration_hashes(
         **rows[1].__dict__, "config_sha256": "different-recorded-hash",
     })
     write_ablation_csv(rows, tmp_path / "ablation.csv")
+
+
+def test_ablation_output_keeps_module_breakdown_and_run_identity(tmp_path: Path) -> None:
+    rows = _rows()
+    rows[0] = AblationRow(**{
+        **rows[0].__dict__,
+        "module_breakdown_path": "ablation.csv.modules/0000.json",
+        "run_id": "fixture-0000",
+    })
+    output = tmp_path / "ablation.csv"
+    write_ablation_csv(rows, output)
+    with output.open(newline="", encoding="utf-8") as stream:
+        first = next(csv.DictReader(stream))
+    assert first["module_breakdown_path"] == "ablation.csv.modules/0000.json"
+    assert first["run_id"] == "fixture-0000"
