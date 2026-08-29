@@ -26,7 +26,34 @@ CLAMP-CUDA 软件端点为 A0B0/A1B0/A0B1/A1B1 `1.000x/1.254x/1.282x/1.482x`，
   `GALA-runtime/records/r2_gaussian_chest_strict_stage_gate_v1_bounds/`，明确标记为
   `quick_cycle_validation`；Query 和 Full 的共同必要下界为 `19,779 cycles`，分别对应乐观
   最大加速 `2.363264x`，但这不是可达调度预测。完整回归为
-  `327 passed, 1 skipped, 2 warnings`。
+  `329 passed, 1 skipped, 2 warnings`。
+
+- 2026-08-29 修正 Query future-visible 验证路径的两个作用域错误：前向、消费者和伴随现在各自
+  使用独立的 32 项候选 FIFO 容量，不再误共享一个总 32 项容量；future 权重只改变 Fusion 候选
+  选择，不再重排关系构造、ComputePod、查询归约等机制覆盖范围外的模块。修正后的 future 成员
+  在同一真实 quick trace 上完成全部 `846,012` 个事件，周期由旧实现约 `45,728` 降为
+  `34,675 cycles`，但仍比实际 Query 的 `34,471 cycles` 慢 `204 cycles`。因此当前 portfolio
+  只能称为 `best_known_not_proven_upper_bound`，不能冒充文档要求的最优 Oracle；资源必要下界
+  `19,779 cycles` 仍只证明完整 Chest 的 Query 派生参考在资源上未被排除。结果位于仓库外
+  `GALA-runtime/records/r2_gaussian_chest_query_oracle_scope_fix_v1_future/`。
+
+- 查询调度器此前虽然定义了 `R_s/R_p/H`，周期引擎却从未推进 round boundary，且查询状态释放
+  会丢失历史，因此 A 的上一迭代支持域预测实际上始终无效。当前实现按真实 `iteration_id` 前进
+  时将本轮 `R_s` 固化为下一轮 `R_p`，在活动查询状态释放后由历史 sidecar 保留，并在下一轮
+  重新分配同一查询时恢复 `R_p/H`；若迭代前进时仍有未闭合 F/C/A，直接拒绝而不混合两轮状态。
+  定向测试证明历史预测在真实 forward/adjoint 两队首发生目标冲突时改变 A 的选择，而关闭 A 的
+  Base 仍按到达顺序单发射。当前 `r2_gaussian_chest_median_packets_v1` 的全部事件都属于唯一的
+  `iteration_id=1`，只能验证 C 的跨阶段发射，不能测量 A 的历史预测收益；下一验证入口必须是
+  相邻真实迭代的同查询样本，不能把单迭代结果包装成完整 A1B0 结论。
+
+- 实际 Query 的 ComputeTelemetry 在同一 quick trace 上精确复现 `34,471 cycles`。FORWARD 从
+  依赖就绪到 Fusion 平均等待 `2,618.26 cycles`，Fusion 到 ComputePod 平均仅 `3.04 cycles`；
+  ADJOINT 从依赖就绪到 Fusion 平均等待 `1,828.13 cycles`，Fusion 到 query replay 平均
+  `665.89 cycles`。四个 Pod 的 active-microcontext 面积为
+  `112,621/134,140/107,609/134,231`，至少一簇活跃周期为
+  `25,794/26,629/24,451/26,889`，最轻与最重 Pod 的工作面积相差约 `24.7%`。这说明当前 Query
+  机制尚未充分改善负载均衡，优先分析 Fusion 排队、伴随 replay 和 Pod 映射，而不是增加前向
+  ComputePod 接口。遥测位于仓库外 `GALA-runtime/records/r2_gaussian_chest_query_telemetry_v1/`。
 
 - 2026-08-29 已将关系窗口记录生命周期改为物理 packet 级回收：每条 RelationPacket 的全部伴随
   lane 完成后立即释放对应关系记录，窗口表项仍保持 producer/forward/consumer/adjoint 四类引用

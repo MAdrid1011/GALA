@@ -249,6 +249,9 @@ class FusionIssueScheduler:
     _slot_to_pack: dict[int, int] = field(default_factory=dict, init=False, repr=False)
     _free_slots: list[int] = field(default_factory=list, init=False, repr=False)
     _next_dynamic_slot: int = field(default=0, init=False, repr=False)
+    _iteration_id: int | None = field(default=None, init=False, repr=False)
+    _support_current: dict[int, int] = field(default_factory=dict, init=False, repr=False)
+    _support_previous: dict[int, int] = field(default_factory=dict, init=False, repr=False)
 
     def __post_init__(self) -> None:
         if min(self.candidate_lanes, self.forward_ports, self.consumer_ports,
@@ -280,6 +283,9 @@ class FusionIssueScheduler:
         self._clock = 0
         self._peak_state_packs = 0
         self._released_state_packs = 0
+        self._iteration_id = None
+        self._support_current.clear()
+        self._support_previous.clear()
         self._reset_slots()
 
     def set_clock(self, cycle: int) -> None:
@@ -311,7 +317,12 @@ class FusionIssueScheduler:
                     slot = heapq.heappop(self._free_slots)
                 self._pack_to_slot[logical_pack] = slot
                 self._slot_to_pack[slot] = logical_pack
-            self.states.setdefault(query_id, QueryState())
+            previous = self._support_previous.get(query_id)
+            self.states[query_id] = QueryState(
+                current_round=self._support_current.get(query_id, 0),
+                previous_round=previous or 0,
+                history_valid=previous is not None,
+            )
             self._peak_state_packs = max(
                 self._peak_state_packs, len(self._pack_to_slot),
             )
@@ -335,7 +346,10 @@ class FusionIssueScheduler:
         *,
         adjoint_query_ids: Iterable[int] = (),
         support_delta: int = 1,
+        iteration_id: int | None = None,
     ) -> None:
+        if iteration_id is not None:
+            self.begin_iteration(iteration_id)
         query_ids = tuple(query_ids)
         adjoint_ids = set(adjoint_query_ids)
         self.allocate(query_ids)
@@ -344,6 +358,31 @@ class FusionIssueScheduler:
                 needs_adjoint=query_id in adjoint_ids,
                 support_delta=support_delta,
             )
+            self._support_current[query_id] = (
+                self._support_current.get(query_id, 0) + support_delta
+            )
+
+    def begin_iteration(self, iteration_id: int) -> None:
+        """Roll observed support into the history sidecar at a real boundary."""
+
+        if iteration_id < 0:
+            raise ValueError("iteration ID must be non-negative")
+        if self._iteration_id is None:
+            self._iteration_id = iteration_id
+            return
+        if iteration_id < self._iteration_id:
+            raise ValueError("query history iteration moves backwards")
+        if iteration_id == self._iteration_id:
+            return
+        self.release_completed()
+        if self.states:
+            raise ValueError("query history advances with live F/C/A state")
+        self._support_previous = (
+            dict(self._support_current)
+            if iteration_id == self._iteration_id + 1 else {}
+        )
+        self._support_current.clear()
+        self._iteration_id = iteration_id
 
     def producer_close(self, query_ids: Iterable[int]) -> None:
         query_ids = tuple(query_ids)

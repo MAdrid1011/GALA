@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 
 from gala_sim.clamp.builder import TraceBuilder
@@ -179,7 +181,7 @@ def test_query_oracle_selects_exact_legal_combination_from_bounded_queue() -> No
     assert set(selected) == {forward_ids[0], consumer}
 
 
-def test_query_oracle_orders_every_ready_stage_by_future_path() -> None:
+def test_query_oracle_does_not_reorder_non_fusion_modules() -> None:
     builder = TraceBuilder()
     first = builder.emit(TraceEvent(
         primitive_kind=int(PrimitiveKind.RELATION), query_id=0,
@@ -195,7 +197,39 @@ def test_query_oracle_orders_every_ready_stage_by_future_path() -> None:
 
     assert engine._ordered_candidates(
         trace, [first, second], future_plan=future
-    ) == [second, first]
+    ) == [first, second]
+
+
+def test_query_oracle_uses_independent_per_source_fifo_capacity() -> None:
+    builder = TraceBuilder()
+    first_forward = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.FORWARD), query_id=0,
+        gaussian_id=0, reduction_key=0, address_token=0,
+    ))
+    second_forward = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.FORWARD), query_id=1,
+        gaussian_id=1, reduction_key=1, address_token=1,
+    ))
+    consumer = builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CONSUMER), query_id=9,
+        gaussian_id=9, reduction_key=9, address_token=9,
+    ))
+    previous = consumer
+    for _ in range(4):
+        previous = builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.QUERY_REDUCTION),
+            query_id=9, reduction_key=9,
+        ), dependencies=[previous])
+    trace = builder.finish()
+    result = CycleEngine(
+        replace(_config(), candidate_fifo_entries=1),
+        policy="query_oracle",
+    ).run(trace, validate_input=False)
+    assert result.oracle_member_results is not None
+    future = result.oracle_member_results["future"]
+
+    assert future.completion_cycles[first_forward] < future.completion_cycles[second_forward]
+    assert future.completion_cycles[consumer] < future.completion_cycles[second_forward]
 
 
 def test_online_oracle_refuses_to_claim_future_visibility() -> None:

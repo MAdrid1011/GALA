@@ -680,7 +680,9 @@ class CycleEngine:
                 raise CycleConfigurationError(
                     "query Oracle candidate ordering requires a future plan"
                 )
-            base_order = sorted(base_order, key=future_plan.query_priority)
+            # Future visibility is confined to Fusion candidate selection.
+            # Reordering unrelated modules changes arbitration outside the
+            # mechanism whose upper bound this Oracle is meant to measure.
         if self.selection.semantic_residency and not self.selection.residency_oracle:
             cache_kinds = {PrimitiveKind.CACHE_REQUEST, PrimitiveKind.CACHE_RETURN}
             cache_positions = [
@@ -809,6 +811,7 @@ class CycleEngine:
                     adjoint_query_ids=(
                         (query_id,) if relation_id in adjoint_relation_ids else ()
                     ),
+                    iteration_id=int(row["iteration_id"]),
                 )
             elif kind is PrimitiveKind.QUERY_CLOSE:
                 self.issue_scheduler.producer_close((query_id,))
@@ -1718,7 +1721,13 @@ class CycleEngine:
             TaskKind.CONSUMER: deque(),
             TaskKind.ADJOINT: deque(),
         }
-        fusion_oracle_inputs: list[tuple[tuple[int, int], int, TaskKind]] = []
+        fusion_oracle_inputs: dict[
+            TaskKind, list[tuple[tuple[int, int], int]]
+        ] = {
+            TaskKind.FORWARD: [],
+            TaskKind.CONSUMER: [],
+            TaskKind.ADJOINT: [],
+        }
         packet_ready_members: dict[int, set[int]] = defaultdict(set)
         packet_ready_stages: set[tuple[int, int]] = set()
         consumer_credit_owner: dict[int, int] = {}
@@ -1833,8 +1842,8 @@ class CycleEngine:
                 ready[(module_name, partition)].push((event_id, stage))
             elif self.selection.query_oracle:
                 heapq.heappush(
-                    fusion_oracle_inputs,
-                    (fusion_priority(event_id), event_id, task_kind),
+                    fusion_oracle_inputs[task_kind],
+                    (fusion_priority(event_id), event_id),
                 )
             else:
                 fusion_inputs[task_kind].appendleft(event_id)
@@ -2185,12 +2194,12 @@ class CycleEngine:
                 for _ in range(pending_count):
                     event_id, task_kind = fusion_pending.popleft()
                     if self.selection.query_oracle:
-                        if len(fusion_oracle_inputs) >= fusion_capacity:
+                        if len(fusion_oracle_inputs[task_kind]) >= fusion_capacity:
                             blocked_pending.append((event_id, task_kind))
                             continue
                         heapq.heappush(
-                            fusion_oracle_inputs,
-                            (fusion_priority(event_id), event_id, task_kind),
+                            fusion_oracle_inputs[task_kind],
+                            (fusion_priority(event_id), event_id),
                         )
                     else:
                         if len(fusion_inputs[task_kind]) >= fusion_capacity:
@@ -2233,19 +2242,24 @@ class CycleEngine:
                     assert future_plan is not None
                     selected_ids = set(self._select_query_oracle_candidates(
                         trace,
-                        (entry[1] for entry in fusion_oracle_inputs),
+                        (
+                            entry[1]
+                            for queue in fusion_oracle_inputs.values()
+                            for entry in queue
+                        ),
                         future_plan,
                         packet_plan,
                     ))
-                    retained: list[tuple[tuple[int, int], int, TaskKind]] = []
-                    while fusion_oracle_inputs:
-                        entry = heapq.heappop(fusion_oracle_inputs)
-                        if entry[1] in selected_ids:
-                            candidates.append((entry[1], 0))
-                        else:
-                            retained.append(entry)
-                    for entry in retained:
-                        heapq.heappush(fusion_oracle_inputs, entry)
+                    for queue in fusion_oracle_inputs.values():
+                        retained: list[tuple[tuple[int, int], int]] = []
+                        while queue:
+                            entry = heapq.heappop(queue)
+                            if entry[1] in selected_ids:
+                                candidates.append((entry[1], 0))
+                            else:
+                                retained.append(entry)
+                        for entry in retained:
+                            heapq.heappush(queue, entry)
                 else:
                     for task_kind in (
                         TaskKind.FORWARD, TaskKind.CONSUMER, TaskKind.ADJOINT,
@@ -2980,7 +2994,10 @@ class CycleEngine:
                         task_kind.value: len(queue)
                         for task_kind, queue in fusion_inputs.items()
                     }
-                    ready_state["fusion_oracle_inputs"] = len(fusion_oracle_inputs)
+                    ready_state["fusion_oracle_inputs"] = {
+                        task_kind.name.lower(): len(queue)
+                        for task_kind, queue in fusion_oracle_inputs.items()
+                    }
                     owner_gradient_state: dict[str, object] = {}
                     if owner_gradients is not None:
                         pending_adjoint_ids: list[int] = []
