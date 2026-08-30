@@ -5231,6 +5231,12 @@ class CycleReplaySession:
         return self._cycle
 
     @property
+    def completed_cycles(self) -> int:
+        """Latest completed hardware cycle at a quiescent prefix boundary."""
+
+        return self._last_completion_cycle
+
+    @property
     def source_packet_count(self) -> int:
         return self._source_packets
 

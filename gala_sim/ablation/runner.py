@@ -5,10 +5,18 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 import multiprocessing as mp
 from pathlib import Path
-from typing import Callable
+from typing import Any, Callable
 
-from gala_sim.trace import Trace, VirtualPacketArchiveReader, validate_trace
-from gala_sim.timing import CycleConfig, CycleEngine, CycleProgress, CycleResult
+from gala_sim.trace import (
+    Trace, VirtualPacketArchiveReader, validate_trace,
+)
+from gala_sim.timing import (
+    BufferedVirtualCycleConsumer, CycleConfig, CycleEngine, CycleProgress,
+    CycleResult,
+)
+from gala_sim.tools.cycle_throughput import (
+    ArchiveSpeedupMonitor, ThroughputDiagnosticConfig,
+)
 
 from .matrix import AblationVariant, all_variants, validate_matrix
 
@@ -142,6 +150,114 @@ def run_archive_matrix(
     if len(event_counts) != 1:
         raise AssertionError("archive ablation variants changed the dynamic event set")
     return runs
+
+
+def run_archive_speedup_diagnostic(
+    archive_root: Path,
+    config: CycleConfig,
+    diagnostic_config: ThroughputDiagnosticConfig,
+    *,
+    max_events: int,
+    max_frontier_events: int | None = None,
+    max_atomic_packet_events: int | None = None,
+    progress: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    """Replay all variants to common iteration boundaries and stop on convergence."""
+
+    reader = VirtualPacketArchiveReader(Path(archive_root))
+    reader.validate()
+    variants = all_variants()
+    total_iterations = int(reader.manifest["iteration_count"])
+    if total_iterations <= 0:
+        raise ValueError("archive speedup diagnostic requires closed iterations")
+    consumers: dict[str, BufferedVirtualCycleConsumer] = {}
+    for variant in variants:
+        session = CycleEngine(
+            _run_config(config), policy=_policy(variant),
+        ).online_session(
+            max_events=max_events,
+            max_frontier_events=max_frontier_events,
+            max_atomic_packet_events=max_atomic_packet_events,
+            initial_gaussian_count=reader.initial_gaussian_count,
+            total_iterations=total_iterations,
+        )
+        consumers[variant.bits] = BufferedVirtualCycleConsumer(session)
+    monitor = ArchiveSpeedupMonitor(
+        diagnostic_config,
+        variants=tuple(variant.bits for variant in variants),
+    )
+    termination = "complete_trace_replay"
+    for kind, value in reader.records():
+        if kind == "packet":
+            for consumer in consumers.values():
+                consumer.accept_query_packet(value)
+            continue
+        if kind == "lifecycle":
+            for consumer in consumers.values():
+                consumer.accept_lifecycle(value)
+            continue
+        for consumer in consumers.values():
+            consumer.close_iteration(value)
+        completed_counts = {
+            consumer.session.closed_iteration_count
+            for consumer in consumers.values()
+        }
+        event_counts = {
+            consumer.session.completed_event_count
+            for consumer in consumers.values()
+        }
+        if len(completed_counts) != 1 or len(event_counts) != 1:
+            raise AssertionError("archive variants left a common iteration boundary")
+        report = monitor.observe(
+            iteration_id=int(value),
+            completed_iterations=completed_counts.pop(),
+            total_iterations=total_iterations,
+            completed_events=event_counts.pop(),
+            cycles_by_variant={
+                bits: consumer.session.completed_cycles
+                for bits, consumer in consumers.items()
+            },
+        )
+        if progress is not None:
+            progress(report)
+        if (
+            report["stability"]["status"] == "stable"
+            and not report["complete_trace_replay"]
+        ):
+            termination = "stopped_on_stable_speedup"
+            break
+    results = {
+        bits: consumer.finish() for bits, consumer in consumers.items()
+    }
+    dynamic_event_sets = {
+        tuple(sorted(result.event_counts.items())) for result in results.values()
+    }
+    if len(dynamic_event_sets) != 1:
+        raise AssertionError("speedup diagnostic variants changed the dynamic event set")
+    report = monitor.report()
+    latest = report["samples"][-1]
+    for bits, result in results.items():
+        if result.total_cycles != latest["cycles_by_variant"][bits]:
+            raise AssertionError(
+                f"variant {bits} prefix result disagrees with convergence boundary"
+            )
+    report.update({
+        "termination": termination,
+        "archive": str(Path(archive_root).resolve()),
+        "measured_iteration_count": latest["completed_iterations"],
+        "measured_last_iteration": latest["iteration_id"],
+        "variant_results": {
+            bits: {
+                "measured_prefix_cycles": result.total_cycles,
+                "projected_total_cycles": latest["projected_total_cycles"][bits],
+                "speedup_vs_base_asic": latest["cumulative_speedup_vs_base"][bits],
+                "completed_events": consumers[bits].session.completed_event_count,
+                "event_counts": result.event_counts,
+            }
+            for bits, result in results.items()
+        },
+    })
+    return report
 
 
 def _run_variant(trace: Trace, config: CycleConfig, variant: AblationVariant) -> AblationRun:

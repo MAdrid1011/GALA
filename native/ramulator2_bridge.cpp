@@ -1,6 +1,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <map>
 #include <memory>
 #include <stdexcept>
 #include <string>
@@ -50,7 +51,28 @@ class Bridge {
         transaction_bytes_);
   }
 
-  void tick() { memory_->tick(); }
+  void enqueue_group(std::uint64_t group_id, const std::uint64_t* addresses,
+                     const std::uint64_t* request_ids, std::size_t count,
+                     bool write) {
+    if (addresses == nullptr || request_ids == nullptr || count == 0) {
+      throw std::invalid_argument("Ramulator request group is empty");
+    }
+    if (pending_groups_.contains(group_id)) {
+      throw std::invalid_argument("Ramulator request group is duplicated");
+    }
+    PendingGroup group;
+    group.write = write;
+    for (std::size_t index = 0; index < count; ++index) {
+      group.beats.push_back({addresses[index], request_ids[index]});
+    }
+    pending_groups_.emplace(group_id, std::move(group));
+    issue_waiting();
+  }
+
+  void tick() {
+    issue_waiting();
+    memory_->tick();
+  }
 
   std::size_t completion_count() const { return completions_.size(); }
 
@@ -69,8 +91,37 @@ class Bridge {
   int transaction_bytes() const { return transaction_bytes_; }
 
  private:
+  struct PendingBeat {
+    std::uint64_t address;
+    std::uint64_t request_id;
+  };
+
+  struct PendingGroup {
+    bool write{};
+    std::deque<PendingBeat> beats;
+  };
+
+  void issue_waiting() {
+    auto group = pending_groups_.begin();
+    while (group != pending_groups_.end()) {
+      while (!group->second.beats.empty()) {
+        const PendingBeat& beat = group->second.beats.front();
+        if (!try_issue(beat.address, group->second.write, beat.request_id)) {
+          break;
+        }
+        group->second.beats.pop_front();
+      }
+      if (group->second.beats.empty()) {
+        group = pending_groups_.erase(group);
+      } else {
+        ++group;
+      }
+    }
+  }
+
   std::unique_ptr<Ramulator::IFrontEnd> frontend_;
   std::unique_ptr<Ramulator::IMemorySystem> memory_;
+  std::map<std::uint64_t, PendingGroup> pending_groups_;
   std::deque<std::uint64_t> completions_;
   int transaction_bytes_{};
 };
@@ -111,6 +162,20 @@ int gala_ramulator_try_issue(void* handle, std::uint64_t address, int write,
                                                        request_id)
                    ? 1
                    : 0;
+      },
+      -1);
+}
+
+int gala_ramulator_enqueue_group(void* handle, std::uint64_t group_id,
+                                 const std::uint64_t* addresses,
+                                 const std::uint64_t* request_ids,
+                                 std::size_t count, int write) noexcept {
+  return guard(
+      [&]() {
+        if (handle == nullptr) throw std::invalid_argument("bridge handle is null");
+        static_cast<Bridge*>(handle)->enqueue_group(
+            group_id, addresses, request_ids, count, write != 0);
+        return 0;
       },
       -1);
 }

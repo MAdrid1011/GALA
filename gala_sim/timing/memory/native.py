@@ -148,6 +148,22 @@ class NativeRamulator2Binding:
             self._raise_native("Ramulator request issue failed")
         return result == 1
 
+    def enqueue_group(
+        self, *, group_id: int, addresses: tuple[int, ...],
+        request_ids: tuple[int, ...], is_write: bool,
+    ) -> None:
+        if not addresses or len(addresses) != len(request_ids):
+            raise ValueError("Ramulator request group arrays are invalid")
+        count = len(addresses)
+        address_array = (ctypes.c_uint64 * count)(*addresses)
+        request_array = (ctypes.c_uint64 * count)(*request_ids)
+        result = self._library.gala_ramulator_enqueue_group(
+            self._handle, int(group_id), address_array, request_array,
+            count, int(bool(is_write)),
+        )
+        if result != 0:
+            self._raise_native("Ramulator request group enqueue failed")
+
     def tick(self) -> None:
         if self._library.gala_ramulator_tick(self._handle) != 0:
             self._raise_native("Ramulator tick failed")
@@ -194,6 +210,12 @@ class NativeRamulator2Binding:
             ctypes.c_void_p, ctypes.c_uint64, ctypes.c_int, ctypes.c_uint64,
         ]
         library.gala_ramulator_try_issue.restype = ctypes.c_int
+        library.gala_ramulator_enqueue_group.argtypes = [
+            ctypes.c_void_p, ctypes.c_uint64,
+            ctypes.POINTER(ctypes.c_uint64), ctypes.POINTER(ctypes.c_uint64),
+            ctypes.c_size_t, ctypes.c_int,
+        ]
+        library.gala_ramulator_enqueue_group.restype = ctypes.c_int
         library.gala_ramulator_tick.argtypes = [ctypes.c_void_p]
         library.gala_ramulator_tick.restype = ctypes.c_int
         library.gala_ramulator_completion_count.argtypes = [ctypes.c_void_p]

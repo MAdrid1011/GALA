@@ -10,7 +10,9 @@ import shlex
 import sys
 import time
 
-from gala_sim.ablation import run_archive_matrix, run_matrix
+from gala_sim.ablation import (
+    run_archive_matrix, run_archive_speedup_diagnostic, run_matrix,
+)
 from gala_sim.config import load_config, pending_parameters
 from gala_sim.results import AblationRow, write_ablation_csv
 from gala_sim.results.run import RunOutputWriter
@@ -174,6 +176,13 @@ def _parser() -> argparse.ArgumentParser:
     archive_ablation.add_argument("--dataset", default="Chest")
     archive_ablation.add_argument("--quick-validation", action="store_true")
     archive_ablation.add_argument("--parallel-workers", type=int, default=1)
+    archive_ablation.add_argument(
+        "--stop-when-speedup-stable", action="store_true",
+        help=(
+            "stop all seven variants at a common stable iteration boundary; "
+            "writes a development projection instead of a formal matrix"
+        ),
+    )
     return parser
 
 
@@ -426,6 +435,54 @@ def main(argv: list[str] | None = None) -> int:
             inactivity_timeout_seconds = float(
                 gala_config.value("diagnostic.inactivity_timeout_seconds")
             )
+            if args.stop_when_speedup_stable:
+                if args.parallel_workers != 1:
+                    raise ValueError(
+                        "stable-speedup archive replay currently requires one "
+                        "synchronized matrix worker"
+                    )
+                if args.output.exists():
+                    raise ValueError(
+                        "stable-speedup diagnostic output must not already exist"
+                    )
+
+                def speedup_progress(report) -> None:
+                    latest = report["samples"][-1]
+                    print(json.dumps({
+                        "phase": "archive_speedup_diagnostic",
+                        "iteration": latest["iteration_id"],
+                        "completed_iterations": latest["completed_iterations"],
+                        "total_iterations": latest["total_iterations"],
+                        "completion_fraction": latest["completion_fraction"],
+                        "cycles_by_variant": latest["cycles_by_variant"],
+                        "speedup_vs_base_asic": (
+                            latest["cumulative_speedup_vs_base"]
+                        ),
+                        "interval_speedup_vs_base_asic": (
+                            latest["interval_speedup_vs_base"]
+                        ),
+                        "stability": report["stability"],
+                    }, sort_keys=True), file=sys.stderr, flush=True)
+
+                diagnostic = run_archive_speedup_diagnostic(
+                    args.archive, config,
+                    ThroughputDiagnosticConfig.from_gala(gala_config),
+                    max_events=max_events,
+                    max_frontier_events=max_frontier_events,
+                    max_atomic_packet_events=max_frontier_events,
+                    progress=speedup_progress,
+                )
+                write_json(diagnostic, args.output)
+                print(json.dumps({
+                    "status": "diagnostic_stopped"
+                    if diagnostic["termination"] == "stopped_on_stable_speedup"
+                    else "diagnostic_complete",
+                    "termination": diagnostic["termination"],
+                    "output": str(args.output.resolve()),
+                    "measured_iteration_count": diagnostic["measured_iteration_count"],
+                    "formal_performance_eligible": False,
+                }, sort_keys=True))
+                return 0
             variant_watchdogs: dict[str, InactivityWatchdog] = {}
 
             def cycle_progress(variant, item) -> None:

@@ -37,6 +37,40 @@ class _SingleEntryBinding:
         return type(self)()
 
 
+class _ManagedSingleEntryBinding(_SingleEntryBinding):
+    def __init__(self) -> None:
+        super().__init__()
+        self.waiting: list[tuple[int, bool, int]] = []
+        self.enqueue_calls = 0
+        self.try_issue_calls = 0
+
+    def enqueue_group(
+        self, *, group_id: int, addresses: tuple[int, ...],
+        request_ids: tuple[int, ...], is_write: bool,
+    ) -> None:
+        del group_id
+        self.enqueue_calls += 1
+        self.waiting.extend(
+            (address, is_write, request_id)
+            for address, request_id in zip(addresses, request_ids, strict=True)
+        )
+        self._issue_waiting()
+
+    def try_issue(self, address: int, is_write: bool, request_id: int) -> bool:
+        del address, is_write, request_id
+        self.try_issue_calls += 1
+        raise AssertionError("managed pending requests returned to Python")
+
+    def tick(self) -> None:
+        self._issue_waiting()
+        super().tick()
+
+    def _issue_waiting(self) -> None:
+        if self.pending is None and self.waiting:
+            _address, _is_write, request_id = self.waiting.pop(0)
+            self.pending = request_id
+
+
 def test_ramulator_backend_preserves_concurrent_arrivals_and_frontend_backpressure() -> None:
     backend = Ramulator2Backend(_SingleEntryBinding())
     first = backend.submit_async(
@@ -86,3 +120,20 @@ def test_ramulator_backend_caches_immutable_metadata() -> None:
     assert backend.metadata()["transaction_bytes"] == 64
     backend.submit_async(address=0, size_bytes=64, is_write=False, arrival_cycle=0)
     assert binding.metadata_calls == 1
+
+
+def test_ramulator_backend_delegates_pending_retries_to_managed_binding() -> None:
+    binding = _ManagedSingleEntryBinding()
+    backend = Ramulator2Backend(binding)
+    first = backend.submit_async(
+        address=0, size_bytes=128, is_write=False, arrival_cycle=0,
+    )
+    second = backend.submit_async(
+        address=128, size_bytes=64, is_write=True, arrival_cycle=0,
+    )
+    backend.advance(2)
+    assert [item.request_id for item in backend.pop_completions()] == [first]
+    backend.advance(3)
+    assert [item.request_id for item in backend.pop_completions()] == [second]
+    assert binding.enqueue_calls == 2
+    assert binding.try_issue_calls == 0

@@ -4,7 +4,8 @@ import pytest
 
 from gala_sim.timing import CycleProgress
 from gala_sim.tools.cycle_throughput import (
-    ThroughputConverged, ThroughputDiagnosticConfig, ThroughputMonitor,
+    ArchiveSpeedupMonitor, ThroughputConverged, ThroughputDiagnosticConfig,
+    ThroughputMonitor,
     require_empty_diagnostic_output,
 )
 
@@ -110,3 +111,67 @@ def test_early_stop_diagnostic_requires_empty_output(tmp_path) -> None:
     (empty / "cycles.json").write_text("{}", encoding="utf-8")
     with pytest.raises(ValueError, match="absent or empty"):
         require_empty_diagnostic_output(empty)
+
+
+def test_archive_speedup_monitor_requires_common_stable_intervals() -> None:
+    monitor = ArchiveSpeedupMonitor(
+        _config(), variants=("0000", "1010", "1111"),
+    )
+    report = {}
+    for iteration in range(1, 6):
+        report = monitor.observe(
+            iteration_id=iteration,
+            completed_iterations=iteration,
+            total_iterations=10,
+            completed_events=iteration * 100,
+            cycles_by_variant={
+                "0000": iteration * 100,
+                "1010": iteration * 80,
+                "1111": iteration * 50,
+            },
+        )
+    assert report["stability"]["status"] == "stable"
+    assert report["samples"][-1]["cumulative_speedup_vs_base"] == {
+        "0000": 1.0, "1010": 1.25, "1111": 2.0,
+    }
+    assert report["samples"][-1]["interval_speedup_vs_base"] == {
+        "0000": 1.0, "1010": 1.25, "1111": 2.0,
+    }
+    assert report["formal_performance_eligible"] is False
+
+
+def test_archive_speedup_monitor_rejects_recent_phase_change() -> None:
+    monitor = ArchiveSpeedupMonitor(
+        _config(), variants=("0000", "1111"),
+    )
+    for iteration in range(1, 5):
+        monitor.observe(
+            iteration_id=iteration,
+            completed_iterations=iteration,
+            total_iterations=10,
+            completed_events=iteration * 100,
+            cycles_by_variant={"0000": iteration * 100, "1111": iteration * 50},
+        )
+    report = monitor.observe(
+        iteration_id=5,
+        completed_iterations=5,
+        total_iterations=10,
+        completed_events=500,
+        cycles_by_variant={"0000": 500, "1111": 400},
+    )
+    assert report["stability"]["status"] == "collecting"
+    assert report["stability"]["interval_speedup_relative_span"]["1111"] > 0.01
+
+
+def test_archive_speedup_monitor_rejects_variant_set_drift() -> None:
+    monitor = ArchiveSpeedupMonitor(
+        _config(), variants=("0000", "1111"),
+    )
+    with pytest.raises(ValueError, match="variant set changed"):
+        monitor.observe(
+            iteration_id=1,
+            completed_iterations=1,
+            total_iterations=10,
+            completed_events=100,
+            cycles_by_variant={"0000": 100},
+        )

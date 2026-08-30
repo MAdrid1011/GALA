@@ -104,14 +104,26 @@ class Ramulator2Backend:
             self._beat_to_group[beat_id] = group_id
         self._groups[group_id] = _RequestGroup(record, beat_ids, pending_beats)
         self._audit.append(record)
-        self._issue_waiting()
+        enqueue_group = getattr(self.binding, "enqueue_group", None)
+        if callable(enqueue_group):
+            enqueue_group(
+                group_id=group_id,
+                addresses=tuple(address for _beat_id, address in pending_beats),
+                request_ids=tuple(beat_id for beat_id, _address in pending_beats),
+                is_write=record.is_write,
+            )
+            pending_beats.clear()
+        else:
+            self._issue_waiting()
         return group_id
 
     def advance(self, cycle: int) -> None:
         if cycle < self.current_cycle:
             raise ValueError("Ramulator backend cannot move backwards")
+        native_pending_queue = callable(getattr(self.binding, "enqueue_group", None))
         while self.current_cycle < cycle:
-            self._issue_waiting()
+            if not native_pending_queue:
+                self._issue_waiting()
             try:
                 self.binding.tick()
             except AttributeError as error:

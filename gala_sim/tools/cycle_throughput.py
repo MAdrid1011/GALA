@@ -88,6 +88,19 @@ class RuntimeThroughputSample:
     completion_fraction: float
 
 
+@dataclass(frozen=True)
+class ArchiveSpeedupSample:
+    iteration_id: int
+    completed_iterations: int
+    total_iterations: int
+    completion_fraction: float
+    completed_events: int
+    cycles_by_variant: dict[str, int]
+    cumulative_speedup_vs_base: dict[str, float]
+    interval_speedup_vs_base: dict[str, float]
+    projected_total_cycles: dict[str, float]
+
+
 class ThroughputConverged(RuntimeError):
     """Raised only when an explicitly enabled diagnostic may stop early."""
 
@@ -295,6 +308,178 @@ class ThroughputMonitor:
             raise ValueError("throughput stability values must be finite and positive")
         mean = sum(values) / len(values)
         return (max(values) - min(values)) / mean
+
+
+class ArchiveSpeedupMonitor:
+    """Judge convergence only at common, quiescent iteration boundaries."""
+
+    def __init__(
+        self,
+        config: ThroughputDiagnosticConfig,
+        *,
+        variants: tuple[str, ...],
+        base_variant: str = "0000",
+    ) -> None:
+        if not variants or len(set(variants)) != len(variants):
+            raise ValueError("speedup diagnostic variants must be unique")
+        if base_variant not in variants:
+            raise ValueError("speedup diagnostic base variant is absent")
+        self.config = config
+        self.variants = variants
+        self.base_variant = base_variant
+        self.samples: list[ArchiveSpeedupSample] = []
+        self._consecutive_stable_windows = 0
+        self._last_stability_sample_count = 0
+
+    def observe(
+        self,
+        *,
+        iteration_id: int,
+        completed_iterations: int,
+        total_iterations: int,
+        completed_events: int,
+        cycles_by_variant: dict[str, int],
+    ) -> dict[str, Any]:
+        if completed_iterations <= 0 or total_iterations <= 0:
+            raise ValueError("speedup diagnostic iteration counts must be positive")
+        if completed_iterations > total_iterations:
+            raise ValueError("completed iterations exceed total iterations")
+        if completed_events <= 0:
+            raise ValueError("completed events must be positive")
+        if set(cycles_by_variant) != set(self.variants):
+            raise ValueError("speedup diagnostic variant set changed")
+        normalized_cycles = {
+            bits: int(cycles_by_variant[bits]) for bits in self.variants
+        }
+        if any(value <= 0 for value in normalized_cycles.values()):
+            raise ValueError("speedup diagnostic cycles must be positive")
+        previous = self.samples[-1] if self.samples else None
+        if previous is not None:
+            if iteration_id <= previous.iteration_id:
+                raise ValueError("speedup diagnostic iterations are not monotonic")
+            if completed_iterations <= previous.completed_iterations:
+                raise ValueError("completed iteration count is not monotonic")
+            if completed_events <= previous.completed_events:
+                raise ValueError("completed event count is not monotonic")
+            if total_iterations != previous.total_iterations:
+                raise ValueError("total iteration count changed")
+            if any(
+                normalized_cycles[bits] <= previous.cycles_by_variant[bits]
+                for bits in self.variants
+            ):
+                raise ValueError("variant cycles are not monotonic")
+        base_cycles = normalized_cycles[self.base_variant]
+        cumulative_speedups = {
+            bits: base_cycles / normalized_cycles[bits]
+            for bits in self.variants
+        }
+        interval_speedups: dict[str, float] = {}
+        if previous is not None:
+            base_delta = base_cycles - previous.cycles_by_variant[self.base_variant]
+            if base_delta <= 0:
+                raise ValueError("Base ASIC interval cycles must be positive")
+            interval_speedups = {
+                bits: base_delta / (
+                    normalized_cycles[bits] - previous.cycles_by_variant[bits]
+                )
+                for bits in self.variants
+            }
+        completion_fraction = completed_iterations / total_iterations
+        sample = ArchiveSpeedupSample(
+            iteration_id=int(iteration_id),
+            completed_iterations=int(completed_iterations),
+            total_iterations=int(total_iterations),
+            completion_fraction=completion_fraction,
+            completed_events=int(completed_events),
+            cycles_by_variant=normalized_cycles,
+            cumulative_speedup_vs_base=cumulative_speedups,
+            interval_speedup_vs_base=interval_speedups,
+            projected_total_cycles={
+                bits: cycles / completion_fraction
+                for bits, cycles in normalized_cycles.items()
+            },
+        )
+        self.samples.append(sample)
+        return self.report()
+
+    def report(self) -> dict[str, Any]:
+        usable = self.samples[self.config.warmup_samples:]
+        window = usable[-self.config.stability_window_samples:]
+        enough_samples = (
+            len(window) == self.config.stability_window_samples
+            and all(sample.interval_speedup_vs_base for sample in window)
+        )
+        enough_work = bool(
+            self.samples
+            and self.samples[-1].completion_fraction
+            >= self.config.minimum_completion_fraction
+        )
+        compared_variants = tuple(
+            bits for bits in self.variants if bits != self.base_variant
+        )
+        cumulative_spans: dict[str, float] = {}
+        interval_spans: dict[str, float] = {}
+        projection_spans: dict[str, float] = {}
+        if enough_samples:
+            cumulative_spans = {
+                bits: ThroughputMonitor._relative_span([
+                    sample.cumulative_speedup_vs_base[bits] for sample in window
+                ])
+                for bits in compared_variants
+            }
+            interval_spans = {
+                bits: ThroughputMonitor._relative_span([
+                    sample.interval_speedup_vs_base[bits] for sample in window
+                ])
+                for bits in compared_variants
+            }
+            projection_spans = {
+                bits: ThroughputMonitor._relative_span([
+                    sample.projected_total_cycles[bits] for sample in window
+                ])
+                for bits in self.variants
+            }
+        span_limit = self.config.stability_relative_span
+        stable_window = bool(
+            enough_samples
+            and enough_work
+            and all(value <= span_limit for value in cumulative_spans.values())
+            and all(value <= span_limit for value in interval_spans.values())
+            and all(value <= span_limit for value in projection_spans.values())
+        )
+        if len(self.samples) != self._last_stability_sample_count:
+            if stable_window:
+                self._consecutive_stable_windows += 1
+            else:
+                self._consecutive_stable_windows = 0
+            self._last_stability_sample_count = len(self.samples)
+        stable = (
+            stable_window
+            and self._consecutive_stable_windows
+            >= self.config.required_consecutive_stable_windows
+        )
+        return {
+            "schema_version": "gala-archive-speedup-diagnostic-v1",
+            "result_scope": "development_speedup_projection",
+            "formal_performance_eligible": False,
+            "base_variant": self.base_variant,
+            "variants": list(self.variants),
+            "complete_trace_replay": bool(
+                self.samples and self.samples[-1].completed_iterations
+                == self.samples[-1].total_iterations
+            ),
+            "configuration": asdict(self.config),
+            "samples": [asdict(sample) for sample in self.samples],
+            "stability": {
+                "status": "stable" if stable else "collecting",
+                "enough_samples": enough_samples,
+                "enough_work": enough_work,
+                "cumulative_speedup_relative_span": cumulative_spans,
+                "interval_speedup_relative_span": interval_spans,
+                "projected_cycles_relative_span": projection_spans,
+                "consecutive_stable_windows": self._consecutive_stable_windows,
+            },
+        }
 
 
 def require_empty_diagnostic_output(path: Path) -> None:

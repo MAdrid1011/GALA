@@ -20,7 +20,9 @@ from gala_sim.clamp import (
     UpdateBeginKind,
 )
 from gala_sim.adapters.trace_capture import FIELD_DENSITY
-from gala_sim.ablation import run_archive_matrix, run_matrix
+from gala_sim.ablation import (
+    run_archive_matrix, run_archive_speedup_diagnostic, run_matrix,
+)
 from gala_sim.timing import (
     BufferedVirtualCycleConsumer,
     CycleConfig,
@@ -37,6 +39,7 @@ from gala_sim.timing.engine import (
 from gala_sim.timing.modules import OwnerGradientTracker
 from gala_sim.timing.memory import Ramulator2Backend, RecordedMemoryBackend
 from gala_sim.config import load_config
+from gala_sim.tools.cycle_throughput import ThroughputDiagnosticConfig
 from gala_sim.trace import (
     NumpyChunkSink, Trace, TraceReader, TraceWriter, TraceValidationError,
     validate_trace,
@@ -344,6 +347,51 @@ def test_archive_ablation_runs_canonical_independent_variants(tmp_path: Path) ->
     assert completed == expected
     assert len({tuple(sorted(run.result.event_counts.items())) for run in runs}) == 1
     assert len({id(run.result) for run in runs}) == len(runs)
+
+
+def test_archive_speedup_diagnostic_stops_all_variants_at_common_boundary(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "archive-speedup"
+    writer = VirtualPacketArchiveWriter(archive_root, max_chunk_bytes=64)
+    writer.initialize_gaussians(1)
+    for iteration in range(1, 11):
+        masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
+        masks[0, 0] = 1
+        writer.append_packet(VirtualTracePacket(
+            iteration_id=iteration, template_id=1, query_base=iteration - 1,
+            query_shape=(1, 1), point_ids=np.asarray([0], dtype=np.int64),
+            point_keys=np.asarray([0], dtype=np.uint64), masks=masks,
+            loss_flags=1, backward_confirmed=True,
+        ))
+        writer.close_iteration(iteration)
+    writer.finish()
+    config_path = Path(__file__).parents[1] / "configs/architecture/gala.yaml"
+    config = CycleConfig.from_gala(load_config(config_path), _Memory())
+    diagnostic = ThroughputDiagnosticConfig(
+        report_interval_events=1,
+        report_interval_seconds=1,
+        warmup_samples=1,
+        stability_window_samples=3,
+        required_consecutive_stable_windows=2,
+        stability_relative_span=0.01,
+        minimum_completion_fraction=0.2,
+    )
+
+    report = run_archive_speedup_diagnostic(
+        archive_root, config, diagnostic, max_events=4,
+    )
+
+    assert report["termination"] == "stopped_on_stable_speedup"
+    assert report["measured_iteration_count"] == 5
+    assert report["measured_last_iteration"] == 5
+    assert report["complete_trace_replay"] is False
+    assert set(report["variant_results"]) == {
+        "0000", "1000", "1010", "0100", "0101", "1100", "1111",
+    }
+    assert {
+        item["completed_events"] for item in report["variant_results"].values()
+    } == {report["samples"][-1]["completed_events"]}
 
 
 def test_online_cycle_replay_reports_progress() -> None:
