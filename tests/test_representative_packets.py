@@ -1,13 +1,18 @@
 from __future__ import annotations
 
 from pathlib import Path
+import json
 
 import numpy as np
 import pytest
 
-from gala_sim.tools.representative_packets import plan_representative_packet_groups
+from gala_sim.clamp.events import PrimitiveKind
+from gala_sim.tools.representative_packets import (
+    build_representative_packet_trace, plan_representative_packet_groups,
+)
 from gala_sim.trace import (
     VirtualPacketArchiveReader, VirtualPacketArchiveWriter, VirtualTracePacket,
+    snapshot_live_archive_prefix, validate_trace,
 )
 
 
@@ -106,6 +111,40 @@ def test_archive_descriptors_filter_without_materializing_unselected_packets(
     assert reader.packet(descriptors[0]).iteration_id == 3
 
 
+def test_archive_descriptor_filter_opens_only_selected_chunks(
+    monkeypatch, tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    _archive(archive)
+    reader = VirtualPacketArchiveReader(archive)
+    manifest = json.loads((archive / "manifest.json").read_text(encoding="utf-8"))
+    selected_chunks = {
+        int(item["chunk"])
+        for item in map(
+            json.loads,
+            (archive / "stream.jsonl").read_text(encoding="utf-8").splitlines(),
+        )
+        if item.get("type") == "packet"
+    }
+    opened: list[Path] = []
+    original_load = np.load
+
+    def tracked_load(path, *args, **kwargs):
+        opened.append(Path(path))
+        return original_load(path, *args, **kwargs)
+
+    monkeypatch.setattr(np, "load", tracked_load)
+    descriptors = tuple(reader.packet_descriptors(iterations={3}))
+
+    assert [(item.iteration_id, item.template_id) for item in descriptors] == [
+        (3, 1), (3, 2),
+    ]
+    opened_chunks = {
+        int(path.stem.removeprefix("chunk-")) for path in opened
+    }
+    assert opened_chunks < selected_chunks
+
+
 def test_representative_plan_enforces_requested_group_count(tmp_path: Path) -> None:
     archive = tmp_path / "archive"
     _archive(archive)
@@ -119,3 +158,83 @@ def test_representative_plan_enforces_requested_group_count(tmp_path: Path) -> N
         plan_representative_packet_groups(
             archive, campaign, expected_group_count=3,
         )
+
+
+def test_representative_plan_can_select_only_closed_live_prefix_windows(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    _archive(archive)
+    snapshot = tmp_path / "snapshot"
+    snapshot_live_archive_prefix(
+        archive,
+        snapshot,
+        initial_gaussian_count=4,
+        through_iteration=3,
+    )
+    campaign = tmp_path / "campaign.yaml"
+    campaign.write_text(
+        "representative_iterations:\n"
+        "  - {iteration: 3, roles: [densification]}\n"
+        "  - {iteration: 6, roles: [post_densification]}\n",
+        encoding="utf-8",
+    )
+
+    report = plan_representative_packet_groups(
+        snapshot,
+        campaign,
+        expected_group_count=2,
+        live_prefix=True,
+    )
+
+    assert report["groups"][0]["iterations"] == [2, 3]
+    assert report["live_prefix"] is True
+    assert report["campaign_complete"] is False
+
+
+def test_representative_packet_trace_expands_one_complete_window(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    _archive(archive)
+    campaign = tmp_path / "campaign.yaml"
+    campaign.write_text(
+        "representative_iterations:\n"
+        "  - {iteration: 3, roles: [densification]}\n"
+        "  - {iteration: 6, roles: [post_densification]}\n",
+        encoding="utf-8",
+    )
+    plan = plan_representative_packet_groups(
+        archive, campaign, expected_group_count=4,
+    )
+    plan_path = tmp_path / "plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+    trace = build_representative_packet_trace(
+        archive,
+        plan_path,
+        window_index=1,
+        max_events=128,
+        query_lanes=8,
+    )
+
+    validate_trace(trace)
+    assert trace.metadata["trace_sample"]["iterations"] == [5, 6]
+    assert len(trace.metadata["trace_sample"]["packets"]) == 4
+    assert [
+        packet["query_count"]
+        for packet in trace.metadata["trace_sample"]["packets"]
+    ] == [256, 512, 256, 512]
+    assert set(trace.events["iteration_id"].tolist()) == {5, 6}
+    update_end = np.flatnonzero(
+        trace.events["primitive_kind"] == int(PrimitiveKind.UPDATE_END)
+    )
+    assert update_end.size == 1
+    next_candidates = trace.events[
+        (trace.events["iteration_id"] == 6)
+        & (trace.events["primitive_kind"] == int(PrimitiveKind.RELATION_CANDIDATE))
+    ]
+    assert all(
+        trace.dependency_ids(row).tolist() == update_end.tolist()
+        for row in next_candidates
+    )

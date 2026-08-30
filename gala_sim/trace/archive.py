@@ -28,6 +28,7 @@ from .virtual import (
 
 
 ARCHIVE_SCHEMA_VERSION = "gala-virtual-packet-archive-v1"
+LIVE_PREFIX_SCHEMA_VERSION = "gala-virtual-packet-live-prefix-v1"
 
 
 @dataclass(frozen=True)
@@ -273,6 +274,9 @@ class VirtualPacketArchiveReader:
         """Read packet metadata without inflating point or mask arrays."""
 
         selected = None if iterations is None else {int(value) for value in iterations}
+        if selected is not None:
+            yield from self._selected_packet_descriptors(selected)
+            return
         for chunk_index, relative in enumerate(self.manifest.get("chunks", ())):
             path = self.root / str(relative)
             with np.load(path, allow_pickle=False) as data:
@@ -291,6 +295,65 @@ class VirtualPacketArchiveReader:
                     candidate_count=int(metadata["candidate_count"]),
                     mask_words=int(metadata["mask_words"]),
                 )
+
+    def _selected_packet_descriptors(
+        self, selected: set[int],
+    ) -> Iterator[VirtualPacketArchiveDescriptor]:
+        """Locate sparse iterations from the stream before opening chunks."""
+
+        if any(iteration <= 0 for iteration in selected):
+            raise ValueError("archive descriptor iterations must be positive")
+        stream_path = self.root / str(self.manifest.get("stream_path", "stream.jsonl"))
+        pending: list[tuple[int, int]] = []
+        references: list[tuple[int, int, int]] = []
+        with stream_path.open("r", encoding="utf-8") as stream:
+            for line in stream:
+                item = json.loads(line)
+                kind = item.get("type")
+                if kind == "packet":
+                    pending.append((int(item["chunk"]), int(item["index"])))
+                elif kind == "close_iteration":
+                    iteration_id = int(item["iteration_id"])
+                    if iteration_id in selected:
+                        references.extend(
+                            (chunk, packet, iteration_id)
+                            for chunk, packet in pending
+                        )
+                    pending.clear()
+                    if iteration_id >= max(selected):
+                        break
+                elif kind != "lifecycle":
+                    raise ValueError("virtual packet archive stream record is malformed")
+
+        metadata_by_chunk: dict[int, list[dict[str, Any]]] = {}
+        chunks = self.manifest.get("chunks", ())
+        for chunk_index, packet_index, iteration_id in references:
+            if chunk_index < 0 or chunk_index >= len(chunks):
+                raise ValueError("virtual packet archive chunk index is out of range")
+            if chunk_index not in metadata_by_chunk:
+                path = self.root / str(chunks[chunk_index])
+                with np.load(path, allow_pickle=False) as data:
+                    metadata_by_chunk[chunk_index] = json.loads(
+                        str(data["packets"].item())
+                    )
+            packet_metadata = metadata_by_chunk[chunk_index]
+            if packet_index < 0 or packet_index >= len(packet_metadata):
+                raise ValueError("virtual packet archive packet index is out of range")
+            metadata = packet_metadata[packet_index]
+            if int(metadata["iteration_id"]) != iteration_id:
+                raise ValueError(
+                    "virtual packet archive stream iteration disagrees with its chunk"
+                )
+            yield VirtualPacketArchiveDescriptor(
+                chunk_index=chunk_index,
+                packet_index=packet_index,
+                iteration_id=iteration_id,
+                template_id=int(metadata["template_id"]),
+                query_base=int(metadata["query_base"]),
+                query_shape=tuple(int(value) for value in metadata["query_shape"]),
+                candidate_count=int(metadata["candidate_count"]),
+                mask_words=int(metadata["mask_words"]),
+            )
 
     def packet(self, descriptor: VirtualPacketArchiveDescriptor) -> VirtualTracePacket:
         """Materialize one packet selected from metadata-only descriptors."""
@@ -453,7 +516,10 @@ class VirtualPacketArchiveReader:
 
     def _load_chunk(self, index: int) -> dict[str, Any]:
         if self._chunk_index != index:
-            path = self.root / "chunks" / f"chunk-{index:06d}.npz"
+            chunks = self.manifest.get("chunks", ())
+            if index < 0 or index >= len(chunks):
+                raise ValueError("virtual packet archive chunk index is out of range")
+            path = self.root / str(chunks[index])
             with np.load(path, allow_pickle=False) as data:
                 packet_json = str(data["packets"].item())
                 self._chunk = {
@@ -466,6 +532,130 @@ class VirtualPacketArchiveReader:
         if self._chunk is None:
             raise RuntimeError("virtual packet archive chunk failed to load")
         return self._chunk
+
+
+def snapshot_live_archive_prefix(
+    source_root: Path,
+    output_root: Path,
+    *,
+    initial_gaussian_count: int,
+    through_iteration: int | None = None,
+) -> dict[str, Any]:
+    """Create a metadata-only snapshot of the largest safe live prefix.
+
+    A packet chunk is immutable after its atomic rename.  The snapshot therefore
+    references completed source chunks directly and copies only the stream prefix
+    ending at a closed iteration.  It never includes the writer's current buffered
+    chunk or a partially written JSON line.
+    """
+
+    source_root = Path(source_root).resolve()
+    output_root = Path(output_root).resolve()
+    if initial_gaussian_count < 0:
+        raise ValueError("archive snapshot Gaussian count must be non-negative")
+    if through_iteration is not None and through_iteration <= 0:
+        raise ValueError("archive snapshot iteration must be positive")
+    if source_root == output_root:
+        raise ValueError("archive snapshot output must differ from its source")
+    stream_path = source_root / "stream.jsonl"
+    chunk_root = source_root / "chunks"
+    if not stream_path.is_file() or not chunk_root.is_dir():
+        raise ValueError("live virtual packet archive is missing its stream or chunks")
+    if output_root.exists() and (
+        not output_root.is_dir() or next(output_root.iterdir(), None) is not None
+    ):
+        raise ValueError("archive snapshot output must be absent or empty")
+
+    completed_chunk_count = 0
+    while (chunk_root / f"chunk-{completed_chunk_count:06d}.npz").is_file():
+        completed_chunk_count += 1
+    if completed_chunk_count == 0:
+        raise ValueError("live virtual packet archive has no completed chunk")
+
+    records: list[str] = []
+    safe_record_count = 0
+    safe_iteration: int | None = None
+    closed_iteration_count = 0
+    safe_closed_iteration_count = 0
+    max_referenced_chunk = -1
+    with stream_path.open("r", encoding="utf-8") as stream:
+        for raw_line in stream:
+            try:
+                item = json.loads(raw_line)
+            except json.JSONDecodeError:
+                break
+            kind = item.get("type")
+            if (
+                kind == "close_iteration"
+                and through_iteration is not None
+                and int(item["iteration_id"]) > through_iteration
+            ):
+                break
+            records.append(raw_line if raw_line.endswith("\n") else raw_line + "\n")
+            if kind == "packet":
+                chunk_index = int(item["chunk"])
+                if chunk_index < 0:
+                    raise ValueError("live archive stream has a negative chunk index")
+                max_referenced_chunk = max(max_referenced_chunk, chunk_index)
+            elif kind == "close_iteration":
+                iteration_id = int(item["iteration_id"])
+                closed_iteration_count += 1
+                if max_referenced_chunk < completed_chunk_count:
+                    safe_record_count = len(records)
+                    safe_iteration = iteration_id
+                    safe_closed_iteration_count = closed_iteration_count
+                if through_iteration is not None and iteration_id == through_iteration:
+                    break
+            elif kind != "lifecycle":
+                raise ValueError("live archive stream record is malformed")
+
+    if safe_iteration is None or safe_record_count == 0:
+        raise ValueError("live archive has no closed iteration with completed chunks")
+    if through_iteration is not None and safe_iteration != through_iteration:
+        raise ValueError(
+            f"requested iteration {through_iteration} is not a safe live prefix; "
+            f"latest safe iteration is {safe_iteration}"
+        )
+    selected_records = records[:safe_record_count]
+    selected_items = [json.loads(line) for line in selected_records]
+    selected_packet_records = [
+        item for item in selected_items if item.get("type") == "packet"
+    ]
+    if not selected_packet_records:
+        raise ValueError("live archive safe prefix contains no query packet")
+    selected_chunk_count = 1 + max(
+        int(item["chunk"]) for item in selected_packet_records
+    )
+    chunks = [
+        str((chunk_root / f"chunk-{index:06d}.npz").resolve())
+        for index in range(selected_chunk_count)
+    ]
+    manifest: dict[str, Any] = {
+        "schema_version": ARCHIVE_SCHEMA_VERSION,
+        "status": "passed",
+        "formal_performance_eligible": False,
+        "complete_30k": False,
+        "validation_passed": False,
+        "initial_gaussian_count": int(initial_gaussian_count),
+        "iteration_count": safe_closed_iteration_count,
+        "chunk_count": selected_chunk_count,
+        "stream_path": "stream.jsonl",
+        "chunks": chunks,
+        "metadata": {
+            "live_prefix": {
+                "schema_version": LIVE_PREFIX_SCHEMA_VERSION,
+                "source_archive": str(source_root),
+                "last_closed_iteration": int(safe_iteration),
+                "development_only": True,
+            },
+        },
+    }
+    output_root.mkdir(parents=True, exist_ok=True)
+    (output_root / "stream.jsonl").write_text(
+        "".join(selected_records), encoding="utf-8",
+    )
+    _write_json_atomic(output_root / "manifest.json", manifest)
+    return manifest
 
 
 def _call(consumer: Any, method: str, value: Any) -> None:

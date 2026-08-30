@@ -2,14 +2,26 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any
 
 import numpy as np
 import yaml
 
+from gala_sim.clamp.events import (
+    PrimitiveKind, ResourceClass, TraceEvent, UpdateBeginKind,
+    dependency_dtype, event_dtype,
+)
+from gala_sim.mechanisms import CANONICAL_VARIANT_POLICIES
 from gala_sim.timing.kernel import PackedTileStatistics, packed_tile_statistics
-from gala_sim.trace import VirtualPacketArchiveReader
+from gala_sim.trace import (
+    Trace, VirtualPacketArchiveReader, VirtualQueryEventExpander,
+    VirtualTracePacket,
+)
+from gala_sim.trace.virtual import (
+    RASTER_BLOCK, RASTER_TEMPLATE_ID, VOXEL_BLOCK, VOXEL_TEMPLATE_ID,
+)
 
 
 def plan_representative_packet_groups(
@@ -17,6 +29,7 @@ def plan_representative_packet_groups(
     profiling_campaign: Path,
     *,
     expected_group_count: int,
+    live_prefix: bool = False,
 ) -> dict[str, Any]:
     if expected_group_count <= 0:
         raise ValueError("representative packet group count must be positive")
@@ -37,10 +50,19 @@ def plan_representative_packet_groups(
         windows.append((iteration - 1, iteration, roles))
     if not windows:
         raise ValueError("profiling campaign has no adjacent representative windows")
+    reader = VirtualPacketArchiveReader(Path(archive_root))
+    campaign_window_count = len(windows)
+    if live_prefix:
+        prefix = reader.manifest.get("metadata", {}).get("live_prefix", {})
+        if not isinstance(prefix, dict) or "last_closed_iteration" not in prefix:
+            raise ValueError("live-prefix planning requires a live archive snapshot")
+        last_closed_iteration = int(prefix["last_closed_iteration"])
+        windows = [window for window in windows if window[1] <= last_closed_iteration]
+        if not windows:
+            raise ValueError("live archive prefix covers no representative window")
     target_iterations = {
         iteration for begin, end, _roles in windows for iteration in (begin, end)
     }
-    reader = VirtualPacketArchiveReader(Path(archive_root))
     descriptors = {
         (descriptor.iteration_id, descriptor.template_id): descriptor
         for descriptor in reader.packet_descriptors(iterations=target_iterations)
@@ -107,6 +129,8 @@ def plan_representative_packet_groups(
         "schema_version": "gala-representative-packet-plan-v1",
         "result_scope": "representative_speedup_validation",
         "formal_performance_eligible": False,
+        "campaign_complete": len(windows) == campaign_window_count,
+        "live_prefix": bool(live_prefix),
         "archive": str(Path(archive_root).resolve()),
         "profiling_campaign": str(Path(profiling_campaign).resolve()),
         "group_count": len(groups),
@@ -128,3 +152,233 @@ def _tile_record(
             int(value) for value in statistics.lane_histograms[tile_id]
         ],
     }
+
+
+def build_representative_packet_trace(
+    archive_root: Path,
+    plan_path: Path,
+    *,
+    window_index: int,
+    max_events: int,
+    query_lanes: int,
+) -> Trace:
+    """Expand one planned adjacent-iteration window for quick cycle replay."""
+
+    if window_index < 0 or max_events <= 0 or not 0 < query_lanes <= 8:
+        raise ValueError("representative packet trace limits are invalid")
+    plan = json.loads(Path(plan_path).read_text(encoding="utf-8"))
+    if plan.get("schema_version") != "gala-representative-packet-plan-v1":
+        raise ValueError("representative packet plan schema is unsupported")
+    groups = plan.get("groups")
+    if not isinstance(groups, list) or not groups:
+        raise ValueError("representative packet plan has no groups")
+    windows: list[tuple[int, int]] = []
+    for group in groups:
+        iterations = tuple(int(value) for value in group.get("iterations", ()))
+        if len(iterations) != 2:
+            raise ValueError("representative packet group has an invalid window")
+        if iterations not in windows:
+            windows.append(iterations)
+    if window_index >= len(windows):
+        raise ValueError("representative packet window index is out of range")
+    window = windows[window_index]
+    selected_groups = [
+        group for group in groups
+        if tuple(int(value) for value in group["iterations"]) == window
+    ]
+    reader = VirtualPacketArchiveReader(Path(archive_root))
+    descriptors = {
+        (descriptor.iteration_id, descriptor.template_id): descriptor
+        for descriptor in reader.packet_descriptors(iterations=set(window))
+    }
+    expander = VirtualQueryEventExpander(
+        max_events=max_events,
+        relation_query_lanes=query_lanes,
+    )
+    row_parts: list[np.ndarray] = []
+    dependency_parts: list[np.ndarray] = []
+    dependency_offset = 0
+    query_base = 0
+    packet_reports: list[dict[str, Any]] = []
+    max_gaussian_id = -1
+    prior_state_barrier: tuple[int, ...] = ()
+    for iteration_index, iteration_id in enumerate(window):
+        iteration_gradient_frontier: list[int] = []
+        iteration_zero_relation_consumers: list[int] = []
+        for group in sorted(selected_groups, key=lambda item: int(item["template_id"])):
+            template_id = int(group["template_id"])
+            descriptor = descriptors.get((iteration_id, template_id))
+            if descriptor is None:
+                raise ValueError(
+                    f"representative packet {iteration_id}/{template_id} is absent"
+                )
+            source = reader.packet(descriptor)
+            packet = _select_tile_packet(
+                source, tile_id=int(group["tile_id"]), query_base=query_base,
+            )
+            query_base += packet.query_count
+            zero_relation_queries = _zero_relation_query_ids(packet)
+            max_gaussian_id = max(
+                max_gaussian_id, int(packet.point_ids.max()),
+            )
+            for event_packet in expander.expand(
+                packet, external_dependencies=prior_state_barrier,
+            ):
+                rows = event_packet.events.copy()
+                iteration_gradient_frontier.extend(
+                    int(event_id) for event_id in rows["event_id"][
+                        rows["primitive_kind"]
+                        == int(PrimitiveKind.GRADIENT_REDUCTION)
+                    ]
+                )
+                consumer_rows = rows[
+                    rows["primitive_kind"] == int(PrimitiveKind.CONSUMER)
+                ]
+                iteration_zero_relation_consumers.extend(
+                    int(event_id) for event_id, query_id in zip(
+                        consumer_rows["event_id"], consumer_rows["query_id"],
+                        strict=True,
+                    )
+                    if int(query_id) in zero_relation_queries
+                )
+                rows["dependency_begin"] += dependency_offset
+                row_parts.append(rows)
+                dependency_parts.append(event_packet.dependencies)
+                dependency_offset += event_packet.dependencies.size
+            packet_reports.append({
+                "iteration_id": iteration_id,
+                "template_id": template_id,
+                "tile_id": int(group["tile_id"]),
+                "candidate_count": packet.candidate_count,
+                "relation_count": packet.logical_relation_count,
+                "physical_packet_count": next(
+                    int(item["physical_packet_count"])
+                    for item in group["packets"]
+                    if int(item["iteration"]) == iteration_id
+                ),
+                "query_base": packet.query_base,
+                "query_count": packet.query_count,
+                "query_shape": list(packet.query_shape),
+            })
+        if iteration_index + 1 < len(window):
+            barrier_dependencies = (
+                *iteration_gradient_frontier,
+                *iteration_zero_relation_consumers,
+            )
+            barrier_rows, barrier_dependency_column = _noop_update_barrier(
+                event_start=expander.next_event_id,
+                iteration_id=iteration_id,
+                dependencies=barrier_dependencies,
+            )
+            expander.next_event_id += barrier_rows.size
+            barrier_rows["dependency_begin"] += dependency_offset
+            row_parts.append(barrier_rows)
+            dependency_parts.append(barrier_dependency_column)
+            dependency_offset += barrier_dependency_column.size
+            prior_state_barrier = (int(barrier_rows[-1]["event_id"]),)
+    events = np.concatenate(row_parts).astype(event_dtype(), copy=False)
+    dependencies = np.concatenate(dependency_parts).astype(
+        dependency_dtype(), copy=False,
+    )
+    return Trace(
+        events,
+        dependencies,
+        np.empty(0, dtype=np.dtype("<f4")),
+        {
+            "schema_version": "gala-clamp-events-v2",
+            "model": "R2-Gaussian",
+            "dataset": "Chest",
+            "initial_gaussian_count": max_gaussian_id + 1,
+            "state_record_bytes": 128,
+            "trace_sample": {
+                "schema_version": "gala-representative-packet-trace-v1",
+                "result_scope": "quick_cycle_validation",
+                "formal_performance_eligible": False,
+                "quality_eligible": False,
+                "selection": "phase_window_common_median_physical_tile",
+                "cross_iteration_barrier": "validated_noop_optimizer_transaction",
+                "source_plan": str(Path(plan_path).resolve()),
+                "window_index": window_index,
+                "iterations": list(window),
+                "query_lanes": query_lanes,
+                "eligible_policies": [
+                    "base", "query", "residency", "full",
+                    "query_oracle", "residency_oracle",
+                    *CANONICAL_VARIANT_POLICIES,
+                ],
+                "packets": packet_reports,
+                "sample_event_count": int(events.size),
+                "sample_dependency_count": int(dependencies.size),
+            },
+        },
+    )
+
+
+def _select_tile_packet(
+    source: VirtualTracePacket, *, tile_id: int, query_base: int,
+) -> VirtualTracePacket:
+    shape = {
+        RASTER_TEMPLATE_ID: RASTER_BLOCK,
+        VOXEL_TEMPLATE_ID: VOXEL_BLOCK,
+    }.get(source.template_id)
+    if shape is None:
+        raise ValueError(f"unsupported representative template {source.template_id}")
+    tiles = np.right_shift(
+        np.asarray(source.point_keys, dtype=np.uint64), np.uint64(32),
+    )
+    selected = np.flatnonzero(tiles == tile_id)
+    if selected.size == 0:
+        raise ValueError(f"representative packet contains no tile {tile_id}")
+    low_key_mask = np.uint64((1 << 32) - 1)
+    return VirtualTracePacket(
+        iteration_id=source.iteration_id,
+        template_id=source.template_id,
+        query_base=query_base,
+        query_shape=shape,
+        point_ids=source.point_ids[selected].copy(),
+        point_keys=np.bitwise_and(source.point_keys[selected], low_key_mask),
+        masks=source.masks[selected].copy(),
+        state_version=0,
+        field_mask=source.field_mask,
+        loss_flags=source.loss_flags,
+        ssim_radius=source.ssim_radius,
+        backward_confirmed=source.backward_confirmed,
+    )
+
+
+def _zero_relation_query_ids(packet: VirtualTracePacket) -> set[int]:
+    counts = np.zeros(packet.query_count, dtype=np.uint32)
+    for _candidates, query_ids, _gaussians, _keys in packet.iter_relation_arrays(
+        max(packet.logical_relation_count, 1),
+    ):
+        np.add.at(counts, query_ids - packet.query_base, 1)
+    return set(
+        (packet.query_base + np.flatnonzero(counts == 0)).astype(int).tolist()
+    )
+
+
+def _noop_update_barrier(
+    *, event_start: int, iteration_id: int, dependencies: tuple[int, ...],
+) -> tuple[np.ndarray, np.ndarray]:
+    if not dependencies:
+        raise ValueError("representative update barrier has no backward frontier")
+    rows = np.empty(2, dtype=event_dtype())
+    rows[:] = TraceEvent().as_tuple()
+    begin_id = event_start
+    end_id = event_start + 1
+    rows["event_id"] = (begin_id, end_id)
+    rows["iteration_id"] = iteration_id
+    rows["state_version"] = 0
+    rows["resource_class"] = int(ResourceClass.UPDATE)
+    rows["flags"] = int(UpdateBeginKind.OPTIMIZER)
+    rows[0]["primitive_kind"] = int(PrimitiveKind.UPDATE_BEGIN)
+    rows[0]["dependency_begin"] = 0
+    rows[0]["dependency_count"] = len(dependencies)
+    rows[1]["primitive_kind"] = int(PrimitiveKind.UPDATE_END)
+    rows[1]["reduction_key"] = begin_id
+    rows[1]["dependency_begin"] = len(dependencies)
+    rows[1]["dependency_count"] = 1
+    dependency_column = np.asarray(
+        (*dependencies, begin_id), dtype=dependency_dtype(),
+    )
+    return rows, dependency_column

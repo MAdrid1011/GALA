@@ -132,6 +132,81 @@ def test_compute_ready_head_index_is_isolated_to_overlap_guided_issue() -> None:
     )
 
 
+def test_downstream_compute_pressure_is_isolated_to_overlap_guided_issue() -> None:
+    rows = np.empty(2, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = np.arange(2)
+    rows["iteration_id"] = 1
+    rows["primitive_kind"] = [
+        int(PrimitiveKind.ADJOINT), int(PrimitiveKind.GRADIENT_REDUCTION),
+    ]
+    rows["gaussian_id"] = 0
+    rows["relation_id"] = 7
+    tracker = OwnerGradientTracker(
+        pods=4, clusters_per_pod=5, slots_per_cluster=3,
+    )
+    tracker.register_rows(rows)
+
+    assert CycleEngine(
+        _production_config(), policy="variant:1000",
+    )._compute_cluster_pressure(
+        0, PrimitiveKind.ADJOINT, None, tracker,
+    ) is None
+    query_engine = CycleEngine(
+        _production_config(), policy="variant:1010",
+    )
+    assert query_engine._compute_cluster_pressure(
+        0, PrimitiveKind.ADJOINT, None, tracker,
+    ) == {0: 1}
+    assert query_engine._compute_cluster_pressure(
+        0, PrimitiveKind.FORWARD, None, tracker,
+    ) == {}
+    assert query_engine._compute_cluster_pressure(
+        1, PrimitiveKind.GRADIENT_REDUCTION, None, tracker,
+    ) is None
+
+
+def test_overlap_issue_interleaves_resident_adjoint_owner_routes() -> None:
+    rows = np.empty(6, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = np.arange(6)
+    rows["iteration_id"] = 1
+    rows["primitive_kind"] = [
+        int(PrimitiveKind.ADJOINT), int(PrimitiveKind.GRADIENT_REDUCTION),
+        int(PrimitiveKind.ADJOINT), int(PrimitiveKind.GRADIENT_REDUCTION),
+        int(PrimitiveKind.ADJOINT), int(PrimitiveKind.GRADIENT_REDUCTION),
+    ]
+    rows["gaussian_id"] = [0, 0, 20, 20, 1, 1]
+    rows["relation_id"] = [10, 10, 11, 11, 12, 12]
+    tracker = OwnerGradientTracker(
+        pods=4, clusters_per_pod=5, slots_per_cluster=3,
+    )
+    tracker.register_rows(rows)
+    tracker.reserve_adjoint((0,))
+    engine = CycleEngine(_production_config(), policy="variant:1010")
+
+    balanced = engine._balance_compute_adjoint_candidates(
+        [(2, 2), (4, 2)],
+        kind_for=lambda event_id: PrimitiveKind(
+            int(rows[event_id]["primitive_kind"])
+        ),
+        physical_stage_for=lambda _event_id: None,
+        owner_gradients=tracker,
+    )
+
+    assert balanced == [(4, 2), (2, 2)]
+    assert CycleEngine(
+        _production_config(), policy="variant:1000",
+    )._balance_compute_adjoint_candidates(
+        [(2, 2), (4, 2)],
+        kind_for=lambda event_id: PrimitiveKind(
+            int(rows[event_id]["primitive_kind"])
+        ),
+        physical_stage_for=lambda _event_id: None,
+        owner_gradients=tracker,
+    ) == [(2, 2), (4, 2)]
+
+
 def test_compute_ready_priority_drains_owner_gradient_before_flexible_work() -> None:
     engine = CycleEngine(_production_config())
 
@@ -801,6 +876,66 @@ def test_compute_pod_packs_single_slot_work_before_using_empty_cluster() -> None
     }
     assert first_clusters == {"cluster_issue:0"}
     assert second_clusters == first_clusters
+
+
+def test_compute_pod_avoids_cluster_with_downstream_owner_work() -> None:
+    profile = ComputeTemplateProfile(1, {
+        "adjoint": ComputePathProfile((
+            ComputeStage("TRANSFORM", latency=1),
+        ), cluster_issue_slots=1, cluster_issue_cycles=2),
+    })
+    pod = ComputePod(
+        "compute_pod",
+        ModuleTiming(latency=1, initiation_interval=1, queue_capacity=8,
+                     ports=1, banks=1), CounterBlock(),
+        template_profiles={1: profile},
+        resource_capacities={
+            "pods": 1, "clusters_per_pod": 2, "clusters": 2,
+            "cluster_issue": 4, "fma_groups": 2,
+            "transcendental_lanes": 2, "reduction_trees": 2,
+            "microcontext_slots": 8, "feedback_lanes": 2,
+        },
+    )
+
+    plan = pod.reservation_plan(
+        1, PrimitiveKind.ADJOINT, 0, pod=0,
+        cluster_pressure={0: 2, 1: 0},
+    )
+
+    assert {
+        resource for resource, _cycle, _demand in plan
+        if resource.startswith("cluster_issue:")
+    } == {"cluster_issue:1"}
+
+
+def test_compute_pod_pressure_does_not_override_fixed_owner_cluster() -> None:
+    profile = ComputeTemplateProfile(1, {
+        "gradient_reduction": ComputePathProfile((
+            ComputeStage("COMBINE", latency=1),
+        )),
+    })
+    pod = ComputePod(
+        "compute_pod",
+        ModuleTiming(latency=1, initiation_interval=1, queue_capacity=8,
+                     ports=1, banks=1), CounterBlock(),
+        template_profiles={1: profile},
+        resource_capacities={
+            "pods": 1, "clusters_per_pod": 2, "clusters": 2,
+            "cluster_issue": 2, "fma_groups": 2,
+            "transcendental_lanes": 2, "reduction_trees": 2,
+            "microcontext_slots": 8, "feedback_lanes": 2,
+        },
+    )
+
+    plan = pod.reservation_plan(
+        1, PrimitiveKind.GRADIENT_REDUCTION, 0, pod=0,
+        cluster_hint=0, cluster_pressure={0: 9, 1: 0},
+    )
+
+    assert {
+        resource for resource, _cycle, _demand in plan
+        if resource.startswith("cluster_issue:")
+    } == {"cluster_issue:0"}
 
 
 def test_compute_pod_partial_packet_uses_only_active_lane_issue_cycles() -> None:

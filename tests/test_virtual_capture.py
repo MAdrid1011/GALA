@@ -16,6 +16,7 @@ from gala_sim.trace import (
     VirtualLifecycleKind,
     VirtualLifecycleRecord,
     VirtualTracePacket,
+    snapshot_live_archive_prefix,
 )
 from gala_sim.tools.relation_capacity import run_relation_capacity_preflight
 
@@ -98,6 +99,51 @@ def test_virtual_packet_archive_readers_have_independent_packet_objects(tmp_path
     second_packet = second[0][1]
     first_packet.point_ids[0] = 99
     assert second_packet.point_ids[0] == 0
+
+
+def test_live_archive_snapshot_uses_only_a_safe_closed_prefix(tmp_path: Path) -> None:
+    archive_root = tmp_path / "archive"
+    writer = VirtualPacketArchiveWriter(archive_root, max_chunk_bytes=1)
+    writer.initialize_gaussians(1)
+    writer.append_packet(_packet(iteration=1))
+    writer.close_iteration(1)
+    writer.finish()
+    with (archive_root / "stream.jsonl").open("a", encoding="utf-8") as stream:
+        stream.write(json.dumps({"type": "packet", "chunk": 1, "index": 0}) + "\n")
+        stream.write(json.dumps({"type": "close_iteration", "iteration_id": 2}) + "\n")
+
+    snapshot_root = tmp_path / "snapshot"
+    manifest = snapshot_live_archive_prefix(
+        archive_root, snapshot_root, initial_gaussian_count=1,
+    )
+
+    assert manifest["iteration_count"] == 1
+    assert manifest["formal_performance_eligible"] is False
+    assert manifest["chunks"] == [str(
+        (archive_root / "chunks" / "chunk-000000.npz").resolve()
+    )]
+    reader = VirtualPacketArchiveReader(snapshot_root)
+    assert [kind for kind, _ in reader.records()] == ["packet", "close_iteration"]
+    assert reader.validate()["last_iteration"] == 1
+
+
+def test_live_archive_snapshot_rejects_an_unavailable_requested_iteration(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "archive"
+    writer = VirtualPacketArchiveWriter(archive_root, max_chunk_bytes=1)
+    writer.initialize_gaussians(1)
+    writer.append_packet(_packet(iteration=1))
+    writer.close_iteration(1)
+    writer.finish()
+
+    with pytest.raises(ValueError, match="requested iteration 2"):
+        snapshot_live_archive_prefix(
+            archive_root,
+            tmp_path / "snapshot",
+            initial_gaussian_count=1,
+            through_iteration=2,
+        )
 
 
 def test_virtual_packet_capture_fields_reuse_validated_payload() -> None:

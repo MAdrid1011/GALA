@@ -634,6 +634,54 @@ def test_compact_and_expanded_semantic_placement_are_identical() -> None:
     )
 
 
+def test_semantic_compiler_applies_placement_without_residency_hardware() -> None:
+    masks = np.zeros((2, 8), dtype=np.dtype("<u4"))
+    masks[0, 0] = np.uint32((1 << 8) - 1)
+    masks[1, 0] = np.uint32((1 << 16) - 1)
+    source = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 16),
+        point_ids=np.asarray([7, 8], dtype=np.int64),
+        point_keys=np.zeros(2, dtype=np.uint64), masks=masks,
+        loss_flags=1, backward_confirmed=True,
+    )
+    trace = _virtual_trace(source)
+    config = CycleConfig.from_gala(load_config(
+        Path(__file__).parents[1] / "configs/architecture/gala.yaml"
+    ), _Memory())
+
+    base = CycleEngine(config, policy="variant:0000").run(trace)
+    compiler = CycleEngine(config, policy="variant:0100").run(trace)
+
+    assert base.module_counters["compute_pod"]["semantic_placement_keys"] == 0
+    assert compiler.module_counters["compute_pod"]["semantic_placement_keys"] == 2
+    assert (
+        compiler.module_counters["semantic_cache"]["memory_requests"]
+        == base.module_counters["semantic_cache"]["memory_requests"]
+    )
+
+
+def test_query_compiler_applies_compute_placement_without_query_hardware() -> None:
+    masks = np.zeros((2, 8), dtype=np.dtype("<u4"))
+    masks[0, 0] = np.uint32((1 << 8) - 1)
+    masks[1, 0] = np.uint32((1 << 16) - 1)
+    source = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 16),
+        point_ids=np.asarray([7, 8], dtype=np.int64),
+        point_keys=np.zeros(2, dtype=np.uint64), masks=masks,
+        loss_flags=1, backward_confirmed=True,
+    )
+    trace = _virtual_trace(source)
+    config = CycleConfig.from_gala(load_config(
+        Path(__file__).parents[1] / "configs/architecture/gala.yaml"
+    ), _Memory())
+
+    base = CycleEngine(config, policy="variant:0000").run(trace)
+    compiler = CycleEngine(config, policy="variant:1000").run(trace)
+
+    assert base.module_counters["compute_pod"]["semantic_placement_keys"] == 0
+    assert compiler.module_counters["compute_pod"]["semantic_placement_keys"] == 2
+
+
 def test_semantic_worksets_count_physical_packet_readers_not_logical_lanes() -> None:
     masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
     masks[0, 0] = np.uint32((1 << 0) | (1 << 7))

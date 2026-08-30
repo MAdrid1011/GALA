@@ -2012,6 +2012,7 @@ class VirtualInterleavedQueryEventExpander:
                     ids,
                     candidate_start,
                     window_base + pack_index // self.continuation_query_packs,
+                    external_dependencies=external_dependencies,
                     sealed=(
                         (pack_index + 1) % self.continuation_query_packs == 0
                         or pack_index + 1 == len(schedule.infos)
@@ -2041,13 +2042,16 @@ class VirtualInterleavedQueryEventExpander:
             rows["address_token"] = source.point_keys[start:end]
             rows["data_bytes"] = self.relation_candidate_bytes
             rows["flags"] = np.any(source.masks[start:end], axis=1)
-            dependencies = np.asarray(
-                external_dependencies if start == 0 else (),
-                dtype=dependency_dtype(),
+            dependency_count = len(external_dependencies)
+            dependencies = np.tile(
+                np.asarray(external_dependencies, dtype=dependency_dtype()),
+                end - start,
             )
             if dependencies.size:
-                rows["dependency_begin"][0] = 0
-                rows["dependency_count"][0] = dependencies.size
+                rows["dependency_begin"] = np.arange(
+                    0, dependencies.size, dependency_count, dtype=np.uint64,
+                )
+                rows["dependency_count"] = dependency_count
             yield VirtualQueryContinuation((self._packet(rows, dependencies),))
 
     def _pack_query_count(
@@ -2068,6 +2072,7 @@ class VirtualInterleavedQueryEventExpander:
         candidate_start: int,
         window_id: int,
         *,
+        external_dependencies: tuple[int, ...],
         sealed: bool,
     ) -> VirtualQueryContinuation:
         candidates, query_ids, gaussian_ids, _point_keys = columns
@@ -2207,10 +2212,13 @@ class VirtualInterleavedQueryEventExpander:
             close_rows["query_id"], source, self.relation_query_lanes,
         )
         close_dependency_parts = tuple(
-            np.asarray(
-                pack_ids.relation_start + np.flatnonzero(query_ids == query_id),
-                dtype=dependency_dtype(),
-            )
+            np.concatenate((
+                np.asarray(
+                    pack_ids.relation_start + np.flatnonzero(query_ids == query_id),
+                    dtype=dependency_dtype(),
+                ),
+                np.asarray(external_dependencies, dtype=dependency_dtype()),
+            ))
             for query_id in close_rows["query_id"]
         )
         close_dependencies, close_counts = self._dependency_parts(
@@ -2860,7 +2868,10 @@ class VirtualQueryEventExpander:
             source, candidate_start, relation_start, relation_base, emitted_before=0
         )
         counts = self._relation_counts(source)
-        yield from self._query_closes(source, close_start, relation_start, counts)
+        yield from self._query_closes(
+            source, close_start, relation_start, counts,
+            external_dependencies=external_dependencies,
+        )
         yield from self._one_dependency_stage(
             source, PrimitiveKind.CACHE_REQUEST, ResourceClass.CACHE,
             request_start, relation_start, source.candidate_count,
@@ -2900,13 +2911,16 @@ class VirtualQueryEventExpander:
             rows["template_id"] = source.template_id
             rows["field_mask"] = source.field_mask
             rows["flags"] = np.any(source.masks[start:end], axis=1)
-            dependencies = np.asarray(
-                external_dependencies if start == 0 else (),
-                dtype=dependency_dtype(),
+            dependency_count = len(external_dependencies)
+            dependencies = np.tile(
+                np.asarray(external_dependencies, dtype=dependency_dtype()),
+                end - start,
             )
             if dependencies.size:
-                rows["dependency_begin"][0] = 0
-                rows["dependency_count"][0] = dependencies.size
+                rows["dependency_begin"] = np.arange(
+                    0, dependencies.size, dependency_count, dtype=np.uint64,
+                )
+                rows["dependency_count"] = dependency_count
             yield self._make_event_packet(rows, dependencies)
 
     def _relations(
@@ -2964,6 +2978,8 @@ class VirtualQueryEventExpander:
         event_start: int,
         relation_start: int,
         counts: np.ndarray,
+        *,
+        external_dependencies: tuple[int, ...] = (),
     ) -> Iterator[VirtualEventPacket]:
         relation_prefix = np.empty(counts.size + 1, dtype=np.uint64)
         relation_prefix[0] = 0
@@ -2984,11 +3000,14 @@ class VirtualQueryEventExpander:
                 rows["query_id"], source, self.relation_query_lanes,
             )
             dependency_parts = [
-                np.arange(
-                    relation_start + int(relation_prefix[index]),
-                    relation_start + int(relation_prefix[index + 1]),
-                    dtype=dependency_dtype(),
-                )
+                np.concatenate((
+                    np.arange(
+                        relation_start + int(relation_prefix[index]),
+                        relation_start + int(relation_prefix[index + 1]),
+                        dtype=dependency_dtype(),
+                    ),
+                    np.asarray(external_dependencies, dtype=dependency_dtype()),
+                ))
                 for index in range(start, end)
             ]
             dependencies = np.concatenate(
@@ -2996,11 +3015,12 @@ class VirtualQueryEventExpander:
             )
             local_prefix = np.empty((end - start) + 1, dtype=np.uint64)
             local_prefix[0] = 0
-            np.cumsum(counts[start:end], out=local_prefix[1:])
+            close_counts = counts[start:end] + len(external_dependencies)
+            np.cumsum(close_counts, out=local_prefix[1:])
             rows["dependency_begin"] = np.asarray(
                 local_prefix[:-1], dtype=np.uint64,
             )
-            rows["dependency_count"] = counts[start:end].astype(np.uint32, copy=False)
+            rows["dependency_count"] = close_counts.astype(np.uint32, copy=False)
             yield self._make_event_packet(rows, dependencies)
 
     def _one_dependency_stage(

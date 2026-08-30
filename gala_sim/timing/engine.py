@@ -487,6 +487,7 @@ class _BankedFusionSourceQueue:
         compatible_with: tuple[TaskPacket, ...] = (),
         compatible: Callable[[TaskPacket, tuple[TaskPacket, ...]], bool] | None = None,
         eligible: Callable[[TaskPacket], bool] | None = None,
+        shared_control_group: bool = False,
     ) -> tuple[TaskPacket, ...]:
         """Return ready same-state followers for one bounded multicast bundle."""
 
@@ -507,7 +508,11 @@ class _BankedFusionSourceQueue:
             if eligible is not None and not eligible(packet):
                 continue
             if compatible is not None and not compatible(
-                packet, (*compatible_with, *followers),
+                packet, (
+                    compatible_with
+                    if shared_control_group
+                    else (*compatible_with, *followers)
+                ),
             ):
                 continue
             followers.append(packet)
@@ -537,6 +542,32 @@ class _BankedFusionSourceQueue:
                 best = candidate
         return best[2] if best is not None else None
 
+    def semantic_admission_offers(
+        self, *, destinations: int,
+    ) -> tuple[
+        tuple[tuple[TaskKind, int, int, int], frozenset[int]], ...
+    ]:
+        """Return resident state groups that an already-ready task can fill."""
+
+        if destinations <= 1:
+            return ()
+        offers: list[
+            tuple[int, int, tuple[TaskKind, int, int, int], frozenset[int]]
+        ] = []
+        all_banks = frozenset(range(self.banks))
+        for semantic_key, event_ids in self._by_semantic_key.items():
+            occupied = frozenset(
+                self._global[event_id][1] for event_id in event_ids
+            )
+            if len(occupied) >= destinations:
+                continue
+            offers.append((
+                -len(occupied), next(iter(event_ids)), semantic_key,
+                all_banks - occupied,
+            ))
+        offers.sort(key=lambda item: (item[0], item[1]))
+        return tuple((key, banks) for _count, _age, key, banks in offers)
+
     def record_semantic_bundle(self, followers: int) -> None:
         if followers <= 0:
             raise ValueError("semantic Fusion bundle requires followers")
@@ -560,36 +591,132 @@ class _BankedFusionSourceQueue:
             self._bank_cursor = bank_cursor
 
 
+class _FusionPendingQueueView:
+    """Boolean view of one lazily indexed pending source queue."""
+
+    def __init__(self, owner: "_FusionPendingQueues", task_kind: TaskKind) -> None:
+        self._owner = owner
+        self._task_kind = task_kind
+
+    def __bool__(self) -> bool:
+        return self._owner._counts[self._task_kind] != 0
+
+    def __len__(self) -> int:
+        return self._owner._counts[self._task_kind]
+
+
 class _FusionPendingQueues:
     """Pending Fusion admissions partitioned by source kind.
 
     Admissions from different source FIFOs are independent.  Keeping one
     deque per source preserves each FIFO's arrival order while avoiding a
-    full scan of blocked entries from another source on every cycle.
+    full scan of blocked entries from another source on every cycle.  When a
+    compiler workset is present, a lazy per-state/per-Bank index may select an
+    already-ready task that completes a resident same-state group.  This only
+    changes the software-produced admission order before the bounded hardware
+    FIFO; it never waits for future work or expands hardware visibility.
     """
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        semantic_index: Callable[
+            [int, TaskKind], tuple[tuple[TaskKind, int, int, int], int] | None
+        ] | None = None,
+    ) -> None:
         self._queues: dict[TaskKind, deque[int]] = {
             task_kind: deque() for task_kind in TaskKind
+        }
+        self._views = {
+            task_kind: _FusionPendingQueueView(self, task_kind)
+            for task_kind in TaskKind
+        }
+        self._counts = {task_kind: 0 for task_kind in TaskKind}
+        self._live: dict[TaskKind, set[int]] = {
+            task_kind: set() for task_kind in TaskKind
+        }
+        self._semantic_index = semantic_index
+        self._semantic_by_bank: dict[
+            TaskKind,
+            dict[
+                tuple[tuple[TaskKind, int, int, int], int],
+                deque[int],
+            ],
+        ] = {
+            task_kind: defaultdict(deque) for task_kind in TaskKind
         }
         self._count = 0
 
     def append(self, event_id: int, task_kind: TaskKind) -> None:
+        if event_id in self._live[task_kind]:
+            raise ValueError(f"Fusion task {event_id} entered pending twice")
         self._queues[task_kind].append(event_id)
+        self._live[task_kind].add(event_id)
+        self._counts[task_kind] += 1
+        if self._semantic_index is not None:
+            semantic = self._semantic_index(event_id, task_kind)
+            if semantic is not None:
+                self._semantic_by_bank[task_kind][semantic].append(event_id)
         self._count += 1
 
-    def popleft(self, task_kind: TaskKind) -> int:
-        event_id = self._queues[task_kind].popleft()
+    def _commit(self, event_id: int, task_kind: TaskKind) -> int:
+        self._live[task_kind].remove(event_id)
+        self._counts[task_kind] -= 1
         self._count -= 1
         return event_id
 
+    def popleft(self, task_kind: TaskKind) -> int:
+        queue = self._queues[task_kind]
+        live = self._live[task_kind]
+        while queue and queue[0] not in live:
+            queue.popleft()
+        if not queue:
+            raise IndexError("Fusion pending source queue is empty")
+        return self._commit(queue.popleft(), task_kind)
+
+    def popleft_semantic_match(
+        self,
+        task_kind: TaskKind,
+        offers: tuple[
+            tuple[tuple[TaskKind, int, int, int], frozenset[int]], ...
+        ],
+    ) -> int:
+        """Prefer the oldest ready task that fills one resident state group."""
+
+        live = self._live[task_kind]
+        indexes = self._semantic_by_bank[task_kind]
+        for semantic_key, banks in offers:
+            best: tuple[int, deque[int]] | None = None
+            for bank in banks:
+                indexed = indexes.get((semantic_key, bank))
+                if indexed is None:
+                    continue
+                while indexed and indexed[0] not in live:
+                    indexed.popleft()
+                if not indexed:
+                    del indexes[(semantic_key, bank)]
+                    continue
+                candidate = (indexed[0], indexed)
+                if best is None or candidate[0] < best[0]:
+                    best = candidate
+            if best is not None:
+                event_id, indexed = best
+                indexed.popleft()
+                return self._commit(event_id, task_kind)
+        return self.popleft(task_kind)
+
     def queues(self):
-        return self._queues.items()
+        return self._views.items()
 
     def first_event_id(self) -> int | None:
-        for queue in self._queues.values():
-            if queue:
-                return queue[0]
+        for task_kind, view in self._views.items():
+            if view:
+                queue = self._queues[task_kind]
+                live = self._live[task_kind]
+                while queue and queue[0] not in live:
+                    queue.popleft()
+                if queue:
+                    return queue[0]
         return None
 
     def __bool__(self) -> bool:
@@ -1224,6 +1351,17 @@ class CycleEngine:
         self._query_history_bases: dict[tuple[int, int], int] = {}
         self._semantic_cluster_by_key: dict[tuple[int, int], int] = {}
         self._semantic_placement: SemanticPlacement | None = None
+        self._oracle_task_packet_cache: dict[int, TaskPacket] = {}
+        self._oracle_pair_compatibility_cache: dict[
+            tuple[int, int, int, int, int], bool
+        ] = {}
+        oracle_candidates = len(TaskKind) * (
+            config.candidate_fifo_entries
+            or config.modules["fusion_issue"].queue_capacity
+        )
+        self._oracle_pair_cache_max_entries = (
+            oracle_candidates * (oracle_candidates - 1)
+        )
 
     def _register_query_history_base(
         self, iteration_id: int, template_id: int, query_base: int,
@@ -1424,6 +1562,89 @@ class CycleEngine:
             # Reordering unrelated modules changes arbitration outside the
             # mechanism whose upper bound this Oracle is meant to measure.
         return base_order
+
+    def _balance_compute_adjoint_candidates(
+        self,
+        ordered: list[tuple[int, int]],
+        *,
+        kind_for: Callable[[int], PrimitiveKind],
+        physical_stage_for: Callable[[int], PhysicalPacketStage | None],
+        owner_gradients: OwnerGradientTracker | None,
+    ) -> list[tuple[int, int]]:
+        """Interleave resident adjoint route heads by current owner workload."""
+
+        if not self.selection.overlap_guided_issue or owner_gradients is None:
+            return ordered
+        positions: list[int] = []
+        routes: dict[
+            tuple[int, ...], deque[tuple[tuple[int, int], dict[int, int]]]
+        ] = defaultdict(deque)
+        pressure = {
+            cluster: sum(
+                owner_gradients.remaining_gradient_by_key[key]
+                for key in keys
+            )
+            for cluster, keys in owner_gradients.active_by_cluster.items()
+        }
+        for position, candidate in enumerate(ordered):
+            event_id, stage = candidate
+            kind = kind_for(event_id)
+            if (
+                kind is not PrimitiveKind.ADJOINT
+                or self._stages_for(kind)[stage] != "compute_pod"
+            ):
+                continue
+            physical_stage = physical_stage_for(event_id)
+            event_ids = (
+                physical_stage.event_ids
+                if physical_stage is not None else (event_id,)
+            )
+            additions: dict[int, set[int]] = defaultdict(set)
+            for member in event_ids:
+                key = owner_gradients.key_for_adjoint(member)
+                cluster = owner_gradients.cluster_for_key(key)
+                relation_id = owner_gradients.relation_by_adjoint_event[member]
+                if relation_id not in owner_gradients.active_relations_by_key.get(
+                    key, set(),
+                ):
+                    additions[cluster].add(relation_id)
+            weights = {
+                cluster: len(relation_ids)
+                for cluster, relation_ids in additions.items()
+            }
+            route = tuple(sorted(weights))
+            if not route:
+                route = tuple(sorted({
+                    owner_gradients.cluster_for_key(
+                        owner_gradients.key_for_adjoint(member)
+                    )
+                    for member in event_ids
+                }))
+            positions.append(position)
+            routes[route].append((candidate, weights))
+        if len(positions) < 2:
+            return ordered
+
+        balanced: list[tuple[int, int]] = []
+        while routes:
+            route = min(
+                routes,
+                key=lambda candidate_route: (
+                    max(pressure.get(cluster, 0) for cluster in candidate_route),
+                    routes[candidate_route][0][0][0],
+                    candidate_route,
+                ),
+            )
+            candidate, weights = routes[route].popleft()
+            balanced.append(candidate)
+            for cluster, weight in weights.items():
+                pressure[cluster] = pressure.get(cluster, 0) + weight
+            if not routes[route]:
+                del routes[route]
+        result = list(ordered)
+        for position, candidate in zip(positions, balanced, strict=True):
+            result[position] = candidate
+        return result
 
     @staticmethod
     def _task_packet(
@@ -1643,15 +1864,18 @@ class CycleEngine:
             TaskKind.ADJOINT: [],
         }
         for event_id in event_ids:
-            packet = self._task_packet(
-                trace, event_id,
-                packet_plan.stage_for_event(event_id) if packet_plan is not None else None,
-                consumer_owner_ids=(
-                    (consumer_owner_for_event[event_id],)
-                    if consumer_owner_for_event is not None
-                    and event_id in consumer_owner_for_event else ()
-                ),
-            )
+            packet = self._oracle_task_packet_cache.get(event_id)
+            if packet is None:
+                packet = self._task_packet(
+                    trace, event_id,
+                    packet_plan.stage_for_event(event_id) if packet_plan is not None else None,
+                    consumer_owner_ids=(
+                        (consumer_owner_for_event[event_id],)
+                        if consumer_owner_for_event is not None
+                        and event_id in consumer_owner_for_event else ()
+                    ),
+                )
+                self._oracle_task_packet_cache[event_id] = packet
             weight = int(future_plan.critical_cycles[event_id])
             bank = self._fusion_query_state_bank(trace.events[event_id])
             by_kind[packet.task_kind].append((weight, bank, packet))
@@ -1676,83 +1900,236 @@ class CycleEngine:
             ),
             key=lambda item: (-item[0], item[2].event_id),
         )
-        best_score = -1
-        best_ids: tuple[int, ...] = ()
-
-        def search(
-            index: int,
-            score: int,
-            selected: tuple[int, ...],
-            used_sources: dict[TaskKind, int],
-            occupied_keys: frozenset[tuple[ReductionDomain, int]],
-            occupied_targets: frozenset[int],
-            occupied_banks: frozenset[int],
-        ) -> None:
-            nonlocal best_score, best_ids
-            if score > best_score:
-                best_score = score
-                best_ids = selected
-            remaining_slots = self.config.candidate_lanes - len(selected)
-            if remaining_slots == 0 or index == len(candidates):
-                return
-            optimistic = score + sum(
-                weight for weight, _bank, _packet in
-                candidates[index:index + remaining_slots]
-            )
-            if optimistic <= best_score:
-                return
-
-            weight, bank, packet = candidates[index]
+        eligible: list[tuple[int, int, TaskPacket]] = []
+        for weight, bank, packet in candidates:
             tracked_states = (
                 self.issue_scheduler.states.get(query_id)
                 for query_id in packet.readiness_query_ids
             )
-            exact_ready = (
+            if (
                 not self.issue_scheduler.enforce_exact_readiness
                 or all(
                     state is not None
                     and state.exact_ready(packet.task_kind)
                     for state in tracked_states
                 )
-            )
-            target = packet.target_resource
-            if (
-                exact_ready
-                and used_sources[packet.task_kind]
-                < source_limits[packet.task_kind]
-                and packet.conflict_keys.isdisjoint(occupied_keys)
-                and bank not in occupied_banks
-                and (target is None or target not in occupied_targets)
             ):
-                next_sources = dict(used_sources)
-                next_sources[packet.task_kind] += 1
-                search(
-                    index + 1,
-                    score + weight,
-                    (*selected, packet.event_id),
-                    next_sources,
-                    occupied_keys.union(packet.conflict_keys),
-                    (
-                        occupied_targets
-                        if target is None else occupied_targets.union((target,))
-                    ),
-                    occupied_banks.union((bank,)),
-                )
-            search(
-                index + 1, score, selected, used_sources,
-                occupied_keys, occupied_targets, occupied_banks,
-            )
-
-        search(
-            0,
-            0,
-            (),
-            {kind: 0 for kind in TaskKind},
-            frozenset(),
-            frozenset(),
-            frozenset(),
+                eligible.append((weight, bank, packet))
+        return self._maximum_weight_query_candidates(
+            eligible,
+            source_limits=source_limits,
+            pair_cache=self._oracle_pair_compatibility_cache,
+            pair_cache_max_entries=self._oracle_pair_cache_max_entries,
         )
+
+    @staticmethod
+    def _maximum_weight_query_candidates(
+        candidates: list[tuple[int, int, TaskPacket]],
+        *,
+        source_limits: Mapping[TaskKind, int],
+        pair_cache: dict[tuple[int, int, int, int, int], bool] | None = None,
+        pair_cache_max_entries: int | None = None,
+    ) -> tuple[int, ...]:
+        """Select the exact best compatible set for the fixed three-lane issue."""
+
+        candidates = [
+            item for item in candidates
+            if source_limits[item[2].task_kind] > 0
+        ]
+        count = len(candidates)
+        if count == 0:
+            return ()
+
+        def pair_compatible(
+            left_bank: int,
+            left_packet: TaskPacket,
+            right_bank: int,
+            right_packet: TaskPacket,
+        ) -> bool:
+            if left_packet.event_id <= right_packet.event_id:
+                first_id, first_bank = left_packet.event_id, left_bank
+                second_id, second_bank = right_packet.event_id, right_bank
+            else:
+                first_id, first_bank = right_packet.event_id, right_bank
+                second_id, second_bank = left_packet.event_id, left_bank
+            same_source_limit = (
+                source_limits[left_packet.task_kind]
+                if left_packet.task_kind is right_packet.task_kind else 0
+            )
+            key = (
+                first_id, second_id, first_bank, second_bank, same_source_limit,
+            )
+            cached = pair_cache.get(key) if pair_cache is not None else None
+            if cached is not None:
+                return cached
+            result = CycleEngine._query_oracle_pair_compatible(
+                left_bank, left_packet, right_bank, right_packet,
+                source_limits=source_limits,
+            )
+            if pair_cache is not None:
+                if (
+                    pair_cache_max_entries is not None
+                    and len(pair_cache) >= pair_cache_max_entries
+                ):
+                    pair_cache.clear()
+                pair_cache[key] = result
+            return result
+
+        relaxed_width = CycleEngine._relaxed_query_candidate_width(
+            candidates, source_limits=source_limits,
+        )
+        if relaxed_width == 1:
+            return (candidates[0][2].event_id,)
+        if relaxed_width == 2:
+            best_score = candidates[0][0]
+            best_ids = (candidates[0][2].event_id,)
+            for left in range(count - 1):
+                left_weight, left_bank, left_packet = candidates[left]
+                if left_weight + candidates[left + 1][0] <= best_score:
+                    break
+                for right in range(left + 1, count):
+                    right_weight, right_bank, right_packet = candidates[right]
+                    pair_score = left_weight + right_weight
+                    if pair_score <= best_score:
+                        break
+                    if not pair_compatible(
+                        left_bank, left_packet, right_bank, right_packet,
+                    ):
+                        continue
+                    best_score = pair_score
+                    best_ids = (left_packet.event_id, right_packet.event_id)
+                    break
+            return best_ids
+
+        kind_masks = {kind: 0 for kind in TaskKind}
+        for index, (_weight, _bank, packet) in enumerate(candidates):
+            kind_masks[packet.task_kind] |= 1 << index
+
+        compatible = [0] * count
+        for left in range(count):
+            _left_weight, left_bank, left_packet = candidates[left]
+            for right in range(left + 1, count):
+                _right_weight, right_bank, right_packet = candidates[right]
+                if not pair_compatible(
+                    left_bank, left_packet, right_bank, right_packet,
+                ):
+                    continue
+                compatible[left] |= 1 << right
+                compatible[right] |= 1 << left
+
+        best_score = 0
+        best_ids: tuple[int, ...] = ()
+        for left, (left_weight, _left_bank, left_packet) in enumerate(candidates):
+            if source_limits[left_packet.task_kind] <= 0:
+                continue
+            if left_weight > best_score:
+                best_score = left_weight
+                best_ids = (left_packet.event_id,)
+            right_bits = compatible[left] & ~((1 << (left + 1)) - 1)
+            while right_bits:
+                right_bit = right_bits & -right_bits
+                right = right_bit.bit_length() - 1
+                right_bits ^= right_bit
+                right_weight, _right_bank, right_packet = candidates[right]
+                pair_score = left_weight + right_weight
+                if pair_score > best_score:
+                    best_score = pair_score
+                    best_ids = (left_packet.event_id, right_packet.event_id)
+
+                used_sources = {
+                    kind: int(left_packet.task_kind is kind)
+                    + int(right_packet.task_kind is kind)
+                    for kind in TaskKind
+                }
+                allowed_kinds = 0
+                for kind, mask in kind_masks.items():
+                    if used_sources[kind] < source_limits[kind]:
+                        allowed_kinds |= mask
+                third_bits = (
+                    compatible[left]
+                    & compatible[right]
+                    & allowed_kinds
+                    & ~((1 << (right + 1)) - 1)
+                )
+                if not third_bits:
+                    continue
+                third = (third_bits & -third_bits).bit_length() - 1
+                third_weight, _third_bank, third_packet = candidates[third]
+                triple_score = pair_score + third_weight
+                if triple_score > best_score:
+                    best_score = triple_score
+                    best_ids = (
+                        left_packet.event_id,
+                        right_packet.event_id,
+                        third_packet.event_id,
+                    )
         return best_ids
+
+    @staticmethod
+    def _query_oracle_pair_compatible(
+        left_bank: int,
+        left_packet: TaskPacket,
+        right_bank: int,
+        right_packet: TaskPacket,
+        *,
+        source_limits: Mapping[TaskKind, int],
+    ) -> bool:
+        return not (
+            left_bank == right_bank
+            or not left_packet.conflict_keys.isdisjoint(right_packet.conflict_keys)
+            or (
+                left_packet.target_resource is not None
+                and left_packet.target_resource == right_packet.target_resource
+            )
+            or (
+                left_packet.task_kind is right_packet.task_kind
+                and source_limits[left_packet.task_kind] < 2
+            )
+        )
+
+    @staticmethod
+    def _relaxed_query_candidate_width(
+        candidates: list[tuple[int, int, TaskPacket]],
+        *,
+        source_limits: Mapping[TaskKind, int],
+    ) -> int:
+        """Bound issue width using only source limits and distinct Banks."""
+
+        groups = tuple({
+            (packet.task_kind, bank)
+            for _weight, bank, packet in candidates
+            if source_limits[packet.task_kind] > 0
+        })
+        if not groups:
+            return 0
+        for first in range(len(groups)):
+            first_kind, first_bank = groups[first]
+            for second in range(first + 1, len(groups)):
+                second_kind, second_bank = groups[second]
+                if first_bank == second_bank or (
+                    first_kind is second_kind
+                    and source_limits[first_kind] < 2
+                ):
+                    continue
+                counts = {
+                    kind: int(first_kind is kind) + int(second_kind is kind)
+                    for kind in TaskKind
+                }
+                for third in range(second + 1, len(groups)):
+                    third_kind, third_bank = groups[third]
+                    if third_bank in {first_bank, second_bank}:
+                        continue
+                    if counts[third_kind] < source_limits[third_kind]:
+                        return 3
+        for first in range(len(groups)):
+            first_kind, first_bank = groups[first]
+            for second_kind, second_bank in groups[first + 1:]:
+                if first_bank != second_bank and (
+                    first_kind is not second_kind
+                    or source_limits[first_kind] >= 2
+                ):
+                    return 2
+        return 1
 
     def _fusion_port_limit(self, kind: PrimitiveKind) -> tuple[str, int]:
         timing_ports = self.config.modules["fusion_issue"].ports
@@ -1787,6 +2164,30 @@ class CycleEngine:
             )
         )
 
+    def _fusion_pending_semantic_index(
+        self, row: np.void, task_kind: TaskKind,
+    ) -> tuple[tuple[TaskKind, int, int, int], int] | None:
+        if task_kind not in {TaskKind.FORWARD, TaskKind.ADJOINT}:
+            return None
+        return (
+            (
+                task_kind,
+                int(row["gaussian_id"]),
+                int(row["state_version"]),
+                int(row["template_id"]),
+            ),
+            self._fusion_query_state_bank(row),
+        )
+
+    def _joint_semantic_priority_enabled(self) -> bool:
+        if not self.selection.overlap_guided_issue:
+            return True
+        # In Full, A+C must choose from the real source heads before D expands
+        # an accepted leader into a same-state control bundle.  Letting the
+        # semantic index replace those heads would bypass the compiler's query
+        # release order and starve the downstream adjoint replay lanes.
+        return False
+
     def _peek_fusion_input_candidates(
         self,
         inputs: Mapping[TaskKind, _BankedFusionSourceQueue],
@@ -1803,8 +2204,7 @@ class CycleEngine:
 
         if (
             self.selection.semantic_worksets
-            and self.selection.semantic_residency
-            and not self.selection.overlap_guided_issue
+            and self._joint_semantic_priority_enabled()
             and self.config.fusion_semantic_bundle_index_bytes is not None
         ):
             destinations = min(
@@ -1897,7 +2297,6 @@ class CycleEngine:
         destinations = self.config.cache_multicast_destinations
         if (
             not self.selection.semantic_worksets
-            or not self.selection.semantic_residency
             or self.selection.overlap_guided_issue != coordinated_issue
             or self.config.fusion_semantic_bundle_index_bytes is None
             or destinations is None
@@ -1905,7 +2304,6 @@ class CycleEngine:
         ):
             return None
         best: tuple[int, int, TaskPacket, tuple[TaskPacket, ...]] | None = None
-        excluded = frozenset(packet.event_id for packet in candidates)
         for leader in candidates:
             if leader.task_kind not in {TaskKind.FORWARD, TaskKind.ADJOINT}:
                 continue
@@ -1913,9 +2311,15 @@ class CycleEngine:
                 tuple(
                     packet for packet in candidates
                     if packet.event_id != leader.event_id
+                    and (
+                        packet.task_kind is not leader.task_kind
+                        or inputs[leader.task_kind]._semantic_key(packet)
+                        != inputs[leader.task_kind]._semantic_key(leader)
+                    )
                 )
                 if coordinated_issue else ()
             )
+            excluded = frozenset(packet.event_id for packet in blockers)
             occupied_banks = frozenset(
                 (packet.query_id // self.config.relation_query_lanes)
                 % inputs[leader.task_kind].banks
@@ -1935,6 +2339,7 @@ class CycleEngine:
                     self._fusion_packet_exact_ready
                     if coordinated_issue else None
                 ),
+                shared_control_group=coordinated_issue,
             )
             if not followers:
                 continue
@@ -1942,6 +2347,32 @@ class CycleEngine:
             if best is None or candidate[:2] < best[:2]:
                 best = candidate
         return (best[2], best[3]) if best is not None else None
+
+    def _query_compound_bundle(
+        self,
+        accepted: tuple[TaskPacket, ...],
+        *,
+        row_for: Callable[[int], np.void],
+    ) -> tuple[TaskPacket, tuple[TaskPacket, ...]] | None:
+        """Pack exact compiler-selected heads into one static control word."""
+
+        if (
+            not self.selection.query_load_rules
+            or self.selection.overlap_guided_issue
+            or len(accepted) < 2
+        ):
+            return None
+        selected: list[TaskPacket] = []
+        occupied_banks: set[int] = set()
+        for packet in accepted:
+            bank = self._fusion_query_state_bank(row_for(packet.event_id))
+            if bank in occupied_banks:
+                continue
+            selected.append(packet)
+            occupied_banks.add(bank)
+        if len(selected) < 2:
+            return None
+        return selected[0], tuple(selected[1:])
 
     def _module_issue_ports(self, module_name: str) -> int:
         """Return the actual issue slots represented by a module instance.
@@ -2445,6 +2876,48 @@ class CycleEngine:
             if kind is PrimitiveKind.GRADIENT_REDUCTION else None,
         )
 
+    def _compute_cluster_pressure(
+        self,
+        event_id: int,
+        kind: PrimitiveKind,
+        physical_stage: PhysicalPacketStage | None,
+        owner_gradients: OwnerGradientTracker | None,
+    ) -> Mapping[int, int] | None:
+        """Return current downstream owner work for overlap-guided placement."""
+
+        if (
+            not self.selection.overlap_guided_issue
+            or owner_gradients is None
+            or kind not in {PrimitiveKind.FORWARD, PrimitiveKind.ADJOINT}
+        ):
+            return None
+        pressure = {
+            cluster: sum(
+                owner_gradients.remaining_gradient_by_key[key]
+                for key in keys
+            )
+            for cluster, keys in owner_gradients.active_by_cluster.items()
+        }
+        if kind is PrimitiveKind.FORWARD:
+            return pressure
+        event_ids = (
+            physical_stage.event_ids
+            if physical_stage is not None else (event_id,)
+        )
+        additions: dict[int, set[int]] = defaultdict(set)
+        for member in event_ids:
+            key = owner_gradients.key_for_adjoint(member)
+            relation_id = owner_gradients.relation_by_adjoint_event[member]
+            active_relations = owner_gradients.active_relations_by_key.get(key, set())
+            if relation_id in active_relations:
+                continue
+            additions.setdefault(
+                owner_gradients.cluster_for_key(key), set(),
+            ).add(relation_id)
+        for cluster, relation_ids in additions.items():
+            pressure[cluster] = pressure.get(cluster, 0) + len(relation_ids)
+        return pressure
+
     def _physical_service_cycles(
         self,
         module_name: str,
@@ -2495,7 +2968,10 @@ class CycleEngine:
         instances = self.config.cache_instances
         if instances is None:
             raise CycleConfigurationError("cache instance count is not configured")
-        cluster = self._semantic_cluster_by_key.get((iteration_id, gaussian_id))
+        cluster = (
+            self._semantic_cluster_by_key.get((iteration_id, gaussian_id))
+            if self.selection.semantic_residency else None
+        )
         capacities = self.config.compute_resource_capacities
         if cluster is not None and capacities is not None:
             clusters_per_pod = int(capacities["clusters_per_pod"])
@@ -2515,11 +2991,11 @@ class CycleEngine:
         if placement is None:
             return
         if not (
-            self.selection.semantic_worksets
-            and self.selection.semantic_residency
+            self.selection.query_load_rules
+            or self.selection.semantic_worksets
         ):
             raise CycleConfigurationError(
-                "semantic placement requires compiler worksets and residency"
+                "compute placement requires compiler load metadata"
             )
         if not placement.cluster_by_key:
             return
@@ -2646,8 +3122,8 @@ class CycleEngine:
                 lambda: SemanticPlacement.from_trace(trace, packet_plan, self.config),
             )
             if (
-                self.selection.semantic_worksets
-                and self.selection.semantic_residency
+                self.selection.query_load_rules
+                or self.selection.semantic_worksets
             ) else None
         )
         self._install_semantic_placement(semantic_placement)
@@ -2857,7 +3333,14 @@ class CycleEngine:
             self.config.fusion_query_state_banks
             or self.modules["fusion_issue"].timing.banks
         )
-        fusion_pending = _FusionPendingQueues()
+        fusion_pending = _FusionPendingQueues(
+            semantic_index=(
+                lambda event_id, task_kind: self._fusion_pending_semantic_index(
+                    trace.events[event_id], task_kind,
+                )
+                if self.selection.semantic_worksets else None
+            ),
+        )
         fusion_inputs: dict[TaskKind, _BankedFusionSourceQueue] = {
             kind: _BankedFusionSourceQueue(
                 capacity=fusion_capacity, banks=fusion_banks,
@@ -2867,6 +3350,8 @@ class CycleEngine:
             )
             for kind in TaskKind
         }
+        query_compound_issues = 0
+        query_compound_followers = 0
         fusion_oracle_inputs: dict[
             TaskKind, list[tuple[tuple[int, int], int]]
         ] = {
@@ -3382,7 +3867,19 @@ class CycleEngine:
                 else:
                     queue = fusion_inputs[task_kind]
                     while pending and not queue.full:
-                        event_id = fusion_pending.popleft(task_kind)
+                        offers = queue.semantic_admission_offers(
+                            destinations=min(
+                                int(self.config.cache_multicast_destinations or 1),
+                                int(self.config.candidate_lanes),
+                            ),
+                        )
+                        event_id = (
+                            fusion_pending.popleft_semantic_match(
+                                task_kind, offers,
+                            )
+                            if self.selection.semantic_worksets and offers
+                            else fusion_pending.popleft(task_kind)
+                        )
                         packet = self._task_packet(
                             trace, event_id,
                             packet_plan.stage_for_event(event_id),
@@ -3415,6 +3912,7 @@ class CycleEngine:
                 )
             candidates: list[tuple[int, int]] = []
             semantic_fusion_followers: dict[int, int] = {}
+            query_compound_fusion_followers: dict[int, int] = {}
             for ready_key in tuple(ready):
                 queue = ready[ready_key]
                 module_name, _partition = ready_key
@@ -3454,9 +3952,9 @@ class CycleEngine:
                 (
                     fusion_candidate_packets,
                     fusion_borrow_commits,
-                ) = self._peek_fusion_input_candidates(
-                    fusion_inputs, borrow_cursor=fusion_borrow_cursor,
-                )
+            ) = self._peek_fusion_input_candidates(
+                fusion_inputs, borrow_cursor=fusion_borrow_cursor,
+            )
                 semantic_bundle = self._semantic_fusion_bundle(
                     fusion_inputs, fusion_candidate_packets,
                 )
@@ -3528,6 +4026,17 @@ class CycleEngine:
                     if event_id in fusion_packets else (event_id, stage)
                     for event_id, stage in ordered
                 ]
+                if not semantic_fusion_followers:
+                    query_compound = self._query_compound_bundle(
+                        decision.accepted,
+                        row_for=lambda event_id: trace.events[event_id],
+                    )
+                    if query_compound is not None:
+                        leader, followers = query_compound
+                        query_compound_fusion_followers = {
+                            follower.event_id: leader.event_id
+                            for follower in followers
+                        }
                 if self.selection.overlap_guided_issue:
                     coordinated_bundle = self._semantic_fusion_bundle(
                         fusion_inputs, list(decision.accepted),
@@ -3552,6 +4061,14 @@ class CycleEngine:
                 PrimitiveKind(int(trace.events[item[0]]["primitive_kind"])),
                 item[1],
             ))
+            ordered = self._balance_compute_adjoint_candidates(
+                ordered,
+                kind_for=lambda event_id: PrimitiveKind(
+                    int(trace.events[event_id]["primitive_kind"])
+                ),
+                physical_stage_for=packet_plan.stage_for_event,
+                owner_gradients=owner_gradients,
+            )
             replay_advanced = False
             for ordered_position, (event_id, stage) in enumerate(ordered):
                 row = trace.events[event_id]
@@ -3627,13 +4144,17 @@ class CycleEngine:
                     # every ready follower in the same multicast group.
                     progressed = True
                     continue
-                semantic_leader = (
+                control_leader = (
                     semantic_fusion_followers.get(event_id)
                     if module_name == "fusion_issue" and stage == 0 else None
                 )
-                if semantic_leader is not None:
+                if control_leader is None and module_name == "fusion_issue" and stage == 0:
+                    control_leader = query_compound_fusion_followers.get(
+                        event_id
+                    )
+                if control_leader is not None:
                     # The follower stays in its source FIFO until the accepted
-                    # leader commits this one physical semantic submission.
+                    # leader commits this one physical control submission.
                     continue
                 if (
                     module_name == "fusion_issue" and stage == 0
@@ -3901,6 +4422,9 @@ class CycleEngine:
                                     PrimitiveKind.ADJOINT,
                                 }
                                 else None
+                            ),
+                            cluster_pressure=self._compute_cluster_pressure(
+                                event_id, kind, physical_stage, owner_gradients,
                             ),
                         )
                     except KeyError as error:
@@ -4368,6 +4892,73 @@ class CycleEngine:
                             module.counters.accepted += 1
                             module.counters.busy_cycles += follower_service
                             source.commit(follower_id)
+                    compound_followers = tuple(
+                        follower_id
+                        for follower_id, leader_id
+                        in query_compound_fusion_followers.items()
+                        if leader_id == event_id
+                    )
+                    if compound_followers:
+                        query_compound_issues += 1
+                        query_compound_followers += len(compound_followers)
+                        self.issue_scheduler.commit_issued(
+                            fusion_packets[follower_id]
+                            for follower_id in compound_followers
+                        )
+                        for follower_id in compound_followers:
+                            follower_row = trace.events[follower_id]
+                            follower_kind = PrimitiveKind(
+                                int(follower_row["primitive_kind"])
+                            )
+                            if (
+                                follower_kind is PrimitiveKind.CONSUMER
+                                and self.issue_scheduler.strict_lifecycle
+                            ):
+                                try:
+                                    owner = consumer_credit_owner.get(
+                                        follower_id
+                                    )
+                                    if (
+                                        owner is None
+                                        or not self.issue_scheduler.successor_dispatch(
+                                            owner
+                                        )
+                                    ):
+                                        raise CycleConfigurationError(
+                                            f"consumer {follower_id} has no committed credit owner"
+                                        )
+                                except ValueError as error:
+                                    raise CycleConfigurationError(
+                                        str(error)
+                                    ) from error
+                            follower_stage = packet_plan.stage_for_event(
+                                follower_id
+                            )
+                            follower_service = self._physical_service_cycles(
+                                module_name, follower_row, follower_kind,
+                                follower_stage,
+                            )
+                            heapq.heappush(in_flight, (
+                                cycle + follower_service,
+                                follower_id, stage, module_name,
+                            ))
+                            follower_key = (
+                                module_name,
+                                self._module_partition(
+                                    module_name, follower_row,
+                                ),
+                            )
+                            module_inflight[follower_key] += 1
+                            module.counters.accepted += 1
+                            module.counters.busy_cycles += follower_service
+                            follower_task_kind = {
+                                PrimitiveKind.FORWARD: TaskKind.FORWARD,
+                                PrimitiveKind.CONSUMER: TaskKind.CONSUMER,
+                                PrimitiveKind.ADJOINT: TaskKind.ADJOINT,
+                            }[follower_kind]
+                            fusion_inputs[follower_task_kind].commit(
+                                follower_id,
+                            )
                     if fusion_port_name is not None:
                         fusion_port_issued[fusion_port_name] = (
                             fusion_port_issued.get(fusion_port_name, 0) + 1
@@ -4662,6 +5253,8 @@ class CycleEngine:
             "semantic_adjoint_bundle_followers": (
                 fusion_inputs[TaskKind.ADJOINT].semantic_bundle_followers
             ),
+            "query_compound_issues": query_compound_issues,
+            "query_compound_followers": query_compound_followers,
             "live_forward_count": f_count,
             "live_consumer_count": c_count,
             "live_adjoint_count": a_count,
@@ -5107,7 +5700,14 @@ class CycleReplaySession:
             engine.config.fusion_query_state_banks
             or engine.modules["fusion_issue"].timing.banks
         )
-        self._fusion_pending = _FusionPendingQueues()
+        self._fusion_pending = _FusionPendingQueues(
+            semantic_index=(
+                lambda event_id, task_kind: engine._fusion_pending_semantic_index(
+                    self._events[event_id], task_kind,
+                )
+                if engine.selection.semantic_worksets else None
+            ),
+        )
         self._fusion_inputs: dict[TaskKind, _BankedFusionSourceQueue] = {
             kind: _BankedFusionSourceQueue(
                 capacity=fusion_capacity, banks=fusion_banks,
@@ -5117,6 +5717,8 @@ class CycleReplaySession:
             )
             for kind in TaskKind
         }
+        self._query_compound_issues = 0
+        self._query_compound_followers = 0
         self._in_flight: list[tuple[int, int, int, str]] = []
         self._lane_outputs: list[tuple[int, int, int | None]] = []
         self._separate_lane_completion: set[int] = set()
@@ -5519,8 +6121,10 @@ class CycleReplaySession:
         self._ensure_open()
         packets = tuple(packets)
         if (
-            self.engine.selection.semantic_worksets
-            and self.engine.selection.semantic_residency
+            (
+                self.engine.selection.query_load_rules
+                or self.engine.selection.semantic_worksets
+            )
             and self.engine.config.compute_templates is not None
         ):
             missing = [
@@ -5538,7 +6142,7 @@ class CycleReplaySession:
             ]
             if missing:
                 raise CycleConfigurationError(
-                    "online semantic worksets require placement registration; "
+                    "online compiler load metadata requires placement registration; "
                     f"first missing key is {missing[0]}"
                 )
         for packet in packets:
@@ -5898,12 +6502,12 @@ class CycleReplaySession:
 
         self._ensure_open()
         if not (
-            self.engine.selection.semantic_worksets
-            and self.engine.selection.semantic_residency
+            self.engine.selection.query_load_rules
+            or self.engine.selection.semantic_worksets
         ):
             if placement.cluster_by_key:
                 raise CycleConfigurationError(
-                    "semantic placement requires compiler worksets and residency"
+                    "compute placement requires compiler load metadata"
                 )
             return
         if self._events or self._in_flight or self._memory_waiters:
@@ -6146,6 +6750,8 @@ class CycleReplaySession:
             "semantic_adjoint_bundle_followers": (
                 self._fusion_inputs[TaskKind.ADJOINT].semantic_bundle_followers
             ),
+            "query_compound_issues": self._query_compound_issues,
+            "query_compound_followers": self._query_compound_followers,
             "live_forward_count": f_count,
             "live_consumer_count": c_count,
             "live_adjoint_count": a_count,
@@ -6499,7 +7105,22 @@ class CycleReplaySession:
             for task_kind, pending in self._fusion_pending.queues():
                 queue = self._fusion_inputs[task_kind]
                 while pending and not queue.full:
-                    event_id = self._fusion_pending.popleft(task_kind)
+                    offers = queue.semantic_admission_offers(
+                        destinations=min(
+                            int(
+                                self.engine.config.cache_multicast_destinations
+                                or 1
+                            ),
+                            int(self.engine.config.candidate_lanes),
+                        ),
+                    )
+                    event_id = (
+                        self._fusion_pending.popleft_semantic_match(
+                            task_kind, offers,
+                        )
+                        if self.engine.selection.semantic_worksets and offers
+                        else self._fusion_pending.popleft(task_kind)
+                    )
                     packet = self._task_packet(event_id)
                     queue.append(
                         packet,
@@ -6536,6 +7157,7 @@ class CycleReplaySession:
                 self._fusion_inputs, fusion_candidate_packets,
             )
             semantic_fusion_followers: dict[int, int] = {}
+            query_compound_fusion_followers: dict[int, int] = {}
             if semantic_bundle is not None:
                 leader, followers = semantic_bundle
                 semantic_fusion_followers = {
@@ -6578,6 +7200,17 @@ class CycleReplaySession:
                         (next(order), stage) if event_id in fusion_packets else (event_id, stage)
                         for event_id, stage in ordered
                     ]
+                    if not semantic_fusion_followers:
+                        query_compound = self.engine._query_compound_bundle(
+                            decision.accepted,
+                            row_for=self._events.__getitem__,
+                        )
+                        if query_compound is not None:
+                            leader, followers = query_compound
+                            query_compound_fusion_followers = {
+                                follower.event_id: leader.event_id
+                                for follower in followers
+                            }
                     if self.engine.selection.overlap_guided_issue:
                         coordinated_bundle = self.engine._semantic_fusion_bundle(
                             self._fusion_inputs, list(decision.accepted),
@@ -6599,8 +7232,17 @@ class CycleReplaySession:
                 ordered.sort(key=lambda item: self.engine._ready_issue_priority(
                     self._kinds[item[0]], item[1],
                 ))
+                ordered = self.engine._balance_compute_adjoint_candidates(
+                    ordered,
+                    kind_for=self._kinds.__getitem__,
+                    physical_stage_for=self._packet_stage_by_event.get,
+                    owner_gradients=self._owner_gradients,
+                )
                 for ordered_position, (event_id, stage) in enumerate(ordered):
-                    if event_id in semantic_fusion_followers:
+                    if (
+                        event_id in semantic_fusion_followers
+                        or event_id in query_compound_fusion_followers
+                    ):
                         continue
                     if (
                         not replay_advanced
@@ -6698,6 +7340,12 @@ class CycleReplaySession:
                             in semantic_fusion_followers.items()
                             if leader_id == event_id
                         ),
+                        query_compound_fusion_followers=tuple(
+                            follower_id
+                            for follower_id, leader_id
+                            in query_compound_fusion_followers.items()
+                            if leader_id == event_id
+                        ),
                     ):
                         progressed = True
             if not replay_advanced:
@@ -6747,6 +7395,7 @@ class CycleReplaySession:
         multicast_followers: tuple[int, ...] = (),
         return_multicast_followers: tuple[int, ...] = (),
         semantic_fusion_followers: tuple[int, ...] = (),
+        query_compound_fusion_followers: tuple[int, ...] = (),
     ) -> bool:
         row = self._events[event_id]
         kind = self._kinds[event_id]
@@ -7051,6 +7700,9 @@ class CycleReplaySession:
                         }
                         else None
                     ),
+                    cluster_pressure=self.engine._compute_cluster_pressure(
+                        event_id, kind, physical_stage, self._owner_gradients,
+                    ),
                 )
             except KeyError as error:
                 raise CycleConfigurationError(str(error)) from error
@@ -7292,6 +7944,66 @@ class CycleReplaySession:
                     module.counters.accepted += 1
                     module.counters.busy_cycles += follower_service
                     source.commit(follower_id)
+            if query_compound_fusion_followers:
+                self._query_compound_issues += 1
+                self._query_compound_followers += len(
+                    query_compound_fusion_followers
+                )
+                self.engine.issue_scheduler.commit_issued(
+                    self._task_packet(follower_id)
+                    for follower_id in query_compound_fusion_followers
+                )
+                for follower_id in query_compound_fusion_followers:
+                    follower_row = self._events[follower_id]
+                    follower_kind = self._kinds[follower_id]
+                    if (
+                        follower_kind is PrimitiveKind.CONSUMER
+                        and self.engine.issue_scheduler.strict_lifecycle
+                    ):
+                        try:
+                            owner = self._consumer_credit_owner.get(
+                                follower_id
+                            )
+                            dispatched = (
+                                owner is not None
+                                and self.engine.issue_scheduler.successor_dispatch(
+                                    owner
+                                )
+                            )
+                            if not dispatched:
+                                raise CycleConfigurationError(
+                                    f"consumer {follower_id} has no query-state owner"
+                                )
+                        except ValueError as error:
+                            raise CycleConfigurationError(
+                                str(error)
+                            ) from error
+                    follower_stage = self._packet_stage_by_event.get(
+                        follower_id
+                    )
+                    follower_service = self.engine._physical_service_cycles(
+                        module_name, follower_row, follower_kind,
+                        follower_stage,
+                    )
+                    heapq.heappush(self._in_flight, (
+                        self._cycle + follower_service,
+                        follower_id, stage, module_name,
+                    ))
+                    follower_key = (
+                        module_name,
+                        self._module_partition_for(
+                            module_name, follower_id,
+                        ),
+                    )
+                    self._module_inflight[follower_key] += 1
+                    module.counters.accepted += 1
+                    module.counters.busy_cycles += follower_service
+                    follower_task_kind = self._fusion_task_by_kind[
+                        follower_kind
+                    ]
+                    self._fusion_inputs[follower_task_kind].commit(
+                        follower_id,
+                    )
             if port_name:
                 self._cycle_fusion_ports[port_name] = self._cycle_fusion_ports.get(port_name, 0) + 1
         return True
@@ -7664,13 +8376,17 @@ class BufferedVirtualCycleConsumer:
         if not self._packets:
             return
         selection = self.session.engine.selection
-        if not selection.semantic_worksets and not selection.semantic_residency:
+        if not (
+            selection.query_load_rules
+            or selection.semantic_worksets
+            or selection.semantic_residency
+        ):
             packets = tuple(self._packets)
             self._packets.clear()
             self.session.accept_query_packets(packets)
             return
         packets = tuple(self._packets)
-        if selection.semantic_worksets and selection.semantic_residency:
+        if selection.query_load_rules or selection.semantic_worksets:
             placement = SemanticPlacement.from_virtual_packets(
                 packets,
                 self.session.engine.config,

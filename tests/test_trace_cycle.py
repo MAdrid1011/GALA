@@ -34,6 +34,7 @@ from gala_sim.timing import (
 from gala_sim.timing.engine import (
     _BankedFusionSourceQueue,
     _DependencyIndex,
+    _FusionPendingQueues,
     _ReadyCandidateQueue,
 )
 from gala_sim.timing.modules import OwnerGradientTracker
@@ -60,6 +61,25 @@ from gala_sim.clamp.events import dependency_dtype, event_dtype
 class _Memory:
     def submit(self, *, address: int, size_bytes: int, is_write: bool, arrival_cycle: int) -> int:
         return arrival_cycle + size_bytes // 64 + int(is_write)
+
+
+def test_semantic_pending_admission_uses_only_ready_matching_bank() -> None:
+    semantic = {
+        10: ((TaskKind.FORWARD, 7, 0, 1), 0),
+        11: ((TaskKind.FORWARD, 8, 0, 1), 1),
+        12: ((TaskKind.FORWARD, 7, 0, 1), 2),
+    }
+    pending = _FusionPendingQueues(
+        semantic_index=lambda event_id, _kind: semantic[event_id],
+    )
+    for event_id in semantic:
+        pending.append(event_id, TaskKind.FORWARD)
+
+    offer = (((TaskKind.FORWARD, 7, 0, 1), frozenset({2})),)
+    assert pending.popleft_semantic_match(TaskKind.FORWARD, offer) == 12
+    assert pending.popleft(TaskKind.FORWARD) == 10
+    assert pending.popleft_semantic_match(TaskKind.FORWARD, offer) == 11
+    assert not pending
 
 
 def _trace():
@@ -1381,12 +1401,12 @@ def _semantic_fusion_bundle_fixture() -> tuple[Trace, CycleConfig]:
 
 @pytest.mark.parametrize(("policy", "expected_issues", "expected_followers"), [
     ("variant:0000", 0, 0),
-    ("variant:0100", 0, 0),
+    ("variant:0100", 1, 2),
     ("variant:0101", 1, 2),
     ("variant:1010", 0, 0),
-    ("variant:1111", 2, 2),
+    ("variant:1111", 1, 2),
 ])
-def test_semantic_fusion_bundle_is_isolated_to_combined_residency(
+def test_semantic_fusion_bundle_is_driven_by_compiler_worksets(
     policy: str, expected_issues: int, expected_followers: int,
 ) -> None:
     trace, config = _semantic_fusion_bundle_fixture()
@@ -1402,8 +1422,9 @@ def test_semantic_fusion_bundle_is_isolated_to_combined_residency(
 
 
 @pytest.mark.parametrize(("policy", "expected_issues"), [
+    ("variant:0100", 1),
     ("variant:0101", 1),
-    ("variant:1111", 2),
+    ("variant:1111", 1),
 ])
 def test_semantic_fusion_bundle_matches_offline_and_online_replay(
     policy: str, expected_issues: int,
@@ -1412,10 +1433,12 @@ def test_semantic_fusion_bundle_matches_offline_and_online_replay(
     offline = CycleEngine(config, policy=policy).run(
         trace, validate_input=False,
     )
-    session = CycleEngine(
-        config, policy=policy,
-    ).online_session(
-        max_events=16, semantic_workset_totals={(7, 3): 4},
+    engine = CycleEngine(config, policy=policy)
+    session = engine.online_session(
+        max_events=16,
+        semantic_workset_totals=(
+            {(7, 3): 4} if engine.selection.semantic_residency else None
+        ),
     )
 
     session.accept_event_packet(VirtualEventPacket(
@@ -1942,16 +1965,37 @@ def test_semantic_residency_groups_ready_adjoint_state() -> None:
     assert [item.event_id for item in bundle[1]] == [11, 12]
 
 
-def test_semantic_ready_group_priority_isolated_from_other_variants() -> None:
-    config = replace(
-        _config(), candidate_lanes=3,
-        fusion_forward_ports=2, fusion_consumer_ports=1,
-        fusion_adjoint_ports=2, fusion_semantic_bundle_index_bytes=320,
-        cache_multicast_destinations=4,
+def test_semantic_ready_group_priority_defers_to_query_heads_in_joint_variant() -> None:
+    config = CycleConfig.from_gala(
+        load_config(
+            Path(__file__).parents[1] / "configs/architecture/gala.yaml"
+        ),
+        _Memory(),
     )
 
-    def candidates(policy: str) -> list[int]:
+    def candidates(
+        policy: str, *, previous_support: bool = False,
+        current_support: int = 0,
+    ) -> list[int]:
         engine = CycleEngine(config, policy=policy)
+        if previous_support:
+            scheduler = engine.issue_scheduler
+            scheduler.set_strict_lifecycle()
+            scheduler.relation_accept(
+                (100,), iteration_id=0, history_keys=((1, 0),),
+            )
+            scheduler.producer_close((100,))
+            scheduler.reduction_writeback((100,))
+            scheduler.forward_retire((100,))
+            assert scheduler.release_completed() == 1
+            scheduler.begin_iteration(1)
+        if current_support:
+            scheduler = engine.issue_scheduler
+            scheduler.set_strict_lifecycle()
+            for _ in range(current_support):
+                scheduler.relation_accept(
+                    (100,), iteration_id=0, history_keys=((1, 0),),
+                )
         inputs = {
             kind: _BankedFusionSourceQueue(capacity=32, banks=8)
             for kind in TaskKind
@@ -1974,6 +2018,10 @@ def test_semantic_ready_group_priority_isolated_from_other_variants() -> None:
         return [item.event_id for item in selected]
 
     assert candidates("variant:0101") == [10]
+    assert candidates("variant:1111") == [10, 1, 11]
+    assert candidates("variant:1111", current_support=208) == [10, 1, 11]
+    assert candidates("variant:1111", current_support=209) == [10, 1, 11]
+    assert candidates("variant:1111", previous_support=True) == [10, 1, 11]
     assert candidates("variant:0000") == [10, 1, 11]
     assert candidates("variant:1010") == [10, 1, 11]
 
@@ -2200,7 +2248,7 @@ def test_relation_constructor_separates_append_banks_and_dynamic_support_lanes()
     )
 
 
-def test_query_load_rules_order_three_fifo_heads_without_enabling_fusion() -> None:
+def test_query_load_rules_compound_exact_different_bank_fifo_heads() -> None:
     builder = TraceBuilder()
     builder.emit(TraceEvent(
         primitive_kind=int(PrimitiveKind.FORWARD), query_id=9,
@@ -2237,10 +2285,12 @@ def test_query_load_rules_order_three_fifo_heads_without_enabling_fusion() -> No
     result = engine.run(builder.finish())
 
     assert committed == [1, 0]
-    assert any(
+    assert not any(
         stall.module == "fusion_issue" and stall.reason == "base_single_issue"
         for stall in result.stalls
     )
+    assert result.module_counters["fusion_issue"]["query_compound_issues"] == 1
+    assert result.module_counters["fusion_issue"]["query_compound_followers"] == 1
     assert set(result.completion_cycles) == {0, 1}
 
 

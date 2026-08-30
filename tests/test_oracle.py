@@ -4,6 +4,7 @@ from dataclasses import replace
 
 import numpy as np
 
+from gala_sim.clamp import ReductionDomain, TaskKind, TaskPacket
 from gala_sim.clamp.builder import TraceBuilder
 from gala_sim.clamp.events import PrimitiveKind, TraceEvent
 from gala_sim.timing import CycleConfig, CycleConfigurationError, CycleEngine, ModuleTiming
@@ -179,6 +180,99 @@ def test_query_oracle_selects_exact_legal_combination_from_bounded_queue() -> No
     )
 
     assert set(selected) == {forward_ids[0], consumer}
+
+
+def test_query_oracle_compatibility_graph_matches_exhaustive_selection() -> None:
+    kinds = (
+        TaskKind.FORWARD, TaskKind.FORWARD, TaskKind.ADJOINT,
+        TaskKind.CONSUMER, TaskKind.ADJOINT, TaskKind.FORWARD,
+        TaskKind.CONSUMER, TaskKind.ADJOINT, TaskKind.FORWARD,
+    )
+    banks = (0, 0, 1, 2, 3, 1, 4, 5, 6)
+    packets = [TaskPacket(
+        event_id=index, query_id=index, gaussian_id=index,
+        reduction_key=(0 if index in {1, 4} else index),
+        resource=index, state_version=0, template_id=0,
+        address_token=index, task_kind=kind,
+        reduction_domain=(
+            ReductionDomain.GAUSSIAN
+            if kind is TaskKind.ADJOINT else ReductionDomain.QUERY
+        ),
+        target_resource=(7 if index in {2, 6} else index),
+    ) for index, kind in enumerate(kinds)]
+    candidates = [
+        (20 - index, banks[index], packet)
+        for index, packet in enumerate(packets)
+    ]
+    limits = {
+        TaskKind.FORWARD: 2,
+        TaskKind.CONSUMER: 1,
+        TaskKind.ADJOINT: 2,
+    }
+    best_score = 0
+    expected: tuple[int, ...] = ()
+
+    def exhaustive(
+        index: int, score: int, selected: tuple[int, ...],
+        counts: dict[TaskKind, int], keys: frozenset[tuple[ReductionDomain, int]],
+        targets: frozenset[int], occupied_banks: frozenset[int],
+    ) -> None:
+        nonlocal best_score, expected
+        if score > best_score:
+            best_score = score
+            expected = tuple(packets[item].event_id for item in selected)
+        if len(selected) == 3 or index == len(candidates):
+            return
+        weight, bank, packet = candidates[index]
+        target = packet.target_resource
+        if (
+            counts[packet.task_kind] < limits[packet.task_kind]
+            and packet.conflict_keys.isdisjoint(keys)
+            and bank not in occupied_banks
+            and (target is None or target not in targets)
+        ):
+            next_counts = dict(counts)
+            next_counts[packet.task_kind] += 1
+            exhaustive(
+                index + 1, score + weight, (*selected, index), next_counts,
+                keys.union(packet.conflict_keys),
+                targets if target is None else targets.union((target,)),
+                occupied_banks.union((bank,)),
+            )
+        exhaustive(
+            index + 1, score, selected, counts, keys, targets, occupied_banks,
+        )
+
+    exhaustive(
+        0, 0, (), {kind: 0 for kind in TaskKind},
+        frozenset(), frozenset(), frozenset(),
+    )
+
+    assert CycleEngine._maximum_weight_query_candidates(
+        candidates, source_limits=limits,
+    ) == expected
+
+
+def test_query_oracle_same_bank_queue_has_bounded_exact_selection() -> None:
+    candidates = [(
+        256 - event_id,
+        0,
+        TaskPacket(
+            event_id=event_id, query_id=event_id, gaussian_id=event_id,
+            reduction_key=event_id, resource=event_id, state_version=0,
+            template_id=0, address_token=event_id,
+            task_kind=TaskKind.FORWARD,
+        ),
+    ) for event_id in range(128)]
+
+    assert CycleEngine._maximum_weight_query_candidates(
+        candidates,
+        source_limits={
+            TaskKind.FORWARD: 2,
+            TaskKind.CONSUMER: 0,
+            TaskKind.ADJOINT: 2,
+        },
+    ) == (0,)
 
 
 def test_query_oracle_borrows_idle_consumer_slot_under_frozen_port_limits() -> None:

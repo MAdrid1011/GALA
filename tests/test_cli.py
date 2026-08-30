@@ -47,6 +47,26 @@ def test_cli_validates_compact_packet_archive_without_false_formal_promotion(
     assert json.loads(output.read_text()) == report
 
 
+def test_cli_snapshots_a_closed_archive_prefix(tmp_path: Path, capsys) -> None:
+    archive_root = tmp_path / "archive"
+    writer = VirtualPacketArchiveWriter(archive_root, max_chunk_bytes=1)
+    writer.initialize_gaussians(1)
+    writer.append_packet(_packet())
+    writer.close_iteration(1)
+    writer.finish()
+    output = tmp_path / "snapshot"
+
+    assert main([
+        "trace-archive-snapshot", "--archive", str(archive_root),
+        "--output", str(output), "--initial-gaussian-count", "1",
+        "--through-iteration", "1",
+    ]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "passed"
+    assert report["iteration_count"] == 1
+    assert (output / "manifest.json").is_file()
+
+
 def test_formal_cycle_cli_writes_failed_preflight_without_timing_bypass(
     tmp_path: Path, capsys,
 ) -> None:

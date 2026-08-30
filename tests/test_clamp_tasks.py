@@ -50,6 +50,8 @@ def test_query_history_survives_release_and_changes_next_iteration_priority() ->
         adjoint_ports=1,
     )
     scheduler.set_strict_lifecycle()
+    assert not scheduler.has_previous_support
+    assert scheduler.peak_current_support == 0
     for _ in range(3):
         scheduler.relation_accept(
             (1,), iteration_id=0, history_keys=((1, 0),),
@@ -58,6 +60,7 @@ def test_query_history_survives_release_and_changes_next_iteration_priority() ->
         (2,), iteration_id=0, adjoint_query_ids=(2,),
         history_keys=((1, 1),),
     )
+    assert scheduler.peak_current_support == 3
     scheduler.producer_close((1, 2))
     scheduler.reduction_writeback((1, 2))
     scheduler.forward_retire((1, 1, 1, 2))
@@ -68,6 +71,8 @@ def test_query_history_survives_release_and_changes_next_iteration_priority() ->
         (101, 102), iteration_id=1, adjoint_query_ids=(102,),
         history_keys=((1, 0), (1, 1)),
     )
+    assert scheduler.has_previous_support
+    assert scheduler.peak_current_support == 1
     scheduler.producer_close((102,))
     scheduler.reduction_writeback((102,))
     scheduler.forward_retire((102,))
@@ -96,6 +101,23 @@ def test_query_history_survives_release_and_changes_next_iteration_priority() ->
         "query_load_rule_evaluations": 0,
         "query_load_rule_selection_changes": 0,
     }
+
+
+def test_query_history_is_invalidated_after_skipping_an_iteration() -> None:
+    scheduler = FusionIssueScheduler(
+        candidate_lanes=3, forward_ports=1, consumer_ports=1,
+        adjoint_ports=1,
+    )
+    scheduler.set_strict_lifecycle()
+    scheduler.relation_accept((1,), iteration_id=0, history_keys=((1, 0),))
+    scheduler.producer_close((1,))
+    scheduler.reduction_writeback((1,))
+    scheduler.forward_retire((1,))
+    assert scheduler.release_completed() == 1
+
+    scheduler.begin_iteration(2)
+
+    assert not scheduler.has_previous_support
 
 
 def test_forecast_is_pure_and_issue_uses_typed_conflict_keys() -> None:

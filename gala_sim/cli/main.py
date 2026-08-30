@@ -28,7 +28,9 @@ from gala_sim.timing.memory import NativeRamulator2Binding, Ramulator2Backend
 from gala_sim.timing.resources import ResourceUsage
 from gala_sim.tools.cycle_preflight import run_cycle_preflight, write_cycle_preflight
 from gala_sim.tools.relation_capacity import run_relation_capacity_preflight
-from gala_sim.tools.representative_packets import plan_representative_packet_groups
+from gala_sim.tools.representative_packets import (
+    build_representative_packet_trace, plan_representative_packet_groups,
+)
 from gala_sim.tools.cycle_throughput import (
     ThroughputConverged, ThroughputDiagnosticConfig, ThroughputMonitor,
     require_empty_diagnostic_output,
@@ -45,6 +47,7 @@ from gala_sim.trace import (
     VirtualPacketArchiveReader,
     complete_captured_packet_sample, dependency_closed_query_sample,
     derive_quick_relation_packets, real_query_packet_sample,
+    snapshot_live_archive_prefix,
     validate_packet_derivation, validate_trace,
 )
 
@@ -83,10 +86,26 @@ def _parser() -> argparse.ArgumentParser:
     archive_validate = commands.add_parser("trace-archive-validate")
     archive_validate.add_argument("--archive", type=Path, required=True)
     archive_validate.add_argument("--output", type=Path, required=True)
+    archive_snapshot = commands.add_parser("trace-archive-snapshot")
+    archive_snapshot.add_argument("--archive", type=Path, required=True)
+    archive_snapshot.add_argument("--output", type=Path, required=True)
+    archive_snapshot.add_argument("--initial-gaussian-count", type=int, required=True)
+    archive_snapshot.add_argument("--through-iteration", type=int, default=None)
     representative = commands.add_parser("representative-packet-plan")
     representative.add_argument("--archive", type=Path, required=True)
     representative.add_argument("--campaign", type=Path, required=True)
     representative.add_argument("--expected-groups", type=int, required=True)
+    representative.add_argument(
+        "--live-prefix", action="store_true",
+        help="plan only campaign windows closed by a live archive snapshot",
+    )
+    representative_trace = commands.add_parser("representative-packet-trace")
+    representative_trace.add_argument("--archive", type=Path, required=True)
+    representative_trace.add_argument("--plan", type=Path, required=True)
+    representative_trace.add_argument("--window-index", type=int, required=True)
+    representative_trace.add_argument("--max-events", type=int, required=True)
+    representative_trace.add_argument("--query-lanes", type=int, required=True)
+    representative_trace.add_argument("--output", type=Path, required=True)
     representative.add_argument("--output", type=Path, required=True)
     sample = commands.add_parser("trace-sample")
     sample.add_argument("--trace", type=Path, required=True)
@@ -402,17 +421,51 @@ def main(argv: list[str] | None = None) -> int:
             write_json(report, args.output)
             print(json.dumps(report, sort_keys=True))
             return 0
+        if args.command == "trace-archive-snapshot":
+            report = snapshot_live_archive_prefix(
+                args.archive,
+                args.output,
+                initial_gaussian_count=args.initial_gaussian_count,
+                through_iteration=args.through_iteration,
+            )
+            print(json.dumps({
+                "status": "passed",
+                "iteration_count": report["iteration_count"],
+                "chunk_count": report["chunk_count"],
+                "output": str(args.output.resolve()),
+            }, sort_keys=True))
+            return 0
         if args.command == "representative-packet-plan":
             report = plan_representative_packet_groups(
                 args.archive,
                 args.campaign,
                 expected_group_count=args.expected_groups,
+                live_prefix=args.live_prefix,
             )
             write_json(report, args.output)
             print(json.dumps({
                 "status": "passed",
                 "groups": report["group_count"],
                 "iterations": report["iteration_count"],
+                "campaign_complete": report["campaign_complete"],
+                "output": str(args.output.resolve()),
+            }, sort_keys=True))
+            return 0
+        if args.command == "representative-packet-trace":
+            trace = build_representative_packet_trace(
+                args.archive,
+                args.plan,
+                window_index=args.window_index,
+                max_events=args.max_events,
+                query_lanes=args.query_lanes,
+            )
+            TraceWriter().write(trace, args.output)
+            sample = trace.metadata["trace_sample"]
+            print(json.dumps({
+                "status": "passed",
+                "iterations": sample["iterations"],
+                "events": trace.event_count,
+                "dependencies": int(trace.dependencies.size),
                 "output": str(args.output.resolve()),
             }, sort_keys=True))
             return 0

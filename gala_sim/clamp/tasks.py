@@ -324,6 +324,18 @@ class FusionIssueScheduler:
     def set_strict_lifecycle(self, enabled: bool = True) -> None:
         self.strict_lifecycle = bool(enabled)
 
+    @property
+    def has_previous_support(self) -> bool:
+        """Whether the immediately preceding iteration supplied support history."""
+
+        return bool(self._support_previous)
+
+    @property
+    def peak_current_support(self) -> int:
+        """Largest real support count observed for one live history identity."""
+
+        return max(self._support_current.values(), default=0)
+
     def allocate(
         self,
         query_ids: Iterable[int],

@@ -48,8 +48,10 @@ from .virtual import (
 )
 from .compare import VirtualRecordComparison, compare_virtual_packet_records
 from .archive import (
-    ARCHIVE_SCHEMA_VERSION, VirtualPacketArchiveDescriptor,
+    ARCHIVE_SCHEMA_VERSION, LIVE_PREFIX_SCHEMA_VERSION,
+    VirtualPacketArchiveDescriptor,
     VirtualPacketArchiveReader, VirtualPacketArchiveWriter,
+    snapshot_live_archive_prefix,
 )
 
 __all__ = [
@@ -97,6 +99,8 @@ __all__ = [
     "TRANSACTION_OPTIMIZER",
     "VirtualRecordComparison",
     "compare_virtual_packet_records",
-    "ARCHIVE_SCHEMA_VERSION", "VirtualPacketArchiveDescriptor",
+    "ARCHIVE_SCHEMA_VERSION", "LIVE_PREFIX_SCHEMA_VERSION",
+    "VirtualPacketArchiveDescriptor",
     "VirtualPacketArchiveReader", "VirtualPacketArchiveWriter",
+    "snapshot_live_archive_prefix",
 ]

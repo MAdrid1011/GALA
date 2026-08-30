@@ -782,17 +782,30 @@ def test_vectorized_consumer_dependencies_match_scalar_order(
     assert counts.tolist() == [part.size for part in expected_parts]
 
 
-def test_query_expander_carries_external_state_barrier_on_first_candidate() -> None:
-    masks = _mask(1, 8)
-    masks[0, 0] = 1
+def test_query_expander_carries_external_state_barrier_on_every_candidate() -> None:
+    masks = _mask(3, 8)
+    masks[:, 0] = 1
     source = VirtualTracePacket(
         iteration_id=2, template_id=1, query_base=0, query_shape=(1, 1),
-        point_ids=np.asarray([0]), point_keys=np.asarray([0], dtype=np.uint64),
+        point_ids=np.asarray([0, 1, 2]),
+        point_keys=np.asarray([0, 0, 0], dtype=np.uint64),
         masks=masks, loss_flags=1, backward_confirmed=True,
     )
     expander = VirtualQueryEventExpander(max_events=2, next_event_id=4)
     packets = tuple(expander.expand(source, external_dependencies=(1, 3)))
-    assert packets[0].dependency_ids(0).tolist() == [1, 3]
+    candidate_packets = packets[:2]
+    assert [
+        packet.dependency_ids(index).tolist()
+        for packet in candidate_packets
+        for index in range(packet.event_count)
+    ] == [[1, 3], [1, 3], [1, 3]]
+    close = next(
+        (packet, index)
+        for packet in packets
+        for index, row in enumerate(packet.events)
+        if int(row["primitive_kind"]) == int(PrimitiveKind.QUERY_CLOSE)
+    )
+    assert close[0].dependency_ids(close[1]).tolist()[-2:] == [1, 3]
 
 
 def test_lifecycle_validator_tracks_updates_lineage_and_iteration_ledger() -> None:

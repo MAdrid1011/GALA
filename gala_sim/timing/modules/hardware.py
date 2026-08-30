@@ -357,6 +357,7 @@ class ComputePod(HardwareModule):
         pod: int | None = None,
         cluster_hint: int | None = None,
         active_lanes: int | None = None,
+        cluster_pressure: Mapping[int, int] | None = None,
     ) -> tuple[tuple[str, int, int], ...]:
         """Return ``(resource, cycle, demand)`` entries for one accepted task."""
 
@@ -395,7 +396,7 @@ class ComputePod(HardwareModule):
         self._discard_retired(start_cycle)
         fallback: tuple[tuple[str, int, int], ...] = ()
         best_fit: tuple[tuple[str, int, int], ...] = ()
-        best_issue_occupancy = -1
+        best_rank: tuple[int, int] | None = None
         for cluster in candidate_clusters:
             plan: list[tuple[str, int, int]] = []
             for point in range(start_cycle, start_cycle + issue_cycles):
@@ -424,9 +425,14 @@ class ComputePod(HardwareModule):
                     for resource, point, _demand in candidate
                     if resource.startswith("cluster_issue:")
                 )
-                if issue_occupancy > best_issue_occupancy:
+                pressure = (
+                    int(cluster_pressure.get(cluster, 0))
+                    if cluster_pressure is not None else 0
+                )
+                rank = (pressure, -issue_occupancy)
+                if best_rank is None or rank < best_rank:
                     best_fit = candidate
-                    best_issue_occupancy = issue_occupancy
+                    best_rank = rank
         return best_fit or fallback
 
     def _discard_retired(self, cycle: int) -> None:
