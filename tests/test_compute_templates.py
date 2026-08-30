@@ -17,7 +17,11 @@ from gala_sim.timing import (
     CycleEngine,
     ModuleTiming,
 )
-from gala_sim.timing.engine import _ReadyCandidateQueue
+from gala_sim.timing.engine import (
+    _QueryReplayLaneScheduler,
+    _QueryReplayLaneWork,
+    _ReadyCandidateQueue,
+)
 from gala_sim.timing.modules import (
     ComputePod, CounterBlock, OwnerGradientTracker, QueryReplayTracker,
 )
@@ -94,6 +98,16 @@ def test_production_compute_profiles_have_audited_path_latencies() -> None:
 def test_query_reduction_bank_count_must_support_bitmask_mapping() -> None:
     with pytest.raises(ValueError, match="power of two"):
         replace(_production_config(), query_reduction_banks=63)
+
+
+def test_query_ready_arbitration_covers_the_complete_resident_queue() -> None:
+    engine = CycleEngine(_production_config())
+
+    assert engine._module_issue_ports("bidirectional_query") == 121
+    assert engine._ready_scan_window("bidirectional_query") == 256
+    assert engine._ready_scan_window("bidirectional_query") == (
+        engine.modules["bidirectional_query"].timing.queue_capacity
+    )
 
 
 def test_production_compute_profile_rejects_unknown_template() -> None:
@@ -221,6 +235,59 @@ def test_query_datapaths_allocate_loss_replay_and_query_volume_ports() -> None:
         replay_busy, row(PrimitiveKind.ADJOINT, 0),
         PrimitiveKind.ADJOINT, packet, 0,
     ) is None
+
+
+def test_query_replay_drains_two_packets_over_all_nine_lanes() -> None:
+    scheduler = _QueryReplayLaneScheduler(
+        replay_base=0,
+        replay_lanes=9,
+        volume_read_base=9,
+        volume_banks=16,
+        initiation_interval=1,
+    )
+    resources = [0] * 25
+
+    def packet(packet_id: int, query_base: int) -> tuple[_QueryReplayLaneWork, ...]:
+        return tuple(
+            _QueryReplayLaneWork(
+                event_id=packet_id * 8 + lane,
+                packet_lane=lane,
+                query_id=query_base + lane,
+            )
+            for lane in range(8)
+        )
+
+    first = scheduler.plan_admission(
+        packet_event_id=0, stage=1, work=packet(0, 0),
+        module_lanes=resources, cycle=0,
+    )
+    assert first is not None
+    assert len(first.dispatches) == 8
+    assert not first.remaining
+    scheduler.commit_admission(first, resources, 0)
+
+    second = scheduler.plan_admission(
+        packet_event_id=8, stage=1, work=packet(1, 8),
+        module_lanes=resources, cycle=0,
+    )
+    assert second is not None
+    assert [item.event_id for item in second.dispatches] == [8]
+    assert [item.event_id for item in second.remaining] == list(range(9, 16))
+    scheduler.commit_admission(second, resources, 0)
+
+    assert scheduler.pending_packets == 1
+    advance = scheduler.advance(resources, 1)
+    assert [item.event_id for item in advance.dispatches] == list(range(9, 16))
+    assert advance.completed_packets == ((8, 1),)
+    assert scheduler.pending_packets == 0
+    assert scheduler.snapshot() == {
+        "adjoint_replay_lane_dispatches": 16,
+        "adjoint_replay_active_cycles": 2,
+        "adjoint_replay_full_cycles": 1,
+        "adjoint_replay_idle_lane_cycles": 2,
+        "adjoint_replay_pending_peak_packets": 1,
+        "adjoint_replay_pending_packets": 0,
+    }
 
 
 def test_compute_pod_reserves_twenty_independent_cluster_issue_slots() -> None:
@@ -472,6 +539,49 @@ def test_ready_queue_compacts_stale_requeue_indexes() -> None:
         physical_stage_for=lambda _event_id: None,
         owner_gradients=None, query_replay=None,
     ) == [retained]
+
+
+def test_ready_queue_capacity_preserves_candidate_and_token_order() -> None:
+    rows = np.empty(21, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = np.arange(rows.size)
+    rows["primitive_kind"] = int(PrimitiveKind.FORWARD)
+    queue = _ReadyCandidateQueue()
+    assert queue.pop_acceptable(
+        1, "compute_pod", capacity=3, row_for=rows.__getitem__,
+        physical_stage_for=lambda _event_id: None,
+        owner_gradients=None, query_replay=None,
+    ) == []
+
+    candidates = [
+        (20, 2), (10, 9), (10, 4),
+        (10, 3), (10, 3), (10, 3), (10, 3),
+    ]
+    for candidate in candidates:
+        queue.push(candidate)
+        ordered = sorted(
+            (*queue._candidate_by_token.items(), *(
+                (token, waiting) for waiting, token in queue._waiting
+            )),
+            key=lambda item: (item[1], item[0]),
+        )
+        assert set(queue._candidate_by_token) == {
+            token for token, _candidate in ordered[:3]
+        }
+
+    # The fourth identical candidate has the newest token, so it waits rather
+    # than displacing one of the three identical visible entries.
+    assert set(queue._candidate_by_token) == {3, 4, 5}
+    assert ((10, 3), 6) in queue._waiting
+
+    selected = []
+    while queue:
+        selected.extend(queue.pop_acceptable(
+            1, "compute_pod", capacity=3, row_for=rows.__getitem__,
+            physical_stage_for=lambda _event_id: None,
+            owner_gradients=None, query_replay=None,
+        ))
+    assert selected == sorted(candidates)
 
 
 def test_compute_telemetry_is_exact_and_does_not_change_cycles() -> None:

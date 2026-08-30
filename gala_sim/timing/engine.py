@@ -152,6 +152,214 @@ class _InFlight:
     module: str
 
 
+@dataclass(frozen=True)
+class _QueryReplayLaneWork:
+    event_id: int
+    packet_lane: int
+    query_id: int
+
+
+@dataclass(frozen=True)
+class _QueryReplayLaneDispatch:
+    event_id: int
+    replay_resource: int
+    volume_resource: int
+
+
+@dataclass(frozen=True)
+class _QueryReplayAdmission:
+    packet_event_id: int
+    stage: int
+    dispatches: tuple[_QueryReplayLaneDispatch, ...]
+    remaining: tuple[_QueryReplayLaneWork, ...]
+
+
+@dataclass
+class _PendingQueryReplayPacket:
+    packet_event_id: int
+    stage: int
+    remaining: tuple[_QueryReplayLaneWork, ...]
+
+
+@dataclass(frozen=True)
+class _QueryReplayAdvance:
+    dispatches: tuple[_QueryReplayLaneDispatch, ...]
+    completed_packets: tuple[tuple[int, int], ...]
+
+
+class _QueryReplayLaneScheduler:
+    """Drain resident RelationPackets over the work-conserving replay lanes."""
+
+    def __init__(
+        self,
+        *,
+        replay_base: int,
+        replay_lanes: int,
+        volume_read_base: int,
+        volume_banks: int,
+        initiation_interval: int,
+    ) -> None:
+        if min(replay_lanes, volume_banks, initiation_interval) <= 0:
+            raise ValueError("query replay resources must be positive")
+        self.replay_base = replay_base
+        self.replay_lanes = replay_lanes
+        self.volume_read_base = volume_read_base
+        self.volume_banks = volume_banks
+        self.initiation_interval = initiation_interval
+        self._pending: deque[_PendingQueryReplayPacket] = deque()
+        self._dispatches_by_cycle: dict[int, int] = {}
+        self._peak_pending_packets = 0
+
+    @property
+    def pending_packets(self) -> int:
+        return len(self._pending)
+
+    def plan_admission(
+        self,
+        *,
+        packet_event_id: int,
+        stage: int,
+        work: tuple[_QueryReplayLaneWork, ...],
+        module_lanes: list[int],
+        cycle: int,
+    ) -> _QueryReplayAdmission | None:
+        if not work or len(work) > self.replay_lanes:
+            raise CycleConfigurationError(
+                "adjoint RelationPacket has an invalid replay lane count"
+            )
+        if len({item.event_id for item in work}) != len(work):
+            raise CycleConfigurationError("adjoint RelationPacket repeats an event")
+        dispatches, remaining = self._select(work, module_lanes, cycle)
+        if not dispatches:
+            return None
+        return _QueryReplayAdmission(
+            packet_event_id=packet_event_id,
+            stage=stage,
+            dispatches=dispatches,
+            remaining=remaining,
+        )
+
+    def commit_admission(
+        self,
+        admission: _QueryReplayAdmission,
+        module_lanes: list[int],
+        cycle: int,
+    ) -> None:
+        self._commit_dispatches(admission.dispatches, module_lanes, cycle)
+        if admission.remaining:
+            self._pending.append(_PendingQueryReplayPacket(
+                packet_event_id=admission.packet_event_id,
+                stage=admission.stage,
+                remaining=admission.remaining,
+            ))
+            self._peak_pending_packets = max(
+                self._peak_pending_packets, len(self._pending)
+            )
+
+    def advance(
+        self, module_lanes: list[int], cycle: int,
+    ) -> _QueryReplayAdvance:
+        dispatches: list[_QueryReplayLaneDispatch] = []
+        completed: list[tuple[int, int]] = []
+        retained: deque[_PendingQueryReplayPacket] = deque()
+        while self._pending:
+            packet = self._pending.popleft()
+            selected, remaining = self._select(
+                packet.remaining, module_lanes, cycle,
+            )
+            if selected:
+                self._commit_dispatches(selected, module_lanes, cycle)
+                dispatches.extend(selected)
+            if remaining:
+                packet.remaining = remaining
+                retained.append(packet)
+            else:
+                completed.append((packet.packet_event_id, packet.stage))
+        self._pending = retained
+        return _QueryReplayAdvance(tuple(dispatches), tuple(completed))
+
+    def snapshot(self) -> dict[str, int]:
+        active_cycles = len(self._dispatches_by_cycle)
+        dispatches = sum(self._dispatches_by_cycle.values())
+        return {
+            "adjoint_replay_lane_dispatches": dispatches,
+            "adjoint_replay_active_cycles": active_cycles,
+            "adjoint_replay_full_cycles": sum(
+                count == self.replay_lanes
+                for count in self._dispatches_by_cycle.values()
+            ),
+            "adjoint_replay_idle_lane_cycles": (
+                active_cycles * self.replay_lanes - dispatches
+            ),
+            "adjoint_replay_pending_peak_packets": self._peak_pending_packets,
+            "adjoint_replay_pending_packets": len(self._pending),
+        }
+
+    def _select(
+        self,
+        work: tuple[_QueryReplayLaneWork, ...],
+        module_lanes: list[int],
+        cycle: int,
+    ) -> tuple[
+        tuple[_QueryReplayLaneDispatch, ...],
+        tuple[_QueryReplayLaneWork, ...],
+    ]:
+        replay_resources = [
+            resource
+            for resource in range(
+                self.replay_base, self.replay_base + self.replay_lanes
+            )
+            if module_lanes[resource] <= cycle
+        ]
+        free_volume_banks = {
+            bank for bank in range(self.volume_banks)
+            if module_lanes[self.volume_read_base + bank] <= cycle
+        }
+        dispatches: list[_QueryReplayLaneDispatch] = []
+        remaining: list[_QueryReplayLaneWork] = []
+        for item in work:
+            bank = item.query_id % self.volume_banks
+            if not replay_resources or bank not in free_volume_banks:
+                remaining.append(item)
+                continue
+            dispatches.append(_QueryReplayLaneDispatch(
+                event_id=item.event_id,
+                replay_resource=replay_resources.pop(0),
+                volume_resource=self.volume_read_base + bank,
+            ))
+            free_volume_banks.remove(bank)
+        return tuple(dispatches), tuple(remaining)
+
+    def _commit_dispatches(
+        self,
+        dispatches: tuple[_QueryReplayLaneDispatch, ...],
+        module_lanes: list[int],
+        cycle: int,
+    ) -> None:
+        for dispatch in dispatches:
+            if (
+                module_lanes[dispatch.replay_resource] > cycle
+                or module_lanes[dispatch.volume_resource] > cycle
+            ):
+                raise CycleConfigurationError(
+                    "query replay admission changed before commit"
+                )
+            module_lanes[dispatch.replay_resource] = (
+                cycle + self.initiation_interval
+            )
+            module_lanes[dispatch.volume_resource] = (
+                cycle + self.initiation_interval
+            )
+        if dispatches:
+            self._dispatches_by_cycle[cycle] = (
+                self._dispatches_by_cycle.get(cycle, 0) + len(dispatches)
+            )
+            if self._dispatches_by_cycle[cycle] > self.replay_lanes:
+                raise CycleConfigurationError(
+                    "query replay dispatch exceeds configured lane count"
+                )
+
+
 class _BankedFusionSourceQueue:
     """One bounded source FIFO with constant-size query-Bank head indexes.
 
@@ -297,6 +505,7 @@ class _ReadyCandidateQueue:
         self._next_token = 0
         self._candidate_by_token: dict[int, tuple[int, int]] = {}
         self._waiting: list[tuple[tuple[int, int], int]] = []
+        self._worst_visible: list[tuple[int, int, int, int]] = []
         self._capacity: int | None = None
         self._general: list[tuple[tuple[int, int], int]] = []
         self._replay_consumers: list[tuple[tuple[int, int], int]] = []
@@ -342,27 +551,43 @@ class _ReadyCandidateQueue:
             and self._capacity is not None
             and len(self._candidate_by_token) >= self._capacity
         ):
-            worst_token, worst_candidate = max(
-                self._candidate_by_token.items(),
-                key=lambda item: (item[1], item[0]),
-            )
+            worst_token, worst_candidate = self._worst_candidate()
             if (candidate, token) >= (worst_candidate, worst_token):
                 heapq.heappush(self._waiting, (candidate, token))
                 return
             self._remove((worst_candidate, worst_token), promote=False)
             heapq.heappush(self._waiting, (worst_candidate, worst_token))
+        self._add_visible(token, candidate)
+        self._maybe_compact()
+
+    def _add_visible(self, token: int, candidate: tuple[int, int]) -> None:
         self._candidate_by_token[token] = candidate
+        event_id, stage = candidate
+        heapq.heappush(
+            self._worst_visible, (-event_id, -stage, -token, token),
+        )
         if self._configured:
             self._index(token, candidate)
-        self._maybe_compact()
+
+    def _worst_candidate(self) -> tuple[int, tuple[int, int]]:
+        while (
+            self._worst_visible
+            and self._worst_visible[0][3] not in self._candidate_by_token
+        ):
+            heapq.heappop(self._worst_visible)
+        if not self._worst_visible:
+            raise CycleConfigurationError(
+                "bounded ready queue lost its visible-candidate index"
+            )
+        token = self._worst_visible[0][3]
+        return token, self._candidate_by_token[token]
 
     def _promote_waiters(self) -> None:
         if self._capacity is None:
             return
         while self._waiting and len(self._candidate_by_token) < self._capacity:
             candidate, token = heapq.heappop(self._waiting)
-            self._candidate_by_token[token] = candidate
-            self._index(token, candidate)
+            self._add_visible(token, candidate)
 
     def _maybe_compact(self) -> None:
         """Bound lazy-deletion overhead after repeated resource requeues.
@@ -382,7 +607,8 @@ class _ReadyCandidateQueue:
             return
         live = len(self._candidate_by_token)
         heap_entries = (
-            len(self._general)
+            len(self._worst_visible)
+            + len(self._general)
             + len(self._replay_consumers)
             + len(self._complex)
             + sum(len(heap) for heap in self._simple_by_cluster.values())
@@ -391,6 +617,12 @@ class _ReadyCandidateQueue:
         threshold = max(128, live * 4 + 64)
         if heap_entries <= threshold:
             return
+
+        self._worst_visible = [
+            (-candidate[0], -candidate[1], -token, token)
+            for token, candidate in self._candidate_by_token.items()
+        ]
+        heapq.heapify(self._worst_visible)
 
         def retain(heap: list[tuple[tuple[int, int], int]]) -> None:
             heap[:] = [
@@ -496,6 +728,11 @@ class _ReadyCandidateQueue:
         for token, candidate in visible[capacity:]:
             heapq.heappush(self._waiting, (candidate, token))
             del self._candidate_by_token[token]
+        self._worst_visible = [
+            (-candidate[0], -candidate[1], -token, token)
+            for token, candidate in self._candidate_by_token.items()
+        ]
+        heapq.heapify(self._worst_visible)
         for token, candidate in self._candidate_by_token.items():
             self._index(token, candidate)
 
@@ -855,6 +1092,20 @@ class CycleEngine:
             cluster_count=clusters, clusters_per_pod=clusters_per_pod,
         )
 
+    @staticmethod
+    def _mark_query_replay_dispatches(
+        telemetry: ComputeTelemetryCollector | None,
+        dispatches: tuple[_QueryReplayLaneDispatch, ...],
+        cycle: int,
+    ) -> None:
+        if telemetry is None:
+            return
+        for dispatch in dispatches:
+            telemetry.mark_issue(
+                (dispatch.event_id,), PrimitiveKind.ADJOINT,
+                "bidirectional_query", cycle,
+            )
+
     def _record_compute_resource_stall(
         self,
         *,
@@ -905,6 +1156,15 @@ class CycleEngine:
         if kind is PrimitiveKind.FORWARD:
             return ("fusion_issue", "compute_pod", "bidirectional_query")
         return ("fusion_issue", "compute_pod")
+
+    @classmethod
+    def _is_query_replay_stage(
+        cls, kind: PrimitiveKind, stage: int,
+    ) -> bool:
+        return (
+            kind is PrimitiveKind.ADJOINT
+            and cls._stages_for(kind)[stage] == "bidirectional_query"
+        )
 
     def _ordered_candidates(
         self,
@@ -1397,6 +1657,54 @@ class CycleEngine:
     def _has_query_resources(self) -> bool:
         return self.config.query_reduction_banks is not None
 
+    def _new_query_replay_lane_scheduler(
+        self,
+    ) -> _QueryReplayLaneScheduler | None:
+        if not self._has_query_resources():
+            return None
+        reduction_banks = self.config.query_reduction_banks
+        loss_slots = self.config.query_loss_queries_per_cycle
+        replay_lanes = self.config.query_adjoint_replay_lanes
+        volume_banks = self.config.query_volume_banks
+        assert (
+            reduction_banks is not None
+            and loss_slots is not None
+            and replay_lanes is not None
+            and volume_banks is not None
+        )
+        replay_base = reduction_banks + loss_slots
+        return _QueryReplayLaneScheduler(
+            replay_base=replay_base,
+            replay_lanes=replay_lanes,
+            volume_read_base=replay_base + replay_lanes,
+            volume_banks=volume_banks,
+            initiation_interval=(
+                self.modules["bidirectional_query"].timing.initiation_interval
+            ),
+        )
+
+    @staticmethod
+    def _query_replay_lane_work(
+        row: np.void,
+        physical_stage: PhysicalPacketStage | None,
+    ) -> tuple[_QueryReplayLaneWork, ...]:
+        if physical_stage is None:
+            return (_QueryReplayLaneWork(
+                event_id=int(row["event_id"]),
+                packet_lane=0,
+                query_id=int(row["query_id"]),
+            ),)
+        return tuple(
+            _QueryReplayLaneWork(
+                event_id=event_id,
+                packet_lane=lane,
+                query_id=physical_stage.query_base + lane,
+            )
+            for event_id, lane in zip(
+                physical_stage.event_ids, physical_stage.lanes, strict=True,
+            )
+        )
+
     def _query_resource_allocation(
         self,
         module_lanes: list[int],
@@ -1665,6 +1973,12 @@ class CycleEngine:
             self.config.candidate_lanes,
             self._module_partition_issue_limit(module_name),
         )
+        if module_name == "bidirectional_query" and self._has_query_resources():
+            # The query unit routes its complete resident input queue to
+            # independent reduction, loss, replay, and query-volume Banks.
+            # Limiting arbitration to the aggregate number of datapaths can
+            # hide an otherwise issuable Bank behind same-Bank queue entries.
+            width = max(width, self.modules[module_name].timing.queue_capacity)
         if (
             module_name == "semantic_cache"
             and self.selection.semantic_residency
@@ -1962,6 +2276,7 @@ class CycleEngine:
         )
         relation_windows = self._new_relation_window_tracker()
         query_replay = self._new_query_replay_tracker()
+        query_replay_lanes = self._new_query_replay_lane_scheduler()
         owner_gradients = self._new_owner_gradient_tracker()
         compute_telemetry = (
             self._new_compute_telemetry() if collect_compute_telemetry else None
@@ -2130,7 +2445,6 @@ class CycleEngine:
         ready: dict[tuple[str, int], _ReadyCandidateQueue] = defaultdict(
             _ReadyCandidateQueue
         )
-        fusion_pending = _FusionPendingQueues()
         fusion_capacity = (
             self.config.candidate_fifo_entries
             or self.modules["fusion_issue"].timing.queue_capacity
@@ -2139,6 +2453,7 @@ class CycleEngine:
             self.config.fusion_query_state_banks
             or self.modules["fusion_issue"].timing.banks
         )
+        fusion_pending = _FusionPendingQueues()
         fusion_inputs: dict[TaskKind, _BankedFusionSourceQueue] = {
             kind: _BankedFusionSourceQueue(
                 capacity=fusion_capacity, banks=fusion_banks,
@@ -2650,7 +2965,10 @@ class CycleEngine:
                 for task_kind, pending in fusion_pending.queues():
                     if self.selection.query_oracle:
                         oracle_queue = fusion_oracle_inputs[task_kind]
-                        while pending and len(oracle_queue) < fusion_capacity:
+                        while (
+                            pending
+                            and len(oracle_queue) < fusion_capacity
+                        ):
                             event_id = fusion_pending.popleft(task_kind)
                             heapq.heappush(
                                 oracle_queue,
@@ -2785,12 +3103,55 @@ class CycleEngine:
                     if event_id in fusion_packets else (event_id, stage)
                     for event_id, stage in ordered
                 ]
+            # Ordinary query work keeps arrival priority over an older
+            # packet's residual lanes.  Residual lanes in turn run before new
+            # adjoint packets, preserving packet admission order while still
+            # filling any replay resources left in this cycle.
+            ordered.sort(key=lambda item: self._is_query_replay_stage(
+                PrimitiveKind(int(trace.events[item[0]]["primitive_kind"])),
+                item[1],
+            ))
+            replay_advanced = False
             for ordered_position, (event_id, stage) in enumerate(ordered):
                 row = trace.events[event_id]
                 kind = PrimitiveKind(int(row["primitive_kind"]))
                 physical_stage = packet_plan.stage_for_event(event_id)
                 stages = self._stages_for(kind)
                 module_name = stages[stage]
+                if (
+                    not replay_advanced
+                    and kind is PrimitiveKind.ADJOINT
+                    and module_name == "bidirectional_query"
+                ):
+                    if (
+                        query_replay_lanes is not None
+                        and query_replay_lanes.pending_packets
+                    ):
+                        replay_advance = query_replay_lanes.advance(
+                            module_busy_until["bidirectional_query"], cycle,
+                        )
+                        self._mark_query_replay_dispatches(
+                            compute_telemetry, replay_advance.dispatches, cycle,
+                        )
+                        for packet_event_id, packet_stage_index in (
+                            replay_advance.completed_packets
+                        ):
+                            packet_row = trace.events[packet_event_id]
+                            packet_stage = packet_plan.stage_for_event(
+                                packet_event_id
+                            )
+                            completion = cycle + self._physical_service_cycles(
+                                "bidirectional_query", packet_row,
+                                PrimitiveKind.ADJOINT, packet_stage,
+                            )
+                            heapq.heappush(in_flight, (
+                                completion, packet_event_id,
+                                packet_stage_index, "bidirectional_query",
+                            ))
+                        progressed = (
+                            progressed or bool(replay_advance.dispatches)
+                        )
+                    replay_advanced = True
                 module = self.modules[module_name]
                 timing = module.timing
                 multicast_follower = (
@@ -2870,6 +3231,7 @@ class CycleEngine:
                 module_lane: int | None = None
                 fusion_port_lane: int | None = None
                 query_allocation: tuple[int, ...] = ()
+                query_replay_admission: _QueryReplayAdmission | None = None
                 if fusion_port_name is not None:
                     fusion_port_lane = next((
                         index for index, point in enumerate(
@@ -2883,9 +3245,38 @@ class CycleEngine:
                     )
                 elif module_name == "bidirectional_query" and self._has_query_resources():
                     module_lanes = module_busy_until[module_name]
-                    allocation = self._query_resource_allocation(
-                        module_lanes, row, kind, physical_stage, cycle,
-                    )
+                    if kind is PrimitiveKind.ADJOINT:
+                        if query_replay_lanes is None:
+                            raise CycleConfigurationError(
+                                "adjoint replay scheduler is unavailable"
+                            )
+                        query_replay_admission = (
+                            query_replay_lanes.plan_admission(
+                                packet_event_id=event_id,
+                                stage=stage,
+                                work=self._query_replay_lane_work(
+                                    row, physical_stage,
+                                ),
+                                module_lanes=module_lanes,
+                                cycle=cycle,
+                            )
+                        )
+                        allocation = (
+                            None
+                            if query_replay_admission is None
+                            else tuple(
+                                resource
+                                for dispatch in query_replay_admission.dispatches
+                                for resource in (
+                                    dispatch.replay_resource,
+                                    dispatch.volume_resource,
+                                )
+                            )
+                        )
+                    else:
+                        allocation = self._query_resource_allocation(
+                            module_lanes, row, kind, physical_stage, cycle,
+                        )
                     if allocation is None:
                         reason = (
                             "reduction_bank"
@@ -2902,7 +3293,8 @@ class CycleEngine:
                         self._record_stall(cycle, module_name, reason, event_id)
                         requeue_candidate(event_id, stage)
                         continue
-                    query_allocation = allocation
+                    if query_replay_admission is None:
+                        query_allocation = allocation
                     busy_until = cycle
                 else:
                     module_lanes = module_busy_until[module_name]
@@ -3269,8 +3661,15 @@ class CycleEngine:
                                 ), memory_done,
                             )
                 else:
-                    completion = cycle + self._physical_service_cycles(
-                        module_name, row, kind, physical_stage,
+                    completion = (
+                        None
+                        if (
+                            query_replay_admission is not None
+                            and query_replay_admission.remaining
+                        )
+                        else cycle + self._physical_service_cycles(
+                            module_name, row, kind, physical_stage,
+                        )
                     )
                 if (
                     physical_stage is not None
@@ -3299,6 +3698,16 @@ class CycleEngine:
                     assert fusion_port_lane is not None
                     fusion_busy_until[fusion_port_name][fusion_port_lane] = (
                         cycle + timing.initiation_interval
+                    )
+                elif query_replay_admission is not None:
+                    assert query_replay_lanes is not None
+                    query_replay_lanes.commit_admission(
+                        query_replay_admission,
+                        module_busy_until[module_name], cycle,
+                    )
+                    self._mark_query_replay_dispatches(
+                        compute_telemetry,
+                        query_replay_admission.dispatches, cycle,
                     )
                 elif query_allocation:
                     for lane in query_allocation:
@@ -3374,7 +3783,10 @@ class CycleEngine:
                 )
                 if compute_plan:
                     module.reserve(compute_plan)  # type: ignore[attr-defined]
-                if compute_telemetry is not None:
+                if (
+                    compute_telemetry is not None
+                    and query_replay_admission is None
+                ):
                     compute_telemetry.mark_issue(
                         self._stage_event_ids(
                             event_id, kind, stage, physical_stage,
@@ -3414,6 +3826,31 @@ class CycleEngine:
                             fusion_port_issued.get(fusion_port_name, 0) + 1
                         )
                 progressed = True
+            if (
+                not replay_advanced
+                and query_replay_lanes is not None
+                and query_replay_lanes.pending_packets
+            ):
+                replay_advance = query_replay_lanes.advance(
+                    module_busy_until["bidirectional_query"], cycle,
+                )
+                self._mark_query_replay_dispatches(
+                    compute_telemetry, replay_advance.dispatches, cycle,
+                )
+                for packet_event_id, packet_stage_index in (
+                    replay_advance.completed_packets
+                ):
+                    packet_row = trace.events[packet_event_id]
+                    packet_stage = packet_plan.stage_for_event(packet_event_id)
+                    completion = cycle + self._physical_service_cycles(
+                        "bidirectional_query", packet_row,
+                        PrimitiveKind.ADJOINT, packet_stage,
+                    )
+                    heapq.heappush(in_flight, (
+                        completion, packet_event_id, packet_stage_index,
+                        "bidirectional_query",
+                    ))
+                progressed = progressed or bool(replay_advance.dispatches)
             if not progressed:
                 memory_wakeup = (
                     self.config.memory.next_wakeup()  # type: ignore[attr-defined]
@@ -3598,6 +4035,14 @@ class CycleEngine:
                 )
             module_counters["bidirectional_query"].update(
                 query_replay.snapshot()
+            )
+        if query_replay_lanes is not None:
+            if query_replay_lanes.pending_packets:
+                raise CycleConfigurationError(
+                    "cycle replay ended with partially replayed RelationPackets"
+                )
+            module_counters["bidirectional_query"].update(
+                query_replay_lanes.snapshot()
             )
         if owner_gradients is not None:
             if owner_gradients.active_by_cluster:
@@ -4051,7 +4496,6 @@ class CycleReplaySession:
         self._ready: dict[
             tuple[str, int], _ReadyCandidateQueue
         ] = defaultdict(_ReadyCandidateQueue)
-        self._fusion_pending = _FusionPendingQueues()
         fusion_capacity = (
             engine.config.candidate_fifo_entries
             or engine.modules["fusion_issue"].timing.queue_capacity
@@ -4060,6 +4504,7 @@ class CycleReplaySession:
             engine.config.fusion_query_state_banks
             or engine.modules["fusion_issue"].timing.banks
         )
+        self._fusion_pending = _FusionPendingQueues()
         self._fusion_inputs: dict[TaskKind, _BankedFusionSourceQueue] = {
             kind: _BankedFusionSourceQueue(
                 capacity=fusion_capacity, banks=fusion_banks,
@@ -4085,6 +4530,7 @@ class CycleReplaySession:
         self._consumer_last_reduction: dict[int, tuple[int, int, int]] = {}
         self._relation_windows = engine._new_relation_window_tracker()
         self._query_replay = engine._new_query_replay_tracker()
+        self._query_replay_lanes = engine._new_query_replay_lane_scheduler()
         self._owner_gradients = engine._new_owner_gradient_tracker()
         self._compute_telemetry = (
             engine._new_compute_telemetry() if collect_compute_telemetry else None
@@ -4231,6 +4677,11 @@ class CycleReplaySession:
             violations.append("relation_windows")
         if self._query_replay is not None and self._query_replay.active_queries:
             violations.append("replay_queue")
+        if (
+            self._query_replay_lanes is not None
+            and self._query_replay_lanes.pending_packets
+        ):
+            violations.append("replay_lanes")
         if self._owner_gradients is not None and self._owner_gradients.active_by_cluster:
             violations.append("owner_gradient_slots")
         if self._relation_stage_blocked:
@@ -4998,6 +5449,10 @@ class CycleReplaySession:
             )
         if self._query_replay is not None:
             counters["bidirectional_query"].update(self._query_replay.snapshot())
+        if self._query_replay_lanes is not None:
+            counters["bidirectional_query"].update(
+                self._query_replay_lanes.snapshot()
+            )
         if self._owner_gradients is not None:
             counters["compute_pod"].update(self._owner_gradients.snapshot())
         if self._cache_states:
@@ -5226,6 +5681,33 @@ class CycleReplaySession:
     def _ordered(self, candidates: list[tuple[int, int]]) -> list[tuple[int, int]]:
         return sorted(candidates)
 
+    def _advance_pending_query_replay(self) -> bool:
+        if (
+            self._query_replay_lanes is None
+            or not self._query_replay_lanes.pending_packets
+        ):
+            return False
+        replay_advance = self._query_replay_lanes.advance(
+            self._module_busy_until["bidirectional_query"], self._cycle,
+        )
+        self.engine._mark_query_replay_dispatches(
+            self._compute_telemetry, replay_advance.dispatches, self._cycle,
+        )
+        for packet_event_id, packet_stage_index in (
+            replay_advance.completed_packets
+        ):
+            row = self._events[packet_event_id]
+            physical_stage = self._packet_stage_by_event.get(packet_event_id)
+            completion = self._cycle + self.engine._physical_service_cycles(
+                "bidirectional_query", row,
+                PrimitiveKind.ADJOINT, physical_stage,
+            )
+            heapq.heappush(self._in_flight, (
+                completion, packet_event_id, packet_stage_index,
+                "bidirectional_query",
+            ))
+        return bool(replay_advance.dispatches)
+
     def _drain(
         self,
         *,
@@ -5243,6 +5725,10 @@ class CycleReplaySession:
             or self._lane_outputs
             or self._fusion_pending
             or any(self._fusion_inputs.values())
+            or (
+                self._query_replay_lanes is not None
+                and self._query_replay_lanes.pending_packets
+            )
             or not stream_exhausted
         ):
             # Bank reservations are scoped to one cycle.  Drop old entries so
@@ -5339,6 +5825,7 @@ class CycleReplaySession:
                     (packet.event_id, 0)
                     for packet in fusion_candidate_packets
                 )
+            replay_advanced = False
             if candidates:
                 ordered = self._ordered(candidates)
                 fusion_packets = {
@@ -5360,7 +5847,20 @@ class CycleReplaySession:
                         (next(order), stage) if event_id in fusion_packets else (event_id, stage)
                         for event_id, stage in ordered
                     ]
+                ordered.sort(key=lambda item: self.engine._is_query_replay_stage(
+                    self._kinds[item[0]], item[1],
+                ))
                 for ordered_position, (event_id, stage) in enumerate(ordered):
+                    if (
+                        not replay_advanced
+                        and self.engine._is_query_replay_stage(
+                            self._kinds[event_id], stage,
+                        )
+                    ):
+                        progressed = (
+                            self._advance_pending_query_replay() or progressed
+                        )
+                        replay_advanced = True
                     multicast_followers: tuple[int, ...] = ()
                     if (
                         stage == 0
@@ -5398,6 +5898,8 @@ class CycleReplaySession:
                         multicast_followers=multicast_followers,
                     ):
                         progressed = True
+            if not replay_advanced:
+                progressed = self._advance_pending_query_replay() or progressed
             if not progressed:
                 stage_blocked_after = sum(
                     len(events)
@@ -5522,6 +6024,7 @@ class CycleReplaySession:
         module_lane: int | None = None
         fusion_port_lane: int | None = None
         query_allocation: tuple[int, ...] = ()
+        query_replay_admission: _QueryReplayAdmission | None = None
         if port_name:
             fusion_port_lane = next((
                 index for index, point in enumerate(
@@ -5535,9 +6038,38 @@ class CycleReplaySession:
             )
         elif module_name == "bidirectional_query" and self.engine._has_query_resources():
             module_lanes = self._module_busy_until[module_name]
-            allocation = self.engine._query_resource_allocation(
-                module_lanes, row, kind, physical_stage, self._cycle,
-            )
+            if kind is PrimitiveKind.ADJOINT:
+                if self._query_replay_lanes is None:
+                    raise CycleConfigurationError(
+                        "adjoint replay scheduler is unavailable"
+                    )
+                query_replay_admission = (
+                    self._query_replay_lanes.plan_admission(
+                        packet_event_id=event_id,
+                        stage=stage,
+                        work=self.engine._query_replay_lane_work(
+                            row, physical_stage,
+                        ),
+                        module_lanes=module_lanes,
+                        cycle=self._cycle,
+                    )
+                )
+                allocation = (
+                    None
+                    if query_replay_admission is None
+                    else tuple(
+                        resource
+                        for dispatch in query_replay_admission.dispatches
+                        for resource in (
+                            dispatch.replay_resource,
+                            dispatch.volume_resource,
+                        )
+                    )
+                )
+            else:
+                allocation = self.engine._query_resource_allocation(
+                    module_lanes, row, kind, physical_stage, self._cycle,
+                )
             if allocation is None:
                 reason = (
                     "reduction_bank"
@@ -5556,7 +6088,8 @@ class CycleReplaySession:
                 )
                 self._requeue(event_id, stage)
                 return False
-            query_allocation = allocation
+            if query_replay_admission is None:
+                query_allocation = allocation
             busy_until = self._cycle
         else:
             module_lanes = self._module_busy_until[module_name]
@@ -5751,6 +6284,11 @@ class CycleReplaySession:
             )
             self._requeue(event_id, stage)
             return False
+        if (
+            query_replay_admission is not None
+            and query_replay_admission.remaining
+        ):
+            completion = None
         if completion is not None:
             heapq.heappush(self._in_flight, (completion, event_id, stage, module_name))
         if (
@@ -5778,6 +6316,17 @@ class CycleReplaySession:
             assert fusion_port_lane is not None
             self._fusion_busy_until[port_name][fusion_port_lane] = (
                 self._cycle + timing.initiation_interval
+            )
+        elif query_replay_admission is not None:
+            assert self._query_replay_lanes is not None
+            self._query_replay_lanes.commit_admission(
+                query_replay_admission,
+                self._module_busy_until[module_name], self._cycle,
+            )
+            self.engine._mark_query_replay_dispatches(
+                self._compute_telemetry,
+                query_replay_admission.dispatches,
+                self._cycle,
             )
         elif query_allocation:
             for lane in query_allocation:
@@ -5851,7 +6400,10 @@ class CycleReplaySession:
         module.counters.busy_cycles += service_cycles
         if compute_plan:
             module.reserve(compute_plan)  # type: ignore[attr-defined]
-        if self._compute_telemetry is not None:
+        if (
+            self._compute_telemetry is not None
+            and query_replay_admission is None
+        ):
             self._compute_telemetry.mark_issue(
                 self.engine._stage_event_ids(
                     event_id, kind, stage, physical_stage,

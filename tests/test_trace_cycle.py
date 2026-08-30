@@ -1685,7 +1685,6 @@ def test_banked_fusion_fifo_capacity_is_shared_across_banks() -> None:
             resource=32, state_version=0, template_id=0, address_token=32,
             task_kind=TaskKind.FORWARD,
         ), bank=0)
-
     assert len(queue) == 32
     queue.commit(8)
     assert len(queue) == 31

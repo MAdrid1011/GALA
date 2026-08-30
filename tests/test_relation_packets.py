@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from dataclasses import replace
+from pathlib import Path
+
 import numpy as np
 import pytest
-from pathlib import Path
 
 from gala_sim.clamp import (
     PrimitiveKind, ResourceClass, SemanticWorksets, TraceBuilder, TraceEvent,
@@ -583,6 +585,56 @@ def test_online_and_offline_packet_replay_have_exact_cycles_and_completions() ->
     assert online.total_cycles == offline.total_cycles
     assert online.completion_cycles == offline.completion_cycles
     assert online.module_counters == offline.module_counters
+    assert online.compute_telemetry == offline.compute_telemetry
+
+
+def test_online_and_offline_partial_replay_packets_match_each_lane_cycle() -> None:
+    masks = np.zeros((8, 8), dtype=np.dtype("<u4"))
+    masks[:, 0] = np.uint32((1 << 16) - 1)
+    source = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 16),
+        point_ids=np.arange(4, 12, dtype=np.int64),
+        point_keys=np.zeros(8, dtype=np.uint64), masks=masks,
+        loss_flags=1, backward_confirmed=True,
+    )
+    trace = _virtual_trace(source)
+    config_path = Path(__file__).parents[1] / "configs/architecture/gala.yaml"
+    config = replace(
+        CycleConfig.from_gala(load_config(config_path), _Memory()),
+        trace_continuation_query_packs=None,
+    )
+    offline = CycleEngine(config, policy="full").run(
+        trace, collect_compute_telemetry=True,
+    )
+    online_config = replace(config, memory=_Memory())
+    session = CycleEngine(online_config, policy="full").online_session(
+        max_events=2, max_frontier_events=2_048,
+        initial_gaussian_count=12, retain_completion_cycles=True,
+        collect_compute_telemetry=True,
+    )
+
+    session.accept_query_packet(source)
+    session.close_iteration(1)
+    online = session.finish()
+
+    offline_replay = offline.module_counters["bidirectional_query"]
+    online_replay = online.module_counters["bidirectional_query"]
+    replay_keys = (
+        "adjoint_replay_lane_dispatches",
+        "adjoint_replay_active_cycles",
+        "adjoint_replay_full_cycles",
+        "adjoint_replay_idle_lane_cycles",
+        "adjoint_replay_pending_peak_packets",
+        "adjoint_replay_pending_packets",
+    )
+    assert offline_replay["adjoint_replay_pending_peak_packets"] > 0
+    assert {
+        key: offline_replay[key] for key in replay_keys
+    } == {
+        key: online_replay[key] for key in replay_keys
+    }
+    assert online.total_cycles == offline.total_cycles
+    assert online.completion_cycles == offline.completion_cycles
     assert online.compute_telemetry == offline.compute_telemetry
 
 
