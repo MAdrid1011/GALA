@@ -28,6 +28,7 @@ from gala_sim.timing.memory import NativeRamulator2Binding, Ramulator2Backend
 from gala_sim.timing.resources import ResourceUsage
 from gala_sim.tools.cycle_preflight import run_cycle_preflight, write_cycle_preflight
 from gala_sim.tools.relation_capacity import run_relation_capacity_preflight
+from gala_sim.tools.representative_packets import plan_representative_packet_groups
 from gala_sim.tools.cycle_throughput import (
     ThroughputConverged, ThroughputDiagnosticConfig, ThroughputMonitor,
     require_empty_diagnostic_output,
@@ -82,6 +83,11 @@ def _parser() -> argparse.ArgumentParser:
     archive_validate = commands.add_parser("trace-archive-validate")
     archive_validate.add_argument("--archive", type=Path, required=True)
     archive_validate.add_argument("--output", type=Path, required=True)
+    representative = commands.add_parser("representative-packet-plan")
+    representative.add_argument("--archive", type=Path, required=True)
+    representative.add_argument("--campaign", type=Path, required=True)
+    representative.add_argument("--expected-groups", type=int, required=True)
+    representative.add_argument("--output", type=Path, required=True)
     sample = commands.add_parser("trace-sample")
     sample.add_argument("--trace", type=Path, required=True)
     sample.add_argument("--output", type=Path, required=True)
@@ -395,6 +401,20 @@ def main(argv: list[str] | None = None) -> int:
             report = reader.validate(promote=True)
             write_json(report, args.output)
             print(json.dumps(report, sort_keys=True))
+            return 0
+        if args.command == "representative-packet-plan":
+            report = plan_representative_packet_groups(
+                args.archive,
+                args.campaign,
+                expected_group_count=args.expected_groups,
+            )
+            write_json(report, args.output)
+            print(json.dumps({
+                "status": "passed",
+                "groups": report["group_count"],
+                "iterations": report["iteration_count"],
+                "output": str(args.output.resolve()),
+            }, sort_keys=True))
             return 0
         if args.command == "archive-ablation":
             reader = VirtualPacketArchiveReader(args.archive)

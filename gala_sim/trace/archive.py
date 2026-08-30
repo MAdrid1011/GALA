@@ -8,7 +8,9 @@ recreate fresh :class:`VirtualTracePacket` objects for each policy replay.
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Collection
 from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass
 import json
 from pathlib import Path
 from typing import Any, Iterator
@@ -26,6 +28,18 @@ from .virtual import (
 
 
 ARCHIVE_SCHEMA_VERSION = "gala-virtual-packet-archive-v1"
+
+
+@dataclass(frozen=True)
+class VirtualPacketArchiveDescriptor:
+    chunk_index: int
+    packet_index: int
+    iteration_id: int
+    template_id: int
+    query_base: int
+    query_shape: tuple[int, ...]
+    candidate_count: int
+    mask_words: int
 
 
 class VirtualPacketArchiveWriter:
@@ -252,6 +266,39 @@ class VirtualPacketArchiveReader:
                     yield "close_iteration", int(item["iteration_id"])
                 else:
                     raise ValueError("virtual packet archive stream record is malformed")
+
+    def packet_descriptors(
+        self, *, iterations: Collection[int] | None = None,
+    ) -> Iterator[VirtualPacketArchiveDescriptor]:
+        """Read packet metadata without inflating point or mask arrays."""
+
+        selected = None if iterations is None else {int(value) for value in iterations}
+        for chunk_index, relative in enumerate(self.manifest.get("chunks", ())):
+            path = self.root / str(relative)
+            with np.load(path, allow_pickle=False) as data:
+                packet_metadata = json.loads(str(data["packets"].item()))
+            for packet_index, metadata in enumerate(packet_metadata):
+                iteration_id = int(metadata["iteration_id"])
+                if selected is not None and iteration_id not in selected:
+                    continue
+                yield VirtualPacketArchiveDescriptor(
+                    chunk_index=chunk_index,
+                    packet_index=packet_index,
+                    iteration_id=iteration_id,
+                    template_id=int(metadata["template_id"]),
+                    query_base=int(metadata["query_base"]),
+                    query_shape=tuple(int(value) for value in metadata["query_shape"]),
+                    candidate_count=int(metadata["candidate_count"]),
+                    mask_words=int(metadata["mask_words"]),
+                )
+
+    def packet(self, descriptor: VirtualPacketArchiveDescriptor) -> VirtualTracePacket:
+        """Materialize one packet selected from metadata-only descriptors."""
+
+        return self._packet({
+            "chunk": int(descriptor.chunk_index),
+            "index": int(descriptor.packet_index),
+        })
 
     def replay(self, consumer: Any, *, finish: bool = False) -> None:
         """Feed one independent consumer; callers may replay this reader again."""
