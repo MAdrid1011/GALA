@@ -96,8 +96,8 @@ class ArchiveSpeedupSample:
     completion_fraction: float
     completed_events: int
     cycles_by_variant: dict[str, int]
-    cumulative_speedup_vs_base: dict[str, float]
-    interval_speedup_vs_base: dict[str, float]
+    cumulative_cycle_ratio_vs_0000: dict[str, float]
+    interval_cycle_ratio_vs_0000: dict[str, float]
     projected_total_cycles: dict[str, float]
 
 
@@ -369,16 +369,16 @@ class ArchiveSpeedupMonitor:
             ):
                 raise ValueError("variant cycles are not monotonic")
         base_cycles = normalized_cycles[self.base_variant]
-        cumulative_speedups = {
+        cumulative_cycle_ratios = {
             bits: base_cycles / normalized_cycles[bits]
             for bits in self.variants
         }
-        interval_speedups: dict[str, float] = {}
+        interval_cycle_ratios: dict[str, float] = {}
         if previous is not None:
             base_delta = base_cycles - previous.cycles_by_variant[self.base_variant]
             if base_delta <= 0:
                 raise ValueError("Base ASIC interval cycles must be positive")
-            interval_speedups = {
+            interval_cycle_ratios = {
                 bits: base_delta / (
                     normalized_cycles[bits] - previous.cycles_by_variant[bits]
                 )
@@ -392,8 +392,8 @@ class ArchiveSpeedupMonitor:
             completion_fraction=completion_fraction,
             completed_events=int(completed_events),
             cycles_by_variant=normalized_cycles,
-            cumulative_speedup_vs_base=cumulative_speedups,
-            interval_speedup_vs_base=interval_speedups,
+            cumulative_cycle_ratio_vs_0000=cumulative_cycle_ratios,
+            interval_cycle_ratio_vs_0000=interval_cycle_ratios,
             projected_total_cycles={
                 bits: cycles / completion_fraction
                 for bits, cycles in normalized_cycles.items()
@@ -407,7 +407,7 @@ class ArchiveSpeedupMonitor:
         window = usable[-self.config.stability_window_samples:]
         enough_samples = (
             len(window) == self.config.stability_window_samples
-            and all(sample.interval_speedup_vs_base for sample in window)
+            and all(sample.interval_cycle_ratio_vs_0000 for sample in window)
         )
         enough_work = bool(
             self.samples
@@ -423,13 +423,13 @@ class ArchiveSpeedupMonitor:
         if enough_samples:
             cumulative_spans = {
                 bits: ThroughputMonitor._relative_span([
-                    sample.cumulative_speedup_vs_base[bits] for sample in window
+                    sample.cumulative_cycle_ratio_vs_0000[bits] for sample in window
                 ])
                 for bits in compared_variants
             }
             interval_spans = {
                 bits: ThroughputMonitor._relative_span([
-                    sample.interval_speedup_vs_base[bits] for sample in window
+                    sample.interval_cycle_ratio_vs_0000[bits] for sample in window
                 ])
                 for bits in compared_variants
             }
@@ -459,7 +459,7 @@ class ArchiveSpeedupMonitor:
             >= self.config.required_consecutive_stable_windows
         )
         return {
-            "schema_version": "gala-archive-speedup-diagnostic-v1",
+            "schema_version": "gala-archive-cycle-ratio-diagnostic-v2",
             "result_scope": "development_speedup_projection",
             "formal_performance_eligible": False,
             "base_variant": self.base_variant,
@@ -474,8 +474,8 @@ class ArchiveSpeedupMonitor:
                 "status": "stable" if stable else "collecting",
                 "enough_samples": enough_samples,
                 "enough_work": enough_work,
-                "cumulative_speedup_relative_span": cumulative_spans,
-                "interval_speedup_relative_span": interval_spans,
+                "cumulative_cycle_ratio_relative_span": cumulative_spans,
+                "interval_cycle_ratio_relative_span": interval_spans,
                 "projected_cycles_relative_span": projection_spans,
                 "consecutive_stable_windows": self._consecutive_stable_windows,
             },

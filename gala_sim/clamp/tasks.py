@@ -647,6 +647,11 @@ class FusionIssueScheduler:
             ),
         )
 
+    def compiler_admission_key(self, task: TaskPacket) -> tuple[int, ...]:
+        """Rank ready compiler work using exact current F/C/A state."""
+
+        return self._sort_key(task, use_history_prediction=False)
+
     def issue(
         self,
         candidates: Iterable[TaskPacket],

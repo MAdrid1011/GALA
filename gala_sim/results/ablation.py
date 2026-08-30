@@ -7,7 +7,10 @@ from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Iterable
 
-from gala_sim.ablation import AblationVariant, all_variants, validate_matrix
+from gala_sim.ablation.matrix import (
+    ASIC_BASE_VARIANTS, GPU_COMPILER_VARIANTS, AblationVariant, all_variants,
+    comparison_baseline, validate_matrix,
+)
 
 
 @dataclass(frozen=True)
@@ -16,7 +19,7 @@ class AblationRow:
     dataset: str
     bits: str
     cycles: int
-    speedup_vs_base_asic: float
+    speedup_vs_base_asic: float | None
     local_gpu_seconds: float | None
     orin_seconds: float | None
     speedup_vs_orin: float | None
@@ -27,6 +30,9 @@ class AblationRow:
     status: str
     module_breakdown_path: str | None = None
     run_id: str | None = None
+    comparison_baseline: str = ""
+    gpu_base_seconds: float | None = None
+    speedup_vs_gpu_base: float | None = None
 
 
 def validate_full_variant(base_cycles: int, full_cycles: int, entry_bits: str,
@@ -44,6 +50,22 @@ def write_ablation_csv(rows: Iterable[AblationRow], path: Path) -> None:
     validate_matrix([row.bits for row in rows])
     if rows[0].model != rows[-1].model or rows[0].dataset != rows[-1].dataset:
         raise ValueError("ablation rows do not describe one model/dataset pair")
+    for row in rows:
+        expected_baseline = comparison_baseline(row.bits)
+        if row.comparison_baseline != expected_baseline:
+            raise ValueError(
+                f"variant {row.bits} must use {expected_baseline} as its baseline"
+            )
+        if (
+            row.bits in GPU_COMPILER_VARIANTS or row.bits == "0000"
+        ) and row.speedup_vs_base_asic is not None:
+            raise ValueError(
+                f"variant {row.bits} cannot report speedup versus Base ASIC"
+            )
+        if row.bits in ASIC_BASE_VARIANTS and row.speedup_vs_gpu_base is not None:
+            raise ValueError(
+                f"variant {row.bits} cannot report compiler speedup versus GPU Base"
+            )
     path.parent.mkdir(parents=True, exist_ok=True)
     fieldnames = list(asdict(rows[0]))
     with path.open("w", newline="", encoding="utf-8") as stream:

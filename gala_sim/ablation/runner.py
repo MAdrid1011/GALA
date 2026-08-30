@@ -17,8 +17,10 @@ from gala_sim.timing import (
 from gala_sim.tools.cycle_throughput import (
     ArchiveSpeedupMonitor, ThroughputDiagnosticConfig,
 )
-
-from .matrix import AblationVariant, all_variants, validate_matrix
+from .matrix import (
+    AblationVariant, asic_speedup, all_variants, comparison_baseline,
+    validate_matrix,
+)
 
 
 @dataclass(frozen=True)
@@ -250,7 +252,16 @@ def run_archive_speedup_diagnostic(
             bits: {
                 "measured_prefix_cycles": result.total_cycles,
                 "projected_total_cycles": latest["projected_total_cycles"][bits],
-                "speedup_vs_base_asic": latest["cumulative_speedup_vs_base"][bits],
+                "comparison_baseline": comparison_baseline(bits),
+                "cycle_ratio_vs_0000": latest[
+                    "cumulative_cycle_ratio_vs_0000"
+                ][bits],
+                "speedup_vs_base_asic": asic_speedup(
+                    bits,
+                    base_cycles=latest["cycles_by_variant"]["0000"],
+                    cycles=latest["cycles_by_variant"][bits],
+                ),
+                "speedup_vs_gpu_base": None,
                 "completed_events": consumers[bits].session.completed_event_count,
                 "event_counts": result.event_counts,
             }

@@ -23,23 +23,24 @@
 
 ## 3. 加速比口径
 
-每个组合首先报告相对于 Base ASIC 的加速比。
+纯编译配置 `1000`、`0100` 和 `1100` 运行在 GPU 软件路径上，只报告相对于同一工作量 GPU
+Base 的加速比。GPU Base 使用 AGX Orin 合理估算值时，必须同时记录估算方法、区间，并明确标记
+为估算而非实机测量；不得用 ASIC 周期替代纯编译配置的 GPU 时间。
+
+```text
+speedup_vs_gpu_base = gpu_base_seconds / gpu_variant_seconds
+```
+
+Base ASIC 单独报告绝对周期、换算时间和相对于同工作量 AGX Orin GPU Base 的平台级加速比。
+包含硬件机制的 `1010`、`0101` 和 `1111` 才报告相对于 Base ASIC 的加速比。
 
 ```text
 speedup_vs_base_asic = cycles_0000 / cycles_variant
 ```
 
-只有在同一校准套件、数据类型和批量范围下取得 AGX Orin 实测向量后，平台级结果才报告相对于
-AGX Orin 的加速比。
-
-```text
-speedup_vs_orin = orin_normalized_seconds * clock_hz / cycles_variant
-```
-
-结果表必须包含绝对周期、相对于 Base ASIC 的加速比和本地 GPU 原始时间。缺少同套件 Orin 实测
-时，AGX Orin 换算时间和 `speedup_vs_orin` 固定为 `unavailable`，不得用公开规格 extrapolation
-补值，也不得用于锚点、数量级检查、方向判断或达标门槛。Oracle 结果独立标记，不能与实际机制
-结果混入同一几何平均。
+结果表必须为每一行显式记录比较基准。`1000`、`0100`、`1100` 的
+`speedup_vs_base_asic` 固定为空；`1010`、`0101`、`1111` 的 `speedup_vs_gpu_base` 固定为空。
+Oracle 结果独立标记，不能与实际机制结果混入同一几何平均。
 
 ## 4. 输出文件
 
@@ -56,8 +57,8 @@ speedup_vs_orin = orin_normalized_seconds * clock_hz / cycles_variant
 | `gpu_reference.json` | 本地 GPU 时间、校准项，以及可用时的同套件 Orin 实测换算 |
 | `status.json` | 运行状态、失败原因和验收结果 |
 
-活动组合汇总为 `ablation.csv`。表中每行绑定模型、数据集、开关位、绝对周期、相对 Base ASIC
-的加速比、质量差异和配置哈希；Orin 字段只有取得同套件实测时才填写，否则保持 `unavailable`。
+活动组合汇总为 `ablation.csv`。表中每行绑定模型、数据集、开关位、比较基准、相应加速比、
+质量差异和配置哈希。AGX Orin 估算值必须保留估算状态与不确定区间。
 结果生成器只读取这些机器可读文件，不允许手工填写论文表格。
 
 ## 5. 一致性断言
@@ -67,6 +68,7 @@ speedup_vs_orin = orin_normalized_seconds * clock_hz / cycles_variant
 - 正式配置集合和顺序严格等于 `0000,1000,1010,0100,0101,1100,1111`
 - 任何启用 C 的配置同时启用 A，任何启用 D 的配置同时启用 B
 - 仅允许调度顺序、缓存事件、停顿原因和周期数变化
-- 相对于 Base ASIC 的加速比统一使用同一任务的 `0000`
-- 相对于 Orin 的加速比仅在同套件 Orin 实测可用时计算，并统一使用同一任务的分阶段换算时间
+- `1000`、`0100`、`1100` 只与同一任务的 GPU Base 比较
+- `1010`、`0101`、`1111` 只与同一任务的 Base ASIC 比较
+- Base ASIC 与 GPU Base 的平台级比较必须使用相同工作量
 - 任一质量越界时，该组合不进入性能汇总

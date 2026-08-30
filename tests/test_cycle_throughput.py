@@ -131,10 +131,10 @@ def test_archive_speedup_monitor_requires_common_stable_intervals() -> None:
             },
         )
     assert report["stability"]["status"] == "stable"
-    assert report["samples"][-1]["cumulative_speedup_vs_base"] == {
+    assert report["samples"][-1]["cumulative_cycle_ratio_vs_0000"] == {
         "0000": 1.0, "1010": 1.25, "1111": 2.0,
     }
-    assert report["samples"][-1]["interval_speedup_vs_base"] == {
+    assert report["samples"][-1]["interval_cycle_ratio_vs_0000"] == {
         "0000": 1.0, "1010": 1.25, "1111": 2.0,
     }
     assert report["formal_performance_eligible"] is False
@@ -160,7 +160,7 @@ def test_archive_speedup_monitor_rejects_recent_phase_change() -> None:
         cycles_by_variant={"0000": 500, "1111": 400},
     )
     assert report["stability"]["status"] == "collecting"
-    assert report["stability"]["interval_speedup_relative_span"]["1111"] > 0.01
+    assert report["stability"]["interval_cycle_ratio_relative_span"]["1111"] > 0.01
 
 
 def test_archive_speedup_monitor_rejects_variant_set_drift() -> None:

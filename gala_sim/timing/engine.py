@@ -680,12 +680,15 @@ class _FusionPendingQueues:
         offers: tuple[
             tuple[tuple[TaskKind, int, int, int], frozenset[int]], ...
         ],
+        *,
+        priority: Callable[[int], tuple[int, ...]] | None = None,
     ) -> int:
-        """Prefer the oldest ready task that fills one resident state group."""
+        """Fill a resident state group without overriding query-load order."""
 
         live = self._live[task_kind]
         indexes = self._semantic_by_bank[task_kind]
-        for semantic_key, banks in offers:
+        semantic_matches: list[tuple[int, int, deque[int]]] = []
+        for offer_index, (semantic_key, banks) in enumerate(offers):
             best: tuple[int, deque[int]] | None = None
             for bank in banks:
                 indexed = indexes.get((semantic_key, bank))
@@ -701,8 +704,25 @@ class _FusionPendingQueues:
                     best = candidate
             if best is not None:
                 event_id, indexed = best
-                indexed.popleft()
-                return self._commit(event_id, task_kind)
+                if priority is None:
+                    indexed.popleft()
+                    return self._commit(event_id, task_kind)
+                semantic_matches.append((offer_index, event_id, indexed))
+        if priority is not None and semantic_matches:
+            queue = self._queues[task_kind]
+            while queue and queue[0] not in live:
+                queue.popleft()
+            if not queue:
+                raise IndexError("Fusion pending source queue is empty")
+            fifo_head = queue[0]
+            _offer_index, event_id, indexed = min(
+                semantic_matches,
+                key=lambda item: (priority(item[1]), item[0], item[1]),
+            )
+            if priority(fifo_head) < priority(event_id):
+                return self.popleft(task_kind)
+            indexed.popleft()
+            return self._commit(event_id, task_kind)
         return self.popleft(task_kind)
 
     def queues(self):
@@ -752,6 +772,9 @@ class _ReadyCandidateQueue:
         self._semantic_location_by_token: dict[
             int, tuple[PrimitiveKind, int, int]
         ] = {}
+        self._compiler_semantic_request_key: (
+            tuple[PrimitiveKind, int, int] | None
+        ) = None
         self._complex: list[tuple[tuple[int, int], int]] = []
         self._complex_event_ids: dict[int, tuple[int, ...]] = {}
         self._configured = False
@@ -1091,6 +1114,52 @@ class _ReadyCandidateQueue:
             choices.append(complex_entry)
         return min(choices, default=None)
 
+    def _compiler_semantic_request_candidate(
+        self,
+    ) -> tuple[tuple[int, int], int] | None:
+        """Keep compiler-ordered requests local without delaying ready returns."""
+
+        general = self._peek(self._general)
+        if general is None:
+            return None
+        assert self._row_for is not None
+        assert self._kind_for is not None or self._physical_stage_for is not None
+        event_id, stage = general[0]
+        row = self._row_for(event_id)
+        kind = (
+            self._kind_for(event_id)
+            if self._kind_for is not None
+            else PrimitiveKind(int(row["primitive_kind"]))
+        )
+        if stage != 0 or kind is not PrimitiveKind.CACHE_REQUEST:
+            return general
+
+        preferred = self._compiler_semantic_request_key
+        if preferred is not None:
+            entry = self._peek(self._semantic_by_key.get(preferred, []))
+            if entry is not None:
+                return entry
+            self._compiler_semantic_request_key = None
+
+        groups: list[
+            tuple[int, tuple[int, int], tuple[PrimitiveKind, int, int]]
+        ] = []
+        for semantic_key, heap in self._semantic_by_key.items():
+            if semantic_key[0] is not PrimitiveKind.CACHE_REQUEST:
+                continue
+            entry = self._peek(heap)
+            if entry is None:
+                continue
+            live_count = sum(
+                token in self._candidate_by_token for _candidate, token in heap
+            )
+            groups.append((-live_count, entry[0][0], semantic_key))
+        if not groups:
+            return general
+        _count, _oldest, preferred = min(groups)
+        self._compiler_semantic_request_key = preferred
+        return self._peek(self._semantic_by_key[preferred])
+
     def _remove(
         self, entry: tuple[tuple[int, int], int], *, promote: bool = True,
     ) -> None:
@@ -1139,6 +1208,7 @@ class _ReadyCandidateQueue:
         owner_gradients: OwnerGradientTracker | None,
         query_replay: QueryReplayTracker | None,
         semantic_multicast_destinations: int | None = None,
+        compiler_semantic_order: bool = False,
     ) -> list[tuple[int, int]]:
         self._configure(
             module_name, capacity=capacity, row_for=row_for,
@@ -1158,7 +1228,11 @@ class _ReadyCandidateQueue:
         )
         selection_limit = min(width, len(self._candidate_by_token))
         for _ in range(selection_limit):
-            entry = self._earliest_acceptable(provisional_owner_active)
+            entry = (
+                self._compiler_semantic_request_candidate()
+                if compiler_semantic_order and module_name == "semantic_cache"
+                else self._earliest_acceptable(provisional_owner_active)
+            )
             if entry is None:
                 break
             candidate, token = entry
@@ -2204,6 +2278,7 @@ class CycleEngine:
 
         if (
             self.selection.semantic_worksets
+            and self.selection.semantic_residency
             and self._joint_semantic_priority_enabled()
             and self.config.fusion_semantic_bundle_index_bytes is not None
         ):
@@ -2297,6 +2372,7 @@ class CycleEngine:
         destinations = self.config.cache_multicast_destinations
         if (
             not self.selection.semantic_worksets
+            or not self.selection.semantic_residency
             or self.selection.overlap_guided_issue != coordinated_issue
             or self.config.fusion_semantic_bundle_index_bytes is None
             or destinations is None
@@ -2794,6 +2870,11 @@ class CycleEngine:
                 if module_name == "semantic_cache"
                 and self.selection.semantic_residency
                 else None
+            ),
+            compiler_semantic_order=(
+                module_name == "semantic_cache"
+                and self.selection.semantic_worksets
+                and not self.selection.semantic_residency
             ),
         )
 
@@ -3338,7 +3419,10 @@ class CycleEngine:
                 lambda event_id, task_kind: self._fusion_pending_semantic_index(
                     trace.events[event_id], task_kind,
                 )
-                if self.selection.semantic_worksets else None
+                if (
+                    self.selection.semantic_worksets
+                    and self.selection.semantic_residency
+                ) else None
             ),
         )
         fusion_inputs: dict[TaskKind, _BankedFusionSourceQueue] = {
@@ -3875,9 +3959,30 @@ class CycleEngine:
                         )
                         event_id = (
                             fusion_pending.popleft_semantic_match(
-                                task_kind, offers,
+                                task_kind,
+                                offers,
+                                priority=(
+                                    (
+                                        lambda pending_event_id:
+                                        self.issue_scheduler.compiler_admission_key(
+                                            self._task_packet(
+                                                trace,
+                                                pending_event_id,
+                                                packet_plan.stage_for_event(
+                                                    pending_event_id
+                                                ),
+                                            )
+                                        )
+                                    )
+                                    if self.selection.query_load_rules
+                                    else None
+                                ),
                             )
-                            if self.selection.semantic_worksets and offers
+                            if (
+                                self.selection.semantic_worksets
+                                and self.selection.semantic_residency
+                                and offers
+                            )
                             else fusion_pending.popleft(task_kind)
                         )
                         packet = self._task_packet(
@@ -5705,7 +5810,10 @@ class CycleReplaySession:
                 lambda event_id, task_kind: engine._fusion_pending_semantic_index(
                     self._events[event_id], task_kind,
                 )
-                if engine.selection.semantic_worksets else None
+                if (
+                    engine.selection.semantic_worksets
+                    and engine.selection.semantic_residency
+                ) else None
             ),
         )
         self._fusion_inputs: dict[TaskKind, _BankedFusionSourceQueue] = {
@@ -7116,9 +7224,24 @@ class CycleReplaySession:
                     )
                     event_id = (
                         self._fusion_pending.popleft_semantic_match(
-                            task_kind, offers,
+                            task_kind,
+                            offers,
+                            priority=(
+                                (
+                                    lambda pending_event_id:
+                                    self.engine.issue_scheduler.compiler_admission_key(
+                                        self._task_packet(pending_event_id)
+                                    )
+                                )
+                                if self.engine.selection.query_load_rules
+                                else None
+                            ),
                         )
-                        if self.engine.selection.semantic_worksets and offers
+                        if (
+                            self.engine.selection.semantic_worksets
+                            and self.engine.selection.semantic_residency
+                            and offers
+                        )
                         else self._fusion_pending.popleft(task_kind)
                     )
                     packet = self._task_packet(event_id)

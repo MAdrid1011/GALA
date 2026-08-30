@@ -1,6 +1,12 @@
 """Machine-readable run and ablation result writers."""
 
 from .manifest import RunManifest, write_json
-from .ablation import AblationRow, write_ablation_csv, validate_full_variant
+from gala_sim.ablation.matrix import asic_speedup, comparison_baseline, gpu_speedup
 
-__all__ = ["RunManifest", "write_json", "AblationRow", "write_ablation_csv", "validate_full_variant"]
+from .ablation import AblationRow, validate_full_variant, write_ablation_csv
+
+__all__ = [
+    "RunManifest", "write_json", "AblationRow", "asic_speedup",
+    "comparison_baseline", "gpu_speedup", "write_ablation_csv",
+    "validate_full_variant",
+]

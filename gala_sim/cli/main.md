@@ -20,7 +20,7 @@
 
 `gala-r2-trace-runner --virtual-capture --packet-archive-root <dir> --capture-config <gala.yaml>` 在不展开事件列的情况下保存有序、紧凑的 packet/lifecycle 归档；在线周期模式可复用 `--online-cycle-config`，无需重复传入 `--capture-config`。归档按配置的未压缩数组字节上限分块，可由多个独立周期会话重复读取。归档只有在完整 `1..30000` 迭代和显式验证证据同时满足时才允许标记正式资格。
 
-其余入口为 `config-check`、`cycle-preflight`、`trace-validate`、`cycle-replay` 和 `ablation`。query sample 和显式迭代窗口 trace 默认均被周期入口拒绝；调用者必须显式传入 `--quick-validation`，输出 manifest 会固定 `formal_performance_eligible=false`。`ablation --parallel-workers N` 可并行运行独立变体；父进程按固定 `0000,1000,1010,0100,0101,1100,1111` 顺序收集并验证结果，并拒绝 C 脱离 A 或 D 脱离 B 的配置。消融命令会为每个变体写出 `ablation.csv.modules/<bits>.json`，CSV 的 `module_breakdown_path` 和 `run_id` 指向对应记录，manifest 记录 `Full` 与 `1111` 的严格策略别名。消融进度只输出绝对周期和相对 Base ASIC 的加速比；没有同套件 AGX Orin 实测校准时，不生成 Orin 比较。
+其余入口为 `config-check`、`cycle-preflight`、`trace-validate`、`cycle-replay` 和 `ablation`。query sample 和显式迭代窗口 trace 默认均被周期入口拒绝；调用者必须显式传入 `--quick-validation`，输出 manifest 会固定 `formal_performance_eligible=false`。`ablation --parallel-workers N` 可并行运行独立变体；父进程按固定 `0000,1000,1010,0100,0101,1100,1111` 顺序收集并验证结果，并拒绝 C 脱离 A 或 D 脱离 B 的配置。消融命令会为每个变体写出 `ablation.csv.modules/<bits>.json`，CSV 的 `module_breakdown_path` 和 `run_id` 指向对应记录，manifest 记录 `Full` 与 `1111` 的严格策略别名。消融进度输出绝对周期和逐行比较基准；只有 `1010`、`0101`、`1111` 输出相对 Base ASIC 的加速比，`1000`、`0100`、`1100` 必须绑定同工作量 GPU 测量后才输出相对 GPU Base 的加速比。
 
 `cycle-replay --throughput-progress` 按完整迭代输出运行健康状态、墙钟事件吞吐、每事件模拟周期、总周期投影和按配置时钟换算的 ASIC 秒数。只有显式增加 `--stop-when-throughput-stable` 才允许稳定窗口提前结束；该路径要求输出目录不存在或为空，只写 `throughput.json`、非正式 manifest 和标明非正式资格的状态记录，不写 `cycles.json`。不带早停选项时始终保留完整重放语义。公开规格 extrapolation 不接入周期诊断，也不生成任何 `speedup_vs_orin` 字段。
 

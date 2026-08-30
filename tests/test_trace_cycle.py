@@ -82,6 +82,35 @@ def test_semantic_pending_admission_uses_only_ready_matching_bank() -> None:
     assert not pending
 
 
+def test_joint_compiler_admission_preserves_query_release_priority() -> None:
+    semantic = {
+        10: ((TaskKind.FORWARD, 7, 0, 1), 0),
+        11: ((TaskKind.FORWARD, 8, 0, 1), 1),
+        12: ((TaskKind.FORWARD, 7, 0, 1), 2),
+    }
+    offer = (((TaskKind.FORWARD, 7, 0, 1), frozenset({2})),)
+
+    def make_pending() -> _FusionPendingQueues:
+        pending = _FusionPendingQueues(
+            semantic_index=lambda event_id, _kind: semantic[event_id],
+        )
+        for event_id in semantic:
+            pending.append(event_id, TaskKind.FORWARD)
+        return pending
+
+    query_first = make_pending()
+    priorities = {10: (0,), 11: (2,), 12: (1,)}
+    assert query_first.popleft_semantic_match(
+        TaskKind.FORWARD, offer, priority=priorities.__getitem__,
+    ) == 10
+
+    semantic_tie_break = make_pending()
+    priorities = {10: (0,), 11: (2,), 12: (0,)}
+    assert semantic_tie_break.popleft_semantic_match(
+        TaskKind.FORWARD, offer, priority=priorities.__getitem__,
+    ) == 12
+
+
 def _trace():
     builder = TraceBuilder()
     relation = builder.emit(TraceEvent(
@@ -409,6 +438,15 @@ def test_archive_speedup_diagnostic_stops_all_variants_at_common_boundary(
     assert set(report["variant_results"]) == {
         "0000", "1000", "1010", "0100", "0101", "1100", "1111",
     }
+    assert report["schema_version"] == "gala-archive-cycle-ratio-diagnostic-v2"
+    assert {
+        bits for bits, item in report["variant_results"].items()
+        if item["speedup_vs_base_asic"] is not None
+    } == {"1010", "0101", "1111"}
+    assert all(
+        report["variant_results"][bits]["speedup_vs_gpu_base"] is None
+        for bits in ("1000", "0100", "1100")
+    )
     assert {
         item["completed_events"] for item in report["variant_results"].values()
     } == {report["samples"][-1]["completed_events"]}
@@ -1401,7 +1439,7 @@ def _semantic_fusion_bundle_fixture() -> tuple[Trace, CycleConfig]:
 
 @pytest.mark.parametrize(("policy", "expected_issues", "expected_followers"), [
     ("variant:0000", 0, 0),
-    ("variant:0100", 1, 2),
+    ("variant:0100", 0, 0),
     ("variant:0101", 1, 2),
     ("variant:1010", 0, 0),
     ("variant:1111", 1, 2),
@@ -1422,7 +1460,7 @@ def test_semantic_fusion_bundle_is_driven_by_compiler_worksets(
 
 
 @pytest.mark.parametrize(("policy", "expected_issues"), [
-    ("variant:0100", 1),
+    ("variant:0100", 0),
     ("variant:0101", 1),
     ("variant:1111", 1),
 ])
@@ -1458,7 +1496,7 @@ def test_semantic_fusion_bundle_matches_offline_and_online_replay(
     ] == expected_issues
     assert online_followers == offline.module_counters["fusion_issue"][
         "semantic_bundle_followers"
-    ] == 2
+    ] == expected_issues * 2
     assert session.completed_event_count == session.accepted_event_count
     assert session.quiescent
 
@@ -2018,6 +2056,7 @@ def test_semantic_ready_group_priority_defers_to_query_heads_in_joint_variant() 
         return [item.event_id for item in selected]
 
     assert candidates("variant:0101") == [10]
+    assert candidates("variant:0100") == [10, 1, 11]
     assert candidates("variant:1111") == [10, 1, 11]
     assert candidates("variant:1111", current_support=208) == [10, 1, 11]
     assert candidates("variant:1111", current_support=209) == [10, 1, 11]
@@ -2133,6 +2172,31 @@ def test_semantic_ready_index_selects_noncontiguous_same_key_followers() -> None
 
     assert selected == [(0, 0), (2, 0), (4, 0), (5, 0)]
     assert list(queue) == [(1, 0), (3, 0)]
+
+
+def test_compiler_semantic_order_groups_requests_without_multicast() -> None:
+    rows = np.empty(3, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = np.arange(3)
+    rows["primitive_kind"] = int(PrimitiveKind.CACHE_REQUEST)
+    rows["gaussian_id"] = [7, 8, 7]
+    rows["state_version"] = 3
+    queue = _ReadyCandidateQueue()
+    for event_id in range(3):
+        queue.push((event_id, 0))
+
+    selected = queue.pop_acceptable(
+        2, "semantic_cache", capacity=8, row_for=rows.__getitem__,
+        kind_for=lambda event_id: PrimitiveKind(
+            int(rows[event_id]["primitive_kind"])
+        ),
+        physical_stage_for=lambda _event_id: None,
+        owner_gradients=None, query_replay=None,
+        compiler_semantic_order=True,
+    )
+
+    assert selected == [(0, 0), (2, 0)]
+    assert list(queue) == [(1, 0)]
 
 
 def test_fusion_issue_banks_by_physical_query_state_index() -> None:

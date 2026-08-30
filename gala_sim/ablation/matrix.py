@@ -7,6 +7,40 @@ from dataclasses import dataclass
 from gala_sim.mechanisms import CANONICAL_VARIANT_BITS, validate_variant_bits
 
 
+GPU_COMPILER_VARIANTS = frozenset({"1000", "0100", "1100"})
+ASIC_BASE_VARIANTS = frozenset({"1010", "0101", "1111"})
+
+
+def comparison_baseline(bits: str) -> str:
+    validate_variant_bits(bits)
+    if bits == "0000":
+        return "agx_orin_gpu_base_estimate"
+    if bits in GPU_COMPILER_VARIANTS:
+        return "gpu_base"
+    return "base_asic"
+
+
+def asic_speedup(bits: str, *, base_cycles: int, cycles: int) -> float | None:
+    validate_variant_bits(bits)
+    if base_cycles <= 0 or cycles <= 0:
+        raise ValueError("cycle counts must be positive")
+    return base_cycles / cycles if bits in ASIC_BASE_VARIANTS else None
+
+
+def gpu_speedup(
+    bits: str, *, gpu_base_seconds: float | None,
+    gpu_variant_seconds: float | None,
+) -> float | None:
+    validate_variant_bits(bits)
+    if bits not in GPU_COMPILER_VARIANTS:
+        return None
+    if gpu_base_seconds is None or gpu_variant_seconds is None:
+        return None
+    if gpu_base_seconds <= 0 or gpu_variant_seconds <= 0:
+        raise ValueError("GPU times must be positive")
+    return gpu_base_seconds / gpu_variant_seconds
+
+
 @dataclass(frozen=True, order=True)
 class AblationVariant:
     bits: str

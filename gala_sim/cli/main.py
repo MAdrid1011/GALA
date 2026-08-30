@@ -14,7 +14,9 @@ from gala_sim.ablation import (
     run_archive_matrix, run_archive_speedup_diagnostic, run_matrix,
 )
 from gala_sim.config import load_config, pending_parameters
-from gala_sim.results import AblationRow, write_ablation_csv
+from gala_sim.results import (
+    AblationRow, asic_speedup, comparison_baseline, write_ablation_csv,
+)
 from gala_sim.results.run import RunOutputWriter
 from gala_sim.results.manifest import write_json
 from gala_sim.identity import sha256_file
@@ -325,7 +327,11 @@ def _write_archive_ablation_outputs(
         rows.append(AblationRow(
             model=model, dataset=dataset, bits=bits,
             cycles=run.result.total_cycles,
-            speedup_vs_base_asic=base_cycles / run.result.total_cycles,
+            comparison_baseline=comparison_baseline(bits),
+            speedup_vs_base_asic=asic_speedup(
+                bits, base_cycles=base_cycles, cycles=run.result.total_cycles,
+            ),
+            gpu_base_seconds=None, speedup_vs_gpu_base=None,
             local_gpu_seconds=None, orin_seconds=None, speedup_vs_orin=None,
             psnr_delta_db=None, ssim_delta=None, lpips_delta=None,
             config_sha256=str(config.config_sha256 or ""), status="passed",
@@ -335,7 +341,7 @@ def _write_archive_ablation_outputs(
     write_ablation_csv(rows, output)
     full_cycles = next(run.result.total_cycles for run in runs if run.variant.bits == "1111")
     write_json({
-        "schema_version": "gala-ablation-manifest-v1",
+        "schema_version": "gala-ablation-manifest-v2",
         "result_scope": (
             "formal_performance" if formal_performance_eligible
             else "quick_cycle_validation"
@@ -521,6 +527,8 @@ def main(argv: list[str] | None = None) -> int:
 
                 def speedup_progress(report) -> None:
                     latest = report["samples"][-1]
+                    cycle_ratios = latest["cumulative_cycle_ratio_vs_0000"]
+                    interval_ratios = latest["interval_cycle_ratio_vs_0000"]
                     print(json.dumps({
                         "phase": "archive_speedup_diagnostic",
                         "iteration": latest["iteration_id"],
@@ -528,12 +536,16 @@ def main(argv: list[str] | None = None) -> int:
                         "total_iterations": latest["total_iterations"],
                         "completion_fraction": latest["completion_fraction"],
                         "cycles_by_variant": latest["cycles_by_variant"],
-                        "speedup_vs_base_asic": (
-                            latest["cumulative_speedup_vs_base"]
-                        ),
-                        "interval_speedup_vs_base_asic": (
-                            latest["interval_speedup_vs_base"]
-                        ),
+                        "cycle_ratio_vs_0000": cycle_ratios,
+                        "interval_cycle_ratio_vs_0000": interval_ratios,
+                        "speedup_vs_base_asic": {
+                            bits: cycle_ratios[bits]
+                            for bits in ("1010", "0101", "1111")
+                        },
+                        "interval_speedup_vs_base_asic": {
+                            bits: interval_ratios[bits]
+                            for bits in ("1010", "0101", "1111")
+                        } if interval_ratios else {},
                         "stability": report["stability"],
                     }, sort_keys=True), file=sys.stderr, flush=True)
 
@@ -591,7 +603,12 @@ def main(argv: list[str] | None = None) -> int:
                 print(json.dumps({
                     "variant": run.variant.bits,
                     "cycles": run.result.total_cycles,
-                    "speedup_vs_base_asic": base_cycles / run.result.total_cycles,
+                    "comparison_baseline": comparison_baseline(run.variant.bits),
+                    "speedup_vs_base_asic": asic_speedup(
+                        run.variant.bits, base_cycles=base_cycles,
+                        cycles=run.result.total_cycles,
+                    ),
+                    "speedup_vs_gpu_base": None,
                     "completed": True,
                 }, sort_keys=True), file=sys.stderr, flush=True)
 
@@ -1048,7 +1065,12 @@ def main(argv: list[str] | None = None) -> int:
             progress_record: dict[str, object] = {
                 "variant": run.variant.bits,
                 "cycles": run.result.total_cycles,
-                "speedup_vs_base_asic": base_cycles / run.result.total_cycles,
+                "comparison_baseline": comparison_baseline(run.variant.bits),
+                "speedup_vs_base_asic": asic_speedup(
+                    run.variant.bits, base_cycles=base_cycles,
+                    cycles=run.result.total_cycles,
+                ),
+                "speedup_vs_gpu_base": None,
                 "completed": True,
             }
             print(json.dumps(progress_record, sort_keys=True), file=sys.stderr, flush=True)
@@ -1099,7 +1121,13 @@ def main(argv: list[str] | None = None) -> int:
                 dataset=dataset,
                 bits=run.variant.bits,
                 cycles=run.result.total_cycles,
-                speedup_vs_base_asic=base_cycles / run.result.total_cycles,
+                comparison_baseline=comparison_baseline(run.variant.bits),
+                speedup_vs_base_asic=asic_speedup(
+                    run.variant.bits, base_cycles=base_cycles,
+                    cycles=run.result.total_cycles,
+                ),
+                gpu_base_seconds=None,
+                speedup_vs_gpu_base=None,
                 local_gpu_seconds=None,
                 orin_seconds=None,
                 speedup_vs_orin=None,
@@ -1116,7 +1144,7 @@ def main(argv: list[str] | None = None) -> int:
             ))
         write_ablation_csv(rows, args.output)
         write_json({
-            "schema_version": "gala-ablation-manifest-v1",
+            "schema_version": "gala-ablation-manifest-v2",
             "result_scope": "quick_cycle_validation" if quick_scope else "formal_performance",
             "formal_performance_eligible": not quick_scope,
             "trace_sample": sample_metadata,
