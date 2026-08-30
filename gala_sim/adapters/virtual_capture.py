@@ -53,6 +53,7 @@ class VirtualCaptureConsumer:
     lifecycle_consumer: Any | None = None
     packet_archive_root: Path | None = None
     packet_archive_chunk_bytes: int | None = None
+    packet_archive_max_inflight_chunks: int = 1
     _expander: VirtualQueryEventExpander = field(init=False)
     _event_validator: VirtualEventStreamValidator = field(
         default_factory=VirtualEventStreamValidator, init=False
@@ -95,6 +96,7 @@ class VirtualCaptureConsumer:
             self._packet_archive = VirtualPacketArchiveWriter(
                 self.packet_archive_root,
                 max_chunk_bytes=self.packet_archive_chunk_bytes,
+                max_inflight_chunks=self.packet_archive_max_inflight_chunks,
             )
 
     def initialize_gaussians(self, count: int) -> None:
@@ -174,7 +176,6 @@ class VirtualCaptureConsumer:
 
     def finish(
         self, *, capture_audit: dict[str, int] | None = None,
-        complete_30k: bool = False, validation_passed: bool = False,
     ) -> dict[str, Any]:
         self._ensure_lifecycle()
         if self._current_iteration is not None:
@@ -200,7 +201,7 @@ class VirtualCaptureConsumer:
         archive_manifest = None
         if self._packet_archive is not None:
             archive_manifest = self._packet_archive.finish(
-                complete_30k=complete_30k, validation_passed=validation_passed,
+                metadata={"capture_audit": dict(sorted((capture_audit or {}).items()))},
             )
         elapsed = time.monotonic() - self._started_at
         archive_eligible = bool(
@@ -215,7 +216,7 @@ class VirtualCaptureConsumer:
             "status": "passed",
             "formal_performance_eligible": bool(archive_eligible),
             "complete_30k": archive_complete_30k,
-            "validation_passed": bool(validation_passed),
+            "validation_passed": False,
             "packet_count": self._packet_count,
             "query_count": self._query_count,
             "candidate_count": self._candidate_count,

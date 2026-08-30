@@ -4840,6 +4840,7 @@ class CycleEngine:
         initial_gaussian_count: int = 0,
         semantic_workset_totals: Mapping[tuple[int, int], int] | None = None,
         retain_completion_cycles: bool = False,
+        total_iterations: int | None = None,
         progress: Callable[[CycleProgress], None] | None = None,
         progress_interval_seconds: float | None = None,
         collect_compute_telemetry: bool = False,
@@ -4859,6 +4860,7 @@ class CycleEngine:
             initial_gaussian_count=initial_gaussian_count,
             semantic_workset_totals=semantic_workset_totals,
             retain_completion_cycles=retain_completion_cycles,
+            total_iterations=total_iterations,
             progress=progress,
             progress_interval_seconds=progress_interval_seconds,
             collect_compute_telemetry=collect_compute_telemetry,
@@ -5014,6 +5016,7 @@ class CycleReplaySession:
         initial_gaussian_count: int = 0,
         semantic_workset_totals: Mapping[tuple[int, int], int] | None = None,
         retain_completion_cycles: bool = False,
+        total_iterations: int | None = None,
         progress: Callable[[CycleProgress], None] | None = None,
         progress_interval_seconds: float | None = None,
         collect_compute_telemetry: bool = False,
@@ -5028,6 +5031,8 @@ class CycleReplaySession:
             raise ValueError("initial Gaussian count must be non-negative")
         if progress_interval_seconds is not None and progress_interval_seconds <= 0:
             raise ValueError("online progress interval must be positive")
+        if total_iterations is not None and total_iterations <= 0:
+            raise ValueError("online total iterations must be positive")
         self.engine = engine
         self.engine.issue_scheduler.reset()
         self.engine._query_history_bases.clear()
@@ -5036,6 +5041,7 @@ class CycleReplaySession:
         self.max_frontier_events = max_frontier_events
         self.max_atomic_packet_events = max_atomic_packet_events
         self.retain_completion_cycles = retain_completion_cycles
+        self.total_iterations = total_iterations
         self.semantic_workset_totals = dict(semantic_workset_totals or {})
         if any(key[0] < 0 or key[1] < 0 or value <= 0
                for key, value in self.semantic_workset_totals.items()):
@@ -5182,6 +5188,7 @@ class CycleReplaySession:
         self._source_packets = 0
         self._query_packets = 0
         self._closed_iterations = 0
+        self._last_closed_iteration: int | None = None
         self._last_lifecycle_event: int | None = None
         self._open_lifecycle_begin: int | None = None
         self._open_lifecycle_events: list[int] = []
@@ -5959,9 +5966,12 @@ class CycleReplaySession:
         if (
             record.kind is VirtualLifecycleKind.UPDATE_COMMIT
             and record.all_active
-            and record.active_ids
         ):
-            gaussian_ids = tuple(record.active_ids)
+            gaussian_ids = (
+                tuple(record.active_ids)
+                if record.active_ids
+                else tuple(sorted(self._lifecycle.active_gaussians or ()))
+            )
         elif record.kind is VirtualLifecycleKind.CLONE and record.child_ids:
             gaussian_ids = (record.parent_id, *record.child_ids)
         elif record.kind is VirtualLifecycleKind.SPLIT and record.child_ids:
@@ -6027,6 +6037,7 @@ class CycleReplaySession:
         self._ensure_open()
         self._lifecycle.close_iteration(iteration_id)
         self._closed_iterations += 1
+        self._last_closed_iteration = iteration_id
         self._drain()
         self._completed_reduction_owner.clear()
 
@@ -7577,9 +7588,9 @@ class CycleReplaySession:
             phase="online_replay",
             completed_events=self._completed_events,
             total_events=self._accepted_events,
-            completed_iterations=0,
-            total_iterations=0,
-            last_completed_iteration=None,
+            completed_iterations=self._closed_iterations,
+            total_iterations=self.total_iterations or self._closed_iterations,
+            last_completed_iteration=self._last_closed_iteration,
             simulated_cycles=self._cycle,
             elapsed_seconds=now - self._started_at,
         ))

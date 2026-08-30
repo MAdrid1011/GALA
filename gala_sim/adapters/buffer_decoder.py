@@ -116,7 +116,7 @@ def decode_raster_virtual_packet(
     )
     if hasattr(masks, "detach"):
         masks = masks.detach().cpu().numpy()
-    return VirtualTracePacket(
+    return VirtualTracePacket.from_capture_buffers(
         iteration_id=iteration_id,
         template_id=1,
         query_base=query_base,
@@ -158,7 +158,7 @@ def decode_voxel_virtual_packet(
     )
     if hasattr(masks, "detach"):
         masks = masks.detach().cpu().numpy()
-    return VirtualTracePacket(
+    return VirtualTracePacket.from_capture_buffers(
         iteration_id=iteration_id,
         template_id=2,
         query_base=query_base,

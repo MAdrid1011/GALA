@@ -10,6 +10,8 @@ from gala_sim.tools.inactivity import InactivityWatchdog
 from gala_sim.timing import CycleProgress
 from tests.test_trace_cycle import _trace
 from gala_sim.trace import Trace, TraceWriter
+from gala_sim.trace import VirtualPacketArchiveWriter
+from tests.test_virtual_capture import _packet
 
 
 def test_cli_validates_trace_and_reports_frozen_config(tmp_path: Path, capsys) -> None:
@@ -21,6 +23,28 @@ def test_cli_validates_trace_and_reports_frozen_config(tmp_path: Path, capsys) -
     result = json.loads(capsys.readouterr().out)
     assert result["ready"] is True
     assert result["pending"] == []
+
+
+def test_cli_validates_compact_packet_archive_without_false_formal_promotion(
+    tmp_path: Path, capsys,
+) -> None:
+    archive_root = tmp_path / "archive"
+    writer = VirtualPacketArchiveWriter(archive_root, max_chunk_bytes=1024)
+    writer.initialize_gaussians(1)
+    writer.append_packet(_packet())
+    writer.close_iteration(1)
+    writer.finish()
+    output = tmp_path / "validation.json"
+
+    assert main([
+        "trace-archive-validate", "--archive", str(archive_root),
+        "--output", str(output),
+    ]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["status"] == "passed"
+    assert report["validation_passed"] is True
+    assert report["formal_performance_eligible"] is False
+    assert json.loads(output.read_text()) == report
 
 
 def test_formal_cycle_cli_writes_failed_preflight_without_timing_bypass(

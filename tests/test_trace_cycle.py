@@ -20,7 +20,7 @@ from gala_sim.clamp import (
     UpdateBeginKind,
 )
 from gala_sim.adapters.trace_capture import FIELD_DENSITY
-from gala_sim.ablation import run_matrix
+from gala_sim.ablation import run_archive_matrix, run_matrix
 from gala_sim.timing import (
     BufferedVirtualCycleConsumer,
     CycleConfig,
@@ -315,6 +315,37 @@ def test_archived_packet_replay_matches_live_buffered_cycle(
     assert archive_result.stalls == live_result.stalls
 
 
+def test_archive_ablation_runs_canonical_independent_variants(tmp_path: Path) -> None:
+    masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
+    masks[0, 0] = 1
+    source = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 1),
+        point_ids=np.asarray([0], dtype=np.int64),
+        point_keys=np.asarray([0], dtype=np.uint64), masks=masks,
+        loss_flags=1, backward_confirmed=True,
+    )
+    archive_root = tmp_path / "archive"
+    writer = VirtualPacketArchiveWriter(archive_root, max_chunk_bytes=64)
+    writer.initialize_gaussians(1)
+    writer.append_packet(source)
+    writer.close_iteration(1)
+    writer.finish()
+    completed: list[str] = []
+    config_path = Path(__file__).parents[1] / "configs/architecture/gala.yaml"
+    config = CycleConfig.from_gala(load_config(config_path), _Memory())
+
+    runs = run_archive_matrix(
+        archive_root, config, max_events=4,
+        progress=lambda run: completed.append(run.variant.bits),
+    )
+
+    expected = ["0000", "1000", "1010", "0100", "0101", "1100", "1111"]
+    assert [run.variant.bits for run in runs] == expected
+    assert completed == expected
+    assert len({tuple(sorted(run.result.event_counts.items())) for run in runs}) == 1
+    assert len({id(run.result) for run in runs}) == len(runs)
+
+
 def test_online_cycle_replay_reports_progress() -> None:
     masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
     masks[0, 0] = 1
@@ -335,6 +366,9 @@ def test_online_cycle_replay_reports_progress() -> None:
     assert progress
     assert progress[-1].phase == "online_replay"
     assert progress[-1].completed_events > 0
+    assert progress[-1].completed_iterations == 1
+    assert progress[-1].total_iterations == 1
+    assert progress[-1].last_completed_iteration == 1
 
 
 def test_online_query_packet_batches_expanded_subpackets_before_drain(
@@ -745,12 +779,11 @@ def test_online_lifecycle_commits_share_transaction_begin_dependency() -> None:
     session.accept_query_packet(source)
     session.accept_lifecycle(VirtualLifecycleRecord(
         1, VirtualLifecycleKind.UPDATE_BEGIN, 0,
-        field_mask=1, transaction_kind=2, active_ids=(0, 1, 2),
+        field_mask=1, transaction_kind=2,
     ))
     session.accept_lifecycle(VirtualLifecycleRecord(
         1, VirtualLifecycleKind.UPDATE_COMMIT, 0,
         field_mask=1, transaction_kind=2, all_active=True,
-        active_ids=(0, 1, 2),
     ))
     session.accept_lifecycle(VirtualLifecycleRecord(
         1, VirtualLifecycleKind.UPDATE_END, 0,

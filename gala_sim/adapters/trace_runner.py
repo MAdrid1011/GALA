@@ -173,6 +173,7 @@ def main(argv: list[str] | None = None) -> int:
         consumer_factory = None
         online_sinks = []
     archive_chunk_bytes = None
+    archive_max_inflight_chunks = 1
     if args.packet_archive_root is not None:
         config_path = args.capture_config or args.online_cycle_config
         if config_path is None:
@@ -184,8 +185,11 @@ def main(argv: list[str] | None = None) -> int:
         capture_config = load_config(config_path)
         capture_config.require_ready()
         archive_chunk_bytes = int(capture_config.value("trace.archive_chunk_bytes"))
-        if archive_chunk_bytes <= 0:
-            raise ValueError("trace.archive_chunk_bytes must be positive")
+        archive_max_inflight_chunks = int(
+            capture_config.value("trace.max_inflight_chunks")
+        )
+        if archive_chunk_bytes <= 0 or archive_max_inflight_chunks <= 0:
+            raise ValueError("trace archive chunk capacities must be positive")
     session = TraceSession(
         args.trace_output, state_record_bytes=state_record_bytes,
         chunk_events=chunk_events, stream_only=args.stream_only,
@@ -194,6 +198,7 @@ def main(argv: list[str] | None = None) -> int:
         virtual_packet_consumer_factory=consumer_factory,
         virtual_packet_archive_root=args.packet_archive_root,
         virtual_packet_archive_chunk_bytes=archive_chunk_bytes,
+        virtual_packet_archive_max_inflight_chunks=archive_max_inflight_chunks,
         inactivity_timeout_seconds=inactivity_timeout_seconds,
         progress_interval_seconds=progress_interval_seconds,
     )

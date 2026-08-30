@@ -523,8 +523,51 @@ class VirtualTracePacket:
     loss_flags: int = 0
     ssim_radius: int = 0
     backward_confirmed: bool = False
+    _logical_relation_count_cache: int | None = field(
+        default=None, init=False, repr=False, compare=False,
+    )
 
     def __post_init__(self) -> None:
+        self._validate_structure()
+        self._validate_mask_domain()
+
+    @classmethod
+    def from_capture_buffers(
+        cls, *, iteration_id: int, template_id: int, query_base: int,
+        query_shape: tuple[int, ...], point_ids: np.ndarray,
+        point_keys: np.ndarray, masks: np.ndarray, state_version: int = 0,
+        field_mask: int = 0, loss_flags: int = 0, ssim_radius: int = 0,
+        backward_confirmed: bool = False,
+    ) -> "VirtualTracePacket":
+        """Build a structurally checked packet whose mask audit is deferred.
+
+        Capture buffers come directly from the CUDA validity-mask kernels.  A
+        complete archive reread constructs ordinary packets and performs the
+        full mask-domain audit before the archive can become formally eligible.
+        """
+
+        packet = object.__new__(cls)
+        values = {
+            "iteration_id": iteration_id,
+            "template_id": template_id,
+            "query_base": query_base,
+            "query_shape": query_shape,
+            "point_ids": point_ids,
+            "point_keys": point_keys,
+            "masks": masks,
+            "state_version": state_version,
+            "field_mask": field_mask,
+            "loss_flags": loss_flags,
+            "ssim_radius": ssim_radius,
+            "backward_confirmed": backward_confirmed,
+            "_logical_relation_count_cache": None,
+        }
+        for name, value in values.items():
+            object.__setattr__(packet, name, value)
+        packet._validate_structure()
+        return packet
+
+    def _validate_structure(self) -> None:
         if self.iteration_id < 0 or self.template_id < 0 or self.query_base < 0:
             raise ValueError("virtual trace packet identifiers must be non-negative")
         if not self.query_shape or any(int(value) <= 0 for value in self.query_shape):
@@ -552,6 +595,10 @@ class VirtualTracePacket:
             )
         if np.any(point_ids < 0) or np.any(point_keys < 0):
             raise ValueError("virtual trace point identifiers must be non-negative")
+
+    def _validate_mask_domain(self) -> None:
+        masks = np.asarray(self.masks)
+        point_keys = np.asarray(self.point_keys)
         # Mask off padding bits.  Padding is not part of the official query
         # domain and accepting it would create relations with invalid IDs.
         # Edge-tile bits outside the full query shape must be clear.  The
@@ -565,6 +612,35 @@ class VirtualTracePacket:
         allowed = self._allowed_tile_words()
         if masks.size and np.any(masks & ~allowed[tiles]):
             raise ValueError("virtual trace mask refers outside the output")
+
+    def with_capture_fields(
+        self, *, point_ids: np.ndarray | None = None,
+        loss_flags: int | None = None, ssim_radius: int | None = None,
+        backward_confirmed: bool | None = None,
+    ) -> "VirtualTracePacket":
+        """Update capture metadata without revalidating unchanged packet arrays."""
+
+        replacement_ids = self.point_ids
+        if point_ids is not None:
+            replacement_ids = np.asarray(point_ids, dtype=np.int64)
+            if replacement_ids.ndim != 1 or replacement_ids.shape != self.point_ids.shape:
+                raise ValueError("replacement point identifiers have an invalid shape")
+            if replacement_ids.size and int(replacement_ids.min()) < 0:
+                raise ValueError("replacement point identifiers must be non-negative")
+        replacement_loss_flags = self.loss_flags if loss_flags is None else int(loss_flags)
+        replacement_ssim_radius = self.ssim_radius if ssim_radius is None else int(ssim_radius)
+        if replacement_loss_flags < 0 or replacement_ssim_radius < 0:
+            raise ValueError("replacement capture metadata must be non-negative")
+
+        clone = object.__new__(type(self))
+        for name in self.__dataclass_fields__:
+            object.__setattr__(clone, name, getattr(self, name))
+        object.__setattr__(clone, "point_ids", replacement_ids)
+        object.__setattr__(clone, "loss_flags", replacement_loss_flags)
+        object.__setattr__(clone, "ssim_radius", replacement_ssim_radius)
+        if backward_confirmed is not None:
+            object.__setattr__(clone, "backward_confirmed", bool(backward_confirmed))
+        return clone
 
     @property
     def query_count(self) -> int:
@@ -644,12 +720,19 @@ class VirtualTracePacket:
     def logical_relation_count(self) -> int:
         """Count exact set bits without constructing relation records."""
 
+        cached = self._logical_relation_count_cache
+        if cached is not None:
+            return cached
         if self.masks.size == 0:
-            return 0
-        # A byte lookup avoids relying on a NumPy version-specific bit_count
-        # ufunc while keeping the temporary bounded to the mask packet.
-        table = _POPCOUNT8
-        return int(table[self.masks.view(np.uint8)].sum(dtype=np.uint64))
+            count = 0
+        else:
+            # A byte lookup avoids relying on a NumPy version-specific
+            # bit_count ufunc while keeping the temporary bounded to the mask
+            # packet.  Packets are immutable, so all consumers can reuse this
+            # exact count after the first scan.
+            count = int(_POPCOUNT8[self.masks.view(np.uint8)].sum(dtype=np.uint64))
+        object.__setattr__(self, "_logical_relation_count_cache", count)
+        return count
 
     @property
     def logical_expanded_event_count(self) -> int:

@@ -10,7 +10,7 @@ import shlex
 import sys
 import time
 
-from gala_sim.ablation import run_matrix
+from gala_sim.ablation import run_archive_matrix, run_matrix
 from gala_sim.config import load_config, pending_parameters
 from gala_sim.results import AblationRow, write_ablation_csv
 from gala_sim.results.run import RunOutputWriter
@@ -39,6 +39,7 @@ from gala_sim.trace import (
     CAPTURED_PACKET_SAMPLE_SCHEMA_VERSION, CapturedPacketSpec, QueryDomain,
     QUERY_PACKET_SAMPLE_SCHEMA_VERSIONS, QueryPacketSampleConfig, QueryRange,
     TraceReader, TraceSampleConfig, TraceValidationConfig, TraceWriter,
+    VirtualPacketArchiveReader,
     complete_captured_packet_sample, dependency_closed_query_sample,
     derive_quick_relation_packets, real_query_packet_sample,
     validate_packet_derivation, validate_trace,
@@ -76,6 +77,9 @@ def _parser() -> argparse.ArgumentParser:
     trace.add_argument("--trace", type=Path, required=True)
     trace.add_argument("--scan-events", type=int, default=None)
     trace.add_argument("--index-directory", type=Path, default=None)
+    archive_validate = commands.add_parser("trace-archive-validate")
+    archive_validate.add_argument("--archive", type=Path, required=True)
+    archive_validate.add_argument("--output", type=Path, required=True)
     sample = commands.add_parser("trace-sample")
     sample.add_argument("--trace", type=Path, required=True)
     sample.add_argument("--output", type=Path, required=True)
@@ -156,6 +160,20 @@ def _parser() -> argparse.ArgumentParser:
     ablation.add_argument("--output", type=Path, required=True)
     ablation.add_argument("--quick-validation", action="store_true")
     ablation.add_argument("--parallel-workers", type=int, default=1)
+    archive_ablation = commands.add_parser("archive-ablation")
+    archive_ablation.add_argument("--archive", type=Path, required=True)
+    archive_ablation.add_argument("--config", type=Path, required=True)
+    archive_ablation.add_argument("--ramulator-binding", default=None,
+                                  help="Python object spec module:attribute exposing the async binding API")
+    archive_ablation.add_argument("--ramulator-build-manifest", type=Path, default=None)
+    archive_ablation.add_argument("--ramulator-config", type=Path, default=None)
+    archive_ablation.add_argument("--resource-usage", type=Path, required=True,
+                                  help="JSON ResourceUsage snapshot")
+    archive_ablation.add_argument("--output", type=Path, required=True)
+    archive_ablation.add_argument("--model", default="R2-Gaussian")
+    archive_ablation.add_argument("--dataset", default="Chest")
+    archive_ablation.add_argument("--quick-validation", action="store_true")
+    archive_ablation.add_argument("--parallel-workers", type=int, default=1)
     return parser
 
 
@@ -225,6 +243,87 @@ def _load_resource_usage(path: Path | None) -> ResourceUsage | None:
     )
 
 
+def _write_archive_ablation_outputs(
+    runs, *, output: Path, config: CycleConfig, model: str, dataset: str,
+    formal_performance_eligible: bool, validation_report: dict[str, object],
+    archive: Path,
+) -> None:
+    """Write the same auditable rows as expanded-trace ablation replay."""
+    if output.exists():
+        raise ValueError("archive ablation output CSV must not already exist")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    base_cycles = next(run.result.total_cycles for run in runs if run.variant.bits == "0000")
+    breakdown_root = output.parent / f"{output.name}.modules"
+    result_root = output.parent / f"{output.name}.runs"
+    if any(path.exists() for path in (breakdown_root, result_root)):
+        raise ValueError("archive ablation artifact directories must not already exist")
+    rows: list[AblationRow] = []
+    paths: dict[str, str] = {}
+    for run in runs:
+        bits = run.variant.bits
+        variant_root = result_root / bits
+        RunOutputWriter(variant_root).write_cycles(run.result)
+        stall_counts: dict[str, int] = {}
+        for stall in run.result.stalls:
+            stall_counts[stall.module] = stall_counts.get(stall.module, 0) + stall.count
+        breakdown = breakdown_root / f"{bits}.json"
+        write_json({
+            "schema_version": "gala-ablation-module-breakdown-v1",
+            "result_scope": (
+                "formal_performance" if formal_performance_eligible
+                else "quick_cycle_validation"
+            ),
+            "formal_performance_eligible": formal_performance_eligible,
+            "bits": bits,
+            "run_id": f"{model}-{dataset}-archive-{bits}",
+            "policy": run.result.policy,
+            "total_cycles": run.result.total_cycles,
+            "module_counters": run.result.module_counters,
+            "module_busy_cycles": {
+                name: int(counters.get("busy_cycles", 0))
+                for name, counters in run.result.module_counters.items()
+            },
+            "stall_counts_by_module": stall_counts,
+            "event_counts": run.result.event_counts,
+            "variant_result_path": str(variant_root.relative_to(output.parent)),
+        }, breakdown)
+        paths[bits] = str(breakdown.relative_to(output.parent))
+        rows.append(AblationRow(
+            model=model, dataset=dataset, bits=bits,
+            cycles=run.result.total_cycles,
+            speedup_vs_base_asic=base_cycles / run.result.total_cycles,
+            local_gpu_seconds=None, orin_seconds=None, speedup_vs_orin=None,
+            psnr_delta_db=None, ssim_delta=None, lpips_delta=None,
+            config_sha256=str(config.config_sha256 or ""), status="passed",
+            module_breakdown_path=paths[bits],
+            run_id=f"{model}-{dataset}-archive-{bits}",
+        ))
+    write_ablation_csv(rows, output)
+    full_cycles = next(run.result.total_cycles for run in runs if run.variant.bits == "1111")
+    write_json({
+        "schema_version": "gala-ablation-manifest-v1",
+        "result_scope": (
+            "formal_performance" if formal_performance_eligible
+            else "quick_cycle_validation"
+        ),
+        "formal_performance_eligible": formal_performance_eligible,
+        "archive": str(archive.resolve()),
+        "archive_validation": validation_report,
+        "module_breakdown_directory": str(breakdown_root.relative_to(output.parent)),
+        "variant_result_directory": str(result_root.relative_to(output.parent)),
+        "module_breakdown_paths": paths,
+        "full_alias": {
+            "policy": "full", "variant_bits": "1111",
+            "run_id": f"{model}-{dataset}-archive-1111",
+            "cycles": full_cycles,
+            "selection_contract_equal": (
+                CycleEngine._selection_for_policy("full")
+                == CycleEngine._selection_for_policy("variant:1111")
+            ),
+        },
+    }, output.with_suffix(output.suffix + ".manifest.json"))
+
+
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
@@ -281,6 +380,112 @@ def main(argv: list[str] | None = None) -> int:
             preflight = json.loads(args.preflight.read_text(encoding="utf-8"))
             result = run_native_reference(config, freeze, preflight, args.output)
             print(json.dumps(result, sort_keys=True))
+            return 0
+        if args.command == "trace-archive-validate":
+            reader = VirtualPacketArchiveReader(args.archive)
+            report = reader.validate(promote=True)
+            write_json(report, args.output)
+            print(json.dumps(report, sort_keys=True))
+            return 0
+        if args.command == "archive-ablation":
+            reader = VirtualPacketArchiveReader(args.archive)
+            validation_report = reader.validate(promote=True)
+            quick_scope = bool(args.quick_validation)
+            if not quick_scope and not validation_report["formal_performance_eligible"]:
+                raise ValueError(
+                    "archive is not formally eligible; use --quick-validation only for a development replay"
+                )
+            gala_config = load_config(args.config)
+            binding = _load_binding(
+                args.ramulator_binding, args.ramulator_build_manifest,
+                args.ramulator_config,
+            )
+            usage = _load_resource_usage(args.resource_usage)
+            preflight = run_cycle_preflight(
+                gala_config, memory_backend=binding, resource_usage=usage,
+                reproduction=("gala-sim archive-ablation --config " + str(args.config)),
+            )
+            preflight_output = args.output.parent / f"{args.output.name}.preflight"
+            if preflight.status != "passed":
+                write_cycle_preflight(preflight, preflight_output)
+                print(json.dumps(preflight.as_dict(), sort_keys=True))
+                return 2
+            if binding is None:
+                raise ValueError("archive ablation requires a Ramulator 2 binding")
+            config = CycleConfig.from_gala(
+                gala_config, binding, resource_usage=usage,
+            )
+            max_events = int(gala_config.value("trace.chunk_events"))
+            max_frontier_events = max_events * int(
+                gala_config.value("trace.max_inflight_chunks")
+            )
+            base_cycles: int | None = None
+            progress_interval_seconds = float(
+                gala_config.value("diagnostic.throughput_report_interval_seconds")
+            )
+            inactivity_timeout_seconds = float(
+                gala_config.value("diagnostic.inactivity_timeout_seconds")
+            )
+            variant_watchdogs: dict[str, InactivityWatchdog] = {}
+
+            def cycle_progress(variant, item) -> None:
+                watchdog = variant_watchdogs.setdefault(
+                    variant.bits,
+                    InactivityWatchdog(timeout_seconds=inactivity_timeout_seconds),
+                )
+                observe_cycle_progress(
+                    watchdog,
+                    phase=item.phase,
+                    completed_events=item.completed_events,
+                    completed_iterations=item.completed_iterations,
+                    cpu_seconds=time.process_time(),
+                )
+                print(json.dumps({
+                    "variant": variant.bits,
+                    "phase": item.phase,
+                    "completed_events": item.completed_events,
+                    "accepted_events": item.total_events,
+                    "completed_iterations": item.completed_iterations,
+                    "total_iterations": item.total_iterations,
+                    "simulated_cycles": item.simulated_cycles,
+                    "elapsed_seconds": item.elapsed_seconds,
+                    "watchdog": watchdog.report(status="active"),
+                }, sort_keys=True), file=sys.stderr, flush=True)
+
+            def report_progress(run) -> None:
+                nonlocal base_cycles
+                if run.variant.bits == "0000":
+                    base_cycles = run.result.total_cycles
+                if base_cycles is None:
+                    raise AssertionError("archive Base ASIC result must precede ablation progress")
+                print(json.dumps({
+                    "variant": run.variant.bits,
+                    "cycles": run.result.total_cycles,
+                    "speedup_vs_base_asic": base_cycles / run.result.total_cycles,
+                    "completed": True,
+                }, sort_keys=True), file=sys.stderr, flush=True)
+
+            runs = run_archive_matrix(
+                args.archive, config,
+                max_events=max_events,
+                max_frontier_events=max_frontier_events,
+                max_atomic_packet_events=max_frontier_events,
+                progress_interval_seconds=progress_interval_seconds,
+                progress=report_progress,
+                cycle_progress=cycle_progress,
+                parallel_workers=args.parallel_workers,
+            )
+            _write_archive_ablation_outputs(
+                runs, output=args.output, config=config,
+                model=args.model, dataset=args.dataset,
+                formal_performance_eligible=(
+                    bool(validation_report["formal_performance_eligible"])
+                    and not quick_scope
+                ),
+                validation_report=validation_report,
+                archive=args.archive,
+            )
+            print(json.dumps({"variants": len(runs), "status": "passed"}, sort_keys=True))
             return 0
         if args.command == "trace-captured-packets":
             if args.output.exists() and any(args.output.iterdir()):

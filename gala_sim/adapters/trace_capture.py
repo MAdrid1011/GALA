@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable
 
@@ -99,8 +99,7 @@ class TraceSession:
     virtual_packet_consumer_factory: Callable[[int], Any] | None = None
     virtual_packet_archive_root: Path | None = None
     virtual_packet_archive_chunk_bytes: int | None = None
-    virtual_capture_complete_30k: bool = False
-    virtual_capture_validation_passed: bool = False
+    virtual_packet_archive_max_inflight_chunks: int = 1
     inactivity_timeout_seconds: float = 300.0
     progress_interval_seconds: float = 30.0
     _builder: ChunkedTraceBuilder = field(init=False)
@@ -166,6 +165,9 @@ class TraceSession:
                 packet_consumer=self.virtual_packet_consumer,
                 packet_archive_root=self.virtual_packet_archive_root,
                 packet_archive_chunk_bytes=self.virtual_packet_archive_chunk_bytes,
+                packet_archive_max_inflight_chunks=(
+                    self.virtual_packet_archive_max_inflight_chunks
+                ),
             )
 
     def install(self) -> None:
@@ -223,8 +225,6 @@ class TraceSession:
                 raise RuntimeError("virtual capture consumer is not initialized")
             return self._virtual_consumer.finish(
                 capture_audit=self._audit,
-                complete_30k=self.virtual_capture_complete_30k,
-                validation_passed=self.virtual_capture_validation_passed,
             )
         audit = dict(self._audit)
         audit.setdefault("relation_record_device_batches", 0)
@@ -656,7 +656,7 @@ class TraceSession:
             ):
                 raise ValueError("virtual packet contains an invalid Gaussian index")
             stable_ids = np.asarray(self._gaussian_ids, dtype=np.int64)[point_indexes]
-            virtual_packet = replace(virtual_packet, point_ids=stable_ids)
+            virtual_packet = virtual_packet.with_capture_fields(point_ids=stable_ids)
             pending = _PendingQuery(
                 None, rendered, query_base, query_shape, binning_pointer, output_pointer,
                 template_id, field_mask, virtual_packet=virtual_packet,
@@ -722,8 +722,8 @@ class TraceSession:
                     raise RuntimeError("virtual query has no decoded packet")
                 if self._virtual_consumer is None:
                     raise RuntimeError("virtual capture consumer is not initialized")
-                packet = replace(
-                    item.virtual_packet, loss_flags=item.loss_flags,
+                packet = item.virtual_packet.with_capture_fields(
+                    loss_flags=item.loss_flags,
                     ssim_radius=item.ssim_radius, backward_confirmed=True,
                 )
                 self._virtual_consumer.accept_query(packet)
@@ -1334,7 +1334,6 @@ class TraceSession:
                 self._iteration, VirtualLifecycleKind.UPDATE_BEGIN,
                 self._state_version, field_mask=field_mask,
                 transaction_kind=UPDATE_BEGIN_OPTIMIZER,
-                active_ids=tuple(self._gaussian_ids),
             ))
             self._audit_increment("update_begin_events")
             if field_mask:
@@ -1342,7 +1341,6 @@ class TraceSession:
                     self._iteration, VirtualLifecycleKind.UPDATE_COMMIT,
                     self._state_version, field_mask=field_mask,
                     transaction_kind=UPDATE_BEGIN_OPTIMIZER, all_active=True,
-                    active_ids=tuple(self._gaussian_ids),
                 ))
                 self._audit_increment("optimizer_updated_gaussians", len(self._gaussian_ids))
             else:
@@ -1566,7 +1564,6 @@ class TraceSession:
             self._iteration, VirtualLifecycleKind.UPDATE_BEGIN,
             self._state_version, field_mask=STATE_FIELD_MASK,
             transaction_kind=UPDATE_BEGIN_COLLECTION,
-            active_ids=tuple(self._gaussian_ids),
         ))
         self._virtual_collection_begin = True
         self._audit_increment("update_begin_events")

@@ -7,14 +7,22 @@ recreate fresh :class:`VirtualTracePacket` objects for each policy replay.
 
 from __future__ import annotations
 
-from dataclasses import asdict
+from collections import deque
+from concurrent.futures import Future, ThreadPoolExecutor
 import json
 from pathlib import Path
 from typing import Any, Iterator
+import zipfile
+import zlib
 
 import numpy as np
 
-from .virtual import VirtualLifecycleKind, VirtualLifecycleRecord, VirtualTracePacket
+from .virtual import (
+    VirtualLifecycleKind,
+    VirtualLifecycleRecord,
+    VirtualTraceLifecycleValidator,
+    VirtualTracePacket,
+)
 
 
 ARCHIVE_SCHEMA_VERSION = "gala-virtual-packet-archive-v1"
@@ -23,23 +31,37 @@ ARCHIVE_SCHEMA_VERSION = "gala-virtual-packet-archive-v1"
 class VirtualPacketArchiveWriter:
     """Write an ordered virtual packet stream in byte-bounded compressed chunks."""
 
-    def __init__(self, root: Path, *, max_chunk_bytes: int) -> None:
-        if max_chunk_bytes <= 0:
-            raise ValueError("archive chunk byte capacity must be positive")
+    def __init__(
+        self, root: Path, *, max_chunk_bytes: int, max_inflight_chunks: int = 1,
+    ) -> None:
+        if max_chunk_bytes <= 0 or max_inflight_chunks <= 0:
+            raise ValueError("archive chunk capacities must be positive")
         self.root = Path(root)
         if self.root.exists() and any(self.root.iterdir()):
             raise ValueError("virtual packet archive root must be empty")
         self.max_chunk_bytes = int(max_chunk_bytes)
+        self.max_inflight_chunks = int(max_inflight_chunks)
+        self._chunk_executor = ThreadPoolExecutor(
+            max_workers=self.max_inflight_chunks,
+            thread_name_prefix="gala-archive",
+        )
+        self._chunk_futures: deque[Future[None]] = deque()
         self._chunk_packets: list[dict[str, Any]] = []
         self._chunk_ids: list[np.ndarray] = []
         self._chunk_keys: list[np.ndarray] = []
         self._chunk_masks: list[np.ndarray] = []
         self._chunk_bytes = 0
+        self._chunk_candidate_count = 0
+        self._chunk_mask_count = 0
         self._peak_chunk_bytes = 0
         self._chunk_index = 0
         self._initial_gaussian_count: int | None = None
         self._last_packet_iteration: int | None = None
         self._packet_count = 0
+        self._query_count = 0
+        self._candidate_count = 0
+        self._relation_count = 0
+        self._physical_stream_bytes = 0
         self._closed_iterations: list[int] = []
         self._finished = False
         self.root.mkdir(parents=True, exist_ok=True)
@@ -78,8 +100,8 @@ class VirtualPacketArchiveWriter:
             "loss_flags": int(packet.loss_flags),
             "ssim_radius": int(packet.ssim_radius),
             "backward_confirmed": bool(packet.backward_confirmed),
-            "candidate_offset": int(sum(item.size for item in self._chunk_ids)),
-            "mask_offset": int(sum(item.size for item in self._chunk_masks)),
+            "candidate_offset": self._chunk_candidate_count,
+            "mask_offset": self._chunk_mask_count,
             "candidate_count": int(ids.size),
             "mask_words": int(masks.shape[1]),
         }
@@ -88,10 +110,16 @@ class VirtualPacketArchiveWriter:
         self._chunk_keys.append(keys.copy())
         self._chunk_masks.append(masks.reshape(-1).copy())
         self._chunk_bytes += packet_bytes
+        self._chunk_candidate_count += int(ids.size)
+        self._chunk_mask_count += int(masks.size)
         self._peak_chunk_bytes = max(self._peak_chunk_bytes, self._chunk_bytes)
         self._append_stream({"type": "packet", "chunk": self._chunk_index,
                              "index": len(self._chunk_packets) - 1})
         self._packet_count += 1
+        self._query_count += packet.query_count
+        self._candidate_count += packet.candidate_count
+        self._relation_count += packet.logical_relation_count
+        self._physical_stream_bytes += packet.physical_bytes
         if self._chunk_bytes >= self.max_chunk_bytes:
             self._flush_chunk()
 
@@ -108,30 +136,34 @@ class VirtualPacketArchiveWriter:
 
     def finish(
         self, *, metadata: dict[str, Any] | None = None,
-        complete_30k: bool = False, validation_passed: bool = False,
     ) -> dict[str, Any]:
         self._ensure_open()
         if self._initial_gaussian_count is None:
             raise RuntimeError("archive Gaussian count is not initialized")
         observed_complete_30k = self._closed_iterations == list(range(1, 30_001))
-        if complete_30k and not observed_complete_30k:
-            raise ValueError("formal virtual archive must contain iterations 1 through 30000")
         self._flush_chunk()
         self._stream_file.flush()
         self._stream_file.close()
+        self._finish_chunks()
         result: dict[str, Any] = {
             "schema_version": ARCHIVE_SCHEMA_VERSION,
             "status": "passed",
-            "formal_performance_eligible": bool(observed_complete_30k and validation_passed),
+            "formal_performance_eligible": False,
             "complete_30k": observed_complete_30k,
-            "validation_passed": bool(validation_passed),
+            "validation_passed": False,
             "initial_gaussian_count": self._initial_gaussian_count,
             "packet_count": self._packet_count,
+            "query_count": self._query_count,
+            "candidate_count": self._candidate_count,
+            "relation_count": self._relation_count,
+            "physical_stream_bytes": self._physical_stream_bytes,
             "iteration_count": len(self._closed_iterations),
             "chunk_count": self._chunk_index,
             "max_chunk_bytes": self.max_chunk_bytes,
+            "max_inflight_chunks": self.max_inflight_chunks,
             "peak_uncompressed_chunk_bytes": self._peak_chunk_bytes,
             "chunk_storage": "npz_deflate",
+            "chunk_compression_level": zlib.Z_BEST_SPEED,
             "stream_path": "stream.jsonl",
             "chunks": [f"chunks/chunk-{index:06d}.npz" for index in range(self._chunk_index)],
             "metadata": dict(metadata or {}),
@@ -157,14 +189,27 @@ class VirtualPacketArchiveWriter:
         keys = np.concatenate(self._chunk_keys) if self._chunk_keys else np.empty(0, dtype=np.uint64)
         masks = np.concatenate(self._chunk_masks) if self._chunk_masks else np.empty(0, dtype=np.dtype("<u4"))
         path = chunk_dir / f"chunk-{self._chunk_index:06d}.npz"
-        np.savez_compressed(path, point_ids=ids, point_keys=keys, masks=masks,
-                            packets=np.asarray(json.dumps(self._chunk_packets), dtype=np.str_))
+        packets = np.asarray(json.dumps(self._chunk_packets), dtype=np.str_)
+        while len(self._chunk_futures) >= self.max_inflight_chunks:
+            self._chunk_futures.popleft().result()
+        self._chunk_futures.append(self._chunk_executor.submit(
+            _write_archive_chunk, path, ids, keys, masks, packets,
+        ))
         self._chunk_packets.clear()
         self._chunk_ids.clear()
         self._chunk_keys.clear()
         self._chunk_masks.clear()
         self._chunk_bytes = 0
+        self._chunk_candidate_count = 0
+        self._chunk_mask_count = 0
         self._chunk_index += 1
+
+    def _finish_chunks(self) -> None:
+        try:
+            while self._chunk_futures:
+                self._chunk_futures.popleft().result()
+        finally:
+            self._chunk_executor.shutdown(wait=True, cancel_futures=False)
 
     def _ensure_open(self) -> None:
         if self._finished:
@@ -232,11 +277,110 @@ class VirtualPacketArchiveReader:
         from gala_sim.timing.engine import BufferedVirtualCycleConsumer
 
         session = engine.online_session(
-            initial_gaussian_count=self.initial_gaussian_count, **kwargs,
+            initial_gaussian_count=self.initial_gaussian_count,
+            total_iterations=int(self.manifest["iteration_count"]),
+            **kwargs,
         )
         consumer = BufferedVirtualCycleConsumer(session)
         self.replay(consumer, finish=True)
         return consumer.result
+
+    def validate(self, *, promote: bool = False) -> dict[str, Any]:
+        """Re-read and validate every compact packet and lifecycle record.
+
+        Formal eligibility is derived exclusively from the observed archive
+        contents. ``promote`` records a successful validation in the archive
+        manifest, but cannot make an incomplete iteration stream eligible.
+        """
+        validator = VirtualTraceLifecycleValidator(self.initial_gaussian_count)
+        packet_count = 0
+        query_count = 0
+        candidate_count = 0
+        relation_count = 0
+        physical_stream_bytes = 0
+        closed_iterations: list[int] = []
+        for kind, value in self.records():
+            if kind == "packet":
+                validator.accept_packet(value)
+                packet_count += 1
+                query_count += value.query_count
+                candidate_count += value.candidate_count
+                relation_count += value.logical_relation_count
+                physical_stream_bytes += value.physical_bytes
+            elif kind == "lifecycle":
+                validator.accept_lifecycle(value)
+            else:
+                validator.close_iteration(value)
+                closed_iterations.append(value)
+        ledgers = validator.finalize()
+        observed = {
+            "packet_count": packet_count,
+            "query_count": query_count,
+            "candidate_count": candidate_count,
+            "relation_count": relation_count,
+            "physical_stream_bytes": physical_stream_bytes,
+            "iteration_count": len(closed_iterations),
+        }
+        for name, value in observed.items():
+            recorded = self.manifest.get(name)
+            if recorded is not None and int(recorded) != value:
+                raise ValueError(f"virtual packet archive {name} does not match its stream")
+        complete_30k = closed_iterations == list(range(1, 30_001))
+        if bool(self.manifest.get("complete_30k", False)) != complete_30k:
+            raise ValueError("virtual packet archive complete_30k marker is inconsistent")
+        audit = self.manifest.get("metadata", {}).get("capture_audit", {})
+        audit_contract = {
+            "captured_query_kernel_calls": packet_count,
+            "captured_backward_calls": packet_count,
+            "captured_logical_queries": query_count,
+            "captured_consumers": query_count,
+            "cuda_relation_candidates": candidate_count,
+            "cuda_valid_relations": relation_count,
+            "captured_backward_relations": relation_count,
+        }
+        audit_binding_passed = (
+            isinstance(audit, dict)
+            and all(
+                name in audit and int(audit[name]) == expected
+                for name, expected in audit_contract.items()
+            )
+            and sum(
+                int(audit.get(name, 0))
+                for name in (
+                    "captured_raster_kernel_calls",
+                    "captured_voxel_kernel_calls",
+                )
+            ) == packet_count
+        )
+        if complete_30k and not audit_binding_passed:
+            raise ValueError(
+                "formal virtual packet archive is not bound to complete capture audit counts"
+            )
+        formal_eligible = complete_30k and audit_binding_passed
+        report: dict[str, Any] = {
+            "schema_version": "gala-virtual-packet-archive-validation-v1",
+            "status": "passed",
+            "validation_scope": "complete_compact_packet_and_lifecycle_stream",
+            "validation_passed": True,
+            "complete_30k": complete_30k,
+            "formal_performance_eligible": formal_eligible,
+            "capture_audit_binding_passed": audit_binding_passed,
+            **observed,
+            "state_version_end": validator.state_version,
+            "active_gaussian_count_end": len(validator.active_gaussians or ()),
+            "first_iteration": closed_iterations[0] if closed_iterations else None,
+            "last_iteration": closed_iterations[-1] if closed_iterations else None,
+            "ledger_count": len(ledgers),
+        }
+        if promote:
+            self.manifest.update({
+                "validation_passed": True,
+                "formal_performance_eligible": formal_eligible,
+                "validation_report_path": "validation.json",
+            })
+            _write_json_atomic(self.root / "validation.json", report)
+            _write_json_atomic(self.root / "manifest.json", self.manifest)
+        return report
 
     def _packet(self, item: dict[str, Any]) -> VirtualTracePacket:
         chunk_index = int(item["chunk"])
@@ -284,12 +428,64 @@ def _call(consumer: Any, method: str, value: Any) -> None:
     callback(value)
 
 
+def _write_json_atomic(path: Path, value: dict[str, Any]) -> None:
+    temporary = path.with_name(path.name + ".tmp")
+    temporary.write_text(
+        json.dumps(value, ensure_ascii=True, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    temporary.replace(path)
+
+
+def _write_archive_chunk(
+    path: Path,
+    point_ids: np.ndarray,
+    point_keys: np.ndarray,
+    masks: np.ndarray,
+    packets: np.ndarray,
+) -> None:
+    """Write one standard NPZ chunk without blocking the capture producer."""
+
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    arrays = {
+        "point_ids": point_ids,
+        "point_keys": point_keys,
+        "masks": masks,
+        "packets": packets,
+    }
+    try:
+        with zipfile.ZipFile(
+            temporary,
+            mode="w",
+            compression=zipfile.ZIP_DEFLATED,
+            compresslevel=zlib.Z_BEST_SPEED,
+            allowZip64=True,
+        ) as archive:
+            for name, value in arrays.items():
+                with archive.open(name + ".npy", mode="w", force_zip64=True) as stream:
+                    np.lib.format.write_array(
+                        stream, np.asanyarray(value), allow_pickle=False,
+                    )
+        temporary.replace(path)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
 def _lifecycle_to_dict(record: VirtualLifecycleRecord) -> dict[str, Any]:
-    value = asdict(record)
-    value["kind"] = int(record.kind)
-    for name in ("child_ids", "dependency_ids", "active_ids"):
-        value[name] = list(value[name])
-    return value
+    return {
+        "iteration_id": int(record.iteration_id),
+        "kind": int(record.kind),
+        "state_version": int(record.state_version),
+        "field_mask": int(record.field_mask),
+        "gaussian_id": int(record.gaussian_id),
+        "parent_id": int(record.parent_id),
+        "child_ids": list(record.child_ids),
+        "transaction_kind": int(record.transaction_kind),
+        "all_active": bool(record.all_active),
+        "dependency_ids": list(record.dependency_ids),
+        "active_ids": list(record.active_ids),
+    }
 
 
 def _lifecycle_from_dict(value: dict[str, Any]) -> VirtualLifecycleRecord:

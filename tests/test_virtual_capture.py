@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import threading
+import time
 import numpy as np
 import pytest
 
+import gala_sim.trace.archive as archive_module
 from gala_sim.adapters.trace_capture import LOSS_L1, STATE_FIELD_MASK, TraceSession
 from gala_sim.adapters.virtual_capture import VirtualCaptureConsumer
 from gala_sim.trace import (
@@ -26,13 +29,15 @@ class _ArrayRef:
         return self._pointer
 
 
-def _packet(*, iteration: int = 1, point_id: int = 0) -> VirtualTracePacket:
+def _packet(
+    *, iteration: int = 1, point_id: int = 0, query_base: int = 0,
+) -> VirtualTracePacket:
     masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
     masks[0, 0] = 1
     return VirtualTracePacket(
         iteration_id=iteration,
         template_id=1,
-        query_base=0,
+        query_base=query_base,
         query_shape=(1, 1),
         point_ids=np.asarray([point_id], dtype=np.int64),
         point_keys=np.asarray([0], dtype=np.uint64),
@@ -50,7 +55,7 @@ def test_virtual_packet_archive_roundtrip_preserves_payload_and_order(tmp_path: 
     packet = _packet(point_id=0)
     begin = VirtualLifecycleRecord(
         1, VirtualLifecycleKind.UPDATE_BEGIN, 0,
-        field_mask=STATE_FIELD_MASK, transaction_kind=2,
+        field_mask=STATE_FIELD_MASK, transaction_kind=2, active_ids=(0, 1),
     )
     end = VirtualLifecycleRecord(
         1, VirtualLifecycleKind.UPDATE_END, 0,
@@ -95,6 +100,48 @@ def test_virtual_packet_archive_readers_have_independent_packet_objects(tmp_path
     assert second_packet.point_ids[0] == 0
 
 
+def test_virtual_packet_capture_fields_reuse_validated_payload() -> None:
+    packet = _packet()
+    stable_ids = np.asarray([7], dtype=np.int64)
+    assert packet.logical_relation_count == 1
+
+    updated = packet.with_capture_fields(
+        point_ids=stable_ids, loss_flags=LOSS_L1,
+        ssim_radius=3, backward_confirmed=True,
+    )
+
+    assert updated.point_ids is stable_ids
+    assert updated.point_keys is packet.point_keys
+    assert updated.masks is packet.masks
+    assert updated.loss_flags == LOSS_L1
+    assert updated.ssim_radius == 3
+    assert updated.backward_confirmed is True
+    assert updated._logical_relation_count_cache == 1
+    with pytest.raises(ValueError, match="invalid shape"):
+        packet.with_capture_fields(point_ids=np.asarray([1, 2], dtype=np.int64))
+    with pytest.raises(ValueError, match="non-negative"):
+        packet.with_capture_fields(loss_flags=-1)
+
+
+def test_capture_packet_defers_mask_domain_check_to_archive_reread(tmp_path: Path) -> None:
+    masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
+    masks[0, 0] = 2
+    packet = VirtualTracePacket.from_capture_buffers(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 1),
+        point_ids=np.asarray([0], dtype=np.int64),
+        point_keys=np.asarray([0], dtype=np.uint64), masks=masks,
+        loss_flags=LOSS_L1, backward_confirmed=True,
+    )
+    writer = VirtualPacketArchiveWriter(tmp_path / "archive", max_chunk_bytes=1024)
+    writer.initialize_gaussians(1)
+    writer.append_packet(packet)
+    writer.close_iteration(1)
+    writer.finish()
+
+    with pytest.raises(ValueError, match="outside the output"):
+        list(VirtualPacketArchiveReader(tmp_path / "archive").records())
+
+
 def test_virtual_packet_archive_rejects_cross_chunk_iteration_regression(tmp_path: Path) -> None:
     writer = VirtualPacketArchiveWriter(tmp_path / "archive", max_chunk_bytes=1)
     writer.initialize_gaussians(1)
@@ -105,13 +152,17 @@ def test_virtual_packet_archive_rejects_cross_chunk_iteration_regression(tmp_pat
 
 def test_virtual_packet_archive_reader_retains_only_current_chunk(tmp_path: Path) -> None:
     archive_root = tmp_path / "archive"
-    writer = VirtualPacketArchiveWriter(archive_root, max_chunk_bytes=1)
+    writer = VirtualPacketArchiveWriter(
+        archive_root, max_chunk_bytes=1, max_inflight_chunks=2,
+    )
     writer.initialize_gaussians(2)
     writer.append_packet(_packet(point_id=0))
     writer.append_packet(_packet(point_id=1))
     writer.close_iteration(1)
     manifest = writer.finish()
     assert manifest["chunk_count"] == 2
+    assert manifest["max_inflight_chunks"] == 2
+    assert manifest["chunk_compression_level"] == 1
 
     reader = VirtualPacketArchiveReader(archive_root)
     records = reader.records()
@@ -124,17 +175,156 @@ def test_virtual_packet_archive_reader_retains_only_current_chunk(tmp_path: Path
     assert set(vars(reader)).intersection({"_chunks", "_chunk_cache"}) == set()
 
 
-def test_virtual_packet_archive_failed_formal_gate_keeps_writer_open(tmp_path: Path) -> None:
+def test_virtual_packet_archive_manifest_waits_for_async_chunks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_root = tmp_path / "archive"
+    original_write = archive_module._write_archive_chunk
+    write_started = threading.Event()
+    allow_write = threading.Event()
+
+    def delayed_write(*args: object) -> None:
+        write_started.set()
+        if not allow_write.wait(timeout=2.0):
+            raise TimeoutError("test did not release archive chunk writer")
+        original_write(*args)
+
+    monkeypatch.setattr(archive_module, "_write_archive_chunk", delayed_write)
+    writer = VirtualPacketArchiveWriter(
+        archive_root, max_chunk_bytes=1, max_inflight_chunks=2,
+    )
+    writer.initialize_gaussians(1)
+    writer.append_packet(_packet())
+    assert write_started.wait(timeout=1.0)
+
+    failure: list[BaseException] = []
+
+    def finish() -> None:
+        try:
+            writer.finish()
+        except BaseException as error:
+            failure.append(error)
+
+    finish_thread = threading.Thread(target=finish)
+    finish_thread.start()
+    time.sleep(0.05)
+    assert finish_thread.is_alive()
+    assert not (archive_root / "manifest.json").exists()
+    allow_write.set()
+    finish_thread.join(timeout=2.0)
+
+    assert not finish_thread.is_alive()
+    assert failure == []
+    assert (archive_root / "manifest.json").is_file()
+    assert list(VirtualPacketArchiveReader(archive_root).records())[0][0] == "packet"
+
+
+def test_virtual_packet_archive_propagates_async_write_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    archive_root = tmp_path / "archive"
+
+    def fail_write_array(*args: object, **kwargs: object) -> None:
+        raise OSError("injected archive write failure")
+
+    monkeypatch.setattr(np.lib.format, "write_array", fail_write_array)
+    writer = VirtualPacketArchiveWriter(
+        archive_root, max_chunk_bytes=1, max_inflight_chunks=2,
+    )
+    writer.initialize_gaussians(1)
+    writer.append_packet(_packet())
+
+    with pytest.raises(OSError, match="injected archive write failure"):
+        writer.finish()
+
+    assert not (archive_root / "manifest.json").exists()
+    assert not (archive_root / "chunks" / "chunk-000000.npz").exists()
+    assert not (archive_root / "chunks" / "chunk-000000.npz.tmp").exists()
+
+
+def test_virtual_packet_archive_cannot_be_promoted_without_complete_30k(tmp_path: Path) -> None:
     writer = VirtualPacketArchiveWriter(tmp_path / "archive", max_chunk_bytes=1024)
     writer.initialize_gaussians(1)
     writer.append_packet(_packet())
     writer.close_iteration(1)
-    with pytest.raises(ValueError, match="iterations 1 through 30000"):
-        writer.finish(complete_30k=True, validation_passed=True)
-
     manifest = writer.finish()
     assert manifest["complete_30k"] is False
     assert manifest["formal_performance_eligible"] is False
+    report = VirtualPacketArchiveReader(tmp_path / "archive").validate(promote=True)
+    assert report["validation_passed"] is True
+    assert report["formal_performance_eligible"] is False
+    promoted = json.loads((tmp_path / "archive" / "manifest.json").read_text())
+    assert promoted["validation_passed"] is True
+    assert promoted["formal_performance_eligible"] is False
+
+
+def test_virtual_packet_archive_validation_rejects_manifest_count_drift(tmp_path: Path) -> None:
+    archive_root = tmp_path / "archive"
+    writer = VirtualPacketArchiveWriter(archive_root, max_chunk_bytes=1024)
+    writer.initialize_gaussians(1)
+    writer.append_packet(_packet())
+    writer.close_iteration(1)
+    manifest = writer.finish()
+    manifest["relation_count"] += 1
+    (archive_root / "manifest.json").write_text(json.dumps(manifest), encoding="utf-8")
+
+    with pytest.raises(ValueError, match="relation_count"):
+        VirtualPacketArchiveReader(archive_root).validate()
+
+
+def test_virtual_packet_archive_formal_gate_is_derived_from_stream_and_audit(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "archive"
+    writer = VirtualPacketArchiveWriter(archive_root, max_chunk_bytes=16 * 1024 * 1024)
+    writer.initialize_gaussians(1)
+    for iteration in range(1, 30_001):
+        writer.append_packet(_packet(iteration=iteration, query_base=iteration - 1))
+        writer.close_iteration(iteration)
+    writer.finish(metadata={"capture_audit": {
+        "captured_query_kernel_calls": 30_000,
+        "captured_raster_kernel_calls": 30_000,
+        "captured_voxel_kernel_calls": 0,
+        "captured_backward_calls": 30_000,
+        "captured_logical_queries": 30_000,
+        "captured_consumers": 30_000,
+        "cuda_relation_candidates": 30_000,
+        "cuda_valid_relations": 30_000,
+        "captured_backward_relations": 30_000,
+    }})
+
+    report = VirtualPacketArchiveReader(archive_root).validate(promote=True)
+
+    assert report["complete_30k"] is True
+    assert report["capture_audit_binding_passed"] is True
+    assert report["formal_performance_eligible"] is True
+    promoted = json.loads((archive_root / "manifest.json").read_text())
+    assert promoted["formal_performance_eligible"] is True
+
+
+def test_virtual_packet_archive_formal_gate_rejects_incomplete_audit_binding(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "archive"
+    writer = VirtualPacketArchiveWriter(archive_root, max_chunk_bytes=16 * 1024 * 1024)
+    writer.initialize_gaussians(1)
+    for iteration in range(1, 30_001):
+        writer.append_packet(_packet(iteration=iteration, query_base=iteration - 1))
+        writer.close_iteration(iteration)
+    writer.finish(metadata={"capture_audit": {
+        "captured_query_kernel_calls": 30_000,
+        "captured_raster_kernel_calls": 29_999,
+        "captured_voxel_kernel_calls": 0,
+        "captured_backward_calls": 30_000,
+        "captured_logical_queries": 30_000,
+        "captured_consumers": 30_000,
+        "cuda_relation_candidates": 30_000,
+        "cuda_valid_relations": 30_000,
+        "captured_backward_relations": 30_000,
+    }})
+
+    with pytest.raises(ValueError, match="capture audit counts"):
+        VirtualPacketArchiveReader(archive_root).validate(promote=True)
 
 
 def test_relation_capacity_preflight_reports_exact_topology_failure(tmp_path: Path) -> None:
