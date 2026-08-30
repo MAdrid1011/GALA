@@ -747,6 +747,75 @@ class VirtualTracePacket:
             np.maximum.at(last_base, pair_candidates, pair_bases)
         return counts
 
+    def relation_packet_lane_histograms_by_candidate(
+        self, *, query_lanes: int, max_relations: int,
+    ) -> np.ndarray:
+        """Count physical packets by active-lane count for every candidate."""
+
+        if not 0 < query_lanes <= 8 or max_relations <= 0:
+            raise ValueError("relation packet histogram limits are invalid")
+        histograms = np.zeros(
+            (self.candidate_count, query_lanes + 1), dtype=np.uint64,
+        )
+        fastest_block = (
+            RASTER_BLOCK[-1]
+            if self.template_id == RASTER_TEMPLATE_ID
+            else VOXEL_BLOCK[-1]
+        )
+        if fastest_block % query_lanes == 0:
+            candidate_batch = max(1, max_relations // self.local_query_count)
+            for start in range(0, self.candidate_count, candidate_batch):
+                end = min(start + candidate_batch, self.candidate_count)
+                bits = np.unpackbits(
+                    np.asarray(
+                        self.masks[start:end], dtype=np.dtype("<u4"),
+                    ).view(np.uint8),
+                    axis=1,
+                    bitorder="little",
+                )
+                if self.template_id == RASTER_TEMPLATE_ID:
+                    grouped = bits.reshape(
+                        end - start,
+                        RASTER_BLOCK[0],
+                        RASTER_BLOCK[1] // query_lanes,
+                        query_lanes,
+                    )
+                elif self.template_id == VOXEL_TEMPLATE_ID:
+                    grouped = bits.reshape(
+                        end - start,
+                        VOXEL_BLOCK[0],
+                        VOXEL_BLOCK[1],
+                        VOXEL_BLOCK[2] // query_lanes,
+                        query_lanes,
+                    )
+                else:
+                    raise ValueError(
+                        f"unsupported virtual trace template: {self.template_id}"
+                    )
+                active_lanes = grouped.sum(axis=-1, dtype=np.uint8)
+                reduction_axes = tuple(range(1, active_lanes.ndim))
+                for lane_count in range(1, query_lanes + 1):
+                    histograms[start:end, lane_count] = np.count_nonzero(
+                        active_lanes == lane_count, axis=reduction_axes,
+                    )
+            return histograms
+
+        packet_masks: dict[tuple[int, int], int] = {}
+        for candidates, query_ids, _gaussian_ids, _keys in self.iter_relation_arrays(
+            max_relations
+        ):
+            bases, lanes = _query_packet_coordinates(
+                query_ids, self, query_lanes,
+            )
+            for candidate, base, lane in zip(
+                candidates, bases, lanes, strict=True,
+            ):
+                key = (int(candidate), int(base))
+                packet_masks[key] = packet_masks.get(key, 0) | (1 << int(lane))
+        for (candidate, _base), lane_mask in packet_masks.items():
+            histograms[candidate, lane_mask.bit_count()] += 1
+        return histograms
+
     def relation_store_wavefront(
         self,
         *,

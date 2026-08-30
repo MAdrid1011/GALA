@@ -84,15 +84,17 @@ def test_query_history_survives_release_and_changes_next_iteration_priority() ->
     assert scheduler.states[101].exact_remaining(TaskKind.FORWARD) == 1
     assert scheduler.select(
         (high_previous_load, stable_load), use_load_rules=False,
+        use_history_prediction=False,
     ).accepted == (high_previous_load,)
     assert scheduler.select(
-        (high_previous_load, stable_load), use_load_rules=True,
+        (high_previous_load, stable_load), use_load_rules=False,
+        use_history_prediction=True,
     ).accepted == (stable_load,)
     assert scheduler.history_snapshot() == {
         "query_history_restored": 2,
         "query_history_candidate_evaluations": 2,
-        "query_load_rule_evaluations": 1,
-        "query_load_rule_selection_changes": 1,
+        "query_load_rule_evaluations": 0,
+        "query_load_rule_selection_changes": 0,
     }
 
 

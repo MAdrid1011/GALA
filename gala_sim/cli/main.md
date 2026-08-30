@@ -10,7 +10,7 @@
 
 `trace-sample --trace <dir> --output <dir> --query-range START:COUNT --max-events N --max-dependencies N --scan-events N --scan-backend cpu|cuda|auto` 从一个或多个 query range 的 consumer/gradient terminal 出发，抽取完整传递依赖闭包。输出保留真实 relation、地址、字节数和依赖，只能用于快速周期验证。
 
-`trace-query-packets --trace <dir> --output <dir> --query-range START:COUNT --query-range START:COUNT --scan-events N --scan-backend cpu|cuda|auto --query-lanes N --ssim-radius N` 为连续迭代构造最小真实关系包。命令保留所选查询的真实 Gaussian 支持域和源状态版本，避开 optimizer 全迭代 barrier 的无关 fan-in；v2 输出可在 quick scope 内运行两个 Oracle、全部 A/B/C/D 组合、必要下界和十六项消融，但不能用于更新、质量或正式性能。旧 v1 版本零样本仍只允许查询调度策略。
+`trace-query-packets --trace <dir> --output <dir> --query-range START:COUNT --query-range START:COUNT --scan-events N --scan-backend cpu|cuda|auto --query-lanes N --ssim-radius N` 为连续迭代构造最小真实关系包。命令保留所选查询的真实 Gaussian 支持域和源状态版本，避开 optimizer 全迭代 barrier 的无关 fan-in；v2 输出可在 quick scope 内运行两个 Oracle、必要下界和 `0000,1000,1010,0100,0101,1100,1111` 七项配置，但不能用于更新、质量或正式性能。旧 v1 版本零样本仍只允许查询调度策略。
 
 `trace-packetize --trace <quick-dir> --output <new-dir> --query-domain TEMPLATE:BASE:DIMxDIM[xDIM] --query-lanes N` 为旧版 dependency-closed quick trace 派生物理 RelationPacket lane/mask 元数据。命令只允许 quick trace，只修改 packetized event 的 `flags`，写盘前验证其他事件列、依赖和 payload 完全不变，并验证物理包计划；输出不提升正式性能或质量资格。
 
@@ -20,7 +20,7 @@
 
 `gala-r2-trace-runner --virtual-capture --packet-archive-root <dir> --capture-config <gala.yaml>` 在不展开事件列的情况下保存有序、紧凑的 packet/lifecycle 归档；在线周期模式可复用 `--online-cycle-config`，无需重复传入 `--capture-config`。归档按配置的未压缩数组字节上限分块，可由多个独立周期会话重复读取。归档只有在完整 `1..30000` 迭代和显式验证证据同时满足时才允许标记正式资格。
 
-其余入口为 `config-check`、`cycle-preflight`、`trace-validate`、`cycle-replay` 和 `ablation`。query sample 和显式迭代窗口 trace 默认均被周期入口拒绝；调用者必须显式传入 `--quick-validation`，输出 manifest 会固定 `formal_performance_eligible=false`。`ablation --parallel-workers N` 可并行运行独立变体；父进程按固定 `0000..1111` 顺序收集并验证结果。消融命令会为每个变体写出 `ablation.csv.modules/<bits>.json`，CSV 的 `module_breakdown_path` 和 `run_id` 指向对应记录，manifest 记录 `Full` 与 `1111` 的严格策略别名。消融进度只输出绝对周期和相对 Base ASIC 的加速比；没有同套件 AGX Orin 实测校准时，不生成 Orin 比较。
+其余入口为 `config-check`、`cycle-preflight`、`trace-validate`、`cycle-replay` 和 `ablation`。query sample 和显式迭代窗口 trace 默认均被周期入口拒绝；调用者必须显式传入 `--quick-validation`，输出 manifest 会固定 `formal_performance_eligible=false`。`ablation --parallel-workers N` 可并行运行独立变体；父进程按固定 `0000,1000,1010,0100,0101,1100,1111` 顺序收集并验证结果，并拒绝 C 脱离 A 或 D 脱离 B 的配置。消融命令会为每个变体写出 `ablation.csv.modules/<bits>.json`，CSV 的 `module_breakdown_path` 和 `run_id` 指向对应记录，manifest 记录 `Full` 与 `1111` 的严格策略别名。消融进度只输出绝对周期和相对 Base ASIC 的加速比；没有同套件 AGX Orin 实测校准时，不生成 Orin 比较。
 
 `cycle-replay --throughput-progress` 按完整迭代输出运行健康状态、墙钟事件吞吐、每事件模拟周期、总周期投影和按配置时钟换算的 ASIC 秒数。只有显式增加 `--stop-when-throughput-stable` 才允许稳定窗口提前结束；该路径要求输出目录不存在或为空，只写 `throughput.json`、非正式 manifest 和标明非正式资格的状态记录，不写 `cycles.json`。不带早停选项时始终保留完整重放语义。公开规格 extrapolation 不接入周期诊断，也不生成任何 `speedup_vs_orin` 字段。
 

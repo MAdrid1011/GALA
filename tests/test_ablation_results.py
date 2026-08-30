@@ -18,19 +18,28 @@ def _rows(config_hash: str = "a" * 64) -> list[AblationRow]:
     ) for index, variant in enumerate(all_variants())]
 
 
-def test_ablation_matrix_has_canonical_sixteen_rows(tmp_path: Path) -> None:
+def test_ablation_matrix_has_canonical_seven_rows(tmp_path: Path) -> None:
     variants = validate_matrix([variant.bits for variant in all_variants()])
-    assert variants[0] == AblationVariant("0000")
-    assert variants[-1] == AblationVariant("1111")
+    assert [variant.bits for variant in variants] == [
+        "0000", "1000", "1010", "0100", "0101", "1100", "1111",
+    ]
     output = tmp_path / "ablation.csv"
     write_ablation_csv(_rows(), output)
     with output.open(newline="", encoding="utf-8") as stream:
-        assert len(list(csv.DictReader(stream))) == 16
+        assert len(list(csv.DictReader(stream))) == 7
 
 
 def test_ablation_matrix_rejects_missing_variant() -> None:
-    with pytest.raises(ValueError, match="sixteen"):
+    with pytest.raises(ValueError, match="seven"):
         validate_matrix([variant.bits for variant in all_variants()][:-1])
+
+
+@pytest.mark.parametrize("bits", ["0010", "0001", "0111"])
+def test_ablation_variant_rejects_unsupported_mechanism_combinations(
+    bits: str,
+) -> None:
+    with pytest.raises(ValueError):
+        AblationVariant(bits)
 
 
 def test_ablation_output_does_not_gate_on_recorded_configuration_hashes(

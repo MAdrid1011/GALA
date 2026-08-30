@@ -13,7 +13,8 @@ from gala_sim.clamp.events import EVENT_SCHEMA_VERSION, dependency_dtype
 from gala_sim.config import load_config
 from gala_sim.timing import (
     BufferedVirtualCycleConsumer, CycleConfig, CycleEngine, RelationPacketPlan,
-    RelationPacketPlanError, RelationWindowDescriptor, analyze_cycle_lower_bounds,
+    RelationPacketPlanError, RelationWindowDescriptor, SemanticPlacement,
+    analyze_cycle_lower_bounds,
 )
 from gala_sim.timing.modules import (
     OwnerGradientTracker, QueryReplayTracker, RelationWindowTracker,
@@ -177,46 +178,6 @@ def test_relation_records_reclaim_per_packet_after_its_adjoint_lanes() -> None:
     assert tracker.relation_records_live == 0
 
 
-def test_relation_window_full_stage_barrier_waits_for_all_prior_work() -> None:
-    descriptor = RelationWindowDescriptor(
-        window_id=0,
-        relation_stage_heads=frozenset({1}),
-        producer_event_ids=frozenset({0, 1}),
-        forward_stage_heads=frozenset({2, 3}),
-        consumer_event_ids=frozenset({4, 5}),
-        adjoint_event_ids=frozenset({6}),
-    )
-    tracker = RelationWindowTracker(
-        window_capacity=1, relation_capacity=1, relation_banks=1,
-    )
-    tracker.register(descriptor)
-    assert tracker.full_stage_blocking_reason(
-        0, PrimitiveKind.RELATION_CANDIDATE,
-    ) is None
-    tracker.issue(0, PrimitiveKind.RELATION_CANDIDATE,
-                  physical_stage_head=True, cycle=0)
-
-    assert tracker.full_stage_blocking_reason(
-        4, PrimitiveKind.CONSUMER,
-    ) == "base_forward_stage"
-    tracker.complete_event(2)
-    assert tracker.full_stage_blocking_reason(
-        4, PrimitiveKind.CONSUMER,
-    ) == "base_forward_stage"
-    tracker.complete_event(3)
-    assert tracker.full_stage_blocking_reason(4, PrimitiveKind.CONSUMER) is None
-
-    assert tracker.full_stage_blocking_reason(
-        6, PrimitiveKind.ADJOINT,
-    ) == "base_consumer_stage"
-    tracker.complete_event(4)
-    assert tracker.full_stage_blocking_reason(
-        6, PrimitiveKind.ADJOINT,
-    ) == "base_consumer_stage"
-    tracker.complete_event(5)
-    assert tracker.full_stage_blocking_reason(6, PrimitiveKind.ADJOINT) is None
-
-
 def test_relation_window_and_record_store_have_independent_backpressure() -> None:
     def descriptor(window_id: int, base: int) -> RelationWindowDescriptor:
         return RelationWindowDescriptor(
@@ -310,6 +271,7 @@ def test_query_replay_queue_releases_only_after_last_adjoint_dispatch() -> None:
     tracker.register_rows(rows)
 
     tracker.reserve_consumer(0)
+    tracker.reserve_adjoint((1,))
     tracker.dispatch_adjoint((1,))
     assert tracker.snapshot()["replay_queue_live_entries"] == 1
     tracker.dispatch_adjoint((2,))
@@ -324,7 +286,7 @@ def test_query_replay_queue_releases_only_after_last_adjoint_dispatch() -> None:
     assert tracker.remaining_adjoint_by_query == {}
 
 
-def test_stage_gated_replay_reserves_capacity_only_when_adjoint_starts() -> None:
+def test_replay_reserves_capacity_only_when_adjoint_starts() -> None:
     rows = np.empty(4, dtype=TraceBuilder().finish().events.dtype)
     rows[:] = TraceEvent().as_tuple()
     rows["event_id"] = [0, 1, 2, 3]
@@ -336,7 +298,7 @@ def test_stage_gated_replay_reserves_capacity_only_when_adjoint_starts() -> None
         int(PrimitiveKind.ADJOINT),
         int(PrimitiveKind.ADJOINT),
     ]
-    tracker = QueryReplayTracker(capacity=1, stage_gated=True)
+    tracker = QueryReplayTracker(capacity=1)
     tracker.register_rows(rows)
 
     assert not tracker.blocks_consumer(0)
@@ -360,7 +322,7 @@ def test_stage_gated_replay_reserves_capacity_only_when_adjoint_starts() -> None
     }
 
 
-def test_stage_gated_replay_blocks_adjoint_until_consumer_is_ready() -> None:
+def test_replay_blocks_adjoint_until_consumer_is_ready() -> None:
     rows = np.empty(2, dtype=TraceBuilder().finish().events.dtype)
     rows[:] = TraceEvent().as_tuple()
     rows["event_id"] = [0, 1]
@@ -370,7 +332,7 @@ def test_stage_gated_replay_blocks_adjoint_until_consumer_is_ready() -> None:
         int(PrimitiveKind.CONSUMER),
         int(PrimitiveKind.ADJOINT),
     ]
-    tracker = QueryReplayTracker(capacity=1, stage_gated=True)
+    tracker = QueryReplayTracker(capacity=1)
     tracker.register_rows(rows)
 
     assert tracker.blocks_adjoint((1,))
@@ -607,15 +569,17 @@ def test_online_and_offline_partial_replay_packets_match_each_lane_cycle() -> No
         trace, collect_compute_telemetry=True,
     )
     online_config = replace(config, memory=_Memory())
-    session = CycleEngine(online_config, policy="full").online_session(
+    sink = BufferedVirtualCycleConsumer(CycleEngine(
+        online_config, policy="full",
+    ).online_session(
         max_events=2, max_frontier_events=2_048,
         initial_gaussian_count=12, retain_completion_cycles=True,
         collect_compute_telemetry=True,
-    )
+    ))
 
-    session.accept_query_packet(source)
-    session.close_iteration(1)
-    online = session.finish()
+    sink.accept_query_packet(source)
+    sink.close_iteration(1)
+    online = sink.finish()
 
     offline_replay = offline.module_counters["bidirectional_query"]
     online_replay = online.module_counters["bidirectional_query"]
@@ -636,6 +600,38 @@ def test_online_and_offline_partial_replay_packets_match_each_lane_cycle() -> No
     assert online.total_cycles == offline.total_cycles
     assert online.completion_cycles == offline.completion_cycles
     assert online.compute_telemetry == offline.compute_telemetry
+
+
+def test_compact_and_expanded_semantic_placement_are_identical() -> None:
+    masks = np.zeros((3, 8), dtype=np.dtype("<u4"))
+    masks[0, 0] = np.uint32((1 << 2) - 1)
+    masks[1, 0] = np.uint32((1 << 9) - 1)
+    masks[2, 0] = np.uint32((1 << 16) - 1)
+    source = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 16),
+        point_ids=np.asarray([7, 8, 9], dtype=np.int64),
+        point_keys=np.zeros(3, dtype=np.uint64), masks=masks,
+        loss_flags=1, backward_confirmed=True,
+    )
+    trace = _virtual_trace(source)
+    config = CycleConfig.from_gala(load_config(
+        Path(__file__).parents[1] / "configs/architecture/gala.yaml"
+    ), _Memory())
+    packet_plan = RelationPacketPlan.from_trace(
+        trace, query_lanes=config.relation_query_lanes,
+    )
+
+    expanded = SemanticPlacement.from_trace(trace, packet_plan, config)
+    compact = SemanticPlacement.from_virtual_packets(
+        (source,), config, max_relations=2,
+    )
+
+    assert compact.demand_by_key == expanded.demand_by_key
+    assert compact.cluster_by_key == expanded.cluster_by_key
+    assert (
+        compact.cluster_loads_by_iteration
+        == expanded.cluster_loads_by_iteration
+    )
 
 
 def test_semantic_worksets_count_physical_packet_readers_not_logical_lanes() -> None:
@@ -670,6 +666,48 @@ def test_semantic_worksets_count_physical_packet_readers_not_logical_lanes() -> 
     for result in (offline, online):
         assert result.module_counters["semantic_cache"]["workset_uses"] == 1
         assert result.module_counters["semantic_cache"]["workset_releases"] == 1
+
+
+def test_online_and_offline_semantic_return_multicast_match_exactly() -> None:
+    masks = np.zeros((5, 8), dtype=np.dtype("<u4"))
+    masks[:, 0] = 1
+    source = VirtualTracePacket(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 1),
+        point_ids=np.zeros(5, dtype=np.int64),
+        point_keys=np.arange(5, dtype=np.uint64), masks=masks,
+        loss_flags=1, backward_confirmed=True,
+    )
+    config_path = Path(__file__).parents[1] / "configs/architecture/gala.yaml"
+    offline = CycleEngine(CycleConfig.from_gala(
+        load_config(config_path), _Memory(),
+    ), policy="variant:0101").run(_virtual_trace(source))
+    sink = BufferedVirtualCycleConsumer(CycleEngine(CycleConfig.from_gala(
+        load_config(config_path), _Memory(),
+    ), policy="variant:0101").online_session(
+        max_events=2, max_frontier_events=64, initial_gaussian_count=1,
+        retain_completion_cycles=True,
+    ))
+    sink.accept_query_packet(source)
+    sink.close_iteration(1)
+    online = sink.finish()
+
+    assert online.total_cycles == offline.total_cycles
+    assert online.event_counts == offline.event_counts
+    for counter in (
+        "accepted", "completed", "directory_hits", "directory_misses",
+        "miss_merges", "multicast_reads", "workset_uses", "workset_releases",
+    ):
+        assert (
+            online.module_counters["semantic_cache"][counter]
+            == offline.module_counters["semantic_cache"][counter]
+        )
+    for counter in ("accepted", "completed"):
+        assert (
+            online.module_counters["shared_sram"][counter]
+            == offline.module_counters["shared_sram"][counter]
+        )
+    assert online.module_counters["semantic_cache"]["multicast_reads"] == 1
+    assert online.module_counters["shared_sram"]["accepted"] == 5
 
 
 def test_cycle_bounds_report_physical_packets_and_lane_utilization() -> None:

@@ -9,6 +9,7 @@ from typing import Any, Iterable
 import numpy as np
 
 from gala_sim.clamp.events import dependency_dtype, event_dtype
+from gala_sim.mechanisms import CANONICAL_VARIANT_POLICIES
 
 from .model import Trace
 from .virtual import (
@@ -245,6 +246,11 @@ def complete_captured_packet_sample(
                 "formal_performance_eligible": False,
                 "quality_eligible": False,
                 "selection": "complete_captured_physical_packets",
+                "eligible_policies": [
+                    "base", "query", "residency", "full",
+                    "query_oracle", "residency_oracle",
+                    *CANONICAL_VARIANT_POLICIES,
+                ],
                 "query_lanes": query_lanes,
                 "packets": packet_reports,
                 "sample_event_count": int(events.size),

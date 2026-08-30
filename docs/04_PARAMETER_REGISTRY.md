@@ -28,6 +28,7 @@
 | `issue.candidate_lanes` | 3 | lane | Forecast、Conflict、Issue 三级结构 |
 | `issue.candidate_fifo_entries` | 144 | entry_per_source_fifo | 前向、消费者、伴随三条候选 FIFO 的独立容量；由同一完整 trace 的容量扫描冻结 |
 | `issue.bank_head_index_bytes` | 224 | byte | 每源共享 FIFO 的八路 Bank 队首索引与轮转控制元数据，计入 control_metadata 区域 |
+| `issue.semantic_bundle_index_bytes` | 640 | byte | 前向与伴随 FIFO 的同状态就绪链 head/tail、next、有效位、成束就绪位与共享优先编码控制，对齐后计入 control_metadata 区域 |
 | `issue.bank_head_lookahead` | true | bool | 消费者候选槽空闲时允许观察另一查询状态 Bank 的真实队首 |
 | `issue.forward_ports` | 2 | port | 前向可选出口；消费者队列空闲时可借用其候选槽观察第二个真实队首 |
 | `issue.consumer_ports` | 1 | port | 三输入三输出交叉开关的消费者端口；当前每类仅观察一个真实队首 |
@@ -41,6 +42,7 @@
 | `cache.active_sram_bytes_per_instance` | 131072 | byte | 128 KiB Active SRAM |
 | `cache.miss_merge_entries_per_instance` | 32 | entry | 敏感性默认点 |
 | `cache.multicast_destinations` | 4 | destination | 作用域多播器 |
+| `cache.ready_head_index_bytes` | 18432 | byte | 四缓存实例、每实例 1024 个活动槽、每槽四个 9-bit 就绪队列指针 |
 | `cache.sector_bytes` | 64 | byte | 两个扇区传输 128 B 记录 |
 | `compute.clusters_per_pod` | 5 | cluster | 可重构计算 Pod |
 | `compute.fma_lanes_per_cluster` | 16 | lane | 可重构计算 Pod |
@@ -53,6 +55,7 @@
 | `compute.cluster_issue_slots_per_cluster` | 2 | slot | 二维 interaction 的两条配对算术路径 |
 | `compute.microcontext_bytes_per_cluster` | 6656 | byte | 6.5 KiB 设计值 |
 | `compute.owner_gradient_slots_per_cluster` | 3 | slot | 每个 owner cluster 的并发梯度 epoch；只在 owner ComputePod 接纳时预约 |
+| `compute.ready_head_index_bytes` | 640 | byte | 架构侧查询重叠发射使用的 256 项 ComputePod FIFO 路由类 head/tail、next 和有效位索引；计入 control_metadata 区域 |
 | `compute.template_profiles[1].paths.forward` | pack 4，first 17，last 20，2 lane/cycle | cycle | GALA `ffadc13d`: `interaction_2d` |
 | `compute.template_profiles[1].paths.adjoint` | pack 8，first 27，last 34，1 cycle/lane | cycle | GALA `ffadc13d`: `interaction_2d_adjoint` |
 | `compute.template_profiles[2].paths.forward` | pack 8，first 27，last 34，1 lane/cycle | cycle | GALA `ffadc13d`: `interaction_3d` |

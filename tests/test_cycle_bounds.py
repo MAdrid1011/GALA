@@ -133,7 +133,7 @@ def test_cycle_bounds_only_rule_out_targets_proven_below_a_necessary_floor() -> 
     assert reachability["full"].maximum_coverable_cycles == 272
 
 
-def test_residency_bound_includes_global_stage_gated_fusion_issue() -> None:
+def test_residency_bound_includes_base_single_fusion_issue() -> None:
     builder = TraceBuilder()
     for kind in (
         PrimitiveKind.FORWARD,
@@ -186,6 +186,73 @@ def test_residency_bound_includes_global_stage_gated_fusion_issue() -> None:
         item.name != "fusion_issue.base_single_issue"
         for scenario in (scenarios["query"], scenarios["full"])
         for item in scenario.components
+    )
+
+
+def test_residency_bound_counts_same_state_forward_bundle_submissions() -> None:
+    builder = TraceBuilder()
+    for query_id in range(6):
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.FORWARD),
+            query_id=query_id, gaussian_id=7,
+            state_version=3, template_id=1,
+        ))
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CONSUMER), query_id=0,
+        gaussian_id=7, state_version=3, template_id=1,
+    ))
+    for query_id in range(4):
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.ADJOINT), query_id=query_id,
+            gaussian_id=7, state_version=3, template_id=1,
+        ))
+    path = ComputePathProfile(
+        (ComputeStage("COMBINE", latency=1),),
+        cluster_issue_cycles=1,
+        packet_first_result_latency=1,
+        packet_last_result_offset=1,
+    )
+    config = replace(
+        _config(), candidate_lanes=3,
+        cache_multicast_destinations=4,
+        fusion_semantic_bundle_index_bytes=320,
+        compute_templates={
+            1: ComputeTemplateProfile(1, {
+                "forward": path, "adjoint": path,
+            }),
+        },
+        compute_resource_capacities={
+            "pods": 1, "clusters_per_pod": 1, "clusters": 1,
+            "cluster_issue": 1, "fma_groups": 1,
+            "transcendental_lanes": 1, "reduction_trees": 1,
+            "microcontext_slots": 1, "feedback_lanes": 1,
+        },
+    )
+
+    report = analyze_cycle_lower_bounds(
+        CycleEngine(config, policy="base"), builder.finish(),
+        base_asic_cycles=100,
+        targets={"query": 2.0, "residency": 2.0, "full": 2.0},
+    )
+    residency = next(
+        scenario for scenario in report.scenarios
+        if scenario.scenario == "residency"
+    )
+    component = next(
+        item for item in residency.components
+        if item.name == "fusion_issue.semantic_bundle_issue"
+    )
+
+    assert component.cycles == 6
+    assert component.evidence["physical_task_count"] == 11
+    assert component.evidence["forward_bundle_submissions"] == 2
+    assert component.evidence["adjoint_bundle_submissions"] == 2
+    assert component.evidence["unbundled_submissions"] == 1
+    assert component.evidence["physical_submissions"] == 5
+    assert component.evidence["destinations_per_bundle"] == 3
+    assert all(
+        item.name != "fusion_issue.base_single_issue"
+        for item in residency.components
     )
 
 

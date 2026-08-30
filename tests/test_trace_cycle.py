@@ -9,6 +9,7 @@ import pytest
 
 from gala_sim.clamp import (
     ChunkedTraceBuilder,
+    FusionIssueScheduler,
     PrimitiveKind,
     ReductionDomain,
     ResourceClass,
@@ -275,7 +276,7 @@ def test_online_cycle_replay_consumes_packets_without_trace_columns() -> None:
     assert session.closed_iteration_count == 1
 
 
-@pytest.mark.parametrize("policy", ["base", "variant:0001", "full"])
+@pytest.mark.parametrize("policy", ["base", "variant:0101", "full"])
 def test_archived_packet_replay_matches_live_buffered_cycle(
     tmp_path: Path, policy: str,
 ) -> None:
@@ -816,15 +817,15 @@ def test_online_lifecycle_lineage_preserves_clone_and_split_order() -> None:
 
 
 def test_online_cycle_replay_consumes_exact_semantic_workset_sidecar() -> None:
-    masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
-    masks[0, 0] = 0b11
+    masks = np.zeros((5, 8), dtype=np.dtype("<u4"))
+    masks[:, 0] = 1
     source = VirtualTracePacket(
         iteration_id=1,
         template_id=1,
         query_base=0,
-        query_shape=(1, 2),
-        point_ids=np.asarray([0], dtype=np.int64),
-        point_keys=np.asarray([0], dtype=np.uint64),
+        query_shape=(1, 1),
+        point_ids=np.zeros(5, dtype=np.int64),
+        point_keys=np.arange(5, dtype=np.uint64),
         masks=masks,
         loss_flags=1,
         backward_confirmed=True,
@@ -841,21 +842,22 @@ def test_online_cycle_replay_consumes_exact_semantic_workset_sidecar() -> None:
         cache_directory_banks=1, cache_sector_bytes=64,
         cache_multicast_destinations=4,
     )
-    session = CycleEngine(config, policy="variant:0001").online_session(
+    session = CycleEngine(config, policy="variant:0101").online_session(
         max_events=4,
         initial_gaussian_count=1,
-        semantic_workset_totals={(0, 0): 2},
+        semantic_workset_totals={(0, 0): 5},
     )
     session.accept_query_packet(source)
     session.close_iteration(1)
     result = session.finish()
     assert result.module_counters["semantic_cache"]["workset_keys"] == 1
-    assert result.module_counters["semantic_cache"]["workset_uses"] == 2
+    assert result.module_counters["semantic_cache"]["workset_uses"] == 5
     assert result.module_counters["semantic_cache"]["workset_releases"] == 1
     assert result.module_counters["semantic_cache"]["miss_merges"] == 1
     assert result.module_counters["semantic_cache"]["multicast_reads"] == 1
-    assert result.event_counts["CACHE_REQUEST"] == 2
-    assert result.event_counts["CACHE_RETURN"] == 2
+    assert result.module_counters["shared_sram"]["accepted"] == 3
+    assert result.event_counts["CACHE_REQUEST"] == 5
+    assert result.event_counts["CACHE_RETURN"] == 5
     assert session.completed_event_count == session.accepted_event_count
     assert session.quiescent
 
@@ -881,7 +883,7 @@ def test_online_residency_retains_cache_return_request_dependency() -> None:
         cache_directory_banks=1,
         cache_sector_bytes=64,
     )
-    session = CycleEngine(config, policy="variant:0001").online_session(
+    session = CycleEngine(config, policy="variant:0101").online_session(
         max_events=16,
         initial_gaussian_count=1,
         semantic_workset_totals={(0, 0): 1},
@@ -925,7 +927,7 @@ def test_buffered_virtual_consumer_derives_totals_before_lifecycle() -> None:
         cache_directory_banks=1, cache_sector_bytes=64,
     )
     sink = BufferedVirtualCycleConsumer(
-        CycleEngine(config, policy="variant:0001").online_session(
+            CycleEngine(config, policy="variant:0101").online_session(
             max_events=4, initial_gaussian_count=1,
         )
     )
@@ -1193,7 +1195,7 @@ def test_cycle_engine_wakes_cache_event_from_async_ramulator_completion() -> Non
     assert result.memory_requests == memory.audit_records()
 
 
-def test_semantic_residency_variant_merges_repeated_state_reads() -> None:
+def test_semantic_residency_with_worksets_merges_repeated_state_reads() -> None:
     builder = TraceBuilder()
     first_request = builder.emit(TraceEvent(
         primitive_kind=int(PrimitiveKind.CACHE_REQUEST), query_id=0,
@@ -1232,20 +1234,163 @@ def test_semantic_residency_variant_merges_repeated_state_reads() -> None:
     )
     base = CycleEngine(config, policy="variant:0000").run(trace)
     worksets = CycleEngine(config, policy="variant:0100").run(trace)
-    residency = CycleEngine(config, policy="variant:0001").run(trace)
     combined = CycleEngine(config, policy="variant:0101").run(trace)
     assert base.module_counters["semantic_cache"]["memory_requests"] == 2
     assert worksets.module_counters["semantic_cache"]["memory_requests"] == 2
     assert worksets.module_counters["semantic_cache"]["workset_keys"] == 1
     assert worksets.module_counters["semantic_cache"]["workset_uses"] == 2
-    assert residency.module_counters["semantic_cache"]["memory_requests"] == 1
-    assert residency.module_counters["semantic_cache"]["directory_misses"] == 1
-    assert residency.module_counters["semantic_cache"]["directory_hits"] == 1
-    assert residency.module_counters["semantic_cache"]["workset_uses"] == 0
     assert combined.module_counters["semantic_cache"]["memory_requests"] == 1
+    assert combined.module_counters["semantic_cache"]["directory_misses"] == 1
+    assert combined.module_counters["semantic_cache"]["directory_hits"] == 1
+    assert combined.module_counters["semantic_cache"]["workset_uses"] == 2
     assert combined.module_counters["semantic_cache"]["workset_releases"] == 1
     assert combined.module_counters["semantic_cache"]["releases"] == 1
     assert combined.module_counters["shared_sram"]["accepted"] == 3
+
+
+def _semantic_fusion_bundle_fixture() -> tuple[Trace, CycleConfig]:
+    builder = TraceBuilder()
+    request_ids = [
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.CACHE_REQUEST), query_id=query_id,
+            gaussian_id=7, state_version=3, template_id=1,
+            address_token=448, data_bytes=64,
+            resource_class=int(ResourceClass.CACHE),
+        ))
+        for query_id in range(4)
+    ]
+    return_ids = [
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.CACHE_RETURN), query_id=query_id,
+            gaussian_id=7, state_version=3, template_id=1,
+            address_token=448, data_bytes=64,
+            resource_class=int(ResourceClass.CACHE),
+        ), dependencies=[request_id])
+        for query_id, request_id in enumerate(request_ids)
+    ]
+    for query_id in range(4):
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.FORWARD), query_id=query_id,
+            gaussian_id=7, state_version=3, template_id=1,
+            relation_id=query_id, reduction_key=query_id,
+            address_token=448, resource_class=int(ResourceClass.ISSUE),
+        ), dependencies=return_ids)
+    timing = ModuleTiming(
+        latency=1, initiation_interval=1, queue_capacity=16, ports=1, banks=2,
+    )
+    config = CycleConfig(
+        modules={name: timing for name in (
+            "relation_constructor", "fusion_issue", "semantic_cache",
+            "compute_pod", "bidirectional_query", "reconstruction_update",
+            "shared_sram",
+        )},
+        memory=_Memory(), clock_frequency_hz=500_000_000,
+        relation_seed_fifo_entries=8, candidate_lanes=3,
+        fusion_query_state_banks=8, fusion_bank_head_lookahead=True,
+        fusion_bank_head_index_bytes=224,
+        fusion_semantic_bundle_index_bytes=320,
+        fusion_forward_ports=2, fusion_consumer_ports=1,
+        fusion_adjoint_ports=2,
+        cache_instances=1, cache_capacity_per_instance=8,
+        cache_directory_banks=2, cache_sector_bytes=64,
+        cache_multicast_destinations=4,
+    )
+    return builder.finish(), config
+
+
+@pytest.mark.parametrize(("policy", "expected_issues", "expected_followers"), [
+    ("variant:0000", 0, 0),
+    ("variant:0100", 0, 0),
+    ("variant:0101", 1, 2),
+    ("variant:1010", 0, 0),
+    ("variant:1111", 2, 2),
+])
+def test_semantic_fusion_bundle_is_isolated_to_combined_residency(
+    policy: str, expected_issues: int, expected_followers: int,
+) -> None:
+    trace, config = _semantic_fusion_bundle_fixture()
+
+    result = CycleEngine(config, policy=policy).run(
+        trace, validate_input=False,
+    )
+
+    fusion = result.module_counters["fusion_issue"]
+    assert fusion["semantic_bundle_issues"] == expected_issues
+    assert fusion["semantic_bundle_followers"] == expected_followers
+    assert set(result.completion_cycles) == set(range(trace.event_count))
+
+
+@pytest.mark.parametrize(("policy", "expected_issues"), [
+    ("variant:0101", 1),
+    ("variant:1111", 2),
+])
+def test_semantic_fusion_bundle_matches_offline_and_online_replay(
+    policy: str, expected_issues: int,
+) -> None:
+    trace, config = _semantic_fusion_bundle_fixture()
+    offline = CycleEngine(config, policy=policy).run(
+        trace, validate_input=False,
+    )
+    session = CycleEngine(
+        config, policy=policy,
+    ).online_session(
+        max_events=16, semantic_workset_totals={(7, 3): 4},
+    )
+
+    session.accept_event_packet(VirtualEventPacket(
+        packet_id=0, global_event_start=0,
+        events=trace.events, dependencies=trace.dependencies,
+    ))
+
+    online_issues = sum(
+        queue.semantic_bundle_issues for queue in session._fusion_inputs.values()
+    )
+    online_followers = sum(
+        queue.semantic_bundle_followers for queue in session._fusion_inputs.values()
+    )
+    assert session._last_completion_cycle == offline.total_cycles
+    assert online_issues == offline.module_counters["fusion_issue"][
+        "semantic_bundle_issues"
+    ] == expected_issues
+    assert online_followers == offline.module_counters["fusion_issue"][
+        "semantic_bundle_followers"
+    ] == 2
+    assert session.completed_event_count == session.accepted_event_count
+    assert session.quiescent
+
+
+def test_semantic_adjoint_bundle_matches_offline_and_online_replay() -> None:
+    builder = TraceBuilder()
+    for query_id in range(4):
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.ADJOINT), query_id=query_id,
+            gaussian_id=7, state_version=3, template_id=1,
+            relation_id=query_id, reduction_key=query_id,
+            address_token=448, resource_class=int(ResourceClass.ISSUE),
+        ))
+    trace = builder.finish()
+    _forward_trace, config = _semantic_fusion_bundle_fixture()
+
+    offline = CycleEngine(config, policy="variant:0101").run(
+        trace, validate_input=False,
+    )
+    session = CycleEngine(config, policy="variant:0101").online_session(
+        max_events=16,
+        retain_completion_cycles=True,
+    )
+    session.accept_event_packet(VirtualEventPacket(
+        packet_id=0, global_event_start=0,
+        events=trace.events, dependencies=trace.dependencies,
+    ))
+
+    adjoint_queue = session._fusion_inputs[TaskKind.ADJOINT]
+    forward_queue = session._fusion_inputs[TaskKind.FORWARD]
+    assert session._last_completion_cycle == offline.total_cycles
+    assert session._completion_cycles == offline.completion_cycles
+    assert adjoint_queue.semantic_bundle_issues == 1
+    assert adjoint_queue.semantic_bundle_followers == 2
+    assert forward_queue.semantic_bundle_issues == 0
+    assert session.quiescent
 
 
 def test_shared_sram_replays_same_address_read_against_fill_write() -> None:
@@ -1335,11 +1480,11 @@ def test_semantic_residency_multicasts_real_ready_requests_without_dropping_depe
         cache_directory_banks=2, cache_sector_bytes=64,
         cache_multicast_destinations=4,
     )
-    result = CycleEngine(config, policy="variant:0001").run(
+    result = CycleEngine(config, policy="variant:0101").run(
         trace, validate_input=False,
     )
     single_destination = CycleEngine(
-        replace(config, cache_multicast_destinations=1), policy="variant:0001",
+        replace(config, cache_multicast_destinations=1), policy="variant:0101",
     ).run(trace, validate_input=False)
     cache = result.module_counters["semantic_cache"]
     assert cache["directory_misses"] == 1
@@ -1347,7 +1492,8 @@ def test_semantic_residency_multicasts_real_ready_requests_without_dropping_depe
     assert cache["multicast_reads"] == 1
     assert cache["memory_requests"] == 1
     assert cache["releases"] == 1
-    assert result.module_counters["shared_sram"]["accepted"] == 6
+    assert result.module_counters["shared_sram"]["accepted"] == 3
+    assert single_destination.module_counters["shared_sram"]["accepted"] == 6
     assert single_destination.module_counters["semantic_cache"]["multicast_reads"] == 0
     assert cache["busy_cycles"] < single_destination.module_counters["semantic_cache"]["busy_cycles"]
     assert result.event_counts["CACHE_REQUEST"] == 5
@@ -1436,7 +1582,7 @@ def test_query_close_keeps_state_resident_until_update_end() -> None:
         cache_directory_banks=2, cache_sector_bytes=64,
         cache_multicast_destinations=1,
     )
-    result = CycleEngine(config, policy="variant:0001").run(trace)
+    result = CycleEngine(config, policy="variant:0101").run(trace)
     cache = result.module_counters["semantic_cache"]
     assert cache["directory_misses"] == 1
     assert cache["directory_hits"] == 1
@@ -1488,11 +1634,12 @@ def test_noop_update_keeps_same_state_version_resident() -> None:
         cache_directory_banks=2, cache_sector_bytes=64,
         cache_multicast_destinations=1,
     )
-    result = CycleEngine(config, policy="variant:0001").run(builder.finish())
+    result = CycleEngine(config, policy="variant:0101").run(builder.finish())
     cache = result.module_counters["semantic_cache"]
     assert cache["directory_misses"] == 1
     assert cache["directory_hits"] == 1
-    assert cache["releases"] == 0
+    assert cache["memory_requests"] == 1
+    assert cache["workset_releases"] == 1
 
 
 def test_cycle_engine_applies_module_queue_and_seed_fifo_backpressure() -> None:
@@ -1548,7 +1695,7 @@ def test_fusion_issue_uses_independent_forward_consumer_and_adjoint_ports() -> N
         fusion_forward_ports=1, fusion_consumer_ports=1, fusion_adjoint_ports=1,
     )
     independent = CycleEngine(
-        independent_port_config, policy="variant:0010"
+        independent_port_config, policy="variant:1010"
     ).run(_fusion_port_trace())
     independent_fusion_stalls = [
         stall for stall in independent.stalls
@@ -1563,6 +1710,7 @@ def test_fusion_issue_uses_independent_forward_consumer_and_adjoint_ports() -> N
         stall.module == "fusion_issue" and stall.reason == "base_single_issue"
         for stall in base.stalls
     )
+    assert base.total_cycles > independent.total_cycles
 
 
 def test_idle_fusion_candidate_slot_borrows_real_fifo_heads_fairly() -> None:
@@ -1571,7 +1719,7 @@ def test_idle_fusion_candidate_slot_borrows_real_fifo_heads_fairly() -> None:
         fusion_forward_ports=2, fusion_consumer_ports=1,
         fusion_adjoint_ports=2,
     )
-    engine = CycleEngine(config, policy="variant:0010")
+    engine = CycleEngine(config, policy="variant:1010")
     def packet(event_id: int, kind: TaskKind) -> TaskPacket:
         return TaskPacket(
             event_id=event_id, query_id=event_id, gaussian_id=event_id,
@@ -1635,6 +1783,118 @@ def test_banked_fusion_fifo_exposes_only_a_real_head_per_bank() -> None:
     assert bank_cursor == 2
     assert len(queue) == 3
     assert queue.head().event_id == 10
+
+
+def test_semantic_residency_prioritizes_fullest_ready_fusion_group() -> None:
+    config = replace(
+        _config(), candidate_lanes=3,
+        fusion_forward_ports=2, fusion_consumer_ports=1,
+        fusion_adjoint_ports=2, fusion_semantic_bundle_index_bytes=320,
+        cache_multicast_destinations=4,
+    )
+    engine = CycleEngine(config, policy="variant:0101")
+    inputs = {
+        kind: _BankedFusionSourceQueue(capacity=32, banks=8)
+        for kind in TaskKind
+    }
+
+    def packet(event_id: int, query_id: int, gaussian_id: int) -> TaskPacket:
+        return TaskPacket(
+            event_id=event_id, query_id=query_id, gaussian_id=gaussian_id,
+            reduction_key=query_id, resource=event_id, state_version=0,
+            template_id=1, address_token=gaussian_id,
+            task_kind=TaskKind.FORWARD,
+        )
+
+    inputs[TaskKind.ADJOINT].append(TaskPacket(
+        event_id=1, query_id=0, gaussian_id=9, reduction_key=9,
+        resource=1, state_version=0, template_id=1, address_token=9,
+        task_kind=TaskKind.ADJOINT,
+    ), bank=0)
+    inputs[TaskKind.FORWARD].append(packet(10, 0, 7), bank=0)
+    inputs[TaskKind.FORWARD].append(packet(11, 8, 7), bank=1)
+    inputs[TaskKind.FORWARD].append(packet(12, 16, 7), bank=2)
+    inputs[TaskKind.FORWARD].append(packet(20, 24, 8), bank=3)
+    inputs[TaskKind.FORWARD].append(packet(21, 32, 8), bank=4)
+
+    selected, borrowed = engine._peek_fusion_input_candidates(
+        inputs, borrow_cursor=0,
+    )
+
+    assert [item.event_id for item in selected] == [10]
+    assert borrowed == {}
+    bundle = engine._semantic_fusion_bundle(inputs, selected)
+    assert bundle is not None
+    assert bundle[0].event_id == 10
+    assert [item.event_id for item in bundle[1]] == [11, 12]
+
+
+def test_semantic_residency_groups_ready_adjoint_state() -> None:
+    config = replace(
+        _config(), candidate_lanes=3,
+        fusion_forward_ports=2, fusion_consumer_ports=1,
+        fusion_adjoint_ports=2, fusion_semantic_bundle_index_bytes=320,
+        cache_multicast_destinations=4,
+    )
+    engine = CycleEngine(config, policy="variant:0101")
+    inputs = {
+        kind: _BankedFusionSourceQueue(capacity=32, banks=8)
+        for kind in TaskKind
+    }
+
+    for event_id, query_id in ((10, 0), (11, 8), (12, 16)):
+        inputs[TaskKind.ADJOINT].append(TaskPacket(
+            event_id=event_id, query_id=query_id, gaussian_id=7,
+            reduction_key=query_id, resource=event_id, state_version=3,
+            template_id=1, address_token=7, task_kind=TaskKind.ADJOINT,
+        ), bank=query_id // 8)
+
+    selected, borrowed = engine._peek_fusion_input_candidates(
+        inputs, borrow_cursor=0,
+    )
+    bundle = engine._semantic_fusion_bundle(inputs, selected)
+
+    assert [item.event_id for item in selected] == [10]
+    assert borrowed == {}
+    assert bundle is not None
+    assert bundle[0].event_id == 10
+    assert [item.event_id for item in bundle[1]] == [11, 12]
+
+
+def test_semantic_ready_group_priority_isolated_from_other_variants() -> None:
+    config = replace(
+        _config(), candidate_lanes=3,
+        fusion_forward_ports=2, fusion_consumer_ports=1,
+        fusion_adjoint_ports=2, fusion_semantic_bundle_index_bytes=320,
+        cache_multicast_destinations=4,
+    )
+
+    def candidates(policy: str) -> list[int]:
+        engine = CycleEngine(config, policy=policy)
+        inputs = {
+            kind: _BankedFusionSourceQueue(capacity=32, banks=8)
+            for kind in TaskKind
+        }
+        inputs[TaskKind.ADJOINT].append(TaskPacket(
+            event_id=1, query_id=0, gaussian_id=9, reduction_key=9,
+            resource=1, state_version=0, template_id=1, address_token=9,
+            task_kind=TaskKind.ADJOINT,
+        ), bank=0)
+        for event_id, query_id, bank in ((10, 0, 0), (11, 8, 1), (12, 16, 2)):
+            inputs[TaskKind.FORWARD].append(TaskPacket(
+                event_id=event_id, query_id=query_id, gaussian_id=7,
+                reduction_key=query_id, resource=event_id, state_version=0,
+                template_id=1, address_token=7,
+                task_kind=TaskKind.FORWARD,
+            ), bank=bank)
+        selected, _borrowed = engine._peek_fusion_input_candidates(
+            inputs, borrow_cursor=0,
+        )
+        return [item.event_id for item in selected]
+
+    assert candidates("variant:0101") == [10]
+    assert candidates("variant:0000") == [10, 1, 11]
+    assert candidates("variant:1010") == [10, 1, 11]
 
 
 def test_banked_fusion_fifo_advances_cursor_only_after_issue_commit() -> None:
@@ -1724,6 +1984,28 @@ def test_owner_gradient_capacity_blocks_compute_not_query_replay() -> None:
     assert pop("compute_pod") == []
 
 
+def test_semantic_ready_index_selects_noncontiguous_same_key_followers() -> None:
+    rows = np.empty(6, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = np.arange(6)
+    rows["primitive_kind"] = int(PrimitiveKind.CACHE_RETURN)
+    rows["gaussian_id"] = [7, 8, 7, 9, 7, 7]
+    rows["state_version"] = [3, 3, 3, 3, 3, 3]
+    queue = _ReadyCandidateQueue()
+    for event_id in range(6):
+        queue.push((event_id, 0))
+
+    selected = queue.pop_acceptable(
+        1, "semantic_cache", capacity=8, row_for=rows.__getitem__,
+        physical_stage_for=lambda _event_id: None,
+        owner_gradients=None, query_replay=None,
+        semantic_multicast_destinations=4,
+    )
+
+    assert selected == [(0, 0), (2, 0), (4, 0), (5, 0)]
+    assert list(queue) == [(1, 0), (3, 0)]
+
+
 def test_fusion_issue_banks_by_physical_query_state_index() -> None:
     timing = ModuleTiming(
         latency=1, initiation_interval=1, queue_capacity=8, ports=3, banks=1,
@@ -1740,7 +2022,7 @@ def test_fusion_issue_banks_by_physical_query_state_index() -> None:
     )
 
     grouped_engine = CycleEngine(
-        replace(config, relation_query_lanes=8), policy="variant:0010",
+        replace(config, relation_query_lanes=8), policy="variant:1010",
     )
     grouped_rows = []
     for query_id in (0, 7, 8):
@@ -1765,7 +2047,7 @@ def test_fusion_issue_banks_by_physical_query_state_index() -> None:
         resource_class=int(ResourceClass.ISSUE),
     ))
     parallel = CycleEngine(
-        config, policy="variant:0010",
+        config, policy="variant:1010",
     ).run(different_banks.finish())
     assert not any(
         stall.module == "fusion_issue" and stall.reason == "bank"
@@ -1784,7 +2066,7 @@ def test_fusion_issue_banks_by_physical_query_state_index() -> None:
         resource_class=int(ResourceClass.ISSUE),
     ))
     serialized = CycleEngine(
-        config, policy="variant:0010",
+        config, policy="variant:1010",
     ).run(same_bank.finish())
     assert any(
         stall.module == "fusion_issue" and stall.reason == "bank"
@@ -1912,6 +2194,50 @@ def test_online_query_load_rules_drain_pending_fifo_heads() -> None:
     assert session.quiescent
 
 
+def test_query_load_rules_do_not_deadlock_consumers_behind_replay_capacity() -> None:
+    builder = TraceBuilder()
+    consumers = [
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.CONSUMER), query_id=query_id,
+            consumer_id=query_id, reduction_key=query_id,
+            resource_class=int(ResourceClass.ISSUE),
+        ))
+        for query_id in range(2)
+    ]
+    for query_id in range(2):
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.ADJOINT), query_id=query_id,
+            gaussian_id=query_id, relation_id=query_id,
+            reduction_key=query_id, resource_class=int(ResourceClass.ISSUE),
+        ), dependencies=consumers)
+
+    result = CycleEngine(
+        replace(
+            _config(),
+            query_reduction_banks=2,
+            query_partial_sum_groups_per_bank=2,
+            query_loss_fma_lanes=2,
+            query_loss_queries_per_cycle=1,
+            query_adjoint_replay_lanes=1,
+            query_replay_queue_entries=1,
+            query_relation_window_entries=1,
+            query_relation_window_entry_bytes=32,
+            query_relation_store_banks=1,
+            query_relation_store_records=8,
+            query_relation_store_record_bytes=3,
+            query_relation_candidate_ordinal_bits=16,
+            query_volume_banks=2,
+            query_volume_word_bytes=16,
+        ),
+        policy="variant:1000",
+    ).run(builder.finish())
+
+    assert set(result.completion_cycles) == set(range(4))
+    replay = result.module_counters["bidirectional_query"]
+    assert replay["replay_queue_peak_entries"] == 1
+    assert replay["replay_queue_live_entries"] == 0
+
+
 def test_online_query_history_uses_template_local_identity_across_iterations() -> None:
     engine = CycleEngine(_config(), policy="variant:1000")
     session = engine.online_session(max_events=16, initial_gaussian_count=1)
@@ -1937,10 +2263,12 @@ def test_online_query_history_uses_template_local_identity_across_iterations() -
     result = session.finish()
 
     assert result.module_counters["fusion_issue"]["query_history_restored"] == 2
-    assert (
-        result.module_counters["fusion_issue"]
-        ["query_history_candidate_evaluations"]
-    ) > 0
+    assert result.module_counters["fusion_issue"][
+        "query_history_candidate_evaluations"
+    ] == 0
+    assert result.module_counters["fusion_issue"][
+        "query_load_rule_evaluations"
+    ] > 0
     assert session.quiescent
 
 
@@ -2022,7 +2350,7 @@ def test_fusion_issue_applies_each_task_class_port_limit() -> None:
         relation_seed_fifo_entries=8, candidate_lanes=3,
         fusion_forward_ports=1, fusion_consumer_ports=1, fusion_adjoint_ports=1,
     )
-    result = CycleEngine(config, policy="variant:0010").run(builder.finish())
+    result = CycleEngine(config, policy="variant:1010").run(builder.finish())
     assert result.module_counters["fusion_issue"]["accepted"] == 2
     assert result.completion_cycles[0] < result.completion_cycles[1]
 
@@ -2030,9 +2358,10 @@ def test_fusion_issue_applies_each_task_class_port_limit() -> None:
 @pytest.mark.parametrize("policy,expected", [
     ("variant:0000", (False, False, False, False)),
     ("variant:1000", (True, False, False, False)),
+    ("variant:1010", (True, False, True, False)),
     ("variant:0100", (False, True, False, False)),
-    ("variant:0010", (False, False, True, False)),
-    ("variant:0001", (False, False, False, True)),
+    ("variant:0101", (False, True, False, True)),
+    ("variant:1100", (True, True, False, False)),
     ("variant:1111", (True, True, True, True)),
     ("query", (True, False, True, False)),
     ("residency", (False, True, False, True)),
@@ -2047,6 +2376,48 @@ def test_cycle_policy_preserves_independent_mechanism_bits(
         selection.overlap_guided_issue,
         selection.semantic_residency,
     ) == expected
+
+
+@pytest.mark.parametrize(
+    "policy", ["variant:0010", "variant:0001", "variant:0111"],
+)
+def test_cycle_engine_rejects_unsupported_mechanism_combinations(
+    policy: str,
+) -> None:
+    with pytest.raises(ValueError, match="unknown cycle policy"):
+        CycleEngine(_config(), policy=policy)
+
+
+def test_overlap_guided_issue_uses_history_without_compiler_load_rules() -> None:
+    scheduler = FusionIssueScheduler(
+        candidate_lanes=3, forward_ports=1, consumer_ports=1,
+        adjoint_ports=1,
+    )
+    scheduler.set_strict_lifecycle()
+    for _ in range(3):
+        scheduler.relation_accept(
+            (1,), iteration_id=0, history_keys=((1, 0),),
+        )
+    scheduler.producer_close((1,))
+    scheduler.reduction_writeback((1,))
+    scheduler.forward_retire((1, 1, 1))
+    assert scheduler.release_completed() == 1
+    scheduler.relation_accept(
+        (101,), iteration_id=1, history_keys=((1, 0),),
+    )
+    scheduler.producer_close((101,))
+    scheduler.reduction_writeback((101,))
+
+    task = TaskPacket(
+        0, 101, 1, 101, 1, 0, 1, 0, TaskKind.FORWARD,
+    )
+    scheduler.select(
+        (task,), use_load_rules=False, use_history_prediction=True,
+    )
+
+    history = scheduler.history_snapshot()
+    assert history["query_history_candidate_evaluations"] == 1
+    assert history["query_load_rule_evaluations"] == 0
 
 
 def test_task_packet_uses_semantic_reduction_domain_and_not_event_id() -> None:
@@ -2096,7 +2467,7 @@ def test_overlap_issue_rejects_same_query_reduction_in_one_cycle() -> None:
         relation_seed_fifo_entries=8, candidate_lanes=3,
         fusion_forward_ports=1, fusion_consumer_ports=1, fusion_adjoint_ports=1,
     )
-    result = CycleEngine(config, policy="variant:0010").run(builder.finish())
+    result = CycleEngine(config, policy="variant:1010").run(builder.finish())
     assert any(
         stall.reason == "scheduler_conflict_or_port" for stall in result.stalls
     )
@@ -2132,7 +2503,7 @@ def test_overlap_scheduler_observes_three_real_input_heads() -> None:
         relation_seed_fifo_entries=8, candidate_lanes=3,
         fusion_forward_ports=1, fusion_consumer_ports=1, fusion_adjoint_ports=1,
     )
-    engine = CycleEngine(config, policy="variant:0010")
+    engine = CycleEngine(config, policy="variant:1010")
     observed: list[tuple[TaskKind, ...]] = []
     original_select = engine.issue_scheduler.select
 
@@ -2206,6 +2577,7 @@ def test_loaded_architecture_uses_three_independent_144_entry_candidate_fifos() 
     assert cycle_config.candidate_fifo_entries == 144
     assert cycle_config.fusion_bank_head_lookahead is True
     assert cycle_config.fusion_bank_head_index_bytes == 224
+    assert cycle_config.fusion_semantic_bundle_index_bytes == 640
 
 
 def test_event_driven_engine_replays_large_dependency_chain() -> None:
@@ -2284,10 +2656,11 @@ def test_ablation_runner_uses_one_validation_for_all_variants(monkeypatch) -> No
 
     monkeypatch.setattr(runner, "validate_trace", counted_validate)
     runs = runner.run_matrix(_trace(), _config())
-    assert len(runs) == 16
+    assert len(runs) == 7
     assert validation_calls == 1
-    assert runs[0].variant.bits == "0000"
-    assert runs[-1].variant.bits == "1111"
+    assert [run.variant.bits for run in runs] == [
+        "0000", "1000", "1010", "0100", "0101", "1100", "1111",
+    ]
     assert runs[-1].result.policy == "variant:1111"
 
 
@@ -2296,7 +2669,7 @@ def test_ablation_runner_reports_each_completed_variant() -> None:
 
     completed: list[str] = []
     runs = run_matrix(_trace(), _config(), progress=lambda run: completed.append(run.variant.bits))
-    assert len(runs) == 16
+    assert len(runs) == 7
     assert completed == [run.variant.bits for run in runs]
 
 
@@ -2363,7 +2736,9 @@ def test_ablation_runner_can_parallelize_independent_variants() -> None:
     from gala_sim.ablation.runner import run_matrix
 
     runs = run_matrix(_trace(), _config(), parallel_workers=2)
-    assert [run.variant.bits for run in runs] == [f"{value:04b}" for value in range(16)]
+    assert [run.variant.bits for run in runs] == [
+        "0000", "1000", "1010", "0100", "0101", "1100", "1111",
+    ]
 
 
 def test_ablation_replays_recorded_memory_for_each_variant() -> None:
@@ -2383,4 +2758,4 @@ def test_ablation_replays_recorded_memory_for_each_variant() -> None:
         memory=RecordedMemoryBackend({(128, 64, False, 0): 1}),
         clock_frequency_hz=500_000_000, relation_seed_fifo_entries=8, candidate_lanes=3,
     )
-    assert len(run_matrix(trace, config)) == 16
+    assert len(run_matrix(trace, config)) == 7

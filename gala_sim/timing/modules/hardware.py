@@ -5,12 +5,14 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import Enum
 import heapq
+from typing import Mapping
 
 import numpy as np
 
 from gala_sim.clamp.events import PrimitiveKind
 from gala_sim.timing.config import ComputeStage, ComputeTemplateProfile, ModuleTiming
 from gala_sim.timing.packets import RelationWindowDescriptor
+from gala_sim.timing.placement import folded_gaussian_index
 
 from .base import CounterBlock, ModuleOutput
 from .protocol import AcceptResult, EventBatch, ModuleOutputs
@@ -224,14 +226,21 @@ class SemanticCacheState:
         if destinations <= 0 or key not in self.active:
             raise ValueError("multicast requires an active key and destinations")
         if not readers_already_active:
-            self.active[key]["active_reads"] = (
-                int(self.active[key]["active_reads"]) + destinations
-            )
-            if not bool(self.active[key].get("predeclared", False)):
-                self.active[key]["remaining_uses"] = (
-                    int(self.active[key]["remaining_uses"]) + destinations
-                )
+            self.reserve_reads(key, readers=destinations)
         self.counters["multicast_reads"] += 1
+
+    def reserve_reads(self, key: tuple[int, int], readers: int) -> None:
+        """Reserve real readers without claiming a physical SRAM multicast."""
+
+        if readers <= 0 or key not in self.active:
+            raise ValueError("read reservation requires an active key and readers")
+        self.active[key]["active_reads"] = (
+            int(self.active[key]["active_reads"]) + readers
+        )
+        if not bool(self.active[key].get("predeclared", False)):
+            self.active[key]["remaining_uses"] = (
+                int(self.active[key]["remaining_uses"]) + readers
+            )
 
     def complete_read(self, key: tuple[int, int]) -> bool:
         if key not in self.active or int(self.active[key]["active_reads"]) <= 0:
@@ -347,6 +356,7 @@ class ComputePod(HardwareModule):
         *,
         pod: int | None = None,
         cluster_hint: int | None = None,
+        active_lanes: int | None = None,
     ) -> tuple[tuple[str, int, int], ...]:
         """Return ``(resource, cycle, demand)`` entries for one accepted task."""
 
@@ -354,6 +364,10 @@ class ComputePod(HardwareModule):
             return ()
         path = self.path_for(template_id, kind)
         stages = path.stages
+        issue_cycles = (
+            path.cluster_issue_cycles
+            if active_lanes is None else path.packet_issue_cycles(active_lanes)
+        )
         clusters = int((self.resource_capacities or {}).get("clusters", 1))
         pods = int((self.resource_capacities or {}).get("pods", 1))
         clusters_per_pod = int(
@@ -380,9 +394,11 @@ class ComputePod(HardwareModule):
             candidate_clusters = tuple(range(clusters))
         self._discard_retired(start_cycle)
         fallback: tuple[tuple[str, int, int], ...] = ()
+        best_fit: tuple[tuple[str, int, int], ...] = ()
+        best_issue_occupancy = -1
         for cluster in candidate_clusters:
             plan: list[tuple[str, int, int]] = []
-            for point in range(start_cycle, start_cycle + path.cluster_issue_cycles):
+            for point in range(start_cycle, start_cycle + issue_cycles):
                 plan.append((
                     f"cluster_issue:{cluster}", point, path.cluster_issue_slots,
                 ))
@@ -397,14 +413,21 @@ class ComputePod(HardwareModule):
             # input lanes are admitted.  The downstream pipeline tokens retain
             # work after admission and do not keep the input context live.
             for point in range(
-                start_cycle, start_cycle + path.cluster_issue_cycles,
+                start_cycle, start_cycle + issue_cycles,
             ):
                 plan.append((f"microcontext_slots:{cluster}", point, 1))
             candidate = tuple(plan)
             fallback = fallback or candidate
             if self._fits(candidate):
-                return candidate
-        return fallback
+                issue_occupancy = sum(
+                    self._resource_use.get((resource, point), 0)
+                    for resource, point, _demand in candidate
+                    if resource.startswith("cluster_issue:")
+                )
+                if issue_occupancy > best_issue_occupancy:
+                    best_fit = candidate
+                    best_issue_occupancy = issue_occupancy
+        return best_fit or fallback
 
     def _discard_retired(self, cycle: int) -> None:
         # Reservations are issued in nondecreasing cycle order.  Retire by
@@ -666,29 +689,6 @@ class RelationWindowTracker:
             return "relation_store_bank"
         return None
 
-    def full_stage_blocking_reason(
-        self, event_id: int, kind: PrimitiveKind,
-    ) -> str | None:
-        """Apply the A-disabled window barriers without changing dependencies."""
-
-        window_id = self.event_to_window.get(event_id)
-        if window_id is None:
-            return None
-        if kind not in {PrimitiveKind.CONSUMER, PrimitiveKind.ADJOINT}:
-            return None
-        state = self.live.get(window_id)
-        if state is None:
-            raise ValueError("relation-window task became ready without a live window")
-        if not state.sealed:
-            return "base_window_unsealed"
-        if kind is PrimitiveKind.CONSUMER and state.forward_events:
-            return "base_forward_stage"
-        if kind is PrimitiveKind.ADJOINT and state.forward_events:
-            return "base_forward_stage"
-        if kind is PrimitiveKind.ADJOINT and state.consumer_events:
-            return "base_consumer_stage"
-        return None
-
     def issue(
         self,
         event_id: int,
@@ -829,10 +829,9 @@ class RelationWindowTracker:
 
 @dataclass
 class QueryReplayTracker:
-    """Consumer-input and adjoint-replay occupancy shared by both replay paths."""
+    """Track ready query gradients and active adjoint-replay contexts."""
 
     capacity: int
-    stage_gated: bool = False
     remaining_adjoint_by_query: dict[tuple[int, int], int] = field(default_factory=dict)
     adjoint_query_by_event: dict[int, tuple[int, int]] = field(default_factory=dict)
     consumer_query_by_event: dict[int, tuple[int, int]] = field(default_factory=dict)
@@ -879,40 +878,20 @@ class QueryReplayTracker:
             )
 
     def blocks_consumer(self, event_id: int) -> bool:
-        query_key = self.consumer_query_by_event.get(event_id)
-        return bool(
-            not self.stage_gated
-            and
-            query_key is not None
-            and self.remaining_adjoint_by_query.get(query_key, 0) > 0
-            and query_key not in self.active_queries
-            and len(self.active_queries) >= self.capacity
-        )
+        # Consumer output is retained in query-volume SRAM.  Replay-queue
+        # capacity applies only once an adjoint packet starts replaying it.
+        return False
 
     def requires_consumer_slot(self, event_id: int) -> bool:
-        query_key = self.consumer_query_by_event.get(event_id)
-        return bool(
-            query_key is not None
-            and self.remaining_adjoint_by_query.get(query_key, 0) > 0
-            and query_key not in self.active_queries
-        )
+        return False
 
     def reserve_consumer(self, event_id: int) -> None:
         query_key = self.consumer_query_by_event.pop(event_id, None)
         if query_key is None or self.remaining_adjoint_by_query.get(query_key, 0) == 0:
             return
-        if self.stage_gated:
-            if query_key in self.ready_queries:
-                raise ValueError("consumer replay input is reserved twice")
-            self.ready_queries.add(query_key)
-            return
-        if query_key in self.active_queries:
+        if query_key in self.ready_queries:
             raise ValueError("consumer replay input is reserved twice")
-        if len(self.active_queries) >= self.capacity:
-            raise ValueError("consumer replay input commits without queue capacity")
-        self.active_queries.add(query_key)
-        self.reservations += 1
-        self.peak_entries = max(self.peak_entries, len(self.active_queries))
+        self.ready_queries.add(query_key)
 
     def _adjoint_query_keys(
         self, event_ids: tuple[int, ...],
@@ -927,8 +906,6 @@ class QueryReplayTracker:
         return tuple(keys)
 
     def blocks_adjoint(self, event_ids: tuple[int, ...]) -> bool:
-        if not self.stage_gated:
-            return False
         query_keys = self._adjoint_query_keys(event_ids)
         new_keys = tuple(
             query_key for query_key in query_keys
@@ -945,10 +922,6 @@ class QueryReplayTracker:
 
     def reserve_adjoint(self, event_ids: tuple[int, ...]) -> None:
         query_keys = self._adjoint_query_keys(event_ids)
-        if not self.stage_gated:
-            if any(query_key not in self.active_queries for query_key in query_keys):
-                raise ValueError("adjoint dispatch has no active replay input")
-            return
         new_keys = tuple(
             query_key for query_key in query_keys
             if query_key not in self.active_queries
@@ -989,6 +962,17 @@ class QueryReplayTracker:
             "replay_queue_live_entries": len(self.active_queries),
         }
 
+    def deadlock_snapshot(self) -> dict[str, object]:
+        """Expose bounded replay state without dumping the complete trace."""
+
+        return {
+            "ready_query_count": len(self.ready_queries),
+            "ready_query_sample": tuple(sorted(self.ready_queries)[:16]),
+            "active_query_count": len(self.active_queries),
+            "active_query_sample": tuple(sorted(self.active_queries)[:16]),
+            "capacity_entries": self.capacity,
+        }
+
 
 @dataclass
 class OwnerGradientTracker:
@@ -997,6 +981,7 @@ class OwnerGradientTracker:
     pods: int
     clusters_per_pod: int
     slots_per_cluster: int
+    cluster_by_key: Mapping[tuple[int, int], int] = field(default_factory=dict)
     remaining_gradient_by_key: dict[tuple[int, int, int], int] = field(default_factory=dict)
     active_relations_by_key: dict[tuple[int, int, int], set[int]] = field(
         default_factory=dict
@@ -1018,6 +1003,13 @@ class OwnerGradientTracker:
     def __post_init__(self) -> None:
         if min(self.pods, self.clusters_per_pod, self.slots_per_cluster) <= 0:
             raise ValueError("owner-gradient resources must be positive")
+        cluster_count = self.pods * self.clusters_per_pod
+        if any(
+            min(iteration_id, gaussian_id, int(cluster)) < 0
+            or int(cluster) >= cluster_count
+            for (iteration_id, gaussian_id), cluster in self.cluster_by_key.items()
+        ):
+            raise ValueError("owner-gradient semantic placement is invalid")
 
     @staticmethod
     def _key(row) -> tuple[int, int, int]:
@@ -1028,11 +1020,14 @@ class OwnerGradientTracker:
         )
 
     def _cluster(self, key: tuple[int, int, int]) -> int:
+        placed = self.cluster_by_key.get((key[0], key[1]))
+        if placed is not None:
+            return int(placed)
         gaussian_id = key[1]
         if gaussian_id < 0:
             raise ValueError("owner-gradient event has no Gaussian identity")
-        pod = gaussian_id % self.pods
-        owner = gaussian_id % self.clusters_per_pod
+        pod = folded_gaussian_index(gaussian_id, self.pods)
+        owner = folded_gaussian_index(gaussian_id, self.clusters_per_pod)
         return pod * self.clusters_per_pod + owner
 
     def register_rows(self, rows) -> None:

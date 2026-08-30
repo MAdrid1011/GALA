@@ -15,6 +15,7 @@ from .packets import (
     RelationWindowDescriptor, RelationWindowPlan,
 )
 from .memory import RecordedMemoryBackend
+from .placement import SemanticPlacement
 from .telemetry import (
     ComputeClusterOccupancyRun, ComputeEventTiming, ComputeTelemetry,
 )
@@ -30,3 +31,4 @@ __all__ += [
     "RelationWindowDescriptor", "RelationWindowPlan",
 ]
 __all__ += ["ComputeClusterOccupancyRun", "ComputeEventTiming", "ComputeTelemetry"]
+__all__ += ["SemanticPlacement"]

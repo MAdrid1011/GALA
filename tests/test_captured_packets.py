@@ -117,6 +117,10 @@ def test_captured_packet_sample_expands_complete_forward_and_backward(
     assert trace.metadata["trace_sample"]["selection"] == (
         "complete_captured_physical_packets"
     )
+    assert trace.metadata["trace_sample"]["eligible_policies"][-7:] == [
+        "variant:0000", "variant:1000", "variant:1010",
+        "variant:0100", "variant:0101", "variant:1100", "variant:1111",
+    ]
 
 
 def test_cli_builds_captured_packet_sample(

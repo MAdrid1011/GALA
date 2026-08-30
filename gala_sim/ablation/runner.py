@@ -1,4 +1,4 @@
-"""Run the fixed sixteen variants over one validated trace."""
+"""Run the seven canonical mechanism configurations over one validated trace."""
 
 from __future__ import annotations
 
@@ -63,7 +63,7 @@ def run_matrix(
     validate_matrix([run.variant.bits for run in runs])
     full = next(run for run in runs if run.variant.bits == "1111")
     # ``full`` is a policy alias for the 1111 variant.  Compare the frozen
-    # selections directly instead of launching a redundant seventeenth replay
+    # selections directly instead of launching a redundant seventh replay
     # over the complete trace merely to re-check that alias.
     if (
         CycleEngine._selection_for_policy("full")

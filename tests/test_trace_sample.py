@@ -210,7 +210,8 @@ def test_real_query_packet_sample_preserves_supports_and_rebases_history() -> No
         "query_oracle", "residency_oracle",
     ]
     assert metadata["eligible_policies"][6:] == [
-        f"variant:{number:04b}" for number in range(16)
+        "variant:0000", "variant:1000", "variant:1010",
+        "variant:0100", "variant:0101", "variant:1100", "variant:1111",
     ]
 
 

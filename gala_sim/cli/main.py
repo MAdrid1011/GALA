@@ -16,6 +16,9 @@ from gala_sim.results import AblationRow, write_ablation_csv
 from gala_sim.results.run import RunOutputWriter
 from gala_sim.results.manifest import write_json
 from gala_sim.identity import sha256_file
+from gala_sim.mechanisms import (
+    CANONICAL_VARIANT_POLICIES, CYCLE_POLICY_NAMES,
+)
 from gala_sim.timing import (
     CycleConfig, CycleEngine, RelationPacketPlan, analyze_cycle_lower_bounds,
 )
@@ -122,7 +125,7 @@ def _parser() -> argparse.ArgumentParser:
     replay.add_argument("--ramulator-config", type=Path, default=None)
     replay.add_argument("--resource-usage", type=Path, required=True,
                         help="JSON ResourceUsage snapshot")
-    replay.add_argument("--policy", default="base")
+    replay.add_argument("--policy", default="base", choices=CYCLE_POLICY_NAMES)
     replay.add_argument("--output", type=Path, required=True)
     replay.add_argument("--quick-validation", action="store_true")
     replay.add_argument("--throughput-progress", action="store_true")
@@ -432,18 +435,43 @@ def main(argv: list[str] | None = None) -> int:
                 or sample_metadata.get("result_scope") != "quick_cycle_validation"
             ):
                 raise ValueError("sampled trace metadata is malformed")
-            if sample_metadata.get("schema_version") in QUERY_PACKET_SAMPLE_SCHEMA_VERSIONS:
+            sample_schema = sample_metadata.get("schema_version")
+            if sample_schema in (
+                *QUERY_PACKET_SAMPLE_SCHEMA_VERSIONS,
+                CAPTURED_PACKET_SAMPLE_SCHEMA_VERSION,
+            ):
                 eligible_policies = sample_metadata.get("eligible_policies")
-                stateful = sample_metadata.get("state_versions_preserved") is True
-                if args.command == "cycle-replay" and (
-                    not isinstance(eligible_policies, list)
-                    or args.policy not in {str(policy) for policy in eligible_policies}
+                if (
+                    eligible_policies is None
+                    and sample_schema == CAPTURED_PACKET_SAMPLE_SCHEMA_VERSION
                 ):
+                    # Captured-packet v1 predates the explicit policy field,
+                    # but its complete forward/backward expansion has this
+                    # fixed scope. New samples always write the declaration.
+                    eligible_policies = [
+                        "base", "query", "residency", "full",
+                        "query_oracle", "residency_oracle",
+                        *CANONICAL_VARIANT_POLICIES,
+                    ]
+                if not isinstance(eligible_policies, list):
+                    raise ValueError("sampled trace policy scope is malformed")
+                stateful = sample_metadata.get("state_versions_preserved") is True
+                if args.command == "cycle-replay" and args.policy not in {
+                    str(policy) for policy in eligible_policies
+                }:
                     raise ValueError(
                         "query packet sample policy is outside its declared scope"
                     )
-                if args.command in {"ablation", "cycle-bounds"} and stateful:
-                    pass
+                if args.command in {"ablation", "cycle-bounds"} and (
+                    sample_schema == CAPTURED_PACKET_SAMPLE_SCHEMA_VERSION
+                    or stateful
+                ):
+                    if args.command == "ablation" and not set(
+                        CANONICAL_VARIANT_POLICIES
+                    ).issubset({str(policy) for policy in eligible_policies}):
+                        raise ValueError(
+                            "sample policy scope does not cover the seven canonical evaluations"
+                        )
                 elif args.command != "cycle-replay":
                     raise ValueError(
                         "only stateful query packet samples support bounds or ablation"

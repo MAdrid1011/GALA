@@ -9,6 +9,7 @@ from typing import Callable, Iterator
 import numpy as np
 
 from gala_sim.clamp.events import PrimitiveKind, dependency_dtype, event_dtype
+from gala_sim.mechanisms import CANONICAL_VARIANT_POLICIES
 
 from .model import Trace
 from .validator import validate_trace
@@ -338,7 +339,7 @@ def real_query_packet_sample(
             "eligible_policies": [
                 "base", "query", "residency", "full",
                 "query_oracle", "residency_oracle",
-                *(f"variant:{number:04b}" for number in range(16)),
+                *CANONICAL_VARIANT_POLICIES,
             ],
             "source_identity": source_identity,
             "source_event_count": trace.event_count,

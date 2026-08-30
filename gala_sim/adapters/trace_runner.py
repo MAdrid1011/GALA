@@ -10,6 +10,8 @@ from pathlib import Path
 import runpy
 import sys
 
+from gala_sim.mechanisms import ONLINE_POLICY_NAMES
+
 from .trace_capture import TraceSession
 
 
@@ -70,7 +72,7 @@ def _parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--online-cycle-policy", default="base",
-        choices=("base", "query_oracle", "residency_oracle", "full"),
+        choices=ONLINE_POLICY_NAMES,
         help="cycle policy used by the bounded online virtual replay",
     )
     parser.add_argument("train_script", type=Path)

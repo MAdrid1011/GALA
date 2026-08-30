@@ -1,8 +1,10 @@
-"""The fixed sixteen-row ablation matrix."""
+"""The seven canonical compiler/architecture mechanism evaluations."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+
+from gala_sim.mechanisms import CANONICAL_VARIANT_BITS, validate_variant_bits
 
 
 @dataclass(frozen=True, order=True)
@@ -10,8 +12,7 @@ class AblationVariant:
     bits: str
 
     def __post_init__(self) -> None:
-        if len(self.bits) != 4 or any(bit not in "01" for bit in self.bits):
-            raise ValueError("ablation bits must be four binary characters in ABCD order")
+        validate_variant_bits(self.bits)
 
     @property
     def compiler_query_load_rules(self) -> bool:
@@ -35,14 +36,19 @@ def parse_variant(value: str) -> AblationVariant:
 
 
 def all_variants() -> tuple[AblationVariant, ...]:
-    return tuple(AblationVariant(f"{number:04b}") for number in range(16))
+    return tuple(AblationVariant(bits) for bits in CANONICAL_VARIANT_BITS)
 
 
 def validate_matrix(bits: list[str] | tuple[str, ...]) -> tuple[AblationVariant, ...]:
     variants = tuple(AblationVariant(value) for value in bits)
     expected = all_variants()
     if set(variants) != set(expected) or len(variants) != len(expected):
-        raise ValueError("ablation matrix must contain each of the sixteen variants exactly once")
+        raise ValueError(
+            "evaluation matrix must contain each of the seven canonical variants exactly once"
+        )
     if variants != expected:
-        raise ValueError("ablation matrix must use canonical 0000..1111 order")
+        raise ValueError(
+            "evaluation matrix must use canonical "
+            "0000,1000,1010,0100,0101,1100,1111 order"
+        )
     return variants

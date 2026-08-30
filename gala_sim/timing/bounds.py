@@ -15,6 +15,7 @@ from gala_sim.timing.packets import (
     RelationPacketPlan,
     RelationWindowPlan,
 )
+from gala_sim.timing.placement import folded_gaussian_index
 
 
 @dataclass(frozen=True)
@@ -618,10 +619,10 @@ def _fusion_components(
     return components
 
 
-def _stage_gated_fusion_component(
+def _base_single_issue_component(
     engine: Any, trace: Trace, packet_plan: RelationPacketPlan,
 ) -> CycleBoundComponent | None:
-    """Bound A/C-disabled execution by its one-task global issue contract."""
+    """Bound C-disabled execution by its one-task global issue contract."""
 
     items = _module_work_items(engine, trace, "fusion_issue", packet_plan)
     if not items:
@@ -642,7 +643,7 @@ def _stage_gated_fusion_component(
         )
     return CycleBoundComponent(
         name="fusion_issue.base_single_issue",
-        category="stage_gated_fusion_issue",
+        category="base_fusion_issue",
         cycles=cycles,
         evidence={
             "physical_task_count": len(items),
@@ -653,8 +654,85 @@ def _stage_gated_fusion_component(
             "minimum_service_cycles": timing.latency,
         },
         limitation=(
-            "Applies only when A/C are disabled and all Fusion task classes "
-            "share the frozen one-task-per-cycle arrival-order issue contract."
+            "Applies only when overlap-guided issue is disabled and all "
+            "Fusion task classes share the one-task-per-cycle arrival-order contract."
+        ),
+    )
+
+
+def _semantic_bundle_issue_component(
+    engine: Any, trace: Trace, packet_plan: RelationPacketPlan,
+) -> CycleBoundComponent | None:
+    """Bound B+D execution using indexed same-state resident-state bundles."""
+
+    destinations = min(
+        int(engine.config.cache_multicast_destinations or 1),
+        int(engine.config.candidate_lanes),
+    )
+    if destinations <= 1:
+        return _base_single_issue_component(engine, trace, packet_plan)
+    items = _module_work_items(engine, trace, "fusion_issue", packet_plan)
+    if not items:
+        return None
+    bundle_counts: dict[
+        PrimitiveKind, dict[tuple[int, int, int], int]
+    ] = {
+        PrimitiveKind.FORWARD: {},
+        PrimitiveKind.ADJOINT: {},
+    }
+    unbundled = 0
+    physical_by_kind: dict[str, int] = {}
+    for event_id, _physical_stage in items:
+        row = trace.events[event_id]
+        kind = PrimitiveKind(int(row["primitive_kind"]))
+        physical_by_kind[kind.name] = physical_by_kind.get(kind.name, 0) + 1
+        if kind in bundle_counts:
+            key = (
+                int(row["gaussian_id"]),
+                int(row["state_version"]),
+                int(row["template_id"]),
+            )
+            by_key = bundle_counts[kind]
+            by_key[key] = by_key.get(key, 0) + 1
+        else:
+            unbundled += 1
+    bundle_submissions = {
+        kind: sum(
+            math.ceil(count / destinations) for count in by_key.values()
+        )
+        for kind, by_key in bundle_counts.items()
+    }
+    submissions = sum(bundle_submissions.values()) + unbundled
+    timing = engine.modules["fusion_issue"].timing
+    cycles = _issue_completion_bound(
+        submissions, ports=1,
+        initiation_interval=timing.initiation_interval,
+        minimum_service=timing.latency,
+    )
+    return CycleBoundComponent(
+        name="fusion_issue.semantic_bundle_issue",
+        category="semantic_fusion_issue",
+        cycles=cycles,
+        evidence={
+            "physical_task_count": len(items),
+            "physical_tasks_by_kind": dict(sorted(physical_by_kind.items())),
+            "same_state_forward_keys": len(bundle_counts[PrimitiveKind.FORWARD]),
+            "same_state_adjoint_keys": len(bundle_counts[PrimitiveKind.ADJOINT]),
+            "forward_bundle_submissions": bundle_submissions[
+                PrimitiveKind.FORWARD
+            ],
+            "adjoint_bundle_submissions": bundle_submissions[
+                PrimitiveKind.ADJOINT
+            ],
+            "unbundled_submissions": unbundled,
+            "physical_submissions": submissions,
+            "destinations_per_bundle": destinations,
+            "initiation_interval": timing.initiation_interval,
+            "minimum_service_cycles": timing.latency,
+        },
+        limitation=(
+            "Assumes same-state forward and adjoint work is simultaneously ready "
+            "with ideal query-Bank distribution; consumers remain single issue."
         ),
     )
 
@@ -687,9 +765,15 @@ def _compute_components(
         )
         path_name = engine.modules["compute_pod"]._path_for(kind)
         count_by_path[path_name] = count_by_path.get(path_name, 0) + 1
+        issue_cycles = (
+            profile.packet_issue_cycles(physical_stage.active_lanes)
+            if physical_stage is not None
+            and kind in {PrimitiveKind.FORWARD, PrimitiveKind.ADJOINT}
+            else profile.cluster_issue_cycles
+        )
         event_demand: dict[str, int] = {
-            "cluster_issue": profile.cluster_issue_slots * profile.cluster_issue_cycles,
-            "microcontext_slots": profile.cluster_issue_cycles,
+            "cluster_issue": profile.cluster_issue_slots * issue_cycles,
+            "microcontext_slots": issue_cycles,
         }
         for stage in profile.stages:
             for resource, value in engine.modules["compute_pod"]._demands(stage):
@@ -827,7 +911,7 @@ def _capacity_diagnostics(
         }
         for row in trace.events[mask]:
             gaussian_id = int(row["gaussian_id"])
-            unique_by_instance[gaussian_id % instances].add(
+            unique_by_instance[folded_gaussian_index(gaussian_id, instances)].add(
                 (gaussian_id, int(row["state_version"]))
             )
         counts = {str(key): len(value) for key, value in unique_by_instance.items()}
@@ -870,8 +954,10 @@ def _capacity_diagnostics(
         gaussian_id = int(row["gaussian_id"])
         if gaussian_id < 0:
             continue
-        pod = gaussian_id % pods
-        cluster = pod * clusters_per_pod + gaussian_id % clusters_per_pod
+        pod = folded_gaussian_index(gaussian_id, pods)
+        cluster = pod * clusters_per_pod + folded_gaussian_index(
+            gaussian_id, clusters_per_pod,
+        )
         owner_keys.setdefault(cluster, set()).add(
             (int(row["iteration_id"]), gaussian_id, int(row["state_version"]))
         )
@@ -1006,14 +1092,18 @@ def analyze_cycle_lower_bounds(
                 engine, trace, packet_plan, compulsory_cache_writes=True,
             )
         )
-        stage_gated_component = (
-            _stage_gated_fusion_component(engine, trace, packet_plan)
+        residency_issue = (
+            (
+                _semantic_bundle_issue_component(engine, trace, packet_plan)
+                if engine.config.fusion_semantic_bundle_index_bytes is not None
+                else _base_single_issue_component(engine, trace, packet_plan)
+            )
             if scenario == "residency" else None
         )
         components = tuple([
             *common_components,
             *scenario_module_components,
-            *((stage_gated_component,) if stage_gated_component is not None else ()),
+            *((residency_issue,) if residency_issue is not None else ()),
             *_memory_components(
                 engine,
                 request_count=request_count,

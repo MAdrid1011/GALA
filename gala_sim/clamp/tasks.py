@@ -582,7 +582,9 @@ class FusionIssueScheduler:
                 f"F={totals[0]}, C={totals[1]}, A={totals[2]}"
             )
 
-    def score(self, task: TaskPacket) -> IssueScore:
+    def score(
+        self, task: TaskPacket, *, use_history_prediction: bool = True,
+    ) -> IssueScore:
         released_work = 0
         completed_queries = 0
         remaining_work = 0
@@ -590,7 +592,11 @@ class FusionIssueScheduler:
             state = self.states.get(query_id)
             if state is None:
                 continue
-            remaining = state.predicted_remaining(task.task_kind)
+            remaining = (
+                state.predicted_remaining(task.task_kind)
+                if use_history_prediction
+                else state.exact_remaining(task.task_kind)
+            )
             releases_lane = remaining == 1
             if releases_lane:
                 released_work += 1
@@ -614,10 +620,20 @@ class FusionIssueScheduler:
             source=task.task_kind,
         )
 
-    def forecast(self, candidates: Iterable[TaskPacket]) -> list[TaskPacket]:
+    def forecast(
+        self,
+        candidates: Iterable[TaskPacket],
+        *,
+        use_history_prediction: bool = True,
+    ) -> list[TaskPacket]:
         """Order FIFO heads using the authoritative runtime comparison key."""
 
-        return sorted(candidates, key=self._sort_key)
+        return sorted(
+            candidates,
+            key=lambda task: self._sort_key(
+                task, use_history_prediction=use_history_prediction,
+            ),
+        )
 
     def issue(
         self,
@@ -626,6 +642,7 @@ class FusionIssueScheduler:
         occupied_keys: set[tuple[ReductionDomain, int]] | None = None,
         occupied_targets: set[int] | None = None,
         use_load_rules: bool = True,
+        use_history_prediction: bool = True,
     ) -> IssueDecision:
         candidates = list(candidates)
         self.observe_arrival(candidates)
@@ -634,6 +651,7 @@ class FusionIssueScheduler:
             occupied_keys=occupied_keys,
             occupied_targets=occupied_targets,
             use_load_rules=use_load_rules,
+            use_history_prediction=use_history_prediction,
         )
         self.commit_issued(decision.accepted)
         return decision
@@ -645,26 +663,31 @@ class FusionIssueScheduler:
         occupied_keys: set[tuple[ReductionDomain, int]] | None = None,
         occupied_targets: set[int] | None = None,
         use_load_rules: bool = True,
+        use_history_prediction: bool = True,
     ) -> IssueDecision:
         """Choose ready conflict-free FIFO heads without committing state."""
 
         candidates = list(candidates)
-        if not use_load_rules:
+        if not use_load_rules and not use_history_prediction:
             return self.select_in_order(
                 candidates,
                 occupied_keys=occupied_keys,
                 occupied_targets=occupied_targets,
             )
-        self._load_rule_evaluations += 1
-        self._history_candidate_evaluations += sum(
-            any(
-                (state := self.states.get(query_id)) is not None
-                and state.history_valid
-                for query_id in task.query_lane_ids
+        if use_load_rules:
+            self._load_rule_evaluations += 1
+        if use_history_prediction:
+            self._history_candidate_evaluations += sum(
+                any(
+                    (state := self.states.get(query_id)) is not None
+                    and state.history_valid
+                    for query_id in task.query_lane_ids
+                )
+                for task in candidates
             )
-            for task in candidates
+        ordered = self.forecast(
+            candidates, use_history_prediction=use_history_prediction,
         )
-        ordered = self.forecast(candidates)
         baseline = self.select_in_order(
             candidates,
             occupied_keys=occupied_keys,
@@ -673,7 +696,7 @@ class FusionIssueScheduler:
         selected = self.select_in_order(
             ordered, occupied_keys=occupied_keys, occupied_targets=occupied_targets,
         )
-        if tuple(task.event_id for task in selected.accepted) != tuple(
+        if use_load_rules and tuple(task.event_id for task in selected.accepted) != tuple(
             task.event_id for task in baseline.accepted
         ):
             self._load_rule_selection_changes += 1
@@ -746,7 +769,7 @@ class FusionIssueScheduler:
             self._round_robin_head = TaskKind((int(first_kind) % len(TaskKind)) + 1)
 
     def _sort_key(
-        self, task: TaskPacket,
+        self, task: TaskPacket, *, use_history_prediction: bool = True,
     ) -> tuple[int, int, int, int, int, int, int]:
         if not self.strict_lifecycle:
             priority = {
@@ -755,7 +778,9 @@ class FusionIssueScheduler:
                 TaskKind.ADJOINT: self.states.get(task.query_id, QueryState()).adjoint_count,
             }[task.task_kind]
             return (priority, task.query_id, task.reduction_key, 0, 0, 0, task.event_id)
-        score = self.score(task)
+        score = self.score(
+            task, use_history_prediction=use_history_prediction,
+        )
         distance = (
             int(score.source) - int(self._round_robin_head)
         ) % len(TaskKind)

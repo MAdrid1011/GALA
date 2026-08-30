@@ -179,6 +179,12 @@ parameters:
       source: GALA low-cost banked Fusion FIFO head-index metadata
       scope: hardware
       status: frozen
+    semantic_bundle_index_bytes:
+      value: 640
+      unit: byte
+      source: docs/03_HARDWARE_CONTRACT.md:semantic-fusion-bundle
+      scope: hardware
+      status: frozen
     bank_head_lookahead:
       value: true
       unit: bool
@@ -254,6 +260,12 @@ parameters:
       source: docs/04_PARAMETER_REGISTRY.md:architecture-defaults
       scope: hardware
       status: frozen
+    ready_head_index_bytes:
+      value: 18432
+      unit: byte
+      source: docs/03_HARDWARE_CONTRACT.md:semantic-cache
+      scope: hardware
+      status: frozen
     sector_bytes:
       value: 64
       unit: byte
@@ -261,6 +273,12 @@ parameters:
       scope: hardware
       status: frozen
   compute:
+    ready_head_index_bytes:
+      value: 640
+      unit: byte
+      source: docs/03_HARDWARE_CONTRACT.md:compute-ready-head-index
+      scope: hardware
+      status: frozen
     clusters_per_pod:
       value: 5
       unit: cluster

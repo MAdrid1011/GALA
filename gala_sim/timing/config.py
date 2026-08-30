@@ -124,6 +124,19 @@ class ComputePathProfile:
             raise ValueError("ComputePod lane completion exceeds packet last result")
         return offset
 
+    def packet_issue_cycles(self, active_lanes: int) -> int:
+        """Return cluster admission occupancy for one real physical packet."""
+
+        if active_lanes <= 0:
+            raise ValueError("ComputePod packet must contain an active lane")
+        issue_groups = (
+            active_lanes + self.packet_lanes_per_issue - 1
+        ) // self.packet_lanes_per_issue
+        cycles = issue_groups * self.packet_lane_issue_interval
+        if cycles > self.cluster_issue_cycles:
+            raise ValueError("ComputePod packet exceeds the configured full-pack issue window")
+        return cycles
+
 
 @dataclass(frozen=True)
 class ComputeTemplateProfile:
@@ -174,11 +187,13 @@ class CycleConfig:
     candidate_fifo_entries: int | None = None
     fusion_bank_head_lookahead: bool | None = None
     fusion_bank_head_index_bytes: int | None = None
+    fusion_semantic_bundle_index_bytes: int | None = None
     cache_instances: int | None = None
     cache_capacity_per_instance: int | None = None
     cache_directory_banks: int | None = None
     cache_sector_bytes: int | None = None
     cache_multicast_destinations: int | None = None
+    cache_ready_head_index_bytes: int | None = None
     fusion_forward_ports: int | None = None
     fusion_consumer_ports: int | None = None
     fusion_adjoint_ports: int | None = None
@@ -188,6 +203,7 @@ class CycleConfig:
     compute_templates: Mapping[int, ComputeTemplateProfile] | None = None
     compute_resource_capacities: Mapping[str, int] | None = None
     owner_gradient_slots_per_cluster: int | None = None
+    compute_ready_head_index_bytes: int | None = None
     query_reduction_banks: int | None = None
     query_partial_sum_groups_per_bank: int | None = None
     query_loss_fma_lanes: int | None = None
@@ -250,6 +266,11 @@ class CycleConfig:
         ):
             raise ValueError("Fusion Bank head index metadata must be positive")
         if (
+            self.fusion_semantic_bundle_index_bytes is not None
+            and self.fusion_semantic_bundle_index_bytes <= 0
+        ):
+            raise ValueError("Fusion semantic bundle index metadata must be positive")
+        if (
             self.fusion_bank_head_lookahead is not None
             and not isinstance(self.fusion_bank_head_lookahead, bool)
         ):
@@ -260,17 +281,28 @@ class CycleConfig:
             raise ValueError(
                 "Fusion Bank head lookahead and metadata budget must be configured together"
             )
+        if (
+            self.cache_ready_head_index_bytes is not None
+            and self.cache_ready_head_index_bytes <= 0
+        ):
+            raise ValueError("cache ready-head index metadata must be positive")
         if (self.resource_envelope is None) != (self.resource_usage is None):
             raise ValueError("resource envelope and usage must be provided together")
         if self.resource_envelope is not None and self.resource_usage is not None:
             self.resource_envelope.check(self.resource_usage)
-            if (
-                self.fusion_bank_head_index_bytes is not None
-                and self.fusion_bank_head_index_bytes
-                > self.resource_usage.regions.get("control_metadata", 0)
+            indexed_control_bytes = sum(
+                value or 0 for value in (
+                    self.fusion_bank_head_index_bytes,
+                    self.fusion_semantic_bundle_index_bytes,
+                    self.cache_ready_head_index_bytes,
+                    self.compute_ready_head_index_bytes,
+                )
+            )
+            if indexed_control_bytes > self.resource_usage.regions.get(
+                "control_metadata", 0
             ):
                 raise ValueError(
-                    "Fusion Bank head index exceeds control metadata region"
+                    "ready-head indexes exceed control metadata region"
                 )
         if self.compute_templates is not None:
             if not self.compute_templates:
@@ -287,6 +319,11 @@ class CycleConfig:
             and self.owner_gradient_slots_per_cluster <= 0
         ):
             raise ValueError("owner-gradient slot capacity must be positive")
+        if (
+            self.compute_ready_head_index_bytes is not None
+            and self.compute_ready_head_index_bytes <= 0
+        ):
+            raise ValueError("ComputePod ready-head index metadata must be positive")
         query_values = (
             self.query_reduction_banks,
             self.query_partial_sum_groups_per_bank,
@@ -428,11 +465,17 @@ class CycleConfig:
                    fusion_bank_head_index_bytes=int(
                        config.value("issue.bank_head_index_bytes")
                    ),
+                   fusion_semantic_bundle_index_bytes=int(
+                       config.value("issue.semantic_bundle_index_bytes")
+                   ),
                    cache_instances=int(config.value("cache.instances")),
                    cache_capacity_per_instance=int(config.value("cache.active_records_per_instance")),
                    cache_directory_banks=int(config.value("cache.directory_banks_per_instance")),
                    cache_sector_bytes=int(config.value("cache.sector_bytes")),
                    cache_multicast_destinations=int(config.value("cache.multicast_destinations")),
+                   cache_ready_head_index_bytes=int(
+                       config.value("cache.ready_head_index_bytes")
+                   ),
                    fusion_forward_ports=int(config.value("issue.forward_ports")),
                    fusion_consumer_ports=int(config.value("issue.consumer_ports")),
                    fusion_adjoint_ports=int(config.value("issue.adjoint_ports")),
@@ -458,6 +501,9 @@ class CycleConfig:
                    },
                    owner_gradient_slots_per_cluster=int(
                        config.value("compute.owner_gradient_slots_per_cluster")
+                   ),
+                   compute_ready_head_index_bytes=int(
+                       config.value("compute.ready_head_index_bytes")
                    ),
                    query_reduction_banks=int(config.value("query.reduction_banks")),
                    query_partial_sum_groups_per_bank=int(

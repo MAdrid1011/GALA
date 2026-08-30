@@ -69,11 +69,13 @@ def test_production_compute_profiles_have_audited_path_latencies() -> None:
     assert config.query_relation_store_banks == 16
     assert config.relation_support_lanes == 8
     assert config.owner_gradient_slots_per_cluster == 3
+    assert config.compute_ready_head_index_bytes == 640
     assert config.fusion_forward_ports == 2
     assert config.fusion_consumer_ports == 1
     assert config.fusion_adjoint_ports == 2
     assert config.fusion_bank_head_lookahead is True
     assert config.fusion_bank_head_index_bytes == 224
+    assert config.fusion_semantic_bundle_index_bytes == 640
     assert CycleEngine(config)._module_issue_ports("bidirectional_query") == 121
     assert CycleEngine(config)._module_issue_ports("relation_constructor") == 24
     assert config.compute_templates[1].latency_for("forward") == 17
@@ -93,6 +95,10 @@ def test_production_compute_profiles_have_audited_path_latencies() -> None:
     )
     assert {raster_adjoint.packet_completion_offset(lane) for lane in range(8)} == {34}
     assert {voxel_adjoint.packet_completion_offset(lane) for lane in range(8)} == {68}
+    assert raster_forward.packet_issue_cycles(7) == 4
+    assert voxel_forward.packet_issue_cycles(5) == 5
+    assert raster_adjoint.packet_issue_cycles(3) == 3
+    assert voxel_adjoint.packet_issue_cycles(5) == 15
 
 
 def test_query_reduction_bank_count_must_support_bitmask_mapping() -> None:
@@ -108,6 +114,33 @@ def test_query_ready_arbitration_covers_the_complete_resident_queue() -> None:
     assert engine._ready_scan_window("bidirectional_query") == (
         engine.modules["bidirectional_query"].timing.queue_capacity
     )
+
+
+def test_compute_ready_head_index_is_isolated_to_overlap_guided_issue() -> None:
+    config = _production_config()
+
+    assert CycleEngine(config, policy="base")._ready_scan_window("compute_pod") == 40
+    assert (
+        CycleEngine(config, policy="variant:1000")
+        ._ready_scan_window("compute_pod")
+        == 40
+    )
+    assert (
+        CycleEngine(config, policy="variant:1010")
+        ._ready_scan_window("compute_pod")
+        == config.modules["compute_pod"].queue_capacity
+    )
+
+
+def test_compute_ready_priority_drains_owner_gradient_before_flexible_work() -> None:
+    engine = CycleEngine(_production_config())
+
+    assert engine._ready_issue_priority(
+        PrimitiveKind.GRADIENT_REDUCTION, 0,
+    ) < engine._ready_issue_priority(PrimitiveKind.ADJOINT, 2)
+    assert engine._ready_issue_priority(
+        PrimitiveKind.ADJOINT, 2,
+    ) < engine._ready_issue_priority(PrimitiveKind.ADJOINT, 1)
 
 
 def test_production_compute_profile_rejects_unknown_template() -> None:
@@ -366,6 +399,10 @@ def test_ready_selection_finds_reusable_owner_epoch_beyond_fifo_head() -> None:
     rows[257]["gaussian_id"] = rows[0]["gaussian_id"]
     tracker = OwnerGradientTracker(
         pods=4, clusters_per_pod=5, slots_per_cluster=2,
+        cluster_by_key={
+            (1, int(gaussian_id)): 0
+            for gaussian_id in rows["gaussian_id"]
+        },
     )
     tracker.register_rows(rows)
     tracker.reserve_adjoint((0,))
@@ -385,7 +422,7 @@ def test_ready_selection_finds_reusable_owner_epoch_beyond_fifo_head() -> None:
     assert len(queue) == 255
 
 
-def test_ready_index_matches_full_scan_across_owner_state_changes() -> None:
+def test_ready_index_matches_provisional_scan_across_owner_state_changes() -> None:
     rows = np.empty(14, dtype=TraceBuilder().finish().events.dtype)
     rows[:] = TraceEvent().as_tuple()
     rows["event_id"] = np.arange(14)
@@ -408,12 +445,6 @@ def test_ready_index_matches_full_scan_across_owner_state_changes() -> None:
     for candidate in remaining:
         queue.push(candidate)
 
-    def acceptable(candidate: tuple[int, int]) -> bool:
-        event_id, _stage = candidate
-        if PrimitiveKind(int(rows[event_id]["primitive_kind"])) is not PrimitiveKind.ADJOINT:
-            return True
-        return not tracker.blocks_adjoint((event_id,))
-
     for active in (
         {first_key, second_key},
         {tracker.key_for_adjoint(3)},
@@ -423,7 +454,23 @@ def test_ready_index_matches_full_scan_across_owner_state_changes() -> None:
             tracker.active_by_cluster[0] = active
         else:
             tracker.active_by_cluster.clear()
-        expected = [candidate for candidate in sorted(remaining) if acceptable(candidate)][:3]
+        provisional = {
+            cluster: set(keys)
+            for cluster, keys in tracker.active_by_cluster.items()
+        }
+        expected = []
+        for candidate in sorted(remaining):
+            event_id, _stage = candidate
+            if PrimitiveKind(int(rows[event_id]["primitive_kind"])) is PrimitiveKind.ADJOINT:
+                key = tracker.key_for_adjoint(event_id)
+                cluster = tracker.cluster_for_key(key)
+                active_keys = provisional.setdefault(cluster, set())
+                if key not in active_keys and len(active_keys) >= tracker.slots_per_cluster:
+                    continue
+                active_keys.add(key)
+            expected.append(candidate)
+            if len(expected) == 3:
+                break
         selected = queue.pop_acceptable(
             3, "compute_pod", row_for=rows.__getitem__,
             physical_stage_for=lambda _event_id: None,
@@ -469,7 +516,36 @@ def test_ready_index_checks_multi_owner_packet_with_original_capacity_rule() -> 
     assert list(queue) == [(1, 2)]
 
 
-def test_ready_index_reaches_adjoint_behind_full_replay_queue() -> None:
+def test_ready_batch_provisionally_reserves_owner_gradient_slots() -> None:
+    rows = np.empty(3, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = np.arange(3)
+    rows["iteration_id"] = 1
+    rows["primitive_kind"] = int(PrimitiveKind.ADJOINT)
+    rows["state_version"] = 0
+    rows["relation_id"] = np.arange(3)
+    # Events zero and one target the same owner cluster with distinct keys;
+    # event two targets another Pod and remains issuable in the same batch.
+    rows["gaussian_id"] = [0, 20, 1]
+    tracker = OwnerGradientTracker(
+        pods=4, clusters_per_pod=5, slots_per_cluster=1,
+    )
+    tracker.register_rows(rows)
+    queue = _ReadyCandidateQueue()
+    for event_id in range(3):
+        queue.push((event_id, 2))
+
+    selected = queue.pop_acceptable(
+        2, "compute_pod", row_for=rows.__getitem__,
+        physical_stage_for=lambda _event_id: None,
+        owner_gradients=tracker, query_replay=None,
+    )
+
+    assert selected == [(0, 2), (2, 2)]
+    assert list(queue) == [(1, 2)]
+
+
+def test_ready_index_keeps_consumers_live_behind_full_replay_queue() -> None:
     rows = np.empty(4, dtype=TraceBuilder().finish().events.dtype)
     rows[:] = TraceEvent().as_tuple()
     rows["event_id"] = np.arange(4)
@@ -484,16 +560,18 @@ def test_ready_index_reaches_adjoint_behind_full_replay_queue() -> None:
     replay = QueryReplayTracker(capacity=1)
     replay.register_rows(rows)
     replay.reserve_consumer(0)
+    replay.reserve_consumer(1)
+    replay.reserve_adjoint((2,))
     queue = _ReadyCandidateQueue()
     queue.push((1, 1))
-    queue.push((2, 1))
+    queue.push((3, 1))
 
     selected = queue.pop_acceptable(
         1, "bidirectional_query", row_for=rows.__getitem__,
         physical_stage_for=lambda _event_id: None,
         owner_gradients=None, query_replay=replay,
     )
-    assert selected == [(2, 1)]
+    assert selected == [(1, 1)]
 
     replay.dispatch_adjoint((2,))
     selected = queue.pop_acceptable(
@@ -501,7 +579,7 @@ def test_ready_index_reaches_adjoint_behind_full_replay_queue() -> None:
         physical_stage_for=lambda _event_id: None,
         owner_gradients=None, query_replay=replay,
     )
-    assert selected == [(1, 1)]
+    assert selected == [(3, 1)]
 
 
 def test_ready_queue_compacts_stale_requeue_indexes() -> None:
@@ -689,6 +767,55 @@ def test_production_compute_route_stays_in_resident_pod_and_owner_cluster() -> N
     assert any(
         resource == "cluster_issue:17" for resource, _cycle, _demand in gradient
     )
+
+
+def test_compute_pod_packs_single_slot_work_before_using_empty_cluster() -> None:
+    profile = ComputeTemplateProfile(1, {
+        "adjoint": ComputePathProfile((
+            ComputeStage("TRANSFORM", latency=1),
+        ), cluster_issue_slots=1, cluster_issue_cycles=2),
+    })
+    pod = ComputePod(
+        "compute_pod",
+        ModuleTiming(latency=1, initiation_interval=1, queue_capacity=8,
+                     ports=1, banks=1), CounterBlock(),
+        template_profiles={1: profile},
+        resource_capacities={
+            "pods": 1, "clusters_per_pod": 2, "clusters": 2,
+            "cluster_issue": 4, "fma_groups": 2,
+            "transcendental_lanes": 2, "reduction_trees": 2,
+            "microcontext_slots": 8, "feedback_lanes": 2,
+        },
+    )
+    first = pod.reservation_plan(1, PrimitiveKind.ADJOINT, 0, pod=0)
+    pod.reserve(first)
+    second = pod.reservation_plan(1, PrimitiveKind.ADJOINT, 0, pod=0)
+
+    first_clusters = {
+        resource for resource, _cycle, _demand in first
+        if resource.startswith("cluster_issue:")
+    }
+    second_clusters = {
+        resource for resource, _cycle, _demand in second
+        if resource.startswith("cluster_issue:")
+    }
+    assert first_clusters == {"cluster_issue:0"}
+    assert second_clusters == first_clusters
+
+
+def test_compute_pod_partial_packet_uses_only_active_lane_issue_cycles() -> None:
+    compute = CycleEngine(_production_config()).modules["compute_pod"]
+    assert isinstance(compute, ComputePod)
+
+    plan = compute.reservation_plan(
+        2, PrimitiveKind.ADJOINT, 10, pod=0, active_lanes=5,
+    )
+    issue_points = {
+        cycle for resource, cycle, _demand in plan
+        if resource.startswith("cluster_issue:")
+    }
+
+    assert issue_points == set(range(10, 25))
 
 
 def test_compute_pod_tracks_each_stage_resource_window() -> None:
