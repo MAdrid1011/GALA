@@ -54,6 +54,13 @@ def _parser() -> argparse.ArgumentParser:
         help="Gala config providing compact capture software parameters",
     )
     parser.add_argument(
+        "--archive-max-inflight-chunks", type=int, default=None,
+        help=(
+            "override concurrent compact-archive compression chunks; this "
+            "software bound is independent of the online cycle frontier"
+        ),
+    )
+    parser.add_argument(
         "--capture-iteration-range", type=_iteration_range, default=None,
         metavar="START:END",
         help="capture an inclusive validation window while executing all training iterations",
@@ -104,6 +111,18 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("--packet-archive-root requires --virtual-capture")
     if args.capture_config is not None and not args.virtual_capture:
         raise ValueError("--capture-config requires --virtual-capture")
+    if (
+        args.archive_max_inflight_chunks is not None
+        and args.packet_archive_root is None
+    ):
+        raise ValueError(
+            "--archive-max-inflight-chunks requires --packet-archive-root"
+        )
+    if (
+        args.archive_max_inflight_chunks is not None
+        and args.archive_max_inflight_chunks <= 0
+    ):
+        raise ValueError("--archive-max-inflight-chunks must be positive")
     online_options = (
         args.online_cycle_config,
         args.online_ramulator_build_manifest,
@@ -185,8 +204,13 @@ def main(argv: list[str] | None = None) -> int:
         capture_config = load_config(config_path)
         capture_config.require_ready()
         archive_chunk_bytes = int(capture_config.value("trace.archive_chunk_bytes"))
-        archive_max_inflight_chunks = int(
+        configured_archive_chunks = int(
             capture_config.value("trace.max_inflight_chunks")
+        )
+        archive_max_inflight_chunks = (
+            configured_archive_chunks
+            if args.archive_max_inflight_chunks is None
+            else int(args.archive_max_inflight_chunks)
         )
         if archive_chunk_bytes <= 0 or archive_max_inflight_chunks <= 0:
             raise ValueError("trace archive chunk capacities must be positive")

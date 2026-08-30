@@ -422,6 +422,54 @@ def test_trace_runner_virtual_capture_requires_explicit_online_or_audit_scope(
             "--packet-archive-root", str(tmp_path / "archive"),
             "train.py",
         ])
+    with pytest.raises(ValueError, match="requires --packet-archive-root"):
+        main([
+            "--trace-output", str(tmp_path / "trace"),
+            "--archive-max-inflight-chunks", "8", "train.py",
+        ])
+    with pytest.raises(ValueError, match="must be positive"):
+        main([
+            "--trace-output", str(tmp_path / "trace"),
+            "--virtual-capture", "--virtual-capture-audit-only",
+            "--packet-archive-root", str(tmp_path / "archive"),
+            "--archive-max-inflight-chunks", "0", "train.py",
+        ])
+
+
+def test_trace_runner_decouples_archive_compression_from_cycle_frontier(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gala_sim.adapters import trace_runner
+
+    session_arguments: dict[str, object] = {}
+
+    class Session:
+        def __init__(self, *_args: object, **kwargs: object) -> None:
+            session_arguments.update(kwargs)
+
+        def install(self) -> None:
+            pass
+
+        def restore(self) -> None:
+            pass
+
+        def finish(self) -> None:
+            pass
+
+    monkeypatch.setattr(trace_runner, "TraceSession", Session)
+    monkeypatch.setattr(trace_runner.runpy, "run_path", lambda *_args, **_kwargs: None)
+    config_path = Path(__file__).parents[1] / "configs/architecture/gala.yaml"
+
+    assert trace_runner.main([
+        "--trace-output", str(tmp_path / "trace"),
+        "--virtual-capture", "--virtual-capture-audit-only",
+        "--packet-archive-root", str(tmp_path / "archive"),
+        "--capture-config", str(config_path),
+        "--archive-max-inflight-chunks", "8",
+        str(tmp_path / "train.py"),
+    ]) == 0
+
+    assert session_arguments["virtual_packet_archive_max_inflight_chunks"] == 8
 
 
 def test_query_and_backward_batches_preserve_capture_order_across_chunk_sizes(

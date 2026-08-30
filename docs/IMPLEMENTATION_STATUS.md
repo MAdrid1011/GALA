@@ -621,7 +621,7 @@ R²-Gaussian 的官方 CUDA 扩展仍没有直接导出完整 CLAMP 事件缓冲
 
 1. 将有界虚拟数据包直接接入跨包 CycleEngine，并在一迭代和 `600:601` 窗口逐字段对照旧完整 trace；通过后运行一次 canonical 30k 虚拟包流的质量、结构、生命周期和资源门。
 2. 在真实 trace 上通过依赖、状态、释放和动态事件计数检查，再运行 `0000` Base ASIC 和两个受资源约束 Oracle；性能采样继续固定使用 16 组结果。
-3. Base ASIC、两个 Oracle 和覆盖外路径冻结后，完成 A/B/C/D、联合运行和十六项消融；`1111` 必须与完整 GALA 周期完全一致。
+3. Base ASIC、两个 Oracle 和覆盖外路径冻结后，依次完成 A、A+C、B、B+D、A+B、A+B+C+D，并运行固定七项正式消融；C 不得脱离 A，D 不得脱离 B，`1111` 必须与完整 GALA 周期完全一致。
 4. AGX Orin 若要形成正式换算，必须在同一校准套件、数据类型和批量范围下取得 Orin 实测向量；在此之前结果块保持 `agx_orin_estimate.status=unavailable`，不得以峰值规格比补值。
 
 当前不报告面积、功耗、能量、能效、正式周期或论文加速比。上述双窗口结果仅用于同一工作量下的机制覆盖范围、Oracle 和相对 Base ASIC 诊断；在正式 30,000 iteration trace 逐字段闭合前，不将其升级为论文端到端周期。
@@ -646,7 +646,7 @@ Bank、每 Bank 四组部分和、32 条 loss FMA lane 和 8 条伴随重放流�
 `QUERY_REDUCTION`、`CONSUMER`、`ADJOINT` 和 `GRADIENT_REDUCTION` 共用一个通用 issue port，
 且需要继续核对前向贡献进入查询 Bank、伴随 replay 回到 Pod 的阶段映射。该合同一致性问题会人为
 形成约 `24,935-cycle` 的串行瓶颈，使两类机制失去可优化空间。下一入口是修正或证明上述资源与阶段
-映射，并公平重跑同一 Base、两个 Oracle 和必要下界；确认之前不启动十六项消融。
+映射，并公平重跑同一 Base、两个 Oracle 和必要下界；确认之前不启动七项正式消融。
 
 上述 `36,093-cycle` 结果已被后续硬件合同修正取代，不能继续作为当前配置下的 Base 或 Oracle
 结果。周期引擎现已分别建模查询归约、loss、伴随重放、query-volume SRAM、关系窗口、关系记录
@@ -722,7 +722,7 @@ cycles，因此状态为 `portfolio_best_known_not_proven_upper_bound`，不能�
 Bank 从 cycle `448` 到 `129,299` 几乎持续冲突；当前 Python 实现仍用 `query_id` 排序代替权威
 实现的实时 `F/C/A` 负载状态和 `(released_work, completed_queries, -remaining_work)` 比较规则。
 下一入口是按权威 C++ 状态机补齐查询负载规则和每 Pod 有界就绪队列，再重跑同一 Base、Query
-实际机制和受资源约束 portfolio；在此之前不启动十六项消融。
+实际机制和受资源约束 portfolio；在此之前不启动七项正式消融。
 
 完整测试更新为 `285 passed, 1 skipped, 2 warnings`。上述结果均为
 `quick_cycle_validation`，不外推到正式 30K；`speedup_vs_orin` 继续保持 `unavailable`。
@@ -780,7 +780,7 @@ frontier 空位会在同一模拟周期发射前补入后续输入。上述逻�
 减小 `max_frontier_events` 会显式改变软件输入反压，因此不再作为正式分包等价维度：同一 tile 的
 `131,072` frontier 为 `26,671 cycles`，而冻结的 `8,000,000` frontier 为 `26,614 cycles`。
 文档冻结配置仍由 `trace.chunk_events=4,000,000` 与 `trace.max_inflight_chunks=2` 推导正式
-frontier；不得把更小诊断容量产生的额外周期混入 Base ASIC、Oracle 或十六项消融。
+frontier；不得把更小诊断容量产生的额外周期混入 Base ASIC、Oracle 或七项正式消融。
 
 同日的完整捕获物理包最小样本包含真实 Raster 与 Voxel packet，共 `505,391` 个事件、`779,583`
 条依赖、`11,698` 个前向物理包和 `217` 个状态键。合同修复后的 Base 为 `30,497 cycles`；B 与 D
@@ -850,3 +850,17 @@ Full 参考 `2.648560x` 均已达到。`1100` 只启用 A/B 两类编译信息�
 `GALA-runtime/records/r2_gaussian_chest_xor6_13_ablation_v1.csv`，范围仍是
 `quick_cycle_validation`，不能冒充完整三万轮正式性能结果；AGX Orin 实测缺失时仍为
 `unavailable`。定向回归和全仓回归分别为 `148 passed` 与 `393 passed, 1 skipped, 2 warnings`。
+
+## 2026-08-30 正式归档压缩并发短门
+
+紧凑 packet 归档现允许用 `--archive-max-inflight-chunks` 单独设置软件 DEFLATE 在途 chunk 数，
+不再复用 ASIC 在线周期前沿的 `trace.max_inflight_chunks`。该参数不改变事件、关系、硬件队列、
+SRAM、端口或周期；正式周期前沿仍固定由 `trace.chunk_events=4,000,000` 和
+`trace.max_inflight_chunks=2` 推导。
+
+使用相同官方命令完整执行前 601 轮、只捕获真实第 500 至 601 轮，分别测试两路、四路和八路
+归档压缩。三次均自然完成 102 轮、204 个物理 packet 和约 64.83 亿条真实关系，并通过完整
+packet、生命周期与捕获审计验证。manifest 捕获时间分别为 `42.642825 s`、`40.907298 s` 和
+`44.448504 s`；四路相对两路缩短约 `4.07%`，八路反而比四路慢约 `8.66%`。因此正式三万轮
+捕获使用四路软件压缩并发，不继续扩大 worker 数；该选择只优化墙钟归档吞吐，不构成 ASIC
+性能结果。
