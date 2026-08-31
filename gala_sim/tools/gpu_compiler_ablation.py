@@ -61,6 +61,7 @@ def _run_once(
     relation_capacity: int,
     row_start: int,
     row_count: int,
+    diagnostic_warmup_runs: int,
     timeout_seconds: float,
 ) -> dict[str, Any]:
     bundle = bundle_root / variant
@@ -75,6 +76,8 @@ def _run_once(
         str(row_start),
         "--row-count",
         str(row_count),
+        "--diagnostic-warmup-runs",
+        str(diagnostic_warmup_runs),
     ]
     try:
         completed = subprocess.run(
@@ -187,11 +190,17 @@ def run_probe(
     row_count: int,
     warmup_runs: int,
     measured_runs: int,
+    diagnostic_warmup_runs: int,
     timeout_seconds: float,
 ) -> dict[str, Any]:
     if relation_capacity <= 0 or row_start < 0 or row_count <= 0:
         raise GpuCompilerProbeError("relation capacity and row count must be positive")
-    if warmup_runs < 0 or measured_runs <= 0 or timeout_seconds <= 0:
+    if (
+        warmup_runs < 0
+        or measured_runs <= 0
+        or diagnostic_warmup_runs < 0
+        or timeout_seconds <= 0
+    ):
         raise GpuCompilerProbeError("run counts and timeout are invalid")
     if not runner.is_file():
         raise GpuCompilerProbeError(f"runner does not exist: {runner}")
@@ -204,6 +213,7 @@ def run_probe(
                 relation_capacity=relation_capacity,
                 row_start=row_start,
                 row_count=row_count,
+                diagnostic_warmup_runs=diagnostic_warmup_runs,
                 timeout_seconds=timeout_seconds,
             )
     samples: dict[str, list[dict[str, Any]]] = {
@@ -220,6 +230,7 @@ def run_probe(
                 relation_capacity=relation_capacity,
                 row_start=row_start,
                 row_count=row_count,
+                diagnostic_warmup_runs=diagnostic_warmup_runs,
                 timeout_seconds=timeout_seconds,
             )
             samples[variant].append(sample)
@@ -244,6 +255,7 @@ def run_probe(
         "row_count": row_count,
         "relation_capacity": relation_capacity,
         "warmup_runs_per_variant": warmup_runs,
+        "diagnostic_warmup_runs_per_process": diagnostic_warmup_runs,
         "measured_runs_per_variant": measured_runs,
         "summary": summary,
     }
@@ -262,6 +274,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--row-count", type=int, required=True)
     parser.add_argument("--warmup-runs", type=int, default=1)
     parser.add_argument("--measured-runs", type=int, default=5)
+    parser.add_argument("--diagnostic-warmup-runs", type=int, default=1)
     parser.add_argument("--timeout-seconds", type=float, default=300.0)
     args = parser.parse_args(argv)
     result = run_probe(
@@ -273,6 +286,7 @@ def main(argv: list[str] | None = None) -> int:
         row_count=args.row_count,
         warmup_runs=args.warmup_runs,
         measured_runs=args.measured_runs,
+        diagnostic_warmup_runs=args.diagnostic_warmup_runs,
         timeout_seconds=args.timeout_seconds,
     )
     print(json.dumps({

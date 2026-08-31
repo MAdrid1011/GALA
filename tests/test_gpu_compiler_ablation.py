@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
 from gala_sim.tools.gpu_compiler_ablation import (
     GpuCompilerProbeError,
     RUNNER_VARIANTS,
+    _run_once,
     summarize_samples,
 )
 
@@ -58,3 +62,31 @@ def test_summary_rejects_changed_numerics() -> None:
     samples["A1B1"][0]["mean_l1_loss"] = 0.2
     with pytest.raises(GpuCompilerProbeError, match="mean_l1_loss"):
         summarize_samples(samples)
+
+
+def test_runner_receives_in_process_warmup(monkeypatch: pytest.MonkeyPatch) -> None:
+    output = _sample(100.0) | {
+        "bundle_variant": "A0B0",
+        "status": "APPROXIMATE",
+    }
+    captured: list[str] = []
+
+    def fake_run(command: list[str], **_: object) -> SimpleNamespace:
+        captured.extend(command)
+        import json
+
+        return SimpleNamespace(returncode=0, stdout=json.dumps(output), stderr="")
+
+    monkeypatch.setattr("subprocess.run", fake_run)
+    _run_once(
+        Path("runner"),
+        Path("bundles"),
+        "A0B0",
+        relation_capacity=20_000,
+        row_start=1,
+        row_count=2,
+        diagnostic_warmup_runs=1,
+        timeout_seconds=5.0,
+    )
+    index = captured.index("--diagnostic-warmup-runs")
+    assert captured[index + 1] == "1"
