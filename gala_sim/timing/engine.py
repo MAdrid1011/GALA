@@ -1921,6 +1921,8 @@ class CycleEngine:
         self._query_history_bases: dict[tuple[int, int], int] = {}
         self._semantic_cluster_by_key: dict[tuple[int, int], int] = {}
         self._semantic_placement: SemanticPlacement | None = None
+        self._joint_semantic_mode_selections = 0
+        self._joint_query_mode_selections = 0
         self._oracle_task_packet_cache: dict[int, TaskPacket] = {}
         self._oracle_pair_compatibility_cache: dict[
             tuple[int, int, int, int, int], bool
@@ -2749,12 +2751,86 @@ class CycleEngine:
             self._fusion_query_state_bank(row),
         )
 
-    def _joint_semantic_priority_enabled(self) -> bool:
-        # D's ready semantic index is a bounded view over the same source FIFO
-        # heads that A+C may issue.  Keeping a ready same-state leader visible
-        # lets the joint path preserve D's real multicast opportunity; the
-        # subsequent compatibility check still enforces A+C's ports, banks,
-        # reduction keys, and target resources.
+    def _joint_query_releases_more_work(
+        self,
+        inputs: Mapping[TaskKind, _BankedFusionSourceQueue],
+        semantic_group: tuple[TaskPacket, ...],
+        query_candidates: list[TaskPacket],
+    ) -> bool:
+        """Compare the two bounded Full paths using current query state only."""
+
+        ordered = self.issue_scheduler.forecast(
+            query_candidates,
+            use_history_prediction=True,
+            semantic_bundles=self._joint_semantic_bundles(
+                inputs, query_candidates,
+            ),
+        )
+        accepted = self.issue_scheduler.select_in_order(ordered).accepted
+        query_group = list(accepted)
+        coordinated_bundle = self._semantic_fusion_bundle(
+            inputs, list(accepted), coordinated_issue=True,
+        )
+        if coordinated_bundle is not None:
+            _leader, followers = coordinated_bundle
+            accepted_ids = {packet.event_id for packet in query_group}
+            query_group.extend(
+                follower for follower in followers
+                if follower.event_id not in accepted_ids
+            )
+
+        def progress_score(
+            group: Iterable[TaskPacket],
+            *,
+            use_history_prediction: bool,
+        ) -> tuple[int, int, int, int]:
+            released_work = 0
+            completed_queries = 0
+            remaining_work = 0
+            count = 0
+            for packet in group:
+                score = self.issue_scheduler.score(
+                    packet,
+                    use_history_prediction=use_history_prediction,
+                )
+                released_work += score.released_work
+                completed_queries += score.completed_queries
+                remaining_work += score.remaining_work
+                count += 1
+            return released_work, completed_queries, remaining_work, count
+
+        query_score = progress_score(
+            query_group, use_history_prediction=True,
+        )
+        semantic_score = progress_score(
+            semantic_group, use_history_prediction=True,
+        )
+        if query_score[:2] != semantic_score[:2]:
+            return query_score[:2] > semantic_score[:2]
+        if min(query_score[3], semantic_score[3]) == 0:
+            return False
+
+        # History predicts which heads to present, but it must not decide
+        # between two otherwise tied physical issue modes.  A phase change can
+        # make the previous round larger than the current one and inflate the
+        # predicted remaining work.  The live F/C/A sidecar is already read by
+        # Forecast and gives this final comparison an exact bounded input.
+        query_score = progress_score(
+            query_group, use_history_prediction=False,
+        )
+        semantic_score = progress_score(
+            semantic_group, use_history_prediction=False,
+        )
+        if query_score[:2] != semantic_score[:2]:
+            return query_score[:2] > semantic_score[:2]
+        if semantic_group[0].task_kind is TaskKind.FORWARD:
+            return False
+        query_lower_remaining = (
+            query_score[2] * semantic_score[3]
+            < semantic_score[2] * query_score[3]
+        )
+        if not query_lower_remaining:
+            return False
         return True
 
     def _peek_fusion_input_candidates(
@@ -2771,10 +2847,10 @@ class CycleEngine:
         the fixed eight-way selection network fair without changing capacity.
         """
 
+        semantic_group: tuple[TaskPacket, ...] = ()
         if (
             self.selection.semantic_worksets
             and self.selection.semantic_residency
-            and self._joint_semantic_priority_enabled()
             and self.config.fusion_semantic_bundle_index_bytes is not None
         ):
             destinations = min(
@@ -2800,7 +2876,14 @@ class CycleEngine:
                         packet.event_id,
                     ),
                 )
-                return [semantic_leader], {}
+                semantic_group = (
+                    semantic_leader,
+                    *inputs[semantic_leader.task_kind].semantic_followers(
+                        semantic_leader, destinations=destinations,
+                    ),
+                )
+                if not self.selection.overlap_guided_issue:
+                    return [semantic_leader], {}
 
         source_order = (
             TaskKind.FORWARD, TaskKind.CONSUMER, TaskKind.ADJOINT,
@@ -2853,6 +2936,14 @@ class CycleEngine:
             selected.append(packet)
             selection_cursor = (chosen_index + 1) % len(borrow_order)
             borrowed[packet.event_id] = (selection_cursor, bank_cursor)
+        if semantic_group:
+            if self._joint_query_releases_more_work(
+                inputs, semantic_group, selected,
+            ):
+                self._joint_query_mode_selections += 1
+            else:
+                self._joint_semantic_mode_selections += 1
+                return [semantic_group[0]], {}
         return selected, borrowed
 
     def _semantic_fusion_bundle(
@@ -5909,6 +6000,10 @@ class CycleEngine:
         module_counters["fusion_issue"].update({
             **self.issue_scheduler.state_table_snapshot(),
             **self.issue_scheduler.history_snapshot(),
+            "joint_semantic_mode_selections": (
+                self._joint_semantic_mode_selections
+            ),
+            "joint_query_mode_selections": self._joint_query_mode_selections,
             "bank_head_selections": sum(
                 queue.bank_head_selections for queue in fusion_inputs.values()
             ),
@@ -7408,6 +7503,12 @@ class CycleReplaySession:
         counters["fusion_issue"].update({
             **self.engine.issue_scheduler.state_table_snapshot(),
             **self.engine.issue_scheduler.history_snapshot(),
+            "joint_semantic_mode_selections": (
+                self.engine._joint_semantic_mode_selections
+            ),
+            "joint_query_mode_selections": (
+                self.engine._joint_query_mode_selections
+            ),
             "bank_head_selections": sum(
                 queue.bank_head_selections
                 for queue in self._fusion_inputs.values()

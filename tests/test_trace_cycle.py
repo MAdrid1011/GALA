@@ -11,6 +11,7 @@ from gala_sim.clamp import (
     ChunkedTraceBuilder,
     FusionIssueScheduler,
     PrimitiveKind,
+    QueryState,
     ReductionDomain,
     ResourceClass,
     TaskKind,
@@ -2075,6 +2076,69 @@ def test_semantic_ready_group_priority_selects_ready_leader_in_joint_variant() -
     assert candidates("variant:1111", previous_support=True) == [10]
     assert candidates("variant:0000") == [10, 1, 11]
     assert candidates("variant:1010") == [10, 1, 11]
+
+
+def test_joint_adjoint_mode_uses_lower_remaining_work_after_release_tie() -> None:
+    config = replace(
+        _config(), candidate_lanes=3,
+        fusion_forward_ports=2, fusion_consumer_ports=1,
+        fusion_adjoint_ports=2, fusion_semantic_bundle_index_bytes=320,
+        cache_multicast_destinations=4,
+    )
+    engine = CycleEngine(config, policy="variant:1111")
+    inputs = {
+        kind: _BankedFusionSourceQueue(capacity=32, banks=8)
+        for kind in TaskKind
+    }
+
+    def packet(
+        event_id: int, query_id: int, gaussian_id: int, kind: TaskKind,
+    ) -> TaskPacket:
+        return TaskPacket(
+            event_id=event_id, query_id=query_id, gaussian_id=gaussian_id,
+            reduction_key=query_id, resource=event_id, state_version=0,
+            template_id=1, address_token=gaussian_id, task_kind=kind,
+        )
+
+    ordinary = (
+        packet(1, 0, 9, TaskKind.FORWARD),
+        packet(30, 32, 8, TaskKind.CONSUMER),
+        packet(40, 40, 6, TaskKind.ADJOINT),
+    )
+    inputs[TaskKind.FORWARD].append(ordinary[0], bank=0)
+    inputs[TaskKind.CONSUMER].append(ordinary[1], bank=4)
+    inputs[TaskKind.ADJOINT].append(ordinary[2], bank=5)
+    for event_id, query_id, bank in ((10, 8, 1), (11, 16, 2), (12, 24, 3)):
+        inputs[TaskKind.ADJOINT].append(
+            packet(event_id, query_id, 7, TaskKind.ADJOINT), bank=bank,
+        )
+
+    engine.issue_scheduler.states.update({
+        0: QueryState(forward_count=2),
+        8: QueryState(
+            adjoint_count=3, generator_closed=True, reduction_ready=True,
+        ),
+        16: QueryState(
+            adjoint_count=3, generator_closed=True, reduction_ready=True,
+        ),
+        24: QueryState(
+            adjoint_count=3, generator_closed=True, reduction_ready=True,
+        ),
+        32: QueryState(
+            consumer_count=2, generator_closed=True, reduction_ready=True,
+        ),
+        40: QueryState(
+            adjoint_count=2, generator_closed=True, reduction_ready=True,
+        ),
+    })
+    selected, borrowed = engine._peek_fusion_input_candidates(
+        inputs, borrow_cursor=0,
+    )
+
+    assert [item.event_id for item in selected] == [1, 30, 40]
+    assert borrowed == {}
+    assert engine._joint_query_mode_selections == 1
+    assert engine._joint_semantic_mode_selections == 0
 
 
 def test_banked_fusion_fifo_advances_cursor_only_after_issue_commit() -> None:
