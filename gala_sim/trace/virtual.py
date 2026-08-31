@@ -234,12 +234,54 @@ class VirtualIterationLedger:
     physical_stream_bytes: int
 
 
+@dataclass(frozen=True)
+class VirtualPacketValidationSummary:
+    """Validated packet counters that retain no decompressed array payload."""
+
+    iteration_id: int
+    query_base: int
+    query_count: int
+    state_version: int
+    candidate_count: int
+    relation_count: int
+    physical_stream_bytes: int
+    backward_confirmed: bool
+
+    def __post_init__(self) -> None:
+        values = (
+            self.iteration_id,
+            self.query_base,
+            self.query_count,
+            self.state_version,
+            self.candidate_count,
+            self.relation_count,
+            self.physical_stream_bytes,
+        )
+        if any(value < 0 for value in values) or self.query_count <= 0:
+            raise ValueError("virtual packet validation summary is invalid")
+
+    @property
+    def logical_relation_count(self) -> int:
+        """Match the packet counter interface used by archive validation."""
+
+        return self.relation_count
+
+    @property
+    def physical_bytes(self) -> int:
+        """Match the packet byte-count interface used by archive validation."""
+
+        return self.physical_stream_bytes
+
+
 @dataclass
 class VirtualTraceLifecycleValidator:
     """Validate packet counts and lifecycle transitions with bounded state."""
 
     initial_gaussian_count: int
     active_gaussians: set[int] | None = None
+    _active_gaussian_bitmap: np.ndarray | None = field(
+        default=None, init=False, repr=False,
+    )
     state_version: int = 0
     current_iteration: int | None = None
     current_packets: int = 0
@@ -253,7 +295,6 @@ class VirtualTraceLifecycleValidator:
     _iteration_start_version: int = 0
     _iteration_start_gaussians: int = 0
     _open_update: tuple[int, int, int] | None = None
-    _open_commit_expected: tuple[int, ...] = ()
     _open_commit_seen: set[int] = field(default_factory=set)
     _open_commit_all_active: bool = False
     _next_query_base: int | None = None
@@ -266,6 +307,16 @@ class VirtualTraceLifecycleValidator:
             raise ValueError("initial Gaussian count must be non-negative")
         if self.active_gaussians is None:
             self.active_gaussians = set(range(self.initial_gaussian_count))
+        active = self.active_gaussians or set()
+        bitmap_size = max(
+            self.initial_gaussian_count,
+            max(active, default=-1) + 1,
+        )
+        self._active_gaussian_bitmap = np.zeros(bitmap_size, dtype=np.bool_)
+        if active:
+            self._active_gaussian_bitmap[np.fromiter(
+                active, dtype=np.int64, count=len(active),
+            )] = True
         if self._ledgers is None:
             self._ledgers = []
 
@@ -274,42 +325,77 @@ class VirtualTraceLifecycleValidator:
         return tuple(self._ledgers or ())
 
     def accept_packet(self, packet: VirtualTracePacket) -> None:
-        self._select_iteration(packet.iteration_id)
-        if packet.state_version != self.state_version:
+        point_ids = np.asarray(packet.point_ids, dtype=np.int64)
+        if point_ids.size:
+            bitmap = self._active_gaussian_bitmap
+            if bitmap is None:
+                raise RuntimeError("virtual lifecycle active bitmap is unavailable")
+            largest = int(np.max(point_ids))
+            if largest >= bitmap.size or not bool(np.all(bitmap[point_ids])):
+                raise ValueError("virtual packet refers to an inactive Gaussian")
+        relations = packet.logical_relation_count
+        self.accept_packet_summary(VirtualPacketValidationSummary(
+            iteration_id=packet.iteration_id,
+            query_base=packet.query_base,
+            query_count=packet.query_count,
+            state_version=packet.state_version,
+            candidate_count=packet.candidate_count,
+            relation_count=relations,
+            physical_stream_bytes=packet.physical_bytes,
+            backward_confirmed=packet.backward_confirmed,
+        ))
+
+    def accept_packet_summary(self, summary: VirtualPacketValidationSummary) -> None:
+        """Accept counters from an independently validated packet payload."""
+
+        self._select_iteration(summary.iteration_id)
+        if summary.state_version != self.state_version:
             raise ValueError("virtual packet state version does not match lifecycle state")
         if self._open_update is not None:
             raise ValueError("virtual query packet arrived inside an update transaction")
         expected_query_base = self._next_query_base
-        if expected_query_base is not None and packet.query_base != expected_query_base:
+        if expected_query_base is not None and summary.query_base != expected_query_base:
             raise ValueError("virtual packet query base is not contiguous")
-        self._next_query_base = packet.query_base + packet.query_count
-        point_ids = np.asarray(packet.point_ids, dtype=np.int64)
-        if point_ids.size and not set(int(value) for value in np.unique(point_ids)).issubset(
-            self.active_gaussians or set()
-        ):
-            raise ValueError("virtual packet refers to an inactive Gaussian")
-        relations = packet.logical_relation_count
+        self._next_query_base = summary.query_base + summary.query_count
         self.current_packets += 1
-        self.current_queries += packet.query_count
-        self.current_candidates += packet.candidate_count
-        self.current_relations += relations
-        self.current_physical_bytes += packet.physical_bytes
-        if packet.backward_confirmed:
-            self.accept_backward_confirmation(packet)
+        self.current_queries += summary.query_count
+        self.current_candidates += summary.candidate_count
+        self.current_relations += summary.relation_count
+        self.current_physical_bytes += summary.physical_stream_bytes
+        if summary.backward_confirmed:
+            self._accept_backward_confirmation(
+                iteration_id=summary.iteration_id,
+                query_base=summary.query_base,
+                query_count=summary.query_count,
+                relation_count=summary.relation_count,
+            )
 
     def accept_backward_confirmation(self, packet: VirtualTracePacket) -> None:
         """Record the independent backward hook for an accepted packet."""
 
-        self._select_iteration(packet.iteration_id)
+        self._accept_backward_confirmation(
+            iteration_id=packet.iteration_id,
+            query_base=packet.query_base,
+            query_count=packet.query_count,
+            relation_count=packet.logical_relation_count,
+        )
+
+    def _accept_backward_confirmation(
+        self, *, iteration_id: int, query_base: int, query_count: int,
+        relation_count: int,
+    ) -> None:
+        """Record one confirmed backward packet after forward validation."""
+
+        self._select_iteration(iteration_id)
         if self._next_query_base is None or (
-            packet.query_base + packet.query_count > self._next_query_base
+            query_base + query_count > self._next_query_base
         ):
             raise ValueError("backward confirmation refers to an unknown query packet")
-        marker = packet.query_base
+        marker = query_base
         if marker in self._confirmed_query_bases:
             raise ValueError("virtual backward confirmation is duplicated")
         self._confirmed_query_bases.add(marker)
-        self.current_backward_relations += packet.logical_relation_count
+        self.current_backward_relations += relation_count
 
     def accept_lifecycle(self, record: VirtualLifecycleRecord) -> None:
         self._select_iteration(record.iteration_id)
@@ -322,11 +408,6 @@ class VirtualTraceLifecycleValidator:
                 raise ValueError("virtual update begin requires a transaction kind")
             self._open_update = (
                 record.transaction_kind, record.field_mask, record.iteration_id
-            )
-            self._open_commit_expected = (
-                tuple(sorted(self.active_gaussians or ()))
-                if record.transaction_kind == TRANSACTION_OPTIMIZER and record.field_mask
-                else ()
             )
             self._open_commit_seen.clear()
             self._open_commit_all_active = False
@@ -348,7 +429,9 @@ class VirtualTraceLifecycleValidator:
                     raise ValueError("virtual optimizer commit is duplicated")
                 if record.gaussian_id >= 0:
                     raise ValueError("all-active optimizer commit cannot name one Gaussian")
-                if record.active_ids and tuple(record.active_ids) != self._open_commit_expected:
+                if record.active_ids and tuple(record.active_ids) != tuple(
+                    sorted(self.active_gaussians or ())
+                ):
                     raise ValueError("all-active commit snapshot differs from begin snapshot")
                 self._open_commit_all_active = True
                 self.current_optimizer_commits += len(self.active_gaussians or ())
@@ -357,8 +440,6 @@ class VirtualTraceLifecycleValidator:
                 raise ValueError("virtual update commit refers to an inactive Gaussian")
             if record.gaussian_id in self._open_commit_seen:
                 raise ValueError("virtual optimizer Gaussian commit is duplicated")
-            if record.gaussian_id not in self._open_commit_expected:
-                raise ValueError("virtual optimizer commit is outside its begin snapshot")
             self._open_commit_seen.add(record.gaussian_id)
             self.current_optimizer_commits += 1
             return
@@ -367,6 +448,7 @@ class VirtualTraceLifecycleValidator:
             if record.gaussian_id not in (self.active_gaussians or set()):
                 raise ValueError("virtual prune refers to an inactive Gaussian")
             self.active_gaussians.remove(record.gaussian_id)  # type: ignore[union-attr]
+            self._set_gaussian_active(record.gaussian_id, False)
             return
         if record.kind in {VirtualLifecycleKind.CLONE, VirtualLifecycleKind.SPLIT}:
             self._require_collection()
@@ -378,8 +460,10 @@ class VirtualTraceLifecycleValidator:
                 if child in (self.active_gaussians or set()):
                     raise ValueError("virtual lineage child is already active")
                 self.active_gaussians.add(child)  # type: ignore[union-attr]
+                self._set_gaussian_active(child, True)
             if record.kind is VirtualLifecycleKind.SPLIT:
                 self.active_gaussians.remove(record.parent_id)  # type: ignore[union-attr]
+                self._set_gaussian_active(record.parent_id, False)
             return
         if record.kind is VirtualLifecycleKind.UPDATE_END:
             if self._open_update is None:
@@ -391,7 +475,7 @@ class VirtualTraceLifecycleValidator:
                 raise ValueError("virtual update masks do not match")
             if transaction_kind == TRANSACTION_OPTIMIZER and begin_mask:
                 if not self._open_commit_all_active and (
-                    self._open_commit_seen != set(self._open_commit_expected)
+                    self._open_commit_seen != (self.active_gaussians or set())
                 ):
                     raise ValueError("virtual optimizer transaction has incomplete commits")
             if begin_mask:
@@ -399,7 +483,6 @@ class VirtualTraceLifecycleValidator:
             if transaction_kind == TRANSACTION_COLLECTION:
                 self.current_collection_transactions += 1
             self._open_update = None
-            self._open_commit_expected = ()
             self._open_commit_seen.clear()
             self._open_commit_all_active = False
             return
@@ -454,6 +537,17 @@ class VirtualTraceLifecycleValidator:
     def _require_collection(self) -> None:
         if self._open_update is None or self._open_update[0] != TRANSACTION_COLLECTION:
             raise ValueError("Gaussian set modification requires a collection transaction")
+
+    def _set_gaussian_active(self, gaussian_id: int, active: bool) -> None:
+        bitmap = self._active_gaussian_bitmap
+        if bitmap is None:
+            raise RuntimeError("virtual lifecycle active bitmap is unavailable")
+        if gaussian_id >= bitmap.size:
+            expanded = np.zeros(gaussian_id + 1, dtype=np.bool_)
+            expanded[:bitmap.size] = bitmap
+            bitmap = expanded
+            self._active_gaussian_bitmap = bitmap
+        bitmap[gaussian_id] = active
 
     def _reset_iteration_counters(self) -> None:
         self.current_packets = 0

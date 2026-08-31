@@ -564,6 +564,10 @@ def test_online_and_offline_partial_replay_packets_match_each_lane_cycle() -> No
     config = replace(
         CycleConfig.from_gala(load_config(config_path), _Memory()),
         trace_continuation_query_packs=None,
+        # Keep this focused regression on partial-packet draining.  The
+        # production profile has sixteen lanes and would complete this
+        # eight-lane packet without a residual packet.
+        query_adjoint_replay_lanes=9,
     )
     offline = CycleEngine(config, policy="full").run(
         trace, collect_compute_telemetry=True,
@@ -600,6 +604,10 @@ def test_online_and_offline_partial_replay_packets_match_each_lane_cycle() -> No
     assert online.total_cycles == offline.total_cycles
     assert online.completion_cycles == offline.completion_cycles
     assert online.compute_telemetry == offline.compute_telemetry
+    assert (
+        online.module_counters["semantic_cache"]
+        == offline.module_counters["semantic_cache"]
+    )
 
 
 def test_compact_and_expanded_semantic_placement_are_identical() -> None:
@@ -632,6 +640,20 @@ def test_compact_and_expanded_semantic_placement_are_identical() -> None:
         compact.cluster_loads_by_iteration
         == expanded.cluster_loads_by_iteration
     )
+
+
+def test_semantic_placement_stripes_equal_load_ties_across_pods() -> None:
+    placement = SemanticPlacement._from_demands(
+        {(1, gaussian_id): 80 - gaussian_id for gaussian_id in range(8)},
+        8,
+        clusters_per_pod=2,
+    )
+
+    assert [
+        placement.cluster_by_key[(1, gaussian_id)]
+        for gaussian_id in range(4)
+    ] == [0, 2, 4, 6]
+    assert sorted(placement.cluster_loads_by_iteration[1]) == list(range(73, 81))
 
 
 def test_semantic_compiler_applies_placement_without_residency_hardware() -> None:

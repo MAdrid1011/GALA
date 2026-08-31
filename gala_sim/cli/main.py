@@ -88,6 +88,8 @@ def _parser() -> argparse.ArgumentParser:
     archive_validate = commands.add_parser("trace-archive-validate")
     archive_validate.add_argument("--archive", type=Path, required=True)
     archive_validate.add_argument("--output", type=Path, required=True)
+    archive_validate.add_argument("--prefetch-chunks", type=int, default=1)
+    archive_validate.add_argument("--parallel-workers", type=int, default=1)
     archive_snapshot = commands.add_parser("trace-archive-snapshot")
     archive_snapshot.add_argument("--archive", type=Path, required=True)
     archive_snapshot.add_argument("--output", type=Path, required=True)
@@ -423,7 +425,28 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         if args.command == "trace-archive-validate":
             reader = VirtualPacketArchiveReader(args.archive)
-            report = reader.validate(promote=True)
+            last_progress_percent = -1
+
+            def report_archive_progress(completed: int, total: int) -> None:
+                nonlocal last_progress_percent
+                percent = 100 if total == 0 else min(100, completed * 100 // total)
+                if percent <= last_progress_percent and completed != total:
+                    return
+                last_progress_percent = percent
+                print(json.dumps({
+                    "phase": "archive_validation",
+                    "completed_chunks": completed,
+                    "total_chunks": total,
+                    "percent": percent,
+                }, sort_keys=True), file=sys.stderr, flush=True)
+
+            report = reader.validate(
+                promote=True, prefetch_chunks=args.prefetch_chunks,
+                parallel_workers=args.parallel_workers,
+                progress=(
+                    report_archive_progress if args.parallel_workers > 1 else None
+                ),
+            )
             write_json(report, args.output)
             print(json.dumps(report, sort_keys=True))
             return 0

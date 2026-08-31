@@ -219,6 +219,8 @@ class CycleConfig:
     trace_continuation_query_packs: int | None = None
     query_volume_banks: int | None = None
     query_volume_word_bytes: int | None = None
+    query_volume_bank_mapping: str = "linear"
+    query_volume_bank_xor_shift: int | None = None
     memory_peak_bandwidth_bytes_per_second: int | None = None
 
     def __post_init__(self) -> None:
@@ -375,6 +377,26 @@ class CycleConfig:
         ):
             raise ValueError("query reduction bank count must be a power of two")
         if (
+            self.query_volume_banks is not None
+            and self.query_volume_banks & (self.query_volume_banks - 1)
+        ):
+            raise ValueError("query-volume bank count must be a power of two")
+        if self.query_volume_bank_mapping not in {
+            "linear", "xor_folded", "xor_shift",
+        }:
+            raise ValueError("query-volume Bank mapping is unsupported")
+        if (self.query_volume_bank_mapping == "xor_shift") != (
+            self.query_volume_bank_xor_shift is not None
+        ):
+            raise ValueError(
+                "query-volume XOR-shift mapping and shift must be configured together"
+            )
+        if (
+            self.query_volume_bank_xor_shift is not None
+            and self.query_volume_bank_xor_shift <= 0
+        ):
+            raise ValueError("query-volume XOR shift must be positive")
+        if (
             self.query_partial_sum_groups_per_bank is not None
             and self.query_partial_sum_groups_per_bank
             < self.modules["bidirectional_query"].latency
@@ -400,6 +422,29 @@ class CycleConfig:
         missing = required.difference(self.modules)
         if missing:
             raise ValueError(f"cycle configuration lacks modules: {sorted(missing)}")
+
+    def query_volume_bank(self, query_id: int) -> int:
+        """Map one query SRAM address to its configured physical Bank."""
+
+        if self.query_volume_banks is None:
+            raise ValueError("query-volume Bank mapping is unavailable")
+        query_id = int(query_id)
+        if query_id < 0:
+            raise ValueError("query-volume address must be non-negative")
+        mask = self.query_volume_banks - 1
+        if self.query_volume_bank_mapping == "linear":
+            return query_id & mask
+        if self.query_volume_bank_mapping == "xor_shift":
+            assert self.query_volume_bank_xor_shift is not None
+            return (
+                query_id ^ (query_id >> self.query_volume_bank_xor_shift)
+            ) & mask
+        shift = mask.bit_length()
+        folded = 0
+        while query_id:
+            folded ^= query_id & mask
+            query_id >>= shift
+        return folded
 
     @classmethod
     def from_gala(cls, config: GalaConfig,
@@ -543,6 +588,12 @@ class CycleConfig:
                    query_volume_banks=int(config.value("query.query_volume_banks")),
                    query_volume_word_bytes=int(
                        config.value("query.query_volume_word_bytes")
+                   ),
+                   query_volume_bank_mapping=str(
+                       config.value("query.query_volume_bank_mapping")
+                   ),
+                   query_volume_bank_xor_shift=int(
+                       config.value("query.query_volume_bank_xor_shift")
                    ),
                    memory_peak_bandwidth_bytes_per_second=int(
                        config.value("memory.peak_bandwidth_bytes_per_second")

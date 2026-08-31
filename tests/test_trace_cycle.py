@@ -111,6 +111,18 @@ def test_joint_compiler_admission_preserves_query_release_priority() -> None:
     ) == 12
 
 
+def test_query_compiler_admission_selects_best_ready_pending_task() -> None:
+    pending = _FusionPendingQueues()
+    for event_id in (10, 11, 12):
+        pending.append(event_id, TaskKind.FORWARD)
+
+    priorities = {10: (2,), 11: (0,), 12: (1,)}
+    assert pending.popleft_priority(
+        TaskKind.FORWARD, priorities.__getitem__,
+    ) == 11
+    assert pending.popleft(TaskKind.FORWARD) == 10
+
+
 def _trace():
     builder = TraceBuilder()
     relation = builder.emit(TraceEvent(
@@ -2003,7 +2015,7 @@ def test_semantic_residency_groups_ready_adjoint_state() -> None:
     assert [item.event_id for item in bundle[1]] == [11, 12]
 
 
-def test_semantic_ready_group_priority_defers_to_query_heads_in_joint_variant() -> None:
+def test_semantic_ready_group_priority_selects_ready_leader_in_joint_variant() -> None:
     config = CycleConfig.from_gala(
         load_config(
             Path(__file__).parents[1] / "configs/architecture/gala.yaml"
@@ -2057,10 +2069,10 @@ def test_semantic_ready_group_priority_defers_to_query_heads_in_joint_variant() 
 
     assert candidates("variant:0101") == [10]
     assert candidates("variant:0100") == [10, 1, 11]
-    assert candidates("variant:1111") == [10, 1, 11]
-    assert candidates("variant:1111", current_support=208) == [10, 1, 11]
-    assert candidates("variant:1111", current_support=209) == [10, 1, 11]
-    assert candidates("variant:1111", previous_support=True) == [10, 1, 11]
+    assert candidates("variant:1111") == [10]
+    assert candidates("variant:1111", current_support=208) == [10]
+    assert candidates("variant:1111", current_support=209) == [10]
+    assert candidates("variant:1111", previous_support=True) == [10]
     assert candidates("variant:0000") == [10, 1, 11]
     assert candidates("variant:1010") == [10, 1, 11]
 

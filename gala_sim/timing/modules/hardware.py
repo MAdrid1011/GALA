@@ -429,7 +429,12 @@ class ComputePod(HardwareModule):
                     int(cluster_pressure.get(cluster, 0))
                     if cluster_pressure is not None else 0
                 )
-                rank = (pressure, -issue_occupancy)
+                # When downstream owner pressure ties, prefer the cluster with
+                # less already-reserved issue work.  This keeps overlap-guided
+                # placement from concentrating the final packets on one
+                # cluster while preserving fixed-owner routing and all resource
+                # capacity checks.
+                rank = (pressure, issue_occupancy)
                 if best_rank is None or rank < best_rank:
                     best_fit = candidate
                     best_rank = rank

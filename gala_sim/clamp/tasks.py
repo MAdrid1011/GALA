@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from enum import IntEnum
 import heapq
-from typing import Iterable
+from typing import Iterable, Mapping
 
 
 HistoryQueryKey = tuple[int, int]
@@ -637,20 +637,33 @@ class FusionIssueScheduler:
         candidates: Iterable[TaskPacket],
         *,
         use_history_prediction: bool = True,
+        semantic_bundles: Mapping[int, tuple[TaskPacket, ...]] | None = None,
     ) -> list[TaskPacket]:
         """Order FIFO heads using the authoritative runtime comparison key."""
 
+        bundles = semantic_bundles or {}
+
+        def forecast_key(task: TaskPacket) -> tuple[int, ...]:
+            query_key = self._sort_key(
+                task, use_history_prediction=use_history_prediction,
+            )
+            bundle_followers = max(
+                len(bundles.get(task.event_id, ())) - 1, 0,
+            )
+            return (
+                *query_key[:2], -bundle_followers, *query_key[2:],
+            )
+
         return sorted(
             candidates,
-            key=lambda task: self._sort_key(
-                task, use_history_prediction=use_history_prediction,
-            ),
+            key=forecast_key,
         )
 
     def compiler_admission_key(self, task: TaskPacket) -> tuple[int, ...]:
-        """Rank ready compiler work using exact current F/C/A state."""
+        """Rank ready compiler work without consuming runtime cache state."""
 
-        return self._sort_key(task, use_history_prediction=False)
+        key = self._sort_key(task, use_history_prediction=False)
+        return (*key[:3], 0, *key[4:])
 
     def issue(
         self,
@@ -681,6 +694,7 @@ class FusionIssueScheduler:
         occupied_targets: set[int] | None = None,
         use_load_rules: bool = True,
         use_history_prediction: bool = True,
+        semantic_bundles: Mapping[int, tuple[TaskPacket, ...]] | None = None,
     ) -> IssueDecision:
         """Choose ready conflict-free FIFO heads without committing state."""
 
@@ -703,7 +717,9 @@ class FusionIssueScheduler:
                 for task in candidates
             )
         ordered = self.forecast(
-            candidates, use_history_prediction=use_history_prediction,
+            candidates,
+            use_history_prediction=use_history_prediction,
+            semantic_bundles=semantic_bundles,
         )
         baseline = self.select_in_order(
             candidates,

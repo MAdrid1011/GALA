@@ -52,9 +52,9 @@
 | `compute.reduction_inputs_per_cluster` | 16 | input | 十六输入归约树 |
 | `compute.microcontexts_per_cluster` | 4 | context | 计算簇微上下文 |
 | `compute.relations_per_microcontext` | 8 | query lane | 每个物理微上下文内 RelationPacket 的八个查询 lane，不是八个独立 context |
-| `compute.cluster_issue_slots_per_cluster` | 2 | slot | 二维 interaction 的两条配对算术路径 |
+| `compute.cluster_issue_slots_per_cluster` | 3 | slot | ComputePod 每个 cluster 的 issue 槽，吸收联合 replay 的短时并发 |
 | `compute.microcontext_bytes_per_cluster` | 6656 | byte | 6.5 KiB 设计值 |
-| `compute.owner_gradient_slots_per_cluster` | 3 | slot | 每个 owner cluster 的并发梯度 epoch；只在 owner ComputePod 接纳时预约 |
+| `compute.owner_gradient_slots_per_cluster` | 4 | slot | 每个 owner cluster 的并发梯度 epoch；只在 owner ComputePod 接纳时预约，用于吸收联合 replay 回压 |
 | `compute.ready_head_index_bytes` | 640 | byte | 架构侧查询重叠发射使用的 256 项 ComputePod FIFO 路由类 head/tail、next 和有效位索引；计入 control_metadata 区域 |
 | `compute.template_profiles[1].paths.forward` | pack 4，first 17，last 20，2 lane/cycle | cycle | GALA `ffadc13d`: `interaction_2d` |
 | `compute.template_profiles[1].paths.adjoint` | pack 8，first 27，last 34，1 cycle/lane | cycle | GALA `ffadc13d`: `interaction_2d_adjoint` |
@@ -64,7 +64,7 @@
 | `query.partial_sum_groups_per_bank` | 4 | group | 交错部分和 |
 | `query.loss_fma_lanes` | 32 | lane | 查询损失单元 |
 | `query.loss_queries_per_cycle` | 16 | query/cycle | 两条 FP32 FMA 对应一个 L1/L2 查询 |
-| `query.adjoint_replay_lanes` | 9 | lane | 八 lane RelationPacket 上的工作保持伴随重放流水 |
+| `query.adjoint_replay_lanes` | 16 | lane | 八 lane RelationPacket 上的工作保持伴随重放流水，并覆盖同周期的跨包回放 |
 | `query.replay_queue_entries` | 256 | entry | 伴随重放队列 |
 | `query.relation_window_entries` | 256 | window | 并发关系作用域窗口，不是关系记录数 |
 | `query.relation_window_entry_bytes` | 32 | byte | 窗口基址、计数与三类引用 |
@@ -72,7 +72,8 @@
 | `query.relation_store_record_bytes` | 3 | byte | 16 bit tile candidate ordinal 与 8 bit lane mask |
 | `query.relation_candidate_ordinal_bits` | 16 | bit | 每 tile 最多 65,536 个真实候选，逐 packet 预检 |
 | `query.relation_store_records` | 218448 | record | 16 Bank × floor(40 KiB / 3 B) |
-| `query.query_volume_banks` | 16 | bank | 查询结果与梯度 SRAM |
+| `query.query_volume_banks` | 32 | bank | 查询结果与梯度 SRAM 的低成本 bank 切分 |
+| `query.query_volume_bank_xor_shift` | 4 | bit | 查询结果 SRAM 的 XOR-fold 映射 |
 | `query.query_volume_word_bytes` | 16 | byte | 查询 SRAM Bank 端口宽度 |
 | `update.inflight_contexts` | 20 | context | 更新控制 FSM |
 | `memory.channels` | 8 | channel | LPDDR5 接口 |

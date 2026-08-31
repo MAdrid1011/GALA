@@ -48,7 +48,7 @@ def test_production_compute_profiles_have_audited_path_latencies() -> None:
         "pods": 4,
         "clusters_per_pod": 5,
         "clusters": 20,
-        "cluster_issue": 40,
+        "cluster_issue": 60,
         "fma_groups": 80,
         "transcendental_lanes": 40,
         "reduction_trees": 20,
@@ -59,16 +59,20 @@ def test_production_compute_profiles_have_audited_path_latencies() -> None:
     assert config.query_partial_sum_groups_per_bank == 4
     assert config.query_loss_fma_lanes == 32
     assert config.query_loss_queries_per_cycle == 16
-    assert config.query_adjoint_replay_lanes == 9
+    assert config.query_adjoint_replay_lanes == 16
     assert config.query_replay_queue_entries == 256
     assert config.query_relation_window_entries == 256
     assert config.query_relation_store_records == 218_448
     assert config.query_relation_store_record_bytes == 3
     assert config.query_relation_candidate_ordinal_bits == 16
-    assert config.query_volume_banks == 16
+    assert config.query_volume_banks == 32
+    assert config.query_volume_bank_mapping == "xor_shift"
+    assert config.query_volume_bank_xor_shift == 4
+    assert config.query_volume_bank(0) == 0
+    assert config.query_volume_bank(16) == 17
     assert config.query_relation_store_banks == 16
     assert config.relation_support_lanes == 8
-    assert config.owner_gradient_slots_per_cluster == 3
+    assert config.owner_gradient_slots_per_cluster == 4
     assert config.compute_ready_head_index_bytes == 640
     assert config.fusion_forward_ports == 2
     assert config.fusion_consumer_ports == 1
@@ -76,7 +80,7 @@ def test_production_compute_profiles_have_audited_path_latencies() -> None:
     assert config.fusion_bank_head_lookahead is True
     assert config.fusion_bank_head_index_bytes == 224
     assert config.fusion_semantic_bundle_index_bytes == 640
-    assert CycleEngine(config)._module_issue_ports("bidirectional_query") == 121
+    assert CycleEngine(config)._module_issue_ports("bidirectional_query") == 160
     assert CycleEngine(config)._module_issue_ports("relation_constructor") == 24
     assert config.compute_templates[1].latency_for("forward") == 17
     assert config.compute_templates[1].latency_for("adjoint") == 27
@@ -106,24 +110,64 @@ def test_query_reduction_bank_count_must_support_bitmask_mapping() -> None:
         replace(_production_config(), query_reduction_banks=63)
 
 
+def test_query_volume_bank_mapping_requires_power_of_two_banks() -> None:
+    with pytest.raises(ValueError, match="power of two"):
+        replace(_production_config(), query_volume_banks=15)
+    with pytest.raises(ValueError, match="mapping is unsupported"):
+        replace(_production_config(), query_volume_bank_mapping="target_fitted")
+    with pytest.raises(ValueError, match="configured together"):
+        replace(
+            _production_config(),
+            query_volume_bank_mapping="linear",
+            query_volume_bank_xor_shift=2,
+        )
+
+
 def test_query_ready_arbitration_covers_the_complete_resident_queue() -> None:
     engine = CycleEngine(_production_config())
 
-    assert engine._module_issue_ports("bidirectional_query") == 121
+    assert engine._module_issue_ports("bidirectional_query") == 160
     assert engine._ready_scan_window("bidirectional_query") == 256
     assert engine._ready_scan_window("bidirectional_query") == (
         engine.modules["bidirectional_query"].timing.queue_capacity
     )
 
 
+def test_query_ready_head_index_exposes_distinct_resident_banks() -> None:
+    rows = np.empty(4, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = np.arange(4)
+    rows["primitive_kind"] = int(PrimitiveKind.FORWARD)
+    rows["query_id"] = [0, 2, 4, 1]
+
+    indexed = _ReadyCandidateQueue()
+    baseline = _ReadyCandidateQueue()
+    for event_id in range(4):
+        indexed.push((event_id, 2))
+        baseline.push((event_id, 2))
+
+    common = {
+        "row_for": rows.__getitem__,
+        "physical_stage_for": lambda _event_id: None,
+        "owner_gradients": None,
+        "query_replay": None,
+    }
+    assert indexed.pop_acceptable(
+        2, "bidirectional_query", query_reduction_banks=2, **common,
+    ) == [(0, 2), (3, 2)]
+    assert baseline.pop_acceptable(
+        2, "bidirectional_query", **common,
+    ) == [(0, 2), (1, 2)]
+
+
 def test_compute_ready_head_index_is_isolated_to_overlap_guided_issue() -> None:
     config = _production_config()
 
-    assert CycleEngine(config, policy="base")._ready_scan_window("compute_pod") == 40
+    assert CycleEngine(config, policy="base")._ready_scan_window("compute_pod") == 60
     assert (
         CycleEngine(config, policy="variant:1000")
-        ._ready_scan_window("compute_pod")
-        == 40
+            ._ready_scan_window("compute_pod")
+            == 60
     )
     assert (
         CycleEngine(config, policy="variant:1010")
@@ -309,36 +353,36 @@ def test_query_datapaths_allocate_loss_replay_and_query_volume_ports() -> None:
     consumer = engine._query_resource_allocation(
         lanes, row(PrimitiveKind.CONSUMER, 3), PrimitiveKind.CONSUMER, None, 0,
     )
-    assert consumer == (64, 92, 108)
+    assert consumer == (64, 99, 131)
     for lane in consumer:
         lanes[lane] = 1
 
     # A second query can use another loss slot and another SRAM bank.
     assert engine._query_resource_allocation(
         lanes, row(PrimitiveKind.CONSUMER, 4), PrimitiveKind.CONSUMER, None, 0,
-    ) == (65, 93, 109)
+    ) == (65, 100, 132)
     # An adjoint read to query 3 conflicts with the consumer read port, while
     # the independent write port remains legal in the same cycle.
     assert engine._query_resource_allocation(
         lanes, row(PrimitiveKind.ADJOINT, 3), PrimitiveKind.ADJOINT, None, 0,
     ) is None
     read_busy_only = [0] * len(lanes)
-    read_busy_only[92] = 1
+    read_busy_only[99] = 1
     assert engine._query_resource_allocation(
         read_busy_only, row(PrimitiveKind.QUERY_REDUCTION, 3),
         PrimitiveKind.QUERY_REDUCTION, None, 0,
-    ) == (3, 108)
+    ) == (3, 131)
 
-    # The ninth work-conserving lane lets one full eight-lane packet bypass a
-    # busy replay lane.  Two busy lanes leave insufficient packet capacity.
+    # The sixteenth work-conserving lane lets one full eight-lane packet bypass
+    # a busy replay lane.  Nine busy lanes leave insufficient packet capacity.
     replay_busy = [0] * len(lanes)
     replay_busy[80] = 1
     packet = type("Packet", (), {"query_base": 0, "lanes": tuple(range(8))})()
     assert engine._query_resource_allocation(
         replay_busy, row(PrimitiveKind.ADJOINT, 0),
         PrimitiveKind.ADJOINT, packet, 0,
-    ) == (*range(81, 89), *range(89, 97))
-    replay_busy[81] = 1
+    ) == (*range(81, 89), 96, 97, 98, 99, 100, 101, 102, 103)
+    replay_busy[81:89] = [1] * 8
     assert engine._query_resource_allocation(
         replay_busy, row(PrimitiveKind.ADJOINT, 0),
         PrimitiveKind.ADJOINT, packet, 0,
@@ -393,9 +437,84 @@ def test_query_replay_drains_two_packets_over_all_nine_lanes() -> None:
         "adjoint_replay_active_cycles": 2,
         "adjoint_replay_full_cycles": 1,
         "adjoint_replay_idle_lane_cycles": 2,
+        "adjoint_replay_work_shortage_idle_lane_cycles": 2,
+        "adjoint_replay_same_address_idle_lane_cycles": 0,
+        "adjoint_replay_volume_bank_idle_lane_cycles": 0,
+        "adjoint_replay_different_address_bank_idle_lane_cycles": 0,
+        "adjoint_replay_scheduling_idle_lane_cycles": 0,
+        "adjoint_replay_linear_mapping_predicted_bank_idle_lane_cycles": 0,
+        "adjoint_replay_best_xor_shift": 1,
+        "adjoint_replay_best_xor_shift_predicted_bank_idle_lane_cycles": 0,
         "adjoint_replay_pending_peak_packets": 1,
         "adjoint_replay_pending_packets": 0,
     }
+
+
+def test_query_replay_classifies_volume_bank_idle_lanes() -> None:
+    scheduler = _QueryReplayLaneScheduler(
+        replay_base=0,
+        replay_lanes=9,
+        volume_read_base=9,
+        volume_banks=16,
+        initiation_interval=1,
+    )
+    resources = [0] * 25
+    admission = scheduler.plan_admission(
+        packet_event_id=0,
+        stage=1,
+        work=(
+            _QueryReplayLaneWork(event_id=0, packet_lane=0, query_id=0),
+            _QueryReplayLaneWork(event_id=1, packet_lane=1, query_id=16),
+        ),
+        module_lanes=resources,
+        cycle=0,
+    )
+    assert admission is not None
+    scheduler.commit_admission(admission, resources, 0)
+    assert scheduler.snapshot()[
+        "adjoint_replay_work_shortage_idle_lane_cycles"
+    ] == 7
+    assert scheduler.snapshot()[
+        "adjoint_replay_same_address_idle_lane_cycles"
+    ] == 0
+    assert scheduler.snapshot()[
+        "adjoint_replay_volume_bank_idle_lane_cycles"
+    ] == 1
+    assert scheduler.snapshot()[
+        "adjoint_replay_different_address_bank_idle_lane_cycles"
+    ] == 1
+    assert scheduler.snapshot()[
+        "adjoint_replay_scheduling_idle_lane_cycles"
+    ] == 0
+
+
+def test_query_replay_classifies_same_address_idle_lanes() -> None:
+    scheduler = _QueryReplayLaneScheduler(
+        replay_base=0,
+        replay_lanes=9,
+        volume_read_base=9,
+        volume_banks=16,
+        initiation_interval=1,
+    )
+    resources = [0] * 25
+    admission = scheduler.plan_admission(
+        packet_event_id=0,
+        stage=1,
+        work=(
+            _QueryReplayLaneWork(event_id=0, packet_lane=0, query_id=0),
+            _QueryReplayLaneWork(event_id=1, packet_lane=1, query_id=0),
+        ),
+        module_lanes=resources,
+        cycle=0,
+    )
+    assert admission is not None
+    scheduler.commit_admission(admission, resources, 0)
+    snapshot = scheduler.snapshot()
+    assert snapshot["adjoint_replay_same_address_idle_lane_cycles"] == 1
+    assert snapshot["adjoint_replay_volume_bank_idle_lane_cycles"] == 1
+    assert snapshot[
+        "adjoint_replay_different_address_bank_idle_lane_cycles"
+    ] == 0
 
 
 def test_compute_pod_reserves_twenty_independent_cluster_issue_slots() -> None:
@@ -618,6 +737,118 @@ def test_ready_batch_provisionally_reserves_owner_gradient_slots() -> None:
 
     assert selected == [(0, 2), (2, 2)]
     assert list(queue) == [(1, 2)]
+
+
+def test_full_compute_fifo_exposes_ready_owner_gradient_release() -> None:
+    rows = np.empty(8, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = np.arange(8)
+    rows["iteration_id"] = 1
+    rows["state_version"] = 0
+    rows["gaussian_id"] = [0, 0, 20, 20, 40, 40, 60, 60]
+    rows["relation_id"] = [10, 10, 11, 11, 12, 12, 13, 13]
+    rows["primitive_kind"] = [
+        int(PrimitiveKind.ADJOINT),
+        int(PrimitiveKind.GRADIENT_REDUCTION),
+        int(PrimitiveKind.ADJOINT),
+        int(PrimitiveKind.GRADIENT_REDUCTION),
+        int(PrimitiveKind.ADJOINT),
+        int(PrimitiveKind.GRADIENT_REDUCTION),
+        int(PrimitiveKind.ADJOINT),
+        int(PrimitiveKind.GRADIENT_REDUCTION),
+    ]
+    tracker = OwnerGradientTracker(
+        pods=1, clusters_per_pod=1, slots_per_cluster=2,
+    )
+    tracker.register_rows(rows)
+    tracker.reserve_adjoint((0,))
+    tracker.reserve_adjoint((2,))
+    queue = _ReadyCandidateQueue()
+    common = {
+        "capacity": 2,
+        "row_for": rows.__getitem__,
+        "physical_stage_for": lambda _event_id: None,
+        "owner_gradients": tracker,
+        "query_replay": None,
+        "owner_gradient_release_bypass": True,
+    }
+    assert queue.pop_acceptable(2, "compute_pod", **common) == []
+    queue.push((4, 2))
+    queue.push((6, 2))
+    queue.push((1, 0))
+
+    assert queue.pop_acceptable(2, "compute_pod", **common) == [(1, 0)]
+    assert list(queue) == [(4, 2), (6, 2)]
+
+
+def test_full_compute_fifo_promotes_release_after_owner_becomes_active() -> None:
+    rows = np.empty(8, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = np.arange(8)
+    rows["iteration_id"] = 1
+    rows["state_version"] = 0
+    rows["primitive_kind"] = int(PrimitiveKind.FORWARD)
+    rows["primitive_kind"][[0, 1, 2, 3]] = int(PrimitiveKind.ADJOINT)
+    rows["primitive_kind"][7] = int(PrimitiveKind.GRADIENT_REDUCTION)
+    rows["gaussian_id"][[0, 1, 2, 3, 7]] = [0, 20, 40, 60, 0]
+    rows["relation_id"][[0, 1, 2, 3, 7]] = [10, 11, 12, 13, 10]
+    tracker = OwnerGradientTracker(
+        pods=1, clusters_per_pod=1, slots_per_cluster=2,
+    )
+    tracker.register_rows(rows)
+    queue = _ReadyCandidateQueue()
+    common = {
+        "capacity": 2,
+        "row_for": rows.__getitem__,
+        "physical_stage_for": lambda _event_id: None,
+        "owner_gradients": tracker,
+        "query_replay": None,
+        "owner_gradient_release_bypass": True,
+    }
+    assert queue.pop_acceptable(2, "compute_pod", **common) == []
+    queue.push((2, 2))
+    queue.push((3, 2))
+    queue.push((7, 0))
+    tracker.reserve_adjoint((0,))
+    tracker.reserve_adjoint((1,))
+
+    assert queue.pop_acceptable(2, "compute_pod", **common) == [(7, 0)]
+    assert list(queue) == [(2, 2), (3, 2)]
+
+
+def test_owner_release_victim_index_tracks_worst_blocked_adjoint() -> None:
+    rows = np.empty(10, dtype=TraceBuilder().finish().events.dtype)
+    rows[:] = TraceEvent().as_tuple()
+    rows["event_id"] = np.arange(10)
+    rows["iteration_id"] = 1
+    rows["state_version"] = 0
+    rows["primitive_kind"] = int(PrimitiveKind.ADJOINT)
+    rows["primitive_kind"][[7, 8, 9]] = int(PrimitiveKind.GRADIENT_REDUCTION)
+    rows["gaussian_id"] = [0, 0, 20, 40, 0, 20, 40, 0, 20, 20]
+    rows["relation_id"] = [10, 11, 12, 13, 14, 15, 16, 10, 12, 15]
+    tracker = OwnerGradientTracker(
+        pods=1, clusters_per_pod=1, slots_per_cluster=2,
+    )
+    tracker.register_rows(rows)
+    tracker.reserve_adjoint((0,))
+    tracker.reserve_adjoint((2,))
+    queue = _ReadyCandidateQueue()
+    common = {
+        "capacity": 4,
+        "row_for": rows.__getitem__,
+        "physical_stage_for": lambda _event_id: None,
+        "owner_gradients": tracker,
+        "query_replay": None,
+        "owner_gradient_release_bypass": True,
+    }
+    assert queue.pop_acceptable(1, "compute_pod", **common) == []
+    queue.push((1, 2))  # Reuses an active key and must never be displaced.
+    queue.push((3, 2))
+    queue.push((4, 2))
+    queue.push((6, 2))
+    assert queue._blocked_adjoint_victim((8, 0)) == (3, (6, 2))
+    queue._remove(((6, 2), 3), promote=False)
+    assert queue._blocked_adjoint_victim((9, 0)) == (1, (3, 2))
 
 
 def test_ready_index_keeps_consumers_live_behind_full_replay_queue() -> None:
@@ -844,7 +1075,7 @@ def test_production_compute_route_stays_in_resident_pod_and_owner_cluster() -> N
     )
 
 
-def test_compute_pod_packs_single_slot_work_before_using_empty_cluster() -> None:
+def test_compute_pod_balances_single_slot_work_across_empty_clusters() -> None:
     profile = ComputeTemplateProfile(1, {
         "adjoint": ComputePathProfile((
             ComputeStage("TRANSFORM", latency=1),
@@ -875,7 +1106,7 @@ def test_compute_pod_packs_single_slot_work_before_using_empty_cluster() -> None
         if resource.startswith("cluster_issue:")
     }
     assert first_clusters == {"cluster_issue:0"}
-    assert second_clusters == first_clusters
+    assert second_clusters == {"cluster_issue:1"}
 
 
 def test_compute_pod_avoids_cluster_with_downstream_owner_work() -> None:

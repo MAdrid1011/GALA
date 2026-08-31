@@ -472,10 +472,10 @@ def _query_components(
             query_ids = (int(row["query_id"]),)
         if kind in {PrimitiveKind.CONSUMER, PrimitiveKind.ADJOINT}:
             for query_id in query_ids:
-                volume_reads[query_id % volume_banks] += 1
+                volume_reads[engine.config.query_volume_bank(query_id)] += 1
         if kind in {PrimitiveKind.CONSUMER, PrimitiveKind.QUERY_REDUCTION}:
             for query_id in query_ids:
-                volume_writes[query_id % volume_banks] += 1
+                volume_writes[engine.config.query_volume_bank(query_id)] += 1
 
     for direction, counts in (("read", volume_reads), ("write", volume_writes)):
         busiest = int(np.max(counts, initial=0))

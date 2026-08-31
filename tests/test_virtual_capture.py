@@ -304,6 +304,149 @@ def test_virtual_packet_archive_cannot_be_promoted_without_complete_30k(tmp_path
     assert promoted["formal_performance_eligible"] is False
 
 
+def test_virtual_packet_archive_prefetch_preserves_order_and_validation(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "archive"
+    writer = VirtualPacketArchiveWriter(archive_root, max_chunk_bytes=1)
+    writer.initialize_gaussians(1)
+    for iteration in (1, 2):
+        writer.append_packet(_packet(
+            iteration=iteration, query_base=iteration - 1,
+        ))
+        writer.close_iteration(iteration)
+    writer.finish()
+
+    sequential = list(VirtualPacketArchiveReader(archive_root).records())
+    prefetched = list(
+        VirtualPacketArchiveReader(archive_root).records(prefetch_chunks=2)
+    )
+    assert [kind for kind, _ in prefetched] == [kind for kind, _ in sequential]
+    assert [
+        value.iteration_id if kind == "packet" else value
+        for kind, value in prefetched
+    ] == [
+        value.iteration_id if kind == "packet" else value
+        for kind, value in sequential
+    ]
+    report = VirtualPacketArchiveReader(archive_root).validate(prefetch_chunks=2)
+    assert report["validation_passed"] is True
+    assert report["chunk_prefetch_workers"] == 2
+
+
+def test_virtual_packet_archive_rejects_invalid_prefetch_count(tmp_path: Path) -> None:
+    writer = VirtualPacketArchiveWriter(tmp_path / "archive", max_chunk_bytes=1024)
+    writer.initialize_gaussians(1)
+    writer.append_packet(_packet())
+    writer.close_iteration(1)
+    writer.finish()
+
+    with pytest.raises(ValueError, match="prefetch count"):
+        list(VirtualPacketArchiveReader(tmp_path / "archive").records(prefetch_chunks=0))
+
+
+def test_parallel_archive_validation_matches_sequential_report(tmp_path: Path) -> None:
+    archive_root = tmp_path / "archive"
+    writer = VirtualPacketArchiveWriter(archive_root, max_chunk_bytes=1)
+    writer.initialize_gaussians(1)
+    for iteration in (1, 2):
+        writer.append_packet(_packet(
+            iteration=iteration, query_base=iteration - 1,
+        ))
+        writer.close_iteration(iteration)
+    writer.finish()
+
+    sequential = VirtualPacketArchiveReader(archive_root).validate()
+    progress: list[tuple[int, int]] = []
+    parallel = VirtualPacketArchiveReader(archive_root).validate(
+        parallel_workers=2,
+        progress=lambda completed, total: progress.append((completed, total)),
+    )
+
+    assert sequential.pop("parallel_validation_workers") == 1
+    assert parallel.pop("parallel_validation_workers") == 2
+    assert parallel == sequential
+    assert progress == [(1, 2), (2, 2)]
+
+
+def test_parallel_archive_validation_rejects_invalid_worker_count(
+    tmp_path: Path,
+) -> None:
+    writer = VirtualPacketArchiveWriter(tmp_path / "archive", max_chunk_bytes=1024)
+    writer.initialize_gaussians(1)
+    writer.append_packet(_packet())
+    writer.close_iteration(1)
+    writer.finish()
+
+    reader = VirtualPacketArchiveReader(tmp_path / "archive")
+    with pytest.raises(ValueError, match="worker count"):
+        reader.validate(parallel_workers=0)
+    with pytest.raises(ValueError, match="cannot also prefetch"):
+        reader.validate(parallel_workers=2, prefetch_chunks=2)
+
+
+def test_parallel_archive_validation_rejects_invalid_mask_domain(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "archive"
+    masks = np.zeros((1, 8), dtype=np.dtype("<u4"))
+    masks[0, 0] = 2
+    packet = VirtualTracePacket.from_capture_buffers(
+        iteration_id=1, template_id=1, query_base=0, query_shape=(1, 1),
+        point_ids=np.asarray([0], dtype=np.int64),
+        point_keys=np.asarray([0], dtype=np.uint64), masks=masks,
+        loss_flags=LOSS_L1, backward_confirmed=True,
+    )
+    writer = VirtualPacketArchiveWriter(archive_root, max_chunk_bytes=1024)
+    writer.initialize_gaussians(1)
+    writer.append_packet(packet)
+    writer.close_iteration(1)
+    writer.finish()
+
+    with pytest.raises(ValueError, match="outside the output"):
+        VirtualPacketArchiveReader(archive_root).validate(parallel_workers=2)
+
+
+def test_parallel_archive_validation_rejects_inactive_gaussian(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "archive"
+    writer = VirtualPacketArchiveWriter(archive_root, max_chunk_bytes=1024)
+    writer.initialize_gaussians(1)
+    writer.append_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_BEGIN, 0, transaction_kind=1,
+    ))
+    writer.append_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.PRUNE, 0, gaussian_id=0,
+    ))
+    writer.append_lifecycle(VirtualLifecycleRecord(
+        1, VirtualLifecycleKind.UPDATE_END, 0, transaction_kind=1,
+    ))
+    writer.append_packet(_packet())
+    writer.close_iteration(1)
+    writer.finish()
+
+    with pytest.raises(ValueError, match="inactive Gaussian"):
+        VirtualPacketArchiveReader(archive_root).validate(parallel_workers=2)
+
+
+def test_parallel_archive_validation_rejects_missing_packet_reference(
+    tmp_path: Path,
+) -> None:
+    archive_root = tmp_path / "archive"
+    writer = VirtualPacketArchiveWriter(archive_root, max_chunk_bytes=1024)
+    writer.initialize_gaussians(1)
+    writer.append_packet(_packet())
+    writer.close_iteration(1)
+    writer.finish()
+    stream_path = archive_root / "stream.jsonl"
+    records = stream_path.read_text(encoding="utf-8").splitlines()
+    stream_path.write_text(records[-1] + "\n", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="packet count is inconsistent"):
+        VirtualPacketArchiveReader(archive_root).validate(parallel_workers=2)
+
+
 def test_virtual_packet_archive_validation_rejects_manifest_count_drift(tmp_path: Path) -> None:
     archive_root = tmp_path / "archive"
     writer = VirtualPacketArchiveWriter(archive_root, max_chunk_bytes=1024)

@@ -346,9 +346,9 @@ parameters:
       scope: hardware
       status: frozen
     owner_gradient_slots_per_cluster:
-      value: 3
+      value: 4
       unit: slot
-      source: GALA low-cost owner-gradient overlap optimization
+      source: GALA low-cost owner-gradient overlap optimization for replay backpressure
       scope: hardware
       status: frozen
     relations_per_microcontext:
@@ -358,9 +358,9 @@ parameters:
       scope: hardware
       status: frozen
     cluster_issue_slots_per_cluster:
-      value: 2
+      value: 3
       unit: slot
-      source: GALA design config ffadc13d6167cbe3ff50135935d02fa076a0700c:execution_modes.interaction_2d.cluster_interactions_per_cycle
+      source: GALA low-cost ComputePod/replay overlap optimization
       scope: hardware
       status: frozen
     microcontext_bytes_per_cluster:
@@ -473,9 +473,9 @@ parameters:
       scope: hardware
       status: frozen
     adjoint_replay_lanes:
-      value: 9
+      value: 16
       unit: lane
-      source: GALA low-cost replay lower-bound optimization
+      source: GALA low-cost replay lane-balance optimization
       scope: hardware
       status: frozen
     replay_queue_entries:
@@ -522,9 +522,21 @@ parameters:
       scope: hardware
       status: frozen
     query_volume_banks:
-      value: 16
+      value: 32
       unit: bank
-      source: GALA design config:shared_sram.query_volume.bank_count
+      source: GALA low-cost query-volume bank-split optimization
+      scope: hardware
+      status: frozen
+    query_volume_bank_mapping:
+      value: xor_shift
+      unit: enum
+      source: GALA low-cost query-volume Bank balance optimization
+      scope: hardware
+      status: frozen
+    query_volume_bank_xor_shift:
+      value: 4
+      unit: bit
+      source: GALA low-cost query-volume bank-conflict optimization
       scope: hardware
       status: frozen
     query_volume_word_bytes:

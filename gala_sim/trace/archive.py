@@ -12,8 +12,9 @@ from collections.abc import Collection
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass
 import json
+import multiprocessing as mp
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any, Callable, Iterator
 import zipfile
 import zlib
 
@@ -22,6 +23,7 @@ import numpy as np
 from .virtual import (
     VirtualLifecycleKind,
     VirtualLifecycleRecord,
+    VirtualPacketValidationSummary,
     VirtualTraceLifecycleValidator,
     VirtualTracePacket,
 )
@@ -29,6 +31,11 @@ from .virtual import (
 
 ARCHIVE_SCHEMA_VERSION = "gala-virtual-packet-archive-v1"
 LIVE_PREFIX_SCHEMA_VERSION = "gala-virtual-packet-live-prefix-v1"
+
+_VALIDATION_ROOT: Path | None = None
+_VALIDATION_CHUNKS: tuple[str, ...] = ()
+_VALIDATION_PACKET_EPOCHS: tuple[tuple[int, ...], ...] = ()
+_VALIDATION_ACTIVE_BITMAPS: tuple[np.ndarray, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -253,20 +260,101 @@ class VirtualPacketArchiveReader:
     def formal_performance_eligible(self) -> bool:
         return bool(self.manifest.get("formal_performance_eligible", False))
 
-    def records(self) -> Iterator[tuple[str, Any]]:
+    def records(
+        self, *, prefetch_chunks: int = 1, copy_packet_arrays: bool = True,
+    ) -> Iterator[tuple[str, Any]]:
+        if prefetch_chunks <= 0:
+            raise ValueError("archive chunk prefetch count must be positive")
+        if prefetch_chunks > 1:
+            yield from self._prefetched_records(
+                prefetch_chunks, copy_packet_arrays=copy_packet_arrays,
+            )
+            return
         stream_path = self.root / str(self.manifest.get("stream_path", "stream.jsonl"))
         with stream_path.open("r", encoding="utf-8") as stream:
             for line in stream:
                 item = json.loads(line)
                 kind = item.get("type")
                 if kind == "packet":
-                    yield "packet", self._packet(item)
+                    if copy_packet_arrays:
+                        yield "packet", self._packet(item)
+                    else:
+                        chunk = self._load_chunk(int(item["chunk"]))
+                        yield "packet", self._packet_from_chunk(
+                            item, chunk, copy_arrays=False,
+                        )
                 elif kind == "lifecycle":
                     yield "lifecycle", _lifecycle_from_dict(item["record"])
                 elif kind == "close_iteration":
                     yield "close_iteration", int(item["iteration_id"])
                 else:
                     raise ValueError("virtual packet archive stream record is malformed")
+
+    def _prefetched_records(
+        self, prefetch_chunks: int, *, copy_packet_arrays: bool,
+    ) -> Iterator[tuple[str, Any]]:
+        """Inflate a bounded chunk window while preserving stream order."""
+
+        chunks = tuple(str(value) for value in self.manifest.get("chunks", ()))
+        stream_path = self.root / str(self.manifest.get("stream_path", "stream.jsonl"))
+        pending: dict[int, Future[dict[str, Any]]] = {}
+        next_chunk = 0
+
+        with ThreadPoolExecutor(
+            max_workers=prefetch_chunks,
+            thread_name_prefix="gala-archive-read",
+        ) as executor:
+            def fill_window() -> None:
+                nonlocal next_chunk
+                while next_chunk < len(chunks) and len(pending) < prefetch_chunks:
+                    index = next_chunk
+                    pending[index] = executor.submit(
+                        _read_archive_chunk, self.root / chunks[index],
+                    )
+                    next_chunk += 1
+
+            fill_window()
+            active_chunk_index: int | None = None
+            active_chunk: dict[str, Any] | None = None
+            with stream_path.open("r", encoding="utf-8") as stream:
+                for line in stream:
+                    item = json.loads(line)
+                    kind = item.get("type")
+                    if kind == "packet":
+                        chunk_index = int(item["chunk"])
+                        if active_chunk_index != chunk_index:
+                            if chunk_index < 0 or chunk_index >= len(chunks):
+                                raise ValueError(
+                                    "virtual packet archive chunk index is out of range"
+                                )
+                            if active_chunk_index is not None and chunk_index < active_chunk_index:
+                                raise ValueError(
+                                    "virtual packet archive chunk order is not monotonic"
+                                )
+                            while chunk_index not in pending:
+                                if next_chunk >= len(chunks):
+                                    raise ValueError(
+                                        "virtual packet archive chunk reference is missing"
+                                    )
+                                fill_window()
+                            active_chunk = pending.pop(chunk_index).result()
+                            active_chunk_index = chunk_index
+                            fill_window()
+                        if active_chunk is None:
+                            raise RuntimeError(
+                                "virtual packet archive prefetched chunk failed to load"
+                            )
+                        yield "packet", self._packet_from_chunk(
+                            item, active_chunk, copy_arrays=copy_packet_arrays,
+                        )
+                    elif kind == "lifecycle":
+                        yield "lifecycle", _lifecycle_from_dict(item["record"])
+                    elif kind == "close_iteration":
+                        yield "close_iteration", int(item["iteration_id"])
+                    else:
+                        raise ValueError(
+                            "virtual packet archive stream record is malformed"
+                        )
 
     def packet_descriptors(
         self, *, iterations: Collection[int] | None = None,
@@ -395,13 +483,23 @@ class VirtualPacketArchiveReader:
         self.replay(consumer, finish=True)
         return consumer.result
 
-    def validate(self, *, promote: bool = False) -> dict[str, Any]:
+    def validate(
+        self, *, promote: bool = False, prefetch_chunks: int = 1,
+        parallel_workers: int = 1,
+        progress: Callable[[int, int], None] | None = None,
+    ) -> dict[str, Any]:
         """Re-read and validate every compact packet and lifecycle record.
 
         Formal eligibility is derived exclusively from the observed archive
         contents. ``promote`` records a successful validation in the archive
         manifest, but cannot make an incomplete iteration stream eligible.
         """
+        if parallel_workers <= 0:
+            raise ValueError("archive validation worker count must be positive")
+        if parallel_workers > 1 and prefetch_chunks != 1:
+            raise ValueError(
+                "parallel archive validation cannot also prefetch chunks"
+            )
         validator = VirtualTraceLifecycleValidator(self.initial_gaussian_count)
         packet_count = 0
         query_count = 0
@@ -409,9 +507,21 @@ class VirtualPacketArchiveReader:
         relation_count = 0
         physical_stream_bytes = 0
         closed_iterations: list[int] = []
-        for kind, value in self.records():
+        records = (
+            self._parallel_validation_records(
+                parallel_workers, progress=progress,
+            )
+            if parallel_workers > 1
+            else self.records(
+                prefetch_chunks=prefetch_chunks, copy_packet_arrays=False,
+            )
+        )
+        for kind, value in records:
             if kind == "packet":
-                validator.accept_packet(value)
+                if isinstance(value, VirtualPacketValidationSummary):
+                    validator.accept_packet_summary(value)
+                else:
+                    validator.accept_packet(value)
                 packet_count += 1
                 query_count += value.query_count
                 candidate_count += value.candidate_count
@@ -481,6 +591,9 @@ class VirtualPacketArchiveReader:
             "first_iteration": closed_iterations[0] if closed_iterations else None,
             "last_iteration": closed_iterations[-1] if closed_iterations else None,
             "ledger_count": len(ledgers),
+            "chunk_prefetch_workers": prefetch_chunks,
+            "packet_array_copy": False,
+            "parallel_validation_workers": parallel_workers,
         }
         if promote:
             self.manifest.update({
@@ -492,19 +605,84 @@ class VirtualPacketArchiveReader:
             _write_json_atomic(self.root / "manifest.json", self.manifest)
         return report
 
+    def _parallel_validation_records(
+        self, workers: int, *, progress: Callable[[int, int], None] | None,
+    ) -> Iterator[tuple[str, Any]]:
+        """Validate immutable chunks in workers, then replay summaries in order."""
+
+        if "fork" not in mp.get_all_start_methods():
+            raise ValueError("parallel archive validation requires fork support")
+        chunks = tuple(str(value) for value in self.manifest.get("chunks", ()))
+        stream_items, packet_epochs, active_bitmaps = _validation_inputs(
+            self.root / str(self.manifest.get("stream_path", "stream.jsonl")),
+            chunk_count=len(chunks),
+            initial_gaussian_count=self.initial_gaussian_count,
+        )
+        global _VALIDATION_ROOT, _VALIDATION_CHUNKS
+        global _VALIDATION_PACKET_EPOCHS, _VALIDATION_ACTIVE_BITMAPS
+        _VALIDATION_ROOT = self.root
+        _VALIDATION_CHUNKS = chunks
+        _VALIDATION_PACKET_EPOCHS = packet_epochs
+        _VALIDATION_ACTIVE_BITMAPS = active_bitmaps
+        validated_chunks: list[tuple[VirtualPacketValidationSummary, ...]] = []
+        try:
+            context = mp.get_context("fork")
+            with context.Pool(processes=workers) as pool:
+                for completed, summaries in enumerate(
+                    pool.imap(_validate_archive_chunk, range(len(chunks)), chunksize=1),
+                    start=1,
+                ):
+                    validated_chunks.append(summaries)
+                    if progress is not None:
+                        progress(completed, len(chunks))
+        finally:
+            _VALIDATION_ROOT = None
+            _VALIDATION_CHUNKS = ()
+            _VALIDATION_PACKET_EPOCHS = ()
+            _VALIDATION_ACTIVE_BITMAPS = ()
+        for item in stream_items:
+            kind = item.get("type")
+            if kind == "packet":
+                chunk_index = int(item["chunk"])
+                packet_index = int(item["index"])
+                if chunk_index < 0 or chunk_index >= len(validated_chunks):
+                    raise ValueError("virtual packet archive chunk index is out of range")
+                summaries = validated_chunks[chunk_index]
+                if packet_index < 0 or packet_index >= len(summaries):
+                    raise ValueError("virtual packet archive packet index is out of range")
+                yield "packet", summaries[packet_index]
+            elif kind == "lifecycle":
+                yield "lifecycle", _lifecycle_from_dict(item["record"])
+            elif kind == "close_iteration":
+                yield "close_iteration", int(item["iteration_id"])
+            else:
+                raise ValueError("virtual packet archive stream record is malformed")
+
     def _packet(self, item: dict[str, Any]) -> VirtualTracePacket:
         chunk_index = int(item["chunk"])
-        index = int(item["index"])
         chunk = self._load_chunk(chunk_index)
+        return self._packet_from_chunk(item, chunk)
+
+    @staticmethod
+    def _packet_from_chunk(
+        item: dict[str, Any], chunk: dict[str, Any], *, copy_arrays: bool = True,
+    ) -> VirtualTracePacket:
+        index = int(item["index"])
+        if index < 0 or index >= len(chunk["packets"]):
+            raise ValueError("virtual packet archive packet index is out of range")
         meta = chunk["packets"][index]
         candidate_offset = int(meta["candidate_offset"])
         candidate_count = int(meta["candidate_count"])
         mask_offset = int(meta["mask_offset"])
         mask_words = int(meta["mask_words"])
-        ids = chunk["point_ids"][candidate_offset:candidate_offset + candidate_count].copy()
-        keys = chunk["point_keys"][candidate_offset:candidate_offset + candidate_count].copy()
+        ids = chunk["point_ids"][candidate_offset:candidate_offset + candidate_count]
+        keys = chunk["point_keys"][candidate_offset:candidate_offset + candidate_count]
         mask_end = mask_offset + candidate_count * mask_words
-        masks = chunk["masks"][mask_offset:mask_end].reshape(candidate_count, mask_words).copy()
+        masks = chunk["masks"][mask_offset:mask_end].reshape(candidate_count, mask_words)
+        if copy_arrays:
+            ids = ids.copy()
+            keys = keys.copy()
+            masks = masks.copy()
         return VirtualTracePacket(
             iteration_id=int(meta["iteration_id"]), template_id=int(meta["template_id"]),
             query_base=int(meta["query_base"]), query_shape=tuple(meta["query_shape"]),
@@ -520,18 +698,140 @@ class VirtualPacketArchiveReader:
             if index < 0 or index >= len(chunks):
                 raise ValueError("virtual packet archive chunk index is out of range")
             path = self.root / str(chunks[index])
-            with np.load(path, allow_pickle=False) as data:
-                packet_json = str(data["packets"].item())
-                self._chunk = {
-                    "point_ids": np.asarray(data["point_ids"], dtype=np.int64),
-                    "point_keys": np.asarray(data["point_keys"], dtype=np.uint64),
-                    "masks": np.asarray(data["masks"], dtype=np.dtype("<u4")),
-                    "packets": json.loads(packet_json),
-                }
-                self._chunk_index = index
+            self._chunk = _read_archive_chunk(path)
+            self._chunk_index = index
         if self._chunk is None:
             raise RuntimeError("virtual packet archive chunk failed to load")
         return self._chunk
+
+
+def _read_archive_chunk(path: Path) -> dict[str, Any]:
+    """Read one immutable NPZ chunk without mutating reader state."""
+
+    with np.load(path, allow_pickle=False) as data:
+        packet_json = str(data["packets"].item())
+        return {
+            "point_ids": np.asarray(data["point_ids"], dtype=np.int64),
+            "point_keys": np.asarray(data["point_keys"], dtype=np.uint64),
+            "masks": np.asarray(data["masks"], dtype=np.dtype("<u4")),
+            "packets": json.loads(packet_json),
+        }
+
+
+def _active_bitmap(active_gaussians: set[int]) -> np.ndarray:
+    size = max(active_gaussians, default=-1) + 1
+    bitmap = np.zeros(size, dtype=np.bool_)
+    if active_gaussians:
+        bitmap[np.fromiter(
+            active_gaussians, dtype=np.int64, count=len(active_gaussians),
+        )] = True
+    return bitmap
+
+
+def _validation_inputs(
+    stream_path: Path, *, chunk_count: int, initial_gaussian_count: int,
+) -> tuple[
+    tuple[dict[str, Any], ...],
+    tuple[tuple[int, ...], ...],
+    tuple[np.ndarray, ...],
+]:
+    """Bind every packet reference to an exact active-Gaussian epoch."""
+
+    stream_items: list[dict[str, Any]] = []
+    packet_epochs: list[list[int]] = [[] for _ in range(chunk_count)]
+    active_gaussians = set(range(initial_gaussian_count))
+    active_bitmaps = [_active_bitmap(active_gaussians)]
+    active_epoch = 0
+    active_dirty = False
+    with stream_path.open("r", encoding="utf-8") as stream:
+        for line in stream:
+            item = json.loads(line)
+            stream_items.append(item)
+            kind = item.get("type")
+            if kind == "packet":
+                if active_dirty:
+                    active_bitmaps.append(_active_bitmap(active_gaussians))
+                    active_epoch = len(active_bitmaps) - 1
+                    active_dirty = False
+                chunk_index = int(item["chunk"])
+                packet_index = int(item["index"])
+                if chunk_index < 0 or chunk_index >= chunk_count or packet_index < 0:
+                    raise ValueError("virtual packet archive packet reference is invalid")
+                epochs = packet_epochs[chunk_index]
+                if packet_index != len(epochs):
+                    raise ValueError(
+                        "virtual packet archive packet references are not contiguous"
+                    )
+                epochs.append(active_epoch)
+                continue
+            if kind == "close_iteration":
+                continue
+            if kind != "lifecycle":
+                raise ValueError("virtual packet archive stream record is malformed")
+            record = _lifecycle_from_dict(item["record"])
+            if record.kind is VirtualLifecycleKind.PRUNE:
+                if record.gaussian_id not in active_gaussians:
+                    raise ValueError("virtual prune refers to an inactive Gaussian")
+                active_gaussians.remove(record.gaussian_id)
+                active_dirty = True
+            elif record.kind in {
+                VirtualLifecycleKind.CLONE, VirtualLifecycleKind.SPLIT,
+            }:
+                if record.parent_id not in active_gaussians:
+                    raise ValueError("virtual lineage parent is inactive")
+                for child in record.child_ids:
+                    if child in active_gaussians:
+                        raise ValueError("virtual lineage child is already active")
+                    active_gaussians.add(child)
+                if record.kind is VirtualLifecycleKind.SPLIT:
+                    active_gaussians.remove(record.parent_id)
+                active_dirty = True
+    return (
+        tuple(stream_items),
+        tuple(tuple(values) for values in packet_epochs),
+        tuple(active_bitmaps),
+    )
+
+
+def _validate_archive_chunk(
+    chunk_index: int,
+) -> tuple[VirtualPacketValidationSummary, ...]:
+    """Worker entry point for exact payload validation without array IPC."""
+
+    if _VALIDATION_ROOT is None:
+        raise RuntimeError("parallel archive validation worker is not initialized")
+    if chunk_index < 0 or chunk_index >= len(_VALIDATION_CHUNKS):
+        raise ValueError("virtual packet archive chunk index is out of range")
+    chunk = _read_archive_chunk(
+        _VALIDATION_ROOT / _VALIDATION_CHUNKS[chunk_index]
+    )
+    epochs = _VALIDATION_PACKET_EPOCHS[chunk_index]
+    if len(epochs) != len(chunk["packets"]):
+        raise ValueError("virtual packet archive chunk packet count is inconsistent")
+    summaries: list[VirtualPacketValidationSummary] = []
+    for packet_index, active_epoch in enumerate(epochs):
+        packet = VirtualPacketArchiveReader._packet_from_chunk(
+            {"index": packet_index}, chunk, copy_arrays=False,
+        )
+        if active_epoch < 0 or active_epoch >= len(_VALIDATION_ACTIVE_BITMAPS):
+            raise ValueError("virtual packet archive active epoch is invalid")
+        bitmap = _VALIDATION_ACTIVE_BITMAPS[active_epoch]
+        point_ids = np.asarray(packet.point_ids, dtype=np.int64)
+        if point_ids.size:
+            largest = int(np.max(point_ids))
+            if largest >= bitmap.size or not bool(np.all(bitmap[point_ids])):
+                raise ValueError("virtual packet refers to an inactive Gaussian")
+        summaries.append(VirtualPacketValidationSummary(
+            iteration_id=packet.iteration_id,
+            query_base=packet.query_base,
+            query_count=packet.query_count,
+            state_version=packet.state_version,
+            candidate_count=packet.candidate_count,
+            relation_count=packet.logical_relation_count,
+            physical_stream_bytes=packet.physical_bytes,
+            backward_confirmed=packet.backward_confirmed,
+        ))
+    return tuple(summaries)
 
 
 def snapshot_live_archive_prefix(

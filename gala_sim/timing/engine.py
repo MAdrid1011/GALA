@@ -212,6 +212,7 @@ class _QueryReplayLaneScheduler:
         volume_read_base: int,
         volume_banks: int,
         initiation_interval: int,
+        volume_bank_for: Callable[[int], int] | None = None,
     ) -> None:
         if min(replay_lanes, volume_banks, initiation_interval) <= 0:
             raise ValueError("query replay resources must be positive")
@@ -220,9 +221,24 @@ class _QueryReplayLaneScheduler:
         self.volume_read_base = volume_read_base
         self.volume_banks = volume_banks
         self.initiation_interval = initiation_interval
+        self.volume_bank_for = (
+            volume_bank_for
+            if volume_bank_for is not None
+            else lambda query_id: query_id % volume_banks
+        )
         self._pending: deque[_PendingQueryReplayPacket] = deque()
         self._dispatches_by_cycle: dict[int, int] = {}
         self._peak_pending_packets = 0
+        self._diagnostic_cycle: int | None = None
+        self._diagnostic_event_ids: set[int] = set()
+        self._diagnostic_query_ids: set[int] = set()
+        self._diagnostic_banks: set[int] = set()
+        self._work_shortage_idle_lane_cycles = 0
+        self._same_address_idle_lane_cycles = 0
+        self._volume_bank_idle_lane_cycles = 0
+        self._scheduling_idle_lane_cycles = 0
+        self._linear_bank_idle_lane_cycles = 0
+        self._xor_shift_idle_lane_cycles: dict[int, int] = {}
 
     @property
     def pending_packets(self) -> int:
@@ -295,6 +311,14 @@ class _QueryReplayLaneScheduler:
     def snapshot(self) -> dict[str, int]:
         active_cycles = len(self._dispatches_by_cycle)
         dispatches = sum(self._dispatches_by_cycle.values())
+        shortage, same_address, bank_conflict, scheduling = (
+            self._idle_lane_breakdown()
+        )
+        linear_idle, shift_idle = self._candidate_mapping_idle_breakdown()
+        best_shift, best_shift_idle = min(
+            shift_idle.items(), key=lambda item: (item[1], item[0]),
+            default=(0, linear_idle),
+        )
         return {
             "adjoint_replay_lane_dispatches": dispatches,
             "adjoint_replay_active_cycles": active_cycles,
@@ -304,6 +328,22 @@ class _QueryReplayLaneScheduler:
             ),
             "adjoint_replay_idle_lane_cycles": (
                 active_cycles * self.replay_lanes - dispatches
+            ),
+            "adjoint_replay_work_shortage_idle_lane_cycles": shortage,
+            "adjoint_replay_same_address_idle_lane_cycles": same_address,
+            "adjoint_replay_volume_bank_idle_lane_cycles": (
+                same_address + bank_conflict
+            ),
+            "adjoint_replay_different_address_bank_idle_lane_cycles": (
+                bank_conflict
+            ),
+            "adjoint_replay_scheduling_idle_lane_cycles": scheduling,
+            "adjoint_replay_linear_mapping_predicted_bank_idle_lane_cycles": (
+                linear_idle
+            ),
+            "adjoint_replay_best_xor_shift": best_shift,
+            "adjoint_replay_best_xor_shift_predicted_bank_idle_lane_cycles": (
+                best_shift_idle
             ),
             "adjoint_replay_pending_peak_packets": self._peak_pending_packets,
             "adjoint_replay_pending_packets": len(self._pending),
@@ -318,6 +358,7 @@ class _QueryReplayLaneScheduler:
         tuple[_QueryReplayLaneDispatch, ...],
         tuple[_QueryReplayLaneWork, ...],
     ]:
+        self._observe_available_work(work, cycle)
         replay_resources = [
             resource
             for resource in range(
@@ -332,7 +373,7 @@ class _QueryReplayLaneScheduler:
         dispatches: list[_QueryReplayLaneDispatch] = []
         remaining: list[_QueryReplayLaneWork] = []
         for item in work:
-            bank = item.query_id % self.volume_banks
+            bank = self.volume_bank_for(item.query_id)
             if not replay_resources or bank not in free_volume_banks:
                 remaining.append(item)
                 continue
@@ -343,6 +384,101 @@ class _QueryReplayLaneScheduler:
             ))
             free_volume_banks.remove(bank)
         return tuple(dispatches), tuple(remaining)
+
+    def _observe_available_work(
+        self, work: tuple[_QueryReplayLaneWork, ...], cycle: int,
+    ) -> None:
+        if self._diagnostic_cycle != cycle:
+            self._finalize_diagnostic_cycle()
+            self._diagnostic_cycle = cycle
+        self._diagnostic_event_ids.update(item.event_id for item in work)
+        self._diagnostic_query_ids.update(item.query_id for item in work)
+        self._diagnostic_banks.update(
+            self.volume_bank_for(item.query_id) for item in work
+        )
+
+    def _diagnostic_cycle_breakdown(self) -> tuple[int, int, int, int]:
+        if self._diagnostic_cycle is None:
+            return 0, 0, 0, 0
+        dispatches = self._dispatches_by_cycle.get(self._diagnostic_cycle, 0)
+        if dispatches == 0:
+            return 0, 0, 0, 0
+        work_limit = min(self.replay_lanes, len(self._diagnostic_event_ids))
+        query_limit = min(work_limit, len(self._diagnostic_query_ids))
+        bank_limit = min(query_limit, len(self._diagnostic_banks))
+        return (
+            self.replay_lanes - work_limit,
+            work_limit - query_limit,
+            query_limit - bank_limit,
+            bank_limit - dispatches,
+        )
+
+    def _finalize_diagnostic_cycle(self) -> None:
+        shortage, same_address, bank_conflict, scheduling = (
+            self._diagnostic_cycle_breakdown()
+        )
+        self._work_shortage_idle_lane_cycles += shortage
+        self._same_address_idle_lane_cycles += same_address
+        self._volume_bank_idle_lane_cycles += bank_conflict
+        self._scheduling_idle_lane_cycles += scheduling
+        linear_idle, shift_idle = self._candidate_mapping_cycle_idle()
+        previous_linear_idle = self._linear_bank_idle_lane_cycles
+        self._linear_bank_idle_lane_cycles += linear_idle
+        for shift, idle in shift_idle.items():
+            if shift not in self._xor_shift_idle_lane_cycles:
+                self._xor_shift_idle_lane_cycles[shift] = previous_linear_idle
+            self._xor_shift_idle_lane_cycles[shift] += idle
+        for shift in self._xor_shift_idle_lane_cycles.keys() - shift_idle.keys():
+            self._xor_shift_idle_lane_cycles[shift] += linear_idle
+        self._diagnostic_event_ids.clear()
+        self._diagnostic_query_ids.clear()
+        self._diagnostic_banks.clear()
+
+    def _idle_lane_breakdown(self) -> tuple[int, int, int, int]:
+        shortage, same_address, bank_conflict, scheduling = (
+            self._diagnostic_cycle_breakdown()
+        )
+        return (
+            self._work_shortage_idle_lane_cycles + shortage,
+            self._same_address_idle_lane_cycles + same_address,
+            self._volume_bank_idle_lane_cycles + bank_conflict,
+            self._scheduling_idle_lane_cycles + scheduling,
+        )
+
+    def _candidate_mapping_cycle_idle(self) -> tuple[int, dict[int, int]]:
+        if self._diagnostic_cycle is None:
+            return 0, {}
+        dispatches = self._dispatches_by_cycle.get(self._diagnostic_cycle, 0)
+        if dispatches == 0 or not self._diagnostic_query_ids:
+            return 0, {}
+        query_limit = min(self.replay_lanes, len(self._diagnostic_query_ids))
+        mask = self.volume_banks - 1
+
+        def conflicts(banks: set[int]) -> int:
+            return query_limit - min(query_limit, len(banks))
+
+        linear = conflicts({query_id & mask for query_id in self._diagnostic_query_ids})
+        max_shift = max(self._diagnostic_query_ids).bit_length()
+        shifted = {
+            shift: conflicts({
+                (query_id ^ (query_id >> shift)) & mask
+                for query_id in self._diagnostic_query_ids
+            })
+            for shift in range(1, max_shift)
+        }
+        return linear, shifted
+
+    def _candidate_mapping_idle_breakdown(self) -> tuple[int, dict[int, int]]:
+        linear, shifted = self._candidate_mapping_cycle_idle()
+        linear += self._linear_bank_idle_lane_cycles
+        totals = dict(self._xor_shift_idle_lane_cycles)
+        for shift, idle in shifted.items():
+            totals[shift] = totals.get(
+                shift, self._linear_bank_idle_lane_cycles
+            ) + idle
+        for shift in totals.keys() - shifted.keys():
+            totals[shift] += linear - self._linear_bank_idle_lane_cycles
+        return linear, totals
 
     def _commit_dispatches(
         self,
@@ -635,6 +771,14 @@ class _FusionPendingQueues:
         self._live: dict[TaskKind, set[int]] = {
             task_kind: set() for task_kind in TaskKind
         }
+        self._priority_unindexed: dict[TaskKind, deque[int]] = {
+            task_kind: deque() for task_kind in TaskKind
+        }
+        self._priority_heaps: dict[
+            TaskKind, list[tuple[tuple[int, ...], int]]
+        ] = {
+            task_kind: [] for task_kind in TaskKind
+        }
         self._semantic_index = semantic_index
         self._semantic_by_bank: dict[
             TaskKind,
@@ -652,6 +796,7 @@ class _FusionPendingQueues:
             raise ValueError(f"Fusion task {event_id} entered pending twice")
         self._queues[task_kind].append(event_id)
         self._live[task_kind].add(event_id)
+        self._priority_unindexed[task_kind].append(event_id)
         self._counts[task_kind] += 1
         if self._semantic_index is not None:
             semantic = self._semantic_index(event_id, task_kind)
@@ -674,6 +819,36 @@ class _FusionPendingQueues:
             raise IndexError("Fusion pending source queue is empty")
         return self._commit(queue.popleft(), task_kind)
 
+    def popleft_priority(
+        self,
+        task_kind: TaskKind,
+        priority: Callable[[int], tuple[int, ...]],
+    ) -> int:
+        """Admit the best currently ready compiler task of one source kind."""
+
+        event_id = self._priority_event(task_kind, priority)
+        return self._commit(event_id, task_kind)
+
+    def _priority_event(
+        self,
+        task_kind: TaskKind,
+        priority: Callable[[int], tuple[int, ...]],
+    ) -> int:
+        live = self._live[task_kind]
+        if not live:
+            raise IndexError("Fusion pending source queue is empty")
+        unindexed = self._priority_unindexed[task_kind]
+        heap = self._priority_heaps[task_kind]
+        while unindexed:
+            event_id = unindexed.popleft()
+            if event_id in live:
+                heapq.heappush(heap, (priority(event_id), event_id))
+        while heap and heap[0][1] not in live:
+            heapq.heappop(heap)
+        if not heap:
+            raise IndexError("Fusion pending priority index is empty")
+        return heap[0][1]
+
     def popleft_semantic_match(
         self,
         task_kind: TaskKind,
@@ -682,6 +857,7 @@ class _FusionPendingQueues:
         ],
         *,
         priority: Callable[[int], tuple[int, ...]] | None = None,
+        global_priority: bool = False,
     ) -> int:
         """Fill a resident state group without overriding query-load order."""
 
@@ -709,18 +885,21 @@ class _FusionPendingQueues:
                     return self._commit(event_id, task_kind)
                 semantic_matches.append((offer_index, event_id, indexed))
         if priority is not None and semantic_matches:
-            queue = self._queues[task_kind]
-            while queue and queue[0] not in live:
-                queue.popleft()
-            if not queue:
-                raise IndexError("Fusion pending source queue is empty")
-            fifo_head = queue[0]
+            if global_priority:
+                priority_event = self._priority_event(task_kind, priority)
+            else:
+                queue = self._queues[task_kind]
+                while queue and queue[0] not in live:
+                    queue.popleft()
+                if not queue:
+                    raise IndexError("Fusion pending source queue is empty")
+                priority_event = queue[0]
             _offer_index, event_id, indexed = min(
                 semantic_matches,
                 key=lambda item: (priority(item[1]), item[0], item[1]),
             )
-            if priority(fifo_head) < priority(event_id):
-                return self.popleft(task_kind)
+            if priority(priority_event) < priority(event_id):
+                return self._commit(priority_event, task_kind)
             indexed.popleft()
             return self._commit(event_id, task_kind)
         return self.popleft(task_kind)
@@ -753,6 +932,13 @@ class _ReadyCandidateQueue:
         self._next_token = 0
         self._candidate_by_token: dict[int, tuple[int, int]] = {}
         self._waiting: list[tuple[tuple[int, int], int]] = []
+        self._waiting_tokens: set[int] = set()
+        self._waiting_owner_gradient_by_key: dict[
+            tuple[int, int, int], list[tuple[tuple[int, int], int]]
+        ] = defaultdict(list)
+        self._waiting_owner_gradient_key_by_token: dict[
+            int, tuple[int, int, int]
+        ] = {}
         self._worst_visible: list[tuple[int, int, int, int]] = []
         self._capacity: int | None = None
         self._general: list[tuple[tuple[int, int], int]] = []
@@ -766,12 +952,29 @@ class _ReadyCandidateQueue:
         self._simple_location_by_token: dict[
             int, tuple[int, tuple[int, int, int]]
         ] = {}
+        self._simple_worst_by_key: dict[
+            tuple[int, int, int], list[tuple[int, int, int, int]]
+        ] = defaultdict(list)
+        self._simple_worst_key_by_cluster: dict[
+            int,
+            list[tuple[int, int, int, tuple[int, int, int], int, int]],
+        ] = defaultdict(list)
+        self._simple_worst_generation_by_key: dict[
+            tuple[int, int, int], int
+        ] = {}
+        self._simple_worst_token_by_key: dict[tuple[int, int, int], int] = {}
         self._semantic_by_key: dict[
             tuple[PrimitiveKind, int, int], list[tuple[tuple[int, int], int]]
         ] = defaultdict(list)
         self._semantic_location_by_token: dict[
             int, tuple[PrimitiveKind, int, int]
         ] = {}
+        self._query_reduction_by_bank: dict[
+            int, list[tuple[tuple[int, int], int]]
+        ] = defaultdict(list)
+        self._query_reduction_location_by_token: dict[int, int] = {}
+        self._query_reduction_banks: int | None = None
+        self._owner_gradient_release_bypass = False
         self._compiler_semantic_request_key: (
             tuple[PrimitiveKind, int, int] | None
         ) = None
@@ -808,14 +1011,126 @@ class _ReadyCandidateQueue:
             and self._capacity is not None
             and len(self._candidate_by_token) >= self._capacity
         ):
+            victim = self._blocked_adjoint_victim(candidate)
+            if victim is not None:
+                victim_token, victim_candidate = victim
+                self._remove((victim_candidate, victim_token), promote=False)
+                self._push_waiting((victim_candidate, victim_token))
+                self._add_visible(token, candidate)
+                self._maybe_compact()
+                return
             worst_token, worst_candidate = self._worst_candidate()
             if (candidate, token) >= (worst_candidate, worst_token):
-                heapq.heappush(self._waiting, (candidate, token))
+                self._push_waiting((candidate, token))
                 return
             self._remove((worst_candidate, worst_token), promote=False)
-            heapq.heappush(self._waiting, (worst_candidate, worst_token))
+            self._push_waiting((worst_candidate, worst_token))
         self._add_visible(token, candidate)
         self._maybe_compact()
+
+    def _blocked_adjoint_victim(
+        self, candidate: tuple[int, int],
+    ) -> tuple[int, tuple[int, int]] | None:
+        """Make a full FIFO expose a ready reduction that releases an epoch."""
+
+        owner_gradients = self._owner_gradients
+        if (
+            not self._owner_gradient_release_bypass
+            or owner_gradients is None
+            or self._row_for is None
+            or self._physical_stage_for is None
+        ):
+            return None
+        event_id, _stage = candidate
+        row = self._row_for(event_id)
+        kind = (
+            self._kind_for(event_id)
+            if self._kind_for is not None
+            else PrimitiveKind(int(row["primitive_kind"]))
+        )
+        if kind is not PrimitiveKind.GRADIENT_REDUCTION:
+            return None
+        key = owner_gradients.key_by_gradient_event.get(event_id)
+        if key is None or key not in owner_gradients.active_by_cluster.get(
+            owner_gradients.cluster_for_key(key), set(),
+        ):
+            return None
+        victim: tuple[int, tuple[int, int]] | None = None
+        for cluster, active in owner_gradients.active_by_cluster.items():
+            if len(active) < owner_gradients.slots_per_cluster:
+                continue
+            simple = self._worst_blocked_simple(cluster, active)
+            if simple is not None and (
+                victim is None or (simple[1], simple[0]) > (victim[1], victim[0])
+            ):
+                victim = simple
+        for complex_token, event_ids in self._complex_event_ids.items():
+            if not owner_gradients.blocks_adjoint(event_ids):
+                continue
+            complex_candidate = self._candidate_by_token[complex_token]
+            complex_victim = (complex_token, complex_candidate)
+            if victim is None or (
+                complex_candidate, complex_token
+            ) > (victim[1], victim[0]):
+                victim = complex_victim
+        return victim
+
+    def _refresh_simple_worst(
+        self, cluster: int, key: tuple[int, int, int],
+    ) -> tuple[int, tuple[int, int]] | None:
+        heap = self._simple_worst_by_key.get(key)
+        if heap is None:
+            return None
+        while heap and heap[0][3] not in self._candidate_by_token:
+            heapq.heappop(heap)
+        token = heap[0][3] if heap else None
+        if token != self._simple_worst_token_by_key.get(key):
+            generation = self._simple_worst_generation_by_key.get(key, 0) + 1
+            self._simple_worst_generation_by_key[key] = generation
+            if token is None:
+                self._simple_worst_token_by_key.pop(key, None)
+            else:
+                self._simple_worst_token_by_key[key] = token
+                candidate = self._candidate_by_token[token]
+                heapq.heappush(
+                    self._simple_worst_key_by_cluster[cluster],
+                    (
+                        -candidate[0], -candidate[1], -token,
+                        key, generation, token,
+                    ),
+                )
+        if token is None:
+            return None
+        return token, self._candidate_by_token[token]
+
+    def _worst_blocked_simple(
+        self, cluster: int, active: set[tuple[int, int, int]],
+    ) -> tuple[int, tuple[int, int]] | None:
+        heap = self._simple_worst_key_by_cluster.get(cluster)
+        if heap is None:
+            return None
+        reusable: list[
+            tuple[int, int, int, tuple[int, int, int], int, int]
+        ] = []
+        try:
+            while heap:
+                _event, _stage, _token_order, key, generation, token = heap[0]
+                current = self._refresh_simple_worst(cluster, key)
+                if (
+                    current is None
+                    or generation != self._simple_worst_generation_by_key.get(key)
+                    or token != current[0]
+                ):
+                    heapq.heappop(heap)
+                    continue
+                if key in active:
+                    reusable.append(heapq.heappop(heap))
+                    continue
+                return current
+            return None
+        finally:
+            for entry in reusable:
+                heapq.heappush(heap, entry)
 
     def _add_visible(self, token: int, candidate: tuple[int, int]) -> None:
         self._candidate_by_token[token] = candidate
@@ -844,7 +1159,86 @@ class _ReadyCandidateQueue:
             return
         while self._waiting and len(self._candidate_by_token) < self._capacity:
             candidate, token = heapq.heappop(self._waiting)
+            self._mark_waiting_removed(token)
             self._add_visible(token, candidate)
+
+    def _push_waiting(
+        self, entry: tuple[tuple[int, int], int],
+    ) -> None:
+        candidate, token = entry
+        heapq.heappush(self._waiting, entry)
+        self._waiting_tokens.add(token)
+        if self._row_for is None:
+            return
+        event_id, _stage = candidate
+        row = self._row_for(event_id)
+        kind = (
+            self._kind_for(event_id)
+            if self._kind_for is not None
+            else PrimitiveKind(int(row["primitive_kind"]))
+        )
+        if kind is not PrimitiveKind.GRADIENT_REDUCTION:
+            return
+        owner_gradients = self._owner_gradients
+        if owner_gradients is None:
+            return
+        key = owner_gradients.key_by_gradient_event.get(event_id)
+        if key is None:
+            return
+        heapq.heappush(self._waiting_owner_gradient_by_key[key], entry)
+        self._waiting_owner_gradient_key_by_token[token] = key
+
+    def _mark_waiting_removed(self, token: int) -> None:
+        self._waiting_tokens.discard(token)
+        self._waiting_owner_gradient_key_by_token.pop(token, None)
+
+    def _promote_waiting_owner_gradient_release(self) -> bool:
+        """Expose a ready owner release when all visible work is blocked.
+
+        A reduction can reach the upstream waiting heap before its owner epoch
+        becomes active.  In that case admission-time bypass cannot see it.  A
+        full compute FIFO must still be able to exchange one owner-blocked
+        adjoint for that now-ready reduction, preserving the FIFO capacity and
+        returning the displaced adjoint upstream.
+        """
+
+        owner_gradients = self._owner_gradients
+        if (
+            not self._owner_gradient_release_bypass
+            or owner_gradients is None
+            or self._row_for is None
+            or self._physical_stage_for is None
+            or not self._waiting
+            or not self._candidate_by_token
+        ):
+            return False
+
+        release_entry: tuple[tuple[int, int], int] | None = None
+        for active_keys in owner_gradients.active_by_cluster.values():
+            for key in active_keys:
+                waiting = self._waiting_owner_gradient_by_key.get(key)
+                if waiting is None:
+                    continue
+                while waiting and waiting[0][1] not in self._waiting_tokens:
+                    heapq.heappop(waiting)
+                if waiting and (release_entry is None or waiting[0] < release_entry):
+                    release_entry = waiting[0]
+        if release_entry is None:
+            return False
+
+        victim = self._blocked_adjoint_victim(release_entry[0])
+        if victim is None:
+            return False
+        victim_token, victim_candidate = victim
+        self._remove((victim_candidate, victim_token), promote=False)
+        self._push_waiting((victim_candidate, victim_token))
+        self._mark_waiting_removed(release_entry[1])
+        self._waiting.remove(release_entry)
+        heapq.heapify(self._waiting)
+        release_candidate, release_token = release_entry
+        self._add_visible(release_token, release_candidate)
+        self._maybe_compact()
+        return True
 
     def _maybe_compact(self) -> None:
         """Bound lazy-deletion overhead after repeated resource requeues.
@@ -870,7 +1264,10 @@ class _ReadyCandidateQueue:
             + len(self._complex)
             + sum(len(heap) for heap in self._simple_by_cluster.values())
             + sum(len(heap) for heap in self._simple_by_key.values())
+            + sum(len(heap) for heap in self._simple_worst_by_key.values())
+            + sum(len(heap) for heap in self._simple_worst_key_by_cluster.values())
             + sum(len(heap) for heap in self._semantic_by_key.values())
+            + sum(len(heap) for heap in self._query_reduction_by_bank.values())
         )
         threshold = max(128, live * 4 + 64)
         if heap_entries <= threshold:
@@ -899,6 +1296,20 @@ class _ReadyCandidateQueue:
                     empty_keys.append(key)
             for key in empty_keys:
                 del heaps[key]
+        self._simple_worst_by_key.clear()
+        self._simple_worst_key_by_cluster.clear()
+        self._simple_worst_generation_by_key.clear()
+        self._simple_worst_token_by_key.clear()
+        for token, (cluster, key) in self._simple_location_by_token.items():
+            candidate = self._candidate_by_token[token]
+            heapq.heappush(
+                self._simple_worst_by_key[key],
+                (-candidate[0], -candidate[1], -token, token),
+            )
+        for key in tuple(self._simple_worst_by_key):
+            token = self._simple_worst_by_key[key][0][3]
+            cluster = self._simple_location_by_token[token][0]
+            self._refresh_simple_worst(cluster, key)
         empty_semantic_keys = []
         for key, heap in self._semantic_by_key.items():
             retain(heap)
@@ -906,6 +1317,13 @@ class _ReadyCandidateQueue:
                 empty_semantic_keys.append(key)
         for key in empty_semantic_keys:
             del self._semantic_by_key[key]
+        empty_query_banks = []
+        for bank, heap in self._query_reduction_by_bank.items():
+            retain(heap)
+            if not heap:
+                empty_query_banks.append(bank)
+        for bank in empty_query_banks:
+            del self._query_reduction_by_bank[bank]
 
     def _index(self, token: int, candidate: tuple[int, int]) -> None:
         assert self._row_for is not None
@@ -919,6 +1337,22 @@ class _ReadyCandidateQueue:
             if self._kind_for is not None
             else PrimitiveKind(int(row["primitive_kind"]))
         )
+        if (
+            self._module_name == "bidirectional_query"
+            and self._query_reduction_banks is not None
+            and kind in {PrimitiveKind.FORWARD, PrimitiveKind.QUERY_REDUCTION}
+        ):
+            query_id = int(row["query_id"])
+            if query_id < 0:
+                raise CycleConfigurationError(
+                    "query reduction candidate has no query identity"
+                )
+            bank = query_id & (self._query_reduction_banks - 1)
+            heapq.heappush(
+                self._query_reduction_by_bank[bank], (candidate, token),
+            )
+            self._query_reduction_location_by_token[token] = bank
+            return
         if (
             self._module_name == "semantic_cache"
             and candidate[1] == 0
@@ -958,6 +1392,11 @@ class _ReadyCandidateQueue:
             heapq.heappush(self._simple_by_cluster[cluster], (candidate, token))
             heapq.heappush(self._simple_by_key[key], (candidate, token))
             self._simple_location_by_token[token] = (cluster, key)
+            heapq.heappush(
+                self._simple_worst_by_key[key],
+                (-candidate[0], -candidate[1], -token, token),
+            )
+            self._refresh_simple_worst(cluster, key)
             return
         heapq.heappush(self._complex, (candidate, token))
         self._complex_event_ids[token] = event_ids
@@ -972,12 +1411,22 @@ class _ReadyCandidateQueue:
         owner_gradients: OwnerGradientTracker | None,
         query_replay: QueryReplayTracker | None,
         kind_for: Callable[[int], PrimitiveKind] | None = None,
+        query_reduction_banks: int | None = None,
+        owner_gradient_release_bypass: bool = False,
     ) -> None:
         if self._configured:
             if module_name != self._module_name:
                 raise CycleConfigurationError("ready queue changed module ownership")
             if capacity is not None and capacity != self._capacity:
                 raise CycleConfigurationError("ready queue changed hardware capacity")
+            if query_reduction_banks != self._query_reduction_banks:
+                raise CycleConfigurationError(
+                    "ready queue changed query reduction bank indexing"
+                )
+            if owner_gradient_release_bypass != self._owner_gradient_release_bypass:
+                raise CycleConfigurationError(
+                    "ready queue changed owner-gradient release flow control"
+                )
             self._row_for = row_for
             self._kind_for = kind_for
             self._physical_stage_for = physical_stage_for
@@ -996,12 +1445,14 @@ class _ReadyCandidateQueue:
         self._physical_stage_for = physical_stage_for
         self._owner_gradients = owner_gradients
         self._query_replay = query_replay
+        self._query_reduction_banks = query_reduction_banks
+        self._owner_gradient_release_bypass = owner_gradient_release_bypass
         visible = sorted(
             self._candidate_by_token.items(),
             key=lambda item: (item[1], item[0]),
         )
         for token, candidate in visible[capacity:]:
-            heapq.heappush(self._waiting, (candidate, token))
+            self._push_waiting((candidate, token))
             del self._candidate_by_token[token]
         self._worst_visible = [
             (-candidate[0], -candidate[1], -token, token)
@@ -1017,6 +1468,20 @@ class _ReadyCandidateQueue:
         while heap and heap[0][1] not in self._candidate_by_token:
             heapq.heappop(heap)
         return heap[0] if heap else None
+
+    def _query_reduction_candidate(
+        self, excluded_banks: set[int],
+    ) -> tuple[tuple[int, int], int] | None:
+        """Return the oldest resident head from an unused reduction Bank."""
+
+        best: tuple[tuple[int, int], int] | None = None
+        for bank, heap in self._query_reduction_by_bank.items():
+            if bank in excluded_banks:
+                continue
+            entry = self._peek(heap)
+            if entry is not None and (best is None or entry[0] < best[0]):
+                best = entry
+        return best
 
     def _owner_slots_block(
         self,
@@ -1164,6 +1629,7 @@ class _ReadyCandidateQueue:
         self, entry: tuple[tuple[int, int], int], *, promote: bool = True,
     ) -> None:
         _candidate, token = entry
+        self._query_reduction_location_by_token.pop(token, None)
         semantic_key = self._semantic_location_by_token.pop(token, None)
         if semantic_key is not None:
             semantic_heap = self._semantic_by_key[semantic_key]
@@ -1193,6 +1659,8 @@ class _ReadyCandidateQueue:
             heapq.heappop(self._replay_consumers)
         self._complex_event_ids.pop(token, None)
         del self._candidate_by_token[token]
+        if location is not None:
+            self._refresh_simple_worst(*location)
         if promote:
             self._promote_waiters()
 
@@ -1209,6 +1677,8 @@ class _ReadyCandidateQueue:
         query_replay: QueryReplayTracker | None,
         semantic_multicast_destinations: int | None = None,
         compiler_semantic_order: bool = False,
+        query_reduction_banks: int | None = None,
+        owner_gradient_release_bypass: bool = False,
     ) -> list[tuple[int, int]]:
         self._configure(
             module_name, capacity=capacity, row_for=row_for,
@@ -1216,8 +1686,11 @@ class _ReadyCandidateQueue:
             physical_stage_for=physical_stage_for,
             owner_gradients=owner_gradients,
             query_replay=query_replay,
+            query_reduction_banks=query_reduction_banks,
+            owner_gradient_release_bypass=owner_gradient_release_bypass,
         )
         selected: list[tuple[int, int]] = []
+        selected_query_banks: set[int] = set()
         provisional_owner_active = (
             {
                 cluster: set(keys)
@@ -1228,14 +1701,37 @@ class _ReadyCandidateQueue:
         )
         selection_limit = min(width, len(self._candidate_by_token))
         for _ in range(selection_limit):
-            entry = (
+            ordinary = (
                 self._compiler_semantic_request_candidate()
                 if compiler_semantic_order and module_name == "semantic_cache"
                 else self._earliest_acceptable(provisional_owner_active)
             )
+            query_head = (
+                self._query_reduction_candidate(selected_query_banks)
+                if query_reduction_banks is not None
+                else None
+            )
+            entry = min(
+                (
+                    item for item in (ordinary, query_head)
+                    if item is not None
+                ),
+                key=lambda item: item[0],
+                default=None,
+            )
+            if (
+                entry is None
+                and module_name == "compute_pod"
+                and self._promote_waiting_owner_gradient_release()
+            ):
+                ordinary = self._earliest_acceptable(provisional_owner_active)
+                entry = ordinary
             if entry is None:
                 break
             candidate, token = entry
+            query_bank = self._query_reduction_location_by_token.get(token)
+            if query_bank is not None:
+                selected_query_banks.add(query_bank)
             if provisional_owner_active is not None:
                 location = self._simple_location_by_token.get(token)
                 if location is not None:
@@ -2254,13 +2750,12 @@ class CycleEngine:
         )
 
     def _joint_semantic_priority_enabled(self) -> bool:
-        if not self.selection.overlap_guided_issue:
-            return True
-        # In Full, A+C must choose from the real source heads before D expands
-        # an accepted leader into a same-state control bundle.  Letting the
-        # semantic index replace those heads would bypass the compiler's query
-        # release order and starve the downstream adjoint replay lanes.
-        return False
+        # D's ready semantic index is a bounded view over the same source FIFO
+        # heads that A+C may issue.  Keeping a ready same-state leader visible
+        # lets the joint path preserve D's real multicast opportunity; the
+        # subsequent compatibility check still enforces A+C's ports, banks,
+        # reduction keys, and target resources.
+        return True
 
     def _peek_fusion_input_candidates(
         self,
@@ -2424,6 +2919,37 @@ class CycleEngine:
                 best = candidate
         return (best[2], best[3]) if best is not None else None
 
+    def _joint_semantic_bundles(
+        self,
+        inputs: Mapping[TaskKind, _BankedFusionSourceQueue],
+        candidates: Iterable[TaskPacket],
+    ) -> Mapping[int, tuple[TaskPacket, ...]] | None:
+        """Expose already-ready semantic groups to Full's query scoring."""
+
+        destinations = self.config.cache_multicast_destinations
+        if (
+            not self.selection.overlap_guided_issue
+            or not self.selection.semantic_worksets
+            or not self.selection.semantic_residency
+            or self.config.fusion_semantic_bundle_index_bytes is None
+            or destinations is None
+            or destinations <= 1
+        ):
+            return None
+        bundles: dict[int, tuple[TaskPacket, ...]] = {}
+        for leader in candidates:
+            if leader.task_kind not in {TaskKind.FORWARD, TaskKind.ADJOINT}:
+                continue
+            followers = inputs[leader.task_kind].semantic_followers(
+                leader,
+                destinations=min(destinations, self.config.candidate_lanes),
+                compatible=self._fusion_packets_compatible,
+                eligible=self._fusion_packet_exact_ready,
+            )
+            if followers:
+                bundles[leader.event_id] = (leader, *followers)
+        return bundles
+
     def _query_compound_bundle(
         self,
         accepted: tuple[TaskPacket, ...],
@@ -2506,9 +3032,7 @@ class CycleEngine:
     def _has_query_resources(self) -> bool:
         return self.config.query_reduction_banks is not None
 
-    def _new_query_replay_lane_scheduler(
-        self,
-    ) -> _QueryReplayLaneScheduler | None:
+    def _new_query_replay_lane_scheduler(self) -> _QueryReplayLaneScheduler | None:
         if not self._has_query_resources():
             return None
         reduction_banks = self.config.query_reduction_banks
@@ -2530,6 +3054,7 @@ class CycleEngine:
             initiation_interval=(
                 self.modules["bidirectional_query"].timing.initiation_interval
             ),
+            volume_bank_for=self.config.query_volume_bank,
         )
 
     @staticmethod
@@ -2586,6 +3111,7 @@ class CycleEngine:
         replay_base = loss_base + loss_slots
         volume_read_base = replay_base + replay_lanes
         volume_write_base = volume_read_base + volume_banks
+        volume_bank_for = self.config.query_volume_bank
 
         def first_free(begin: int, count: int, needed: int) -> tuple[int, ...] | None:
             available = tuple(
@@ -2607,7 +3133,7 @@ class CycleEngine:
             query_id = int(row["query_id"])
             allocation = (
                 reduction_slot(query_id),
-                volume_write_base + query_id % volume_banks,
+                volume_write_base + volume_bank_for(query_id),
             )
         elif kind is PrimitiveKind.CONSUMER:
             loss = first_free(loss_base, loss_slots, 1)
@@ -2616,8 +3142,8 @@ class CycleEngine:
             query_id = int(row["query_id"])
             allocation = (
                 *loss,
-                volume_read_base + query_id % volume_banks,
-                volume_write_base + query_id % volume_banks,
+                volume_read_base + volume_bank_for(query_id),
+                volume_write_base + volume_bank_for(query_id),
             )
         elif kind is PrimitiveKind.ADJOINT:
             query_ids = (
@@ -2634,7 +3160,9 @@ class CycleEngine:
                 return None
             reads = tuple(
                 volume_read_base + bank
-                for bank in dict.fromkeys(query_id % volume_banks for query_id in query_ids)
+                for bank in dict.fromkeys(
+                    volume_bank_for(query_id) for query_id in query_ids
+                )
             )
             allocation = (*replay, *reads)
         else:
@@ -2875,6 +3403,17 @@ class CycleEngine:
                 module_name == "semantic_cache"
                 and self.selection.semantic_worksets
                 and not self.selection.semantic_residency
+            ),
+            query_reduction_banks=(
+                self.config.query_reduction_banks
+                if module_name == "bidirectional_query"
+                and self.selection.overlap_guided_issue
+                else None
+            ),
+            owner_gradient_release_bypass=(
+                module_name == "compute_pod"
+                and self.selection.query_load_rules
+                and self.config.compute_ready_head_index_bytes is not None
             ),
         )
 
@@ -3974,8 +4513,22 @@ class CycleEngine:
                                             )
                                         )
                                     )
-                                    if self.selection.query_load_rules
+                                    if (
+                                        self.selection.query_load_rules
+                                        and not (
+                                            self.selection.semantic_worksets
+                                            and self.selection.semantic_residency
+                                        )
+                                    )
                                     else None
+                                ),
+                                global_priority=(
+                                    self.selection.query_load_rules
+                                    and task_kind is TaskKind.FORWARD
+                                    and not (
+                                        self.selection.semantic_worksets
+                                        and self.selection.semantic_residency
+                                    )
                                 ),
                             )
                             if (
@@ -3983,7 +4536,24 @@ class CycleEngine:
                                 and self.selection.semantic_residency
                                 and offers
                             )
-                            else fusion_pending.popleft(task_kind)
+                            else (
+                                fusion_pending.popleft_priority(
+                                    task_kind,
+                                    lambda pending_event_id:
+                                    self.issue_scheduler.compiler_admission_key(
+                                        self._task_packet(
+                                            trace,
+                                            pending_event_id,
+                                            packet_plan.stage_for_event(
+                                                pending_event_id
+                                            ),
+                                        )
+                                    ),
+                                )
+                                if self.selection.query_load_rules
+                                and task_kind is TaskKind.FORWARD
+                                else fusion_pending.popleft(task_kind)
+                            )
                         )
                         packet = self._task_packet(
                             trace, event_id,
@@ -4119,6 +4689,11 @@ class CycleEngine:
                         use_load_rules=self.selection.query_load_rules,
                         use_history_prediction=(
                             self.selection.overlap_guided_issue
+                        ),
+                        semantic_bundles=(
+                            self._joint_semantic_bundles(
+                                fusion_inputs, fusion_packets.values(),
+                            )
                         ),
                     )
                 )
@@ -5881,6 +6456,7 @@ class CycleReplaySession:
         self._cache_return_multicast_leaders: dict[int, int] = {}
         self._workset_seen: dict[tuple[int, int], int] = defaultdict(int)
         self._workset_by_request: dict[int, tuple[int, int, int, bool]] = {}
+        self._semantic_workset_keys = len(self.semantic_workset_totals)
         self._workset_use_count = 0
         self._workset_release_count = 0
         self._semantic_placement_keys = 0
@@ -6603,6 +7179,8 @@ class CycleReplaySession:
                 raise CycleConfigurationError(
                     f"semantic workset total changed for key {normalized_key}"
                 )
+            if existing is None:
+                self._semantic_workset_keys += 1
             self.semantic_workset_totals[normalized_key] = normalized_value
 
     def register_semantic_placement(self, placement: SemanticPlacement) -> None:
@@ -6892,7 +7470,7 @@ class CycleReplaySession:
                     cache_totals[key] += value
             counters["semantic_cache"].update(cache_totals)
         counters["semantic_cache"]["memory_requests"] = self._memory_requests
-        counters["semantic_cache"]["workset_keys"] = len(self.semantic_workset_totals)
+        counters["semantic_cache"]["workset_keys"] = self._semantic_workset_keys
         counters["semantic_cache"]["workset_uses"] = self._workset_use_count
         counters["semantic_cache"]["workset_releases"] = self._workset_release_count
         audit_records = getattr(self.engine.config.memory, "audit_records", None)
@@ -7233,8 +7811,22 @@ class CycleReplaySession:
                                         self._task_packet(pending_event_id)
                                     )
                                 )
-                                if self.engine.selection.query_load_rules
+                                if (
+                                    self.engine.selection.query_load_rules
+                                    and not (
+                                        self.engine.selection.semantic_worksets
+                                        and self.engine.selection.semantic_residency
+                                    )
+                                )
                                 else None
+                            ),
+                            global_priority=(
+                                self.engine.selection.query_load_rules
+                                and task_kind is TaskKind.FORWARD
+                                and not (
+                                    self.engine.selection.semantic_worksets
+                                    and self.engine.selection.semantic_residency
+                                )
                             ),
                         )
                         if (
@@ -7242,7 +7834,18 @@ class CycleReplaySession:
                             and self.engine.selection.semantic_residency
                             and offers
                         )
-                        else self._fusion_pending.popleft(task_kind)
+                        else (
+                            self._fusion_pending.popleft_priority(
+                                task_kind,
+                                lambda pending_event_id:
+                                self.engine.issue_scheduler.compiler_admission_key(
+                                    self._task_packet(pending_event_id)
+                                ),
+                            )
+                            if self.engine.selection.query_load_rules
+                            and task_kind is TaskKind.FORWARD
+                            else self._fusion_pending.popleft(task_kind)
+                        )
                     )
                     packet = self._task_packet(event_id)
                     queue.append(
@@ -7315,6 +7918,11 @@ class CycleReplaySession:
                         use_load_rules=self.engine.selection.query_load_rules,
                         use_history_prediction=(
                             self.engine.selection.overlap_guided_issue
+                        ),
+                        semantic_bundles=(
+                            self.engine._joint_semantic_bundles(
+                                self._fusion_inputs, fusion_packets.values(),
+                            )
                         ),
                     )
                     selected = {task.event_id for task in decision.accepted}
@@ -8183,8 +8791,8 @@ class CycleReplaySession:
                     for follower_id in available_followers:
                         self._cache_multicast_followers[follower_id] = (state, key)
             return self._cycle + service_cycles
-        self._memory_requests += 1
         if lookup is CacheLookup.MISS:
+            self._memory_requests += 1
             if async_memory:
                 request_id = self.engine.config.memory.submit_async(
                     address=int(row["address_token"]), size_bytes=data_bytes,

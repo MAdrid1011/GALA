@@ -38,12 +38,21 @@ def test_cli_validates_compact_packet_archive_without_false_formal_promotion(
 
     assert main([
         "trace-archive-validate", "--archive", str(archive_root),
-        "--output", str(output),
+        "--output", str(output), "--parallel-workers", "2",
     ]) == 0
-    report = json.loads(capsys.readouterr().out)
+    captured = capsys.readouterr()
+    report = json.loads(captured.out)
     assert report["status"] == "passed"
     assert report["validation_passed"] is True
     assert report["formal_performance_eligible"] is False
+    assert report["parallel_validation_workers"] == 2
+    progress = [json.loads(line) for line in captured.err.splitlines()]
+    assert progress == [{
+        "completed_chunks": 1,
+        "percent": 100,
+        "phase": "archive_validation",
+        "total_chunks": 1,
+    }]
     assert json.loads(output.read_text()) == report
 
 

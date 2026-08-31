@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from gala_sim.clamp import (
@@ -264,6 +266,53 @@ def test_waiting_age_breaks_an_authoritative_score_tie() -> None:
     scheduler.set_clock(10)
 
     assert scheduler.forecast((younger, older)) == [older, younger]
+
+
+def test_compiler_admission_does_not_consume_runtime_workset_hits() -> None:
+    scheduler = FusionIssueScheduler(
+        candidate_lanes=3, forward_ports=1, consumer_ports=1,
+        adjoint_ports=1,
+    )
+    scheduler.set_strict_lifecycle()
+    scheduler.relation_accept((1,))
+    miss = _task(0, TaskKind.FORWARD, 1, query_id=1)
+    hit = replace(miss, workset_hit=True)
+
+    assert scheduler.compiler_admission_key(hit) == (
+        scheduler.compiler_admission_key(miss)
+    )
+    assert scheduler.forecast((miss, hit)) == [hit, miss]
+
+
+def test_semantic_bundle_breaks_only_the_same_query_release_class() -> None:
+    scheduler = FusionIssueScheduler(
+        candidate_lanes=3, forward_ports=1, consumer_ports=1,
+        adjoint_ports=1,
+    )
+    scheduler.set_strict_lifecycle()
+    scheduler.relation_accept((1, 2, 2, 3))
+    releases_one = _task(0, TaskKind.FORWARD, 1, query_id=1)
+    same_release = _task(1, TaskKind.FORWARD, 3, query_id=3)
+    releases_none = _task(2, TaskKind.FORWARD, 2, query_id=2)
+
+    ordered = scheduler.forecast(
+        (releases_one, same_release, releases_none),
+        semantic_bundles={same_release.event_id: (same_release, releases_one)},
+    )
+
+    assert ordered == [same_release, releases_one, releases_none]
+
+    scheduler.relation_accept((4,))
+    releases_two = TaskPacket(
+        3, 3, 4, 4, 1, 0, 1, 3, TaskKind.FORWARD,
+        conflict_query_ids=(3, 4),
+    )
+    ordered = scheduler.forecast(
+        (same_release, releases_two),
+        semantic_bundles={same_release.event_id: (same_release, releases_none)},
+    )
+
+    assert ordered == [releases_two, same_release]
 
 
 def test_query_state_uses_and_reuses_physical_eight_lane_slots() -> None:

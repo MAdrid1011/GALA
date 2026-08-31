@@ -59,6 +59,7 @@ class SemanticPlacement:
 
         if config.compute_templates is None:
             return cls._from_demands({}, 1)
+        cluster_count, clusters_per_pod = cls._cluster_topology(config)
         path_names = {
             PrimitiveKind.FORWARD: "forward",
             PrimitiveKind.ADJOINT: "adjoint",
@@ -89,7 +90,9 @@ class SemanticPlacement:
             )
             key = (int(row["iteration_id"]), gaussian_id)
             demands[key] += issue_cycles * path.cluster_issue_slots
-        return cls._from_demands(demands, cls._cluster_count(config))
+        return cls._from_demands(
+            demands, cluster_count, clusters_per_pod=clusters_per_pod,
+        )
 
     @classmethod
     def from_virtual_packets(
@@ -105,6 +108,7 @@ class SemanticPlacement:
             raise ValueError("semantic placement relation bound must be positive")
         if config.compute_templates is None:
             return cls._from_demands({}, 1)
+        cluster_count, clusters_per_pod = cls._cluster_topology(config)
         demands: dict[PlacementKey, int] = defaultdict(int)
         for packet in packets:
             try:
@@ -137,23 +141,33 @@ class SemanticPlacement:
                         )
                 if demand:
                     demands[(packet.iteration_id, int(gaussian_id))] += demand
-        return cls._from_demands(demands, cls._cluster_count(config))
+        return cls._from_demands(
+            demands, cluster_count, clusters_per_pod=clusters_per_pod,
+        )
 
     @staticmethod
-    def _cluster_count(config: CycleConfig) -> int:
+    def _cluster_topology(config: CycleConfig) -> tuple[int, int]:
         capacities = config.compute_resource_capacities
         if capacities is None or "clusters" not in capacities:
             raise ValueError("semantic placement requires ComputePod topology")
         cluster_count = int(capacities["clusters"])
-        if cluster_count <= 0:
-            raise ValueError("semantic placement cluster count must be positive")
-        return cluster_count
+        pods = int(capacities.get("pods", 1))
+        clusters_per_pod = int(
+            capacities.get("clusters_per_pod", cluster_count)
+        )
+        if min(cluster_count, pods, clusters_per_pod) <= 0:
+            raise ValueError("semantic placement topology must be positive")
+        if pods * clusters_per_pod != cluster_count:
+            raise ValueError("semantic placement topology does not close")
+        return cluster_count, clusters_per_pod
 
     @classmethod
     def _from_demands(
         cls,
         raw_demands: Mapping[PlacementKey, int],
         cluster_count: int,
+        *,
+        clusters_per_pod: int | None = None,
     ) -> "SemanticPlacement":
         demands = {
             (int(key[0]), int(key[1])): int(value)
@@ -167,18 +181,35 @@ class SemanticPlacement:
             by_iteration[iteration_id].append((gaussian_id, demand))
         cluster_by_key: dict[PlacementKey, int] = {}
         loads_by_iteration: dict[int, tuple[int, ...]] = {}
+        clusters_per_pod = clusters_per_pod or cluster_count
+        if cluster_count % clusters_per_pod:
+            raise ValueError("semantic placement cluster topology is invalid")
+        pod_count = cluster_count // clusters_per_pod
+
+        def interleaved_rank(cluster: int) -> int:
+            return (
+                cluster % clusters_per_pod
+            ) * pod_count + cluster // clusters_per_pod
+
         for iteration_id, work in sorted(by_iteration.items()):
-            heap = [(0, cluster) for cluster in range(cluster_count)]
+            # Equal-load clusters are visited across Pods before advancing to
+            # the next local cluster.  The LPT objective is unchanged, while
+            # the largest simultaneous workset members cannot all inherit one
+            # Pod merely because its cluster IDs are contiguous.
+            heap = [
+                (0, interleaved_rank(cluster), cluster)
+                for cluster in range(cluster_count)
+            ]
             heapq.heapify(heap)
             loads = [0] * cluster_count
             for gaussian_id, demand in sorted(
                 work, key=lambda item: (-item[1], item[0]),
             ):
-                load, cluster = heapq.heappop(heap)
+                load, rank, cluster = heapq.heappop(heap)
                 cluster_by_key[(iteration_id, gaussian_id)] = cluster
                 load += demand
                 loads[cluster] = load
-                heapq.heappush(heap, (load, cluster))
+                heapq.heappush(heap, (load, rank, cluster))
             loads_by_iteration[iteration_id] = tuple(loads)
         return cls(
             cluster_by_key=MappingProxyType(cluster_by_key),
