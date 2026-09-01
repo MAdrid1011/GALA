@@ -1,0 +1,31 @@
+schema_version: gala-model-source-v1
+id: exact_gs
+name: Exact-GS
+implementation: upstream
+repository: https://github.com/brucee1323/Exact-GS.git
+commit: c8f9251e9dfe3e73672c9ae96d54c4486861d6b8
+evidence_level: A
+license: inherited-from-upstream
+exclude_paths:
+  - data
+official_commands:
+  environment: requirements.txt
+  train:
+    - "{python_executable}"
+    - train.py
+    - --method=Exact_GS
+    - "--source_path={dataset_root}"
+  evaluate:
+    - "{python_executable}"
+    - test.py
+    - --method=Exact_GS
+    - "--source_path={dataset_root}"
+    - "--model_path={output_root}"
+output_strategy: dataset_output_directory
+stage_boundaries:
+  - projection_load
+  - exact_gaussian_rasterization
+  - loss_evaluation
+  - backward
+  - optimizer_step
+  - adaptive_gaussian_update

@@ -1,0 +1,12 @@
+include CONTRIBUTING.md
+include LICENSE
+include README.md
+recursive-include configs *.json *.yaml
+recursive-include docs *.md
+recursive-include gala_sim *.cpp *.cu *.md *.py
+recursive-include native *.cpp
+recursive-include tests *.md *.py
+recursive-include tools *.md *.py
+prune workspace
+global-exclude *.arrow *.ckpt *.log *.npy *.npz *.parquet *.pt *.pth
+global-exclude __pycache__ *.py[cod]

@@ -1,16 +1,19 @@
 # manifest.py
 
-生成并校验 R²-Gaussian + Chest 的内容寻址 input-freeze 记录。
-
 ## External Interfaces
 
-- `source_record(...)`：验证固定上游提交、许可和源码树身份。
-- `dataset_record(...)`：记录 Chest 文件清单、几何和参考体身份。
-- `training_record(...)`：对照固定上游源码校验训练快照，并绑定绝对 Python 解释器、数据和输出路径。
-- `environment_snapshot(python_executable)`：用冻结解释器查询 Python、CUDA 和依赖版本。
-- `build_freeze_record(...)`：组合输入身份并生成 self-hash。
-- `verify_freeze_record(record)`：要求记录中存在审计哈希，但不重新计算或比较哈希。
+`source_record()` validates a pinned upstream checkout and license identity.
+`dataset_record()` inventories prepared dataset files, geometry, and reference
+volume. `training_record()` binds and validates an upstream training profile.
+
+`environment_snapshot()` records interpreter, compiler, CUDA, and dependency
+versions. `build_freeze_record()` creates the input identity document, and
+`verify_freeze_record()` validates its schema and required audit fields.
+`build_campaign_freeze_record()` provides the model- and dataset-independent
+public workflow and emits portable repository and workspace references.
 
 ## Internal Helpers
 
-AST helpers提取上游参数默认值、运行时参数、调度追加和 `safe_state` 随机状态。质量检查器核对参考体范围与 LPIPS 切片边界。
+AST helpers extract declared upstream defaults, schedules, and random-state
+behavior without importing the training package. Quality checks validate the
+reference range and configured metric inputs.

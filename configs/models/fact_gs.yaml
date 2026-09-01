@@ -1,0 +1,29 @@
+schema_version: gala-model-source-v1
+id: fact_gs
+name: FaCT-GS
+implementation: upstream
+repository: https://github.com/PaPieta/fact-gs.git
+commit: 9b95ea9370055d9caf148899775173a3bdfe6d61
+evidence_level: A
+license: inherited-from-upstream
+submodules: true
+official_commands:
+  environment: environment.yml
+  train:
+    - "{python_executable}"
+    - train_recon.py
+    - "model.data_source_path={dataset_root}"
+    - "model.model_path={output_root}"
+  evaluate:
+    - "{python_executable}"
+    - test_model.py
+    - "model.data_source_path={dataset_root}"
+    - "model.model_path={output_root}"
+    - model.target=recon
+stage_boundaries:
+  - projection_load
+  - gaussian_rasterization
+  - loss_evaluation
+  - backward
+  - optimizer_step
+  - adaptive_gaussian_update

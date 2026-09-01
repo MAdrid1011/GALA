@@ -8,12 +8,11 @@ from dataclasses import dataclass
 import json
 from pathlib import Path
 import re
-import subprocess
 from typing import Any, Iterable, Mapping
 
 import yaml
 
-from gala_sim.identity import canonical_json, sha256_bytes, sha256_file
+from gala_sim.identity import canonical_json, git_commit, sha256_bytes, sha256_file
 from gala_sim.tools.gpu_profile_campaign import GpuProfileCampaign
 
 
@@ -484,9 +483,7 @@ def build_ncu_plan(
 ) -> dict[str, Any]:
     campaign = GpuProfileCampaign.load(config.campaign)
     repository = config.path.parents[2]
-    repository_commit = subprocess.check_output(
-        ["git", "-C", str(repository), "rev-parse", "HEAD"], text=True,
-    ).strip()
+    repository_commit = git_commit(repository)
     expected_iterations = [item.iteration for item in campaign.representatives]
     loaded = _load_inventory_set(
         inventory_paths, config.campaign_sha256, expected_iterations

@@ -1,15 +1,18 @@
 # preflight.py
 
-实现官方数值路径和长任务的运行时间预测及 GPU 门控。
-
 ## External Interfaces
 
-- `predict_runtime(...)`：由 warmup 后的短测量预测总迭代时间。
-- `decide_long_run(...)`：按冻结阈值和本任务 GPU 利用率决定是否允许长任务。
-- `sample_gpustat(gpu_index=0)`：组合 `gpustat` 与 compute-app 清单，区分外部计算进程。
-- `run_native_preflight(...)`：验证 input-freeze，运行隔离的 60 次迭代校准，写出 `preflight.json` 和 `status.json`。
-- `ComputeProcess`、`GpuSample`、`PreflightDecision`、`NativePreflightReport`：机器可读记录类型。
+`predict_runtime()` projects a complete run from measured work after warmup.
+`decide_long_run()` applies configured duration and utilization gates.
+`sample_gpustat()` captures GPU utilization, memory, and compute-process
+ownership. `run_native_preflight()` validates an input manifest and runs a
+bounded upstream calibration.
+
+`ComputeProcess`, `GpuSample`, `PreflightDecision`, and
+`NativePreflightReport` are the machine-readable record types.
 
 ## Internal Helpers
 
-内部逻辑派生短测量命令、采集 `/proc` CPU 与读取计数、提取 TensorBoard 测量区间，并在采样、启动、训练或测量失败时终止短任务和写出 `failed_preflight`。
+Helpers inspect process CPU time, parse available timing output, and supervise
+only the launched process group. An unrelated compute process prevents launch;
+the preflight never terminates it.

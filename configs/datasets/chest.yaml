@@ -1,8 +1,12 @@
 schema_version: gala-dataset-source-v1
+id: chest
 name: Chest
-model: R2-Gaussian
+provider: google_drive
 source_url: https://drive.google.com/drive/folders/1YZ3w87XrCNyjDRos6gkY8zgT5hESl-PN?usp=sharing
 source_subpath: synthetic_dataset/cone_ntrain_50_angle_360.zip
+archive_name: cone_ntrain_50_angle_360.zip
+archive_size: 2055417966
+sha256: ed7c41fe7a0974e4111ff754efa6a94adafcafaa3b9ee07481d534a424235f0e
 license_url: https://www.cancerimagingarchive.net/collection/lidc-idri/
 raw_source: LIDC-IDRI-0001
 input_format: R2-Gaussian NeRF meta_data.json
@@ -12,4 +16,3 @@ required_files:
   - proj_train
   - proj_test
   - initial_gaussian_npy
-status: planned

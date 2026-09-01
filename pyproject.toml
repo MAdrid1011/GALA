@@ -1,7 +1,13 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "gala-simulator"
 version = "0.1.0"
 description = "Auditable GALA architecture simulator"
+readme = "README.md"
+license = "Apache-2.0"
 requires-python = ">=3.10"
 dependencies = ["PyYAML>=6.0", "numpy>=1.24"]
 
@@ -11,6 +17,18 @@ gala-sim = "gala_sim.cli:main"
 [project.optional-dependencies]
 quality = ["scikit-image>=0.21", "lpips>=0.1.4"]
 parquet = ["pyarrow>=12"]
+assets = ["requests>=2.31", "gdown>=5.2", "tifffile>=2023.7", "olefile>=0.47"]
+
+[project.urls]
+Repository = "https://github.com/MAdrid1011/GALA"
+Documentation = "https://github.com/MAdrid1011/GALA/tree/main/docs"
+
+[tool.setuptools.packages.find]
+include = ["gala_sim", "gala_sim.*"]
+exclude = ["configs*", "docs*", "native*", "tests*", "tools*"]
+
+[tool.setuptools.package-data]
+gala_sim = ["**/*.md", "**/*.cpp", "**/*.cu"]
 
 [tool.pytest.ini_options]
 pythonpath = ["."]

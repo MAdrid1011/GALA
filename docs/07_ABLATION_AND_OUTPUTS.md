@@ -1,74 +1,109 @@
-# 消融矩阵与输出合同
+# Ablation Matrix and Output Contract
 
-## 1. 优化开关
+## 1. Optimization Controls
 
-模拟器定义四个位，但它们不是四个独立机制。A、B 生成编译信息，C、D 是分别消费这些信息的硬件机制。
+The simulator defines four bits, but they are not four independent mechanisms.
+A and B produce compiler metadata; C and D are the hardware mechanisms that
+consume the corresponding metadata.
 
-| 位 | 配置名 | 启用行为 | 关闭行为 |
+| Bit | Configuration key | Enabled behavior | Disabled behavior |
 | --- | --- | --- | --- |
-| A | `compiler.query_load_rules` | 生成查询负载与推进规则 | 保留合法依赖，使用到达顺序 |
-| B | `compiler.semantic_worksets` | 生成高斯驻留、复用与释放信息 | 不提供跨任务语义驻留信息 |
-| C | `architecture.overlap_guided_issue` | 使用历史重叠预测和无冲突融合发射 | 每周期按到达顺序发射一个合法任务 |
-| D | `architecture.semantic_residency` | 启用语义目录、驻留、Miss 合并与作用域多播 | 每个状态请求经基础存储路径完成 |
+| A | `compiler.query_load_rules` | Generate query-load and progress rules | Preserve legal dependencies and use arrival order |
+| B | `compiler.semantic_worksets` | Generate Gaussian residency, reuse, and release metadata | Provide no cross-task semantic residency metadata |
+| C | `architecture.overlap_guided_issue` | Use historical overlap prediction and conflict-free fused issue | Issue one legal task per cycle in arrival order |
+| D | `architecture.semantic_residency` | Enable the semantic directory, residency, miss merging, and scope multicast | Serve every state request through the base memory path |
 
-位序固定为 `ABCD`。`0000` 是 Base ASIC，`1111` 是完整 GALA。关闭开关只移除对应优化，不能删除任务、依赖、队列、数值计算或正确性所需的硬件状态。
+Bits use `ABCD` order. `0000` is Base ASIC and `1111` is full GALA. Disabling a
+control removes only that optimization; it may not remove tasks, dependencies,
+queues, numerical work, or hardware state required for correctness.
 
-硬件 C 仅在 A 开启时合法，硬件 D 仅在 B 开启时合法。运行器必须拒绝 `C=1,A=0` 或 `D=1,B=0` 的配置；其他不属于正式集合的位型不得进入正式结果。
+Hardware C is valid only with A, and hardware D is valid only with B. The runner
+must reject `C=1, A=0`, `D=1, B=0`, and any bit pattern outside the canonical set.
 
-## 2. 组合运行
+## 2. Canonical Matrix
 
-同一已验证 trace 只运行七项正式配置，固定顺序为 `0000`、`1000`、`1010`、`0100`、`0101`、`1100`、`1111`。它们分别表示 Base ASIC、仅编译 A、编译 A 加硬件 C、仅编译 B、编译 B 加硬件 D、编译 A 与 B 联合，以及完整 GALA。每个配置使用相同的硬件资源配置、内存映射、输入事件和数值语义。运行器拒绝缺项、重复项、顺序错误或集合外配置；配置哈希只记录，不作为拒绝条件，统一配置由解析参数快照与资源闭合检查保证。
+One validated trace is replayed in this fixed order:
 
-查询调度聚合点为 `1010`，语义驻留聚合点为 `0101`，两种编译信息联合点为 `1100`。`1000`、`0100` 和 `1100` 均不启用硬件 C 或 D，不能解释为缺少编译前置条件的硬件单开实验。完整 GALA 的周期必须与消融矩阵中的 `1111` 逐周期一致。
+| Variant | Meaning |
+| --- | --- |
+| `0000` | Base ASIC |
+| `1000` | Compiler A only |
+| `1010` | Compiler A with hardware C |
+| `0100` | Compiler B only |
+| `0101` | Compiler B with hardware D |
+| `1100` | Compiler A and B together |
+| `1111` | Full GALA |
 
-## 3. 加速比口径
+Every row uses the same hardware resources, memory mapping, input events, and
+numerical semantics. The runner rejects missing, duplicate, reordered, and
+noncanonical rows. Configuration hashes are audit records, not execution gates;
+uniform configuration is enforced through resolved parameter snapshots and
+resource-closure checks.
 
-纯编译配置 `1000`、`0100` 和 `1100` 运行在 GPU 软件路径上，只报告相对于同一工作量 GPU
-Base 的加速比。GPU Base 使用 AGX Orin 合理估算值时，必须同时记录估算方法、区间，并明确标记
-为估算而非实机测量；不得用 ASIC 周期替代纯编译配置的 GPU 时间。
+The query-scheduling closure point is `1010`, semantic-residency closure is
+`0101`, and the joint compiler point is `1100`. Variants `1000`, `0100`, and
+`1100` enable neither C nor D and must not be described as standalone hardware
+experiments without their compiler prerequisites. Full-entry GALA cycles must
+exactly match the `1111` row.
+
+## 3. Speedup Baselines
+
+Compiler-only variants `1000`, `0100`, and `1100` execute on the GPU software
+path and report speedup only over the same workload's GPU base:
 
 ```text
 speedup_vs_gpu_base = gpu_base_seconds / gpu_variant_seconds
 ```
 
-Base ASIC 单独报告绝对周期、换算时间和相对于同工作量 AGX Orin GPU Base 的平台级加速比。
-包含硬件机制的 `1010`、`0101` 和 `1111` 才报告相对于 Base ASIC 的加速比。
+If the GPU base uses a credible AGX Orin estimate, the method and uncertainty
+interval must be recorded and the value labeled as an estimate rather than a
+measurement. ASIC cycles may not replace GPU time for a compiler-only variant.
+
+Base ASIC reports absolute cycles, converted time, and platform-level speedup
+over an AGX Orin GPU base for the same work when that measurement is available.
+Only hardware variants `1010`, `0101`, and `1111` report speedup over Base ASIC:
 
 ```text
 speedup_vs_base_asic = cycles_0000 / cycles_variant
 ```
 
-结果表必须为每一行显式记录比较基准。`1000`、`0100`、`1100` 的
-`speedup_vs_base_asic` 固定为空；`1010`、`0101`、`1111` 的 `speedup_vs_gpu_base` 固定为空。
-Oracle 结果独立标记，不能与实际机制结果混入同一几何平均。
+Every result row names its comparison baseline explicitly. For `1000`, `0100`,
+and `1100`, `speedup_vs_base_asic` is empty. For `1010`, `0101`, and `1111`,
+`speedup_vs_gpu_base` is empty. Oracle results are labeled separately and are
+excluded from geometric means of implemented mechanisms.
 
-## 4. 输出文件
+## 4. Output Files
 
-每个运行目录包含以下文件。
+Each run directory contains:
 
-| 文件 | 内容 |
+| File | Contents |
 | --- | --- |
-| `manifest.json` | 代码、模型、数据、配置、设备与环境哈希 |
-| `cycles.json` | 端到端周期与模块周期分解 |
-| `stalls.parquet` | 阻塞原因与周期区间 |
-| `memory_requests.parquet` | 每个片外请求的地址、读写、字节数、到达周期和 Ramulator 2 返回周期 |
-| `events.json` | 事件计数、缓存和发射统计 |
-| `quality.json` | CUDA 参考和功能重放的 PSNR、SSIM、LPIPS |
-| `gpu_reference.json` | 本地 GPU 时间、校准项，以及可用时的同套件 Orin 实测换算 |
-| `status.json` | 运行状态、失败原因和验收结果 |
+| `manifest.json` | Code, model, data, configuration, device, and environment identities |
+| `cycles.json` | End-to-end cycles and per-module cycle decomposition |
+| `stalls.parquet` | Stall causes and cycle intervals |
+| `memory_requests.parquet` | Address, operation, byte count, arrival cycle, and Ramulator 2 return cycle for every off-chip request |
+| `events.json` | Event counts, cache statistics, and issue statistics |
+| `quality.json` | PSNR, SSIM, and LPIPS for the CUDA reference and functional replay |
+| `gpu_reference.json` | Local GPU time, calibration items, and matching Orin conversion when available |
+| `status.json` | Run state, failure reason, and acceptance result |
 
-活动组合汇总为 `ablation.csv`。表中每行绑定模型、数据集、开关位、比较基准、相应加速比、
-质量差异和配置哈希。AGX Orin 估算值必须保留估算状态与不确定区间。
-结果生成器只读取这些机器可读文件，不允许手工填写论文表格。
+The active matrix is summarized in `ablation.csv`. Each row binds the model,
+dataset, variant bits, baseline, applicable speedup, quality difference, and
+configuration identity. Any AGX Orin estimate retains its estimate status and
+uncertainty. Result generation reads only machine-readable files; manuscript
+tables may not be filled manually.
 
-## 5. 一致性断言
+## 5. Consistency Assertions
 
-- `1111` 的端到端周期等于完整 GALA 入口输出
-- 七项正式配置的动态有效关系数、数值任务数和更新提交数一致
-- 正式配置集合和顺序严格等于 `0000,1000,1010,0100,0101,1100,1111`
-- 任何启用 C 的配置同时启用 A，任何启用 D 的配置同时启用 B
-- 仅允许调度顺序、缓存事件、停顿原因和周期数变化
-- `1000`、`0100`、`1100` 只与同一任务的 GPU Base 比较
-- `1010`、`0101`、`1111` 只与同一任务的 Base ASIC 比较
-- Base ASIC 与 GPU Base 的平台级比较必须使用相同工作量
-- 任一质量越界时，该组合不进入性能汇总
+- `1111` end-to-end cycles equal the full GALA entry-point result.
+- All seven variants have identical dynamic valid-relation, numerical-task, and
+  update-commit counts.
+- The variant set and order are exactly
+  `0000,1000,1010,0100,0101,1100,1111`.
+- Every variant with C also has A, and every variant with D also has B.
+- Only scheduling order, cache events, stall causes, and cycles may change.
+- `1000`, `0100`, and `1100` compare only with the same workload's GPU base.
+- `1010`, `0101`, and `1111` compare only with the same trace's Base ASIC.
+- Base ASIC and GPU base platform comparisons use identical work.
+- A variant that exceeds any quality limit is excluded from performance
+  aggregation.

@@ -4,31 +4,31 @@ parameters:
     data_min:
       value: 0.0
       unit: scalar
-      source: docs/09_VALIDATION_AND_ACCEPTANCE.md:chest-unified-quality
+      source: docs/09_VALIDATION_AND_ACCEPTANCE.md:unified-quality-protocol
       scope: quality
       status: frozen
     data_max:
       value: 1.0
       unit: scalar
-      source: docs/09_VALIDATION_AND_ACCEPTANCE.md:chest-unified-quality
+      source: docs/09_VALIDATION_AND_ACCEPTANCE.md:unified-quality-protocol
       scope: quality
       status: frozen
     ssim_window:
       value: 11
       unit: voxel
-      source: docs/09_VALIDATION_AND_ACCEPTANCE.md:chest-unified-quality
+      source: docs/09_VALIDATION_AND_ACCEPTANCE.md:unified-quality-protocol
       scope: quality
       status: frozen
     ssim_sigma:
       value: 1.5
       unit: voxel
-      source: docs/09_VALIDATION_AND_ACCEPTANCE.md:chest-unified-quality
+      source: docs/09_VALIDATION_AND_ACCEPTANCE.md:unified-quality-protocol
       scope: quality
       status: frozen
     ssim_boundary:
       value: reflect
       unit: mode
-      source: docs/09_VALIDATION_AND_ACCEPTANCE.md:chest-unified-quality
+      source: docs/09_VALIDATION_AND_ACCEPTANCE.md:unified-quality-protocol
       scope: quality
       status: frozen
     lpips_slices:
@@ -37,31 +37,31 @@ parameters:
         - [42, 85, 128, 170, 213]
         - [42, 85, 128, 170, 213]
       unit: index_list_per_axis
-      source: docs/09_VALIDATION_AND_ACCEPTANCE.md:chest-unified-quality
+      source: docs/09_VALIDATION_AND_ACCEPTANCE.md:unified-quality-protocol
       scope: quality
       status: frozen
     lpips_network:
       value: alex
       unit: model_name
-      source: docs/09_VALIDATION_AND_ACCEPTANCE.md:chest-unified-quality
+      source: docs/09_VALIDATION_AND_ACCEPTANCE.md:unified-quality-protocol
       scope: quality
       status: frozen
     lpips_version:
       value: "0.1"
       unit: version
-      source: docs/09_VALIDATION_AND_ACCEPTANCE.md:chest-unified-quality
+      source: docs/09_VALIDATION_AND_ACCEPTANCE.md:unified-quality-protocol
       scope: quality
       status: frozen
     lpips_backbone_sha256:
       value: 7be5be791159472b1fbf3c69796f7cb30dca7ad8466c2df70058c37116cdee02
       unit: SHA-256
-      source: docs/09_VALIDATION_AND_ACCEPTANCE.md:chest-unified-quality
+      source: docs/09_VALIDATION_AND_ACCEPTANCE.md:unified-quality-protocol
       scope: quality
       status: frozen
     lpips_calibration_sha256:
       value: df73285e35b22355a2df87cdb6b70b343713b667eddbda73e1977e0c860835c0
       unit: SHA-256
-      source: docs/09_VALIDATION_AND_ACCEPTANCE.md:chest-unified-quality
+      source: docs/09_VALIDATION_AND_ACCEPTANCE.md:unified-quality-protocol
       scope: quality
       status: frozen
   clock:
@@ -691,20 +691,20 @@ parameters:
     archive_chunk_bytes:
       value: 67108864
       unit: byte
-      source: docs/IMPLEMENTATION_STATUS.md:compact-packet-archive
+      source: docs/08_PERFORMANCE_ENGINEERING.md:compact-packet-archive
       scope: software
       status: frozen
       allowed_range: [1048576, 268435456]
     chunk_events:
       value: 4000000
       unit: event
-      source: docs/IMPLEMENTATION_STATUS.md:84-stream-validator-calibration
+      source: docs/08_PERFORMANCE_ENGINEERING.md:stream-validator-configuration
       scope: software
       status: frozen
     max_inflight_chunks:
       value: 2
       unit: chunk
-      source: docs/IMPLEMENTATION_STATUS.md:84-stream-validator-calibration
+      source: docs/08_PERFORMANCE_ENGINEERING.md:stream-validator-configuration
       scope: software
       status: frozen
   diagnostic:

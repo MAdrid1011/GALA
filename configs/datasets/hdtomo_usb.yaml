@@ -1,0 +1,22 @@
+schema_version: gala-dataset-source-v1
+id: hdtomo_usb
+name: HDTomo-USB
+provider: zenodo
+record: 4822516
+source_url: https://zenodo.org/records/4822516
+license: CC-BY-4.0
+license_url: https://creativecommons.org/licenses/by/4.0/
+input_format: Zeiss TXRM/TXM and exported TIFF
+conversion:
+  source_object_distance: abs(Recipe/SSDistance)
+  source_detector_distance: abs(Recipe/SSDistance) + abs(Recipe/DSDistance)
+  angles: linear Recipe/StartAngle to Recipe/EndAngle inclusive
+  volume_shape: recon TIFF count and slice dimensions
+  intensity_transform: negative_log
+files:
+  - name: usb.zip
+    size: 3150190658
+    md5: ea9338f5322e3171f74024fcbd162835
+required_content:
+  - projections
+  - recon

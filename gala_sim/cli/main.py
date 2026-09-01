@@ -42,6 +42,8 @@ from gala_sim.tools.inactivity import (
 )
 from gala_sim.tools.preflight import run_native_preflight
 from gala_sim.adapters.native_reference import run_native_reference
+from gala_sim.assets import AssetCatalog, AssetSelection, acquire_assets
+from gala_sim.workspace import WorkspacePaths
 from gala_sim.trace import (
     CAPTURED_PACKET_SAMPLE_SCHEMA_VERSION, CapturedPacketSpec, QueryDomain,
     QUERY_PACKET_SAMPLE_SCHEMA_VERSIONS, QueryPacketSampleConfig, QueryRange,
@@ -56,7 +58,20 @@ from gala_sim.trace import (
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gala-sim")
+    parser.add_argument(
+        "--repository", type=Path, default=None,
+        help="repository root used to resolve relative configuration paths",
+    )
     commands = parser.add_subparsers(dest="command", required=True)
+    workspace = commands.add_parser("workspace-check")
+    workspace.add_argument("--workspace", type=Path, default=None)
+    acquire = commands.add_parser("acquire")
+    acquire.add_argument("--workspace", type=Path, default=None)
+    acquire.add_argument("--all", dest="acquire_all", action="store_true")
+    acquire.add_argument("--models", type=_csv_ids, default=())
+    acquire.add_argument("--datasets", type=_csv_ids, default=())
+    acquire.add_argument("--dry-run", action="store_true")
+    acquire.add_argument("--no-resume", action="store_true")
     config = commands.add_parser("config-check")
     config.add_argument("--config", type=Path, required=True)
     preflight = commands.add_parser("cycle-preflight")
@@ -201,8 +216,8 @@ def _parser() -> argparse.ArgumentParser:
     archive_ablation.add_argument("--resource-usage", type=Path, required=True,
                                   help="JSON ResourceUsage snapshot")
     archive_ablation.add_argument("--output", type=Path, required=True)
-    archive_ablation.add_argument("--model", default="R2-Gaussian")
-    archive_ablation.add_argument("--dataset", default="Chest")
+    archive_ablation.add_argument("--model", required=True)
+    archive_ablation.add_argument("--dataset", required=True)
     archive_ablation.add_argument("--quick-validation", action="store_true")
     archive_ablation.add_argument("--parallel-workers", type=int, default=1)
     archive_ablation.add_argument(
@@ -213,6 +228,13 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     return parser
+
+
+def _csv_ids(value: str) -> tuple[str, ...]:
+    identifiers = tuple(item.strip() for item in value.split(",") if item.strip())
+    if not identifiers:
+        raise argparse.ArgumentTypeError("asset list must contain an identifier")
+    return identifiers
 
 
 def _query_range(value: str) -> QueryRange:
@@ -236,6 +258,12 @@ def _query_domain(value: str) -> QueryDomain:
         return QueryDomain(int(parts[0]), int(parts[1]), shape)
     except ValueError as error:
         raise argparse.ArgumentTypeError(str(error)) from error
+
+
+def _repository_path(path: Path, repository: Path | None) -> Path:
+    if path.is_absolute():
+        return path
+    return WorkspacePaths.discover(repository=repository).repository / path
 
 
 def _load_binding(spec: str | None, build_manifest: Path | None,
@@ -369,14 +397,39 @@ def _write_archive_ablation_outputs(
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     try:
+        if args.command == "workspace-check":
+            paths = WorkspacePaths.discover(
+                repository=args.repository, workspace=args.workspace,
+            ).ensure()
+            report = {
+                "ready": True,
+                "repository": paths.reference(paths.repository),
+                "workspace": paths.reference(paths.root),
+                "directories": [paths.reference(path) for path in paths.managed_directories],
+            }
+            print(json.dumps(report, sort_keys=True))
+            return 0
+        if args.command == "acquire":
+            if not args.acquire_all and not args.models and not args.datasets:
+                raise ValueError("acquire requires --all, --models, or --datasets")
+            paths = WorkspacePaths.discover(
+                repository=args.repository, workspace=args.workspace,
+            )
+            report = acquire_assets(
+                AssetCatalog.load(paths.repository / "configs"),
+                AssetSelection(args.models, args.datasets, args.acquire_all),
+                paths, resume=not args.no_resume, dry_run=args.dry_run,
+            )
+            print(json.dumps(report.as_dict(), sort_keys=True))
+            return 0
         if args.command == "config-check":
-            config = load_config(args.config)
+            config = load_config(_repository_path(args.config, args.repository))
             print(json.dumps({"sha256": config.sha256, "ready": config.ready,
                               "pending": pending_parameters(config.parameters)},
                              sort_keys=True))
             return 0 if config.ready else 2
         if args.command == "cycle-preflight":
-            config = load_config(args.config)
+            config = load_config(_repository_path(args.config, args.repository))
             binding = _load_binding(
                 args.ramulator_binding, args.ramulator_build_manifest,
                 args.ramulator_config,
@@ -391,7 +444,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report.as_dict(), sort_keys=True))
             return 0 if report.status == "passed" else 2
         if args.command == "relation-capacity-preflight":
-            config = load_config(args.config)
+            config = load_config(_repository_path(args.config, args.repository))
             report = run_relation_capacity_preflight(
                 args.archive,
                 config,
@@ -405,7 +458,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report, sort_keys=True))
             return 0 if report["status"] == "passed" else 2
         if args.command == "native-preflight":
-            config = load_config(args.config)
+            config = load_config(_repository_path(args.config, args.repository))
             freeze = json.loads(args.freeze.read_text(encoding="utf-8"))
             command = shlex.join([
                 "gala-sim", "native-preflight", "--config", str(args.config),
@@ -417,7 +470,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report.as_dict(), sort_keys=True))
             return 0 if report.status == "passed" else 2
         if args.command == "native-reference":
-            config = load_config(args.config)
+            config = load_config(_repository_path(args.config, args.repository))
             freeze = json.loads(args.freeze.read_text(encoding="utf-8"))
             preflight = json.loads(args.preflight.read_text(encoding="utf-8"))
             result = run_native_reference(config, freeze, preflight, args.output)
@@ -506,7 +559,7 @@ def main(argv: list[str] | None = None) -> int:
                 raise ValueError(
                     "archive is not formally eligible; use --quick-validation only for a development replay"
                 )
-            gala_config = load_config(args.config)
+            gala_config = load_config(_repository_path(args.config, args.repository))
             binding = _load_binding(
                 args.ramulator_binding, args.ramulator_build_manifest,
                 args.ramulator_config,
@@ -865,7 +918,7 @@ def main(argv: list[str] | None = None) -> int:
             )
         if args.quick_validation and not quick_scope:
             raise ValueError("--quick-validation requires a sampled or windowed trace")
-        gala_config = load_config(args.config)
+        gala_config = load_config(_repository_path(args.config, args.repository))
         binding = _load_binding(
             args.ramulator_binding, args.ramulator_build_manifest,
             args.ramulator_config,

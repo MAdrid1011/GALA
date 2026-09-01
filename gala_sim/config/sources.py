@@ -34,8 +34,13 @@ def load_source_manifest(path: str | Path, *, schema_version: str) -> SourceMani
     if schema_version == "gala-model-source-v1":
         _require_string_fields(document, ("repository", "commit", "evidence_level", "license"))
         commands = document.get("official_commands")
-        if not isinstance(commands, Mapping) or not all(isinstance(value, str) and value for value in commands.values()):
-            raise ConfigError("model manifest official_commands must be non-empty strings")
+        if not isinstance(commands, Mapping) or not all(
+            (isinstance(value, str) and bool(value))
+            or (isinstance(value, list) and bool(value)
+                and all(isinstance(argument, str) and argument for argument in value))
+            for value in commands.values()
+        ):
+            raise ConfigError("model manifest commands must be strings or non-empty argv lists")
     if schema_version == "gala-dataset-source-v1":
         _require_string_fields(document, ("source_url", "license_url", "input_format"))
         required_files = document.get("required_files")

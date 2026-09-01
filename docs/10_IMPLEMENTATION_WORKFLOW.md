@@ -1,86 +1,61 @@
-# 唯一执行工作流
+# Implementation Workflow
 
-本文件规定模拟器的唯一实施顺序。首个组合固定为 R²-Gaussian 与 Chest。该组合完成全部步骤后，才允许开始下一个模型与数据组合。
+## Acquire and Validate Assets
 
-## 1. 冻结输入
+Select model and dataset identifiers from the asset catalog. Acquire immutable
+sources into the ignored workspace, verify repository commits or archive
+checksums, validate licenses, and prepare the dataset without modifying raw
+files.
 
-固定模型提交、数据清单、训练配置、随机种子、CUDA 环境和质量口径。完成数据校验与许可记录。生成运行清单哈希并提交 Git 里程碑。
+## Freeze Inputs
 
-入口条件是模型源码和数据均可核验。退出条件是官方命令能够读取完整数据并生成参考训练配置。
+Bind the model implementation, dataset manifest, training configuration,
+random state, Python environment, CUDA environment, quality protocol, and
+architecture configuration into a local input manifest. Portable references
+are used for files below the repository or workspace roots.
 
-## 2. 跑通官方软件
+## Execute the Numerical Path
 
-在实现者 GPU 上运行官方模型的完整数值路径。先用同一真实组合的短训练配置调试接口，再用论文配置完成训练与重建。输出本地 GPU 原始时间、阶段时间、最终体和 PSNR、SSIM、LPIPS。
+Run the model's configured reference path and produce reconstruction and metric
+inputs. Trace hooks remain side-band instrumentation. Short fixture runs may be
+used to debug an adapter but are never substituted for catalogued execution.
 
-同时运行本地分阶段 GPU 校准。只有取得同套件 AGX Orin 实测向量时才换算到 AGX Orin；否则平台结果保持 `unavailable`。若设备利用率不足或预测达到小时级，先执行长任务预检，不直接扩大运行规模。
+## Capture and Validate Events
 
-退出条件是官方质量闭合、本地阶段时间完整且可追溯。Orin 仅在同套件实测可用时进入退出检查；缺少实测不阻塞 ASIC 主线，也不得用静态规格外推补齐。
+Capture candidate, relation, forward, reduction, consumer, adjoint, gradient,
+update, and set-mutation events through bounded device buffers. Validate event
+identity, dependencies, lineage, state versions, and lifecycle closure before
+cycle replay.
 
-## 3. 捕获真实事件
+## Establish Base ASIC
 
-在不改变数值结果的条件下接入 CLAMP 任务和设备 trace。完成关系、前向、查询归约、消费者、伴随、缓存访问、梯度归约、更新和集合修改事件。使用异步 chunk 传输，避免逐事件同步。
+Replay `0000` through every hardware module using the frozen architecture and
+memory configuration. Record cycles, stalls, memory requests, and peak resource
+occupancy. Base ASIC retains the complete event set and numerical path.
 
-退出条件是 trace 检查通过，动态事件计数与官方执行一致，trace 模式质量与未插桩路径一致。
+## Evaluate Mechanisms
 
-## 4. 建立 Base ASIC
+Evaluate compiler A and matching hardware C, then compiler B and matching
+hardware D. Compiler-only paths compare with the same-work GPU base; hardware
+paths compare with Base ASIC on the same trace. Bounds retain every physical
+resource and remain separate from implemented results.
 
-关闭 A、B、C、D 四项优化，用真实 trace 跑通全部硬件模块。输出 `0000` 的绝对周期、模块周期、停顿原因和资源峰值。Base ASIC 使用完整数学路径和冻结的顶层资源包络。
+When shared engineering is needed, apply it uniformly, repeat input and quality
+checks, and regenerate every affected variant.
 
-退出条件是结果确定可重复，无平均负载、预设命中率或固定 DRAM 延迟，资源占用闭合。
+## Run the Canonical Ablation
 
-## 5. 测量两类技术上界
+Execute `0000`, `1000`, `1010`, `0100`, `0101`, `1100`, and `1111` in that
+order. Validate mechanism prerequisites, identical mathematical event counts,
+quality limits, and exact equality between `1111` and the full GALA entry point.
 
-启用查询调度 Oracle，保留三候选宽度、端口、Bank、队列、依赖和执行资源约束。计算其相对于 Base ASIC 的端到端加速比，并与查询调度目标比较。
+## Add Integrations
 
-随后启用语义驻留 Oracle，保留首次填充、真实状态字节、Active SRAM 容量、目录端口、Bank、填充信用和 LPDDR5 时序。计算其相对于 Base ASIC 的端到端加速比，并与语义驻留目标比较。
+A model integration adds a provenance manifest, registered adapter, command and
+stage mapping, and fixtures. A dataset integration adds a source manifest,
+registered parser, normalization logic, and validation fixtures. Both use the
+same hardware configuration and output contracts.
 
-退出条件是两个 Oracle 均完成，且各自的可覆盖周期、不可覆盖周期和相对于 Base ASIC 的上界均已记录。此时尚不实现实际机制。
-
-## 6. 优化技术覆盖外路径
-
-任一上界不足时，分别分解其机制可覆盖周期与不可覆盖周期。先优化数据加载、GPU kernel 组织、设备同步、trace 管线和周期内核中不属于对应机制的耗时。每项优化公平应用到官方软件、Base ASIC、两个 Oracle 和后续所有消融。质量、事件计数和硬件资源保持不变。
-
-每轮优化后重跑步骤 2 至步骤 5。两个 Oracle 均达到目标后，冻结软件路径、Base ASIC 与上界结果。若工程优化收敛后仍有上界不足，记录可解释的真实上限，不允许扩大硬件资源或修改模型来追赶目标。
-
-## 7. 实现查询调度技术
-
-先实现 A 的查询负载规则，再实现消费 A 编译信息的 C 硬件历史高斯支持域重叠预测、冲突检查和融合发射。依次运行 `1000` 和 `1010`；C 不允许脱离 A 单独运行。`1000` 相对同工作量 GPU Base 检查软件收益，`1010` 相对 Base ASIC 检查硬件联合收益；检查硬件实际收益不超过 Oracle，且质量和事件集合不变。
-
-若实际收益低于目标，先查看预测误差、冲突屏蔽、端口阻塞和不可覆盖周期。只调整硬件合同允许的内部参数，且保持顶层资源包络。参数冻结后重新运行 Base ASIC 和查询调度全部变体。
-
-退出条件是查询调度技术达到可解释的加速比，周期分解能够说明与 Oracle 的差距。
-
-## 8. 实现语义驻留技术
-
-先实现 B 的语义工作集信息，再实现消费 B 编译信息的 D 硬件目录驻留、Miss 合并、多播和释放。依次运行 `0100` 和 `0101`；D 不允许脱离 B 单独运行。`0100` 相对同工作量 GPU Base 检查软件收益，`0101` 相对 Base ASIC 检查硬件联合收益；检查状态版本、首次装入、复用、并发读取和释放事件来自真实 trace。
-
-若实际收益低于目标，定位目录端口、容量、Bank、填充和片外等待。只在允许范围内调整内部组织，并对全部既有变体重跑。
-
-退出条件是语义驻留技术达到可解释的加速比，周期分解能够说明与 Oracle 的差距。
-
-## 9. 联合技术与完整消融
-
-启用 A、B、C、D，运行完整 GALA。检查两类技术同时工作时的队列、存储和端口交互。随后在同一 trace 和硬件配置上按固定顺序运行 `0000`、`1000`、`1010`、`0100`、`0101`、`1100`、`1111` 七项正式配置。
-
-`1000`、`0100`、`1100` 输出 GPU 时间、相对于同工作量 GPU Base 的加速比和质量差异；`1010`、`0101`、`1111` 输出绝对周期、相对于 Base ASIC 的加速比和质量差异。Base ASIC 单独输出绝对周期、时间和相对于同工作量 AGX Orin GPU Base 的平台级加速比。`1111` 必须与完整 GALA 的端到端周期一致。全部组合完成后提交首个完整消融里程碑。
-
-## 10. 扩展下一个组合
-
-首个组合全部验收后，先扩展 R²-Gaussian 的 Walnut 和 HDTomo-USB，再适配 FaCT-GS 与 Exact-GS。每次只增加一个组合，依次执行软件、质量、trace、Base ASIC、实际机制、联合结果和消融。已经冻结的硬件配置不得按模型或数据集重调。
-
-某个组合缺少源码、数据或许可时记录机器可读跳过原因，并继续下一个可获得组合。任何组合发现全局实现错误时，修复后重跑所有受影响的既有结果。
-
-## 11. 提交点
-
-以下节点必须提交 Git 并同步实验记录。
-
-1. 输入和环境冻结
-2. 官方软件与质量闭环
-3. 真实 trace 闭环
-4. Base ASIC 闭环
-5. 查询调度与语义驻留 Oracle 完成
-6. 覆盖外工程路径与 Base ASIC 冻结
-7. 查询调度技术闭环
-8. 语义驻留技术闭环
-9. 联合技术与七项正式消融闭环
-10. 每个新增模型与数据组合闭环
+Generated runs, acquisition reports, traces, profiles, and measurements remain
+under `workspace/`. The public repository documents interfaces and methods,
+not local execution progress.

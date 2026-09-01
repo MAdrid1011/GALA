@@ -1,53 +1,66 @@
-# 性能工程与长任务门控
+# Performance Engineering
 
-## 1. GPU 数值路径
+## Correctness-Preserving Optimization
 
-模型计算、关系生成和 trace 字段构造保留在 GPU。事件写入预分配的设备结构化数组，完整 chunk 通过独立 CUDA stream 异步复制到固定页内存。CPU 在上一 chunk 上执行周期模拟，GPU 同时生成下一 chunk。
+Host and GPU engineering may improve data loading, kernel launch structure,
+allocation reuse, synchronization, trace transfer, compression, and timing
+engine implementation. It must preserve model inputs, numerical operations,
+events, dependencies, state versions, and modeled hardware resources.
 
-禁止逐关系 Python 回调、逐查询设备同步、循环内重新分配大张量、每个 kernel 后读取标量和逐事件写盘。能够批处理的索引、掩码、地址令牌和依赖范围在设备端一次生成。trace chunk 与在途深度只优化软件吞吐，不改变硬件队列或周期。
+An optimization is applied to every affected variant. A change that benefits
+only one mechanism by altering its workload is not a fair comparison.
 
-## 2. 周期模拟路径
+## Profiling Boundaries
 
-周期内核使用事件跳跃、结构化数组和整数索引。依赖唤醒表使用 NumPy CSR 反向边和可变未满足计数，避免为百万级 trace 建立逐事件 Python list/dict；同一已验证 trace 的七项正式消融不重复执行结构校验。热点选择、Bank 映射、队列推进和批量状态更新使用 Numba 或等价开源编译器。Python 对象只用于配置、运行编排和结果写出，不进入逐事件热点。
+GPU profiling records end-to-end time and phase boundaries from the same model,
+dataset, and configuration used by reference execution. Warmup and repetition
+counts come from configuration. Profiler replay and instrumentation overhead
+are excluded from raw application timing.
 
-首个真实样例用分析器定位 CPU 热点。完成一次稳定优化后关闭常驻分析器。正式运行只采集模块计数和低频系统利用率，避免重复 smoke、证书生成和全量 trace 审计。
+CPU simulator profiling separates trace decoding, validation, packetization,
+event scheduling, module advancement, memory integration, and output writing.
 
-## 3. 长任务预检
+## Compact Packet Archive
 
-正式任务先完成配置中的 warmup 与短测量，并按真实事件速率预测总时间。预测达到 `long_run_threshold_seconds` 时，运行 `gpustat` 预检。预检记录 GPU 利用率、显存、CPU、读取吞吐、事件生成速度、异步拷贝重叠率和周期模拟吞吐。
+Compact archives use bounded chunks whose target byte size is configured by
+`trace.archive_chunk_bytes`. Compression runs asynchronously with a bounded
+number of in-flight chunks. Archive metadata records schema, packet counts,
+event counts, uncompressed bytes, compressed bytes, and checksums.
 
-R²-Gaussian 官方基线在启动短测量前同时读取 `gpustat --json` 和 `nvidia-smi` compute-app 列表。目标 GPU 存在任何非本次预检启动的计算进程时，立即写出 `failed_preflight`，不得把外部任务的利用率计入本任务，也不得与其争用 GPU。短测量使用 input-freeze 中解析后的绝对 Python 解释器、工作目录、数据路径和官方入口，仅把迭代数替换为 `warmup_iterations + measure_iterations`，产物写到独立预检目录。
+Changing chunk or worker parameters may change host throughput and storage but
+must not change materialized events or cycle results.
 
-测量区间由上游 TensorBoard `train/iter_time` 标量的 wall-time 确定，起点为 warmup 结束，终点为短测量结束。该区间用于预测论文训练迭代耗时，预检报告同时保留短任务原始 wall time、全部系统采样和日志哈希。官方基线不产生 trace，因此事件速率、异步 trace 拷贝重叠率和周期模拟吞吐必须显式标记为 `not_applicable_native_reference`，不得填零或伪造。预检预测不作为正式端到端时间，也不替代完整运行的阶段计时。
+## Stream Validator Configuration
 
-GPU 利用率低于 `gpu_utilization_floor_percent` 时，不启动小时级任务。实现者先审计数据加载、Python 循环、GPU 到 CPU 同步、显存分配、trace 写出和 CPU 周期热点。只有瓶颈被定位为真实串行依赖、数据源读取或已优化的周期内核后，才允许继续。
+`trace.chunk_events` bounds the event count in one validation chunk and
+`trace.max_inflight_chunks` bounds producer/consumer distance. Validation state
+for dependencies, relations, Gaussian versions, and open updates persists
+across chunks.
 
-## 4. 本地 GPU 到 AGX Orin
+The configuration is a software memory bound, not simulated SRAM. Validation
+must produce identical acceptance and summary values across legal chunk sizes.
 
-校准套件在本地 GPU 上按模型实际批量范围测量 FP32 FMA、EXP、LOG、RCP、SQRT、有效显存带宽、原子操作、kernel 发射和同步。AGX Orin 使用相同校准套件形成版本化参考向量。每个模型阶段由 kernel 统计、执行时间和数据移动量确定权重，再逐阶段换算并求和。
+## Long-Run Preflight
 
-对阶段 $p$ 和校准类别 $j$，`w[p,j]` 表示由 profiler 计数归一化得到的阶段权重，`r[j]` 表示 Orin 校准时间与本地校准时间之比。换算使用 `t_orin = sum_p(t_local[p] * sum_j(w[p,j] * r[j]))`，并要求每个阶段的权重和为 1。校准批量必须覆盖该阶段的实际工作区间，超出覆盖范围时标记为暂定结果。
+Before a long model or replay task, a bounded sample estimates input rate,
+event rate, host memory, device memory, and wall time. The preflight checks for
+unrelated GPU compute processes before launching a GPU workload and reports
+actionable failures without terminating other processes.
 
-校准套件不得只运行峰值矩阵乘或只使用公开峰值规格。原始本地时间始终保留。换算脚本输出每个阶段的本地时间、校准类别、比值、Orin 等效时间和不确定性标记。
+## Runtime Throughput Diagnostic
 
-## 5. 机制上界驱动的优化
+Cycle replay can emit low-frequency progress containing completed events,
+simulated cycles, wall time, and projected completion. Diagnostic stability is
+evaluated only at quiescent iteration boundaries and requires a configured
+sequence of converged windows.
 
-查询调度和语义驻留各自在实现前运行 Oracle。若 Oracle 达不到论文目标，先查看机制覆盖周期、不可覆盖周期和 Amdahl 上界。工程优化只处理机制覆盖外的软件开销，并应用到所有基线和消融组合。
+Stopping after diagnostic convergence produces a diagnostic artifact, not a
+complete cycle result. The ordinary replay path always consumes the full event
+stream.
 
-每次工程优化必须满足三项检查。动态事件计数保持一致，CUDA 参考质量保持一致，Base ASIC 与 Oracle 使用同一新软件路径。达到上界要求后冻结工程配置，实际机制不得通过隐藏软件特例获得额外收益。
+## Parallel Work
 
-## 6. 自动调优边界
-
-允许自动调优 trace chunk、GPU batch、固定页缓冲数量、数据加载 worker、Numba batch 和结果压缩批量。这些值记录在环境配置中。禁止自动调优硬件资源、事件延迟、缓存命中率、冲突数量或模型训练参数来拟合论文结果。
-
-## 7. 超大 Trace 快速验证
-
-全量质量和正式 trace 完整性门仍对完整模型执行一次。模块开发和周期吞吐调试可以从真实 trace 的一个或多个 query range 构造依赖闭合样本；选择从 consumer 和 gradient terminal 开始，必须保留其全部候选、关系、缓存、前向、查询归约、伴随和梯度前置事件，不得生成平均关系或合成命中率。
-
-扫描块、事件上限和 CPU/CUDA 后端必须显式记录。CUDA 扫描只优化软件处理时间，不改变 trace 内容。sample manifest 固定 `result_scope=quick_cycle_validation`、`formal_performance_eligible=false` 和 `quality_eligible=false`。周期与消融入口默认拒绝 sample；只有显式 quick-validation 模式可运行，且结果不得进入正式 Base ASIC、Oracle、论文消融或端到端加速比汇总。
-
-## 8. 运行时吞吐诊断
-
-长周期重放可以按固定完成事件数或固定墙钟间隔低频输出墙钟吞吐、已模拟周期、事件完成比例和线性总周期投影。墙钟事件吞吐只用于健康检查；只有完整 `iteration_id` 的全部事件完成后才形成判稳样本和按迭代比例计算的周期投影。稳定判定丢弃配置化预热样本，并要求最近连续窗口的区间吞吐与总周期投影相对跨度同时不超过门限，且迭代完成比例越过主要增密阶段。累计平均或单一原语长段不能单独触发稳定。
-
-默认入口始终处理完整事件集合。只有显式启用开发诊断停止时，稳定窗口才可中止当前重放；该输出固定为 `development_throughput_projection`、`formal_performance_eligible=false`，不得写入正式 `cycles.json`、消融矩阵或论文表格。完整运行选项始终保留。诊断只报告 ASIC 自身的事件吞吐、周期投影和按配置时钟换算的秒数；没有同套件 AGX Orin 实测校准时，不接入公开规格 extrapolation，也不计算 Orin 加速比。
+Independent ablation variants and archive chunks may execute concurrently when
+they do not share mutable state. Worker counts are bounded explicitly. Parallel
+execution must produce byte-equivalent manifests and cycle values to serial
+execution, apart from wall-clock metadata.

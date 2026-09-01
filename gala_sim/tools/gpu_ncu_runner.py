@@ -17,7 +17,7 @@ import time
 from typing import Any, Mapping
 
 from gala_sim.config import load_config
-from gala_sim.identity import canonical_json, sha256_bytes, sha256_file
+from gala_sim.identity import canonical_json, git_commit, sha256_bytes, sha256_file
 from gala_sim.manifest import verify_freeze_record
 from gala_sim.tools.gpu_profile_artifacts import (
     bind_ncu_profile_to_plan, classify_sass_csv, parse_ncu_csv,
@@ -372,9 +372,7 @@ def _run(args: argparse.Namespace) -> int:
         "capture_job_index": args.capture_job_index,
         "selected_kernel_launch_count": job["selected_kernel_launch_count"],
         "input_freeze": {"path": str(freeze_path), "sha256": sha256_file(freeze_path)},
-        "repository_commit": subprocess.check_output(
-            ["git", "-C", str(repository), "rev-parse", "HEAD"], text=True,
-        ).strip(),
+        "repository_commit": git_commit(repository),
         "command": command, "working_directory": str(working_directory),
         "preflight_iterations": preflight_iterations,
         "preflight_selection": preflight_selection,

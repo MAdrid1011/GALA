@@ -1,63 +1,71 @@
-# 复现目标与证据等级
+# Reproduction Targets and Evidence
 
-## 1. 主评测范围
+## Workload Catalog
 
-主评测使用 R²-Gaussian、FaCT-GS、Exact-GS 和 GR-Gaussian，以及 Chest、Walnut 和 HDTomo-USB。每个可获得的模型与数据集组合都运行完整训练与重建路径，包括关系构造、前向贡献、查询归约、局部消费者、伴随计算、优化器、集合修改和最终体生成。
+The adapter catalog covers four model implementations:
 
-当前可直接进入实现的模型如下。
-
-| 模型 | 代码来源 | 固定提交 | 证据等级 | 执行要求 |
-| --- | --- | --- | --- | --- |
-| R²-Gaussian | 作者官方仓库 | `f2579bf` | A | 必须实现 |
-| FaCT-GS | 作者官方仓库 | `9b95ea9` | A | 必须实现 |
-| Exact-GS | 作者官方仓库 | `c8f9251` | A | 必须实现 |
-| GR-Gaussian | 论文，无公开源码 | 不适用 | C | 自动跳过，获得作者源码后升级 |
-
-证据等级 A 表示作者代码与真实数据均可核验。等级 B 表示算法和数据公开，但需要忠实适配。等级 C 表示缺少作者实现，只能用于接口规划，不能产生正式性能结果。
-
-## 2. 数据集目标
-
-Chest 使用 R²-Gaussian 或 FaCT-GS 发布的 X-3D 胸部投影与体数据。Walnut 使用 FIPS 真实锥束投影及其公开几何。HDTomo-USB 使用 Zenodo 记录 4822516 中的真实 TXRM 投影、扫描元数据和 USB 重建体。
-
-数据下载、转换、校验和与许可记录由模型和数据文档规定。HDTomo-USB 只有在投影强度校正、坐标轴、DSO、DSD、探测器尺寸、偏移、旋转方向和训练角度划分全部通过时才进入正式实验。
-
-## 3. 性能目标
-
-正式结果输出每项任务的绝对端到端周期数。相对 GPU 的加速比使用同一模型、数据、训练配置和输入状态的实测 CUDA 端到端时间，并按 GALA 的 `clock_hz` 将周期换算为时间。
-
-论文当前完整 GALA 的几何平均目标为 $7.336\times$。单项参考范围为 $6.174\times$ 至 $8.843\times$。这些数值是复现目标，不是周期模型的校准输入。硬件参数只能由设计文档、模块微基准或公开存储时序确定，禁止针对某个数据集调节参数以贴合加速比。
-
-最新定稿将编译端点与匹配的 GALA 硬件端点分开记录。R²-Gaussian + Chest 的软件端点（相对 CUDA_OPT）为 A0B0 `1.000x`、A1B0 `1.254x`、A0B1 `1.282x`、A1B1 `1.482x`；匹配硬件端点为 ASIC A0B0 `2.430x`、A1B0 `3.513x`、A0B1 `3.507x`、A1B1 `6.436x`。硬件端点同时包含对应编译元数据和 GALA 执行支持，不定义可与软件端点相乘的独立 ARCH 因子。
-
-在本仓库继续使用同一 trace 的 Base ASIC 作为机制主指标时，可将上述冻结硬件端点换算为相对 A0B0 的参考：A1B0 约 `1.446x`、A0B1 约 `1.443x`、A1B1 约 `2.649x`。这些换算值只用于当前 case 的方向和上界检查，不能替代正式端点，也不参与事件数量、延迟或资源参数的拟合。
-
-首个硬件参数集在 R²-Gaussian Chest 完成功能与模块级校准后冻结。其余模型和数据集必须使用同一硬件配置。结果偏离参考值时，报告模块周期分解、事件数量、队列停顿和存储请求以解释差异，不使用全局缩放因子修正。
-
-## 4. 质量目标
-
-每项正式运行输出 CUDA 参考和完整 GALA 的 PSNR、SSIM 与 LPIPS。论文当前允许的最大质量差异为 PSNR 下降 0.08 dB、SSIM 下降 0.002、LPIPS 增加 0.001。正式实现以不劣于该界限为验收目标。
-
-调度和驻留开关不得改变数学结果集合。质量差异只允许来自确定性的 FP32 归约顺序、FTZ 语义和文档规定的 EXP、LOG、RCP、SQRT 实现。任一质量差异超过目标时，暂停该任务的性能结论，先定位数值路径。
-
-## 5. 阶段目标
-
-| 阶段 | 必须达到的结果 |
+| Identifier | Provenance |
 | --- | --- |
-| 功能闭环 | 一个真实模型和一个真实数据集完成训练、重建与三项质量指标 |
-| 周期闭环 | 同一任务输出逐模块周期、端到端周期和停顿原因 |
-| 单机制闭环 | 查询与驻留两条路径分别比较编译信息和配套硬件，周期变化可解释且质量不越界 |
-| 主评测闭环 | 三个官方模型覆盖三套真实数据，无法获得的组合有机器可读跳过原因 |
-| 全消融闭环 | 七项正式配置按 `0000,1000,1010,0100,0101,1100,1111` 全部输出，`1111` 与端到端周期完全一致 |
-| 结果冻结 | 配置、代码、数据、模型和运行环境均可追溯，表格由结果文件自动生成 |
+| `r2_gaussian` | Pinned R2-Gaussian author repository |
+| `fact_gs` | Pinned FaCT-GS author repository |
+| `exact_gs` | Pinned Exact-GS author repository |
+| `gr_gaussian` | Independent implementation of DOI `10.1109/TCI.2026.3701585` |
 
-## 6. AGX Orin 基线换算
+The dataset catalog covers Chest, the FIPS Walnut cone-beam CT dataset, and the
+USB sample from HDTomo record `4822516`. Model and dataset adapters are
+composable through a shared geometry and projection contract.
 
-当前 AGX Orin 实机校准不可用。`gala_sim.tools.gpu_orin_estimate` 仅保留公开规格 extrapolation
-及其假设，输出固定为 `status=proxy_estimate`、`formal_performance_eligible=false` 和
-`performance_comparison_eligible=false`。公开峰值规格不能预测端到端 Orin 时间，因此该数值不接入周期诊断，
-不用于性能比较、数量级检查、方向判断或 ASIC 达标门槛，也不生成 `speedup_vs_orin`。只有同一校准套件、
-数据类型和批量范围下的 AGX Orin 实测向量才能恢复平台比较。
+An author repository and an independent implementation are different evidence
+types. Manifests preserve that distinction, and public documentation does not
+attribute independently written code to a paper's authors.
 
-软件参考在实现者实际使用的 NVIDIA GPU 上测量，并保存原始设备时间。到 AGX Orin 的换算按执行阶段进行，每个阶段分别使用可移植校准程序测得 FP32 FMA、EXP、LOG、RCP、SQRT、有效显存带宽、原子操作、kernel 发射和同步开销。换算使用同版本 CUDA、相同数据类型和相同批量区间，不使用峰值算力比或单一全局系数。
+## Execution Scope
 
-设备说明可记录 AGX Orin 的 1.30 GHz、2048 个 Ampere CUDA Core 和 204.8 GB/s 峰值带宽，但这些字段不是性能校准向量。每个模型阶段必须根据实际指令、访存和发射计数组合本地与 Orin 实测校准项，得到 Orin 等效时间。原始本地时间、阶段权重、校准比和换算后时间同时写入结果。缺少任一 Orin 校准项时平台结果保持 `unavailable`，不得用公开规格、邻近项目或拟合值代填。
+A workload includes relation construction, forward contributions, query
+reduction, local consumers, adjoint computation, optimizer updates, Gaussian
+set mutation, and final volume generation. All variants use the same complete
+event set and numerical configuration.
+
+Dataset conversion records the source archive identity, geometry convention,
+view partition, preprocessing, and reference-volume identity. Conversion does
+not overwrite raw downloads.
+
+## Performance Contract
+
+Every hardware result reports absolute end-to-end cycles. Time conversion uses
+the configured GALA clock. Compiler-only speedup uses measured end-to-end GPU
+time for the same model, dataset, training configuration, and input state.
+Hardware speedup uses Base ASIC cycles from the same trace.
+
+Published targets are comparison references, not calibration inputs. Hardware
+parameters come from the design, module characterization, or public memory
+timing. No global scale factor is applied to match an expected speedup.
+
+An AGX Orin comparison requires a matching measured calibration vector for
+arithmetic, memory, atomics, launch, and synchronization behavior. Public peak
+specifications may be reported as device metadata but do not produce a measured
+end-to-end time.
+
+## Quality Contract
+
+Each numerical run reports PSNR, SSIM, and LPIPS using the common protocol in
+[Quality Validation](09_VALIDATION_AND_ACCEPTANCE.md). A scheduled replay must
+remain within the configured difference limits from its software reference.
+
+Scheduling and residency do not change the mathematical relation set. Allowed
+differences are limited to documented FP32 operation semantics and legal
+reduction order.
+
+## Evidence Qualification
+
+A qualified result binds:
+
+- model implementation and source identity
+- dataset archive and prepared-manifest identity
+- training and random-state configuration
+- trace schema and event coverage
+- architecture and memory configuration
+- quality metrics and comparison baseline
+
+The repository defines how these records are produced but does not version
+generated performance tables or local execution histories.

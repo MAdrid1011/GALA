@@ -1,67 +1,73 @@
-# 周期模型与事件语义
+# Cycle Model and Event Semantics
 
-## 1. 时间与事件
+## Event Contract
 
-所有模块共享 GALA 的整数周期域。周期内处理顺序固定为完成事件、状态提交、信用释放、候选选择、输入接纳和新完成时间登记。相同周期的同类事件按 `event_id` 稳定排序，使结果可重复。
+The cycle model consumes validated CLAMP events with global IDs, explicit
+dependencies, state versions, relation ownership, template IDs, field masks,
+and deterministic address tokens. Events are immutable after validation.
 
-事件类型覆盖关系候选、有效关系、查询关闭、前向任务、查询归约、局部消费者、伴随任务、缓存请求、缓存返回、高斯梯度归约、更新事务和集合修改。更新事务由 `UPDATE_BEGIN`、`UPDATE_COMMIT`/`SET_MODIFICATION` 与 `UPDATE_END` 组成；提交只记录真实有梯度的字段，集合修改记录 `PRUNE`、`CLONE_*` 和 `SPLIT_*` 的父子 lineage。每个事件带真实依赖、地址令牌、数据长度、执行模板和状态版本。
+Candidate, relation, forward, reduction, consumer, adjoint, gradient, update,
+and set-mutation events form one lifecycle. An update cannot commit until all
+reads and gradients of the old state version have drained.
 
-## 2. 队列与反压
+## Engine Semantics
 
-每个模块声明输入队列、输出队列、在途项和端口数。`valid` 由生产者持有，`ready` 由消费者容量和目标资源共同产生。输入拒绝时事件留在上游，且关闭、释放和版本提交不能越过被阻塞事件。
+The timing engine is event-driven. Each module exposes its next wakeup,
+acceptance decision, state transition, and counters. The engine advances to the
+earliest observable transition and preserves backpressure when a downstream
+resource cannot accept work.
 
-队列容量来自参数注册表。空队列不唤醒模块，满队列记录阻塞来源。周期内同一端口只接纳配置允许的请求数，Bank 冲突由真实地址映射产生。
+A module may inspect its configured queues, tables, ports, and local metadata.
+It may not inspect arbitrary future trace events, expand capacity, or bypass a
+dependency. Deterministic tie-breaking uses physical arrival order and stable
+event IDs.
 
-## 3. 模块服务规则
+## Real-Trace Burst Capacity
 
-关系构造器逐候选检查并在下游有信用时写出有效关系。融合发射单元从前向、消费者和伴随三条公共 FIFO 读取真实队首，并可在空闲候选槽观察另一个 Bank 队首；编译器规则开启时才按当前负载排序，架构侧重叠发射开启时才使用历史预测、冲突选择和总宽度三的交叉开关。架构侧开关关闭时每周期按到达顺序发射一个合法任务。语义缓存逐请求执行目录查找、Miss 合并、填充、多播和释放。计算 Pod 按 `template_id` 占用 FMA、超越函数、归约树和微上下文。
+Trace packets are admitted through bounded frontiers. A packet that exceeds a
+physical window is divided into continuation windows while retaining global
+event and dependency identities. The engine reports peak in-flight events,
+relations, packet bytes, and queue occupancy.
 
-架构侧重叠发射还维护 ComputePod 既有输入 FIFO 的增量路由类 ready-head。每拍只从已经驻留的路由类队首中选择当前 Pod、owner cluster 和模板资源可接纳的任务；模拟器可以用索引等价的软件查找实现，但不得扫描 FIFO 之外的未来事件，也不得扩大队列或计算资源。该索引关闭时维持既有有限候选仲裁，因此 Base 与编译侧查询规则单开不享受该路径。
+Streaming validation carries lifecycle state across chunk boundaries. End of
+stream is accepted only after every relation, reduction, update, and mutation
+has closed.
 
-B 与 D 同时开启时，语义驻留允许把同一
-`(gaussian_id, state_version, template_id)`、已经就绪并分布于不同查询状态 Bank 的最多三个前向
-或伴随任务作为一个语义束提交。一个束只消耗一次 Fusion 控制发射，但每个任务分别进入完成队列、
-伴随重放和 ComputePod，并保留原事件、梯度归约与依赖。C 关闭时优先选择 follower 数最多的已就绪语义链，相同满度
-选择最老 leader，若没有成束链则遵守 Base 的全局到达顺序；C 开启时每周期
-最多一个已通过 Conflict 的前向或伴随 leader 可带 follower，followers 还必须与本周期其他已接受任务
-无归约键、目标资源和查询 Bank 冲突。该路径不增加 C 的三个控制候选槽或前向控制端口，也不改变
-Base、`0010` 或 `1010` 的发射行为。
+## Module Flow
 
-双向查询执行单元模拟查询 Bank、部分和反馈、消费者依赖、损失通路、伴随重放和关系窗口。重建更新单元先等待上一迭代的反向或集合事务屏障，再提交当前版本的真实更新；无写入的 `UPDATE_END` 不推进版本。共享 SRAM 使用真实布局映射 Bank。语义缓存按 `(gaussian_id, state_version)` 保持跨 query 驻留，只有非零写入结束才释放旧版本。片外请求交给 Ramulator 2，并使用其完成周期唤醒等待项。
+1. The relation constructor admits candidates and emits valid relations.
+2. Fusion queues hold physical task heads until dependencies and resources are ready.
+3. The issue unit selects legal work under policy A/C and port constraints.
+4. The semantic cache resolves state reads under policy B/D and SRAM capacity.
+5. Compute Pods execute the declared arithmetic template.
+6. Query and gradient units apply reductions and consumer dependencies.
+7. The update unit commits state versions and set mutations.
+8. Memory requests complete only after all Ramulator transactions return.
 
-Ramulator 2 使用 External frontend 的异步接口。桥接层将逻辑请求拆为 canonical 配置规定的 transaction，逐拍调用 `try_issue`，前端拒绝时保留未发出的 transaction，并与其余硬件模块共同推进 `tick`。只有全部 transaction 返回后，原逻辑请求才完成。正式运行核对 Ramulator 版本、源码提交、配置 SHA-256、通道数、通道宽度、数据率和 transaction 大小，并把每个请求的到达与返回周期写入 `memory_requests.parquet`。
+## Base and Optimized Policies
 
-原生桥接库由 `tools/build_ramulator2_bridge.py` 在仓库外构建。构建清单保存 Ramulator 源码提交、输入共享库哈希、桥接源码哈希、输出库哈希和编译器；正式入口从该清单加载库，不接受未登记的共享对象。
+Base ASIC uses the same modules, templates, ports, banks, queues, interconnect,
+and memory configuration as optimized variants. It issues legal queue heads in
+arrival order and uses the ordinary state-fetch path.
 
-## 4. 端到端周期
+Compiler metadata can expose bounded query-load and semantic-workset
+information. Matching hardware policies consume that metadata for issue and
+residency. Disabled policies do not remove tasks or hardware needed for
+correctness.
 
-端到端起点为首个正式训练输入可被关系构造器接纳的周期。终点为最后一次模型规定的更新或集合修改提交，且所有影响最终体的写回完成的周期。预处理、数据下载和质量指标计算不计入 GALA 周期，但它们分别计入软件参考的可见运行清单。
+## Bounds
 
-每次运行输出总周期、每模块忙周期、队列停顿、端口停顿、Bank 冲突、存储等待、有效关系数、模板执行数、缓存命中与填充、融合发射数量和更新数量。总周期只由事件推进得到。
+Oracle policies may choose the best legal candidate within their declared
+scope but retain dependencies, issue width, ports, banks, queues, capacity,
+compute resources, and memory timing. Oracle output is diagnostic and remains
+separate from implemented variants.
 
-捕获器生成的 raw trace 可在 manifest 中保存 `iteration_event_counts`，其值是每个
-`iteration_id` 的实际事件数且总和必须等于 trace 事件总数。周期引擎在该字段通过覆盖检查时
-直接使用它建立吞吐诊断的迭代索引；缺少字段时仍执行原有全量扫描。该元数据只减少重复索引的
-软件开销，不改变事件集合、依赖或周期语义。
+## End-to-End Cycles
 
-## 5. Base ASIC
+Cycle zero is the first cycle in which the relation constructor can accept
+work. The final cycle is the completion of the last update or set mutation and
+all hardware work that contributes to it. Asset acquisition and offline quality
+metric calculation are outside this interval.
 
-Base ASIC 使用相同 Pod、存储、互连、执行模板和数值语义，关闭四项优化。查询任务使用公共三源 FIFO 和 Bank 队首索引，但每周期按合法到达顺序只发射一个任务，不使用查询负载规则、历史重叠预测或多任务无冲突发射。前向、归约、消费者和伴随按 trace 的逐查询依赖流水，不增加整关系窗口阶段屏障。高斯状态按请求读取，不使用编译器语义工作集、语义驻留、Miss 合并或作用域多播。基础缓冲和正确性所需的状态表保留。
-
-所有工程优化、trace 格式和周期内核优化同时作用于 Base ASIC 和其他消融配置。Base ASIC 的绝对周期是机制消融的主分母。
-
-## 6. 查询调度 Oracle
-
-查询调度 Oracle 对应编译器查询负载规则和高斯重叠引导融合发射。Oracle 可以查看完整未来任务和精确完成时间，从所有已满足依赖的候选中选择使端到端周期最小的无冲突组合。Oracle 仍受三候选宽度、三个输出端口、执行资源、队列容量、Bank 冲突、真实依赖和状态版本约束。
-
-Oracle 只替换候选次序和冲突选择，不能提前生成事件、取消消费者、删除伴随任务或扩大硬件资源。其相对于 Base ASIC 的加速比是当前端到端实现对查询调度技术的可达上界。
-
-## 7. 语义驻留 Oracle
-
-语义驻留 Oracle 对应编译器语义工作集和高斯语义导向缓存。Oracle 知道每个 `(gaussian_id, state_version)` 的未来首次使用、复用目标和最终释放时刻，并在固定容量、Bank、端口、填充信用和片外带宽下选择最优保留与填充顺序。
-
-Oracle 保留首次装入、实际状态字节数、Active SRAM 容量、目录端口、并发读取和片外命令时序。它不能把全部高斯视为常驻，也不能消除真实容量冲突。其相对于 Base ASIC 的加速比是语义驻留技术的可达上界。
-
-## 8. 上界失败回路
-
-若任一 Oracle 低于目标，先从端到端周期中分离该机制可覆盖周期与不可覆盖周期。不可覆盖的软件时间只允许通过通用工程优化降低。优化后的参考、Base ASIC 和全部 Oracle 必须重跑，质量和事件计数必须保持一致。Oracle 达到目标后，冻结软件路径并开始实际模块实现。
+Every run reports end-to-end cycles, per-module active and blocked cycles,
+stall causes, memory transactions, and peak resource occupancy.

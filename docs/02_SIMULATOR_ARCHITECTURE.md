@@ -1,8 +1,13 @@
-# 模拟器软件架构
+# Simulator Software Architecture
 
-## 1. 总体结构
+## 1. Overall Structure
 
-模拟器采用功能执行与周期执行分离、事件合同统一的结构。功能执行器运行真实模型，生成动态关系、原语任务、数值结果和最终重建体。周期执行器读取相同事件，模拟 GALA 的队列、流水、Bank、端口、缓存、存储请求和反压。两条路径共享事件编号、依赖、状态版本和配置哈希。
+The simulator separates functional execution from cycle execution behind one
+event contract. The functional executor runs the real model and produces
+dynamic relations, primitive tasks, numerical results, and the final
+reconstruction. The cycle executor consumes the same events and simulates GALA.
+Both paths share event IDs, dependencies, state versions, and configuration
+identity.
 
 ```text
 Official Model and Dataset
@@ -24,11 +29,15 @@ Model Adapter -> CLAMP Task Builder -> Functional GPU Executor
               Cycles, stalls, module counters
 ```
 
-功能执行器不读取周期结果来改变模型数学路径。周期执行器不生成数值近似来代替功能执行。需要模拟调度顺序对归约数值的影响时，周期执行器输出确定的提交顺序，功能执行器按该顺序执行归约重放。
+Functional execution never reads cycle results to alter the model's
+mathematical path. Cycle execution never fabricates values that approximate the
+functional path. When schedule order can affect numerical output, the cycle
+executor emits a submission order and the functional executor replays legal
+reductions in that order.
 
-## 2. Python 包边界
+## 2. Python Package Boundary
 
-后续代码使用以下包结构。目录名和职责在首个代码里程碑中冻结。
+The initial package layout and responsibilities are:
 
 ```text
 gala_sim/
@@ -45,77 +54,90 @@ gala_sim/
   ablation/            switch semantics and matrix runner
   metrics/             cycle, stall, PSNR, SSIM and LPIPS
   results/             manifest and table writers
-  tools/               download, conversion and preflight utilities
+  tools/               conversion and preflight utilities
 tests/
-  real_smoke/          one licensed real sample per available adapter
-  unit/                arithmetic and state-transition tests only
 configs/
-  architecture/
-  models/
-  datasets/
-  campaigns/
 ```
 
-`timing/modules` 只能包含硬件合同中的模块。`trace`、`results` 和 `tools` 是软件支撑层，不进入被模拟硬件的模块清单。
+`timing/modules` may contain only modules named by the hardware contract.
+`trace`, `results`, and `tools` are simulator support layers and are never
+counted as simulated hardware.
 
-## 3. 功能执行器
+## 3. Functional Executor
 
-模型适配器从官方训练入口接管以下边界。
+Model adapters take ownership of these boundaries around the official training
+entry point:
 
-1. 读取投影、扫描几何、初始高斯和训练配置。
-2. 将关系生成、贡献计算、查询归约、消费者、伴随、更新和集合修改映射为 CLAMP 任务。
-3. 运行原模型的数值公式和训练步数。
-4. 在设备端写出真实动态事件，不在 Python 中重建平均事件。
-5. 保存最终体数据、模型检查点和指标输入。
+1. Read projections, scan geometry, initial Gaussians, and training settings.
+2. Map relation generation, contribution evaluation, query reduction,
+   consumers, adjoint work, updates, and set mutation to CLAMP tasks.
+3. Run the original numerical formulas for the original number of steps.
+4. Write real dynamic events on the device instead of reconstructing average
+   events in Python.
+5. Save the final volume, model checkpoints, and metric inputs.
 
-官方 CUDA 扩展仍作为数值真实性参考。适配器可以增加旁路 trace 输出，但不得删减原有计算。修改 CUDA 扩展时保留上游提交号和最小补丁，并使未启用 trace 时的输出与上游一致。
+The official CUDA extension remains the numerical reference. The adapter adds a
+side-band trace output without removing original computation. The upstream
+commit and minimal extension patch are recorded, and disabling tracing must
+restore output identical to upstream.
 
-## 4. 追踪层
+## 4. Trace Layer
 
-追踪层使用预分配的结构化设备缓冲区。每个事件至少包含以下字段。
+The trace layer uses preallocated structured device buffers. Every event
+contains at least:
 
-| 字段 | 含义 |
+| Field | Meaning |
 | --- | --- |
-| `event_id` | 全局唯一事件编号 |
-| `iteration_id` | 重建迭代编号 |
-| `primitive_kind` | CLAMP 原语类型 |
-| `query_id` | 查询编号，无查询时使用类型化空值 |
-| `gaussian_id` | 高斯编号，无高斯时使用类型化空值 |
-| `state_version` | 高斯状态版本 |
-| `relation_id` | 前向与伴随共享的关系编号 |
-| `consumer_id` | 局部消费者实例编号 |
-| `reduction_key` | 查询或高斯归约键 |
-| `resource_class` | 目标执行资源 |
-| `dependency_begin`、`dependency_count` | 依赖数组范围 |
-| `template_id` | 精确算术模板编号 |
-| `field_mask` | 访问的高斯字段 |
-| `address_token` | 可确定地映射到 SRAM 或 DRAM 地址的布局令牌 |
-| `payload_offset` | 数值重放所需数据范围 |
+| `event_id` | Globally unique event ID |
+| `iteration_id` | Reconstruction iteration |
+| `primitive_kind` | CLAMP primitive type |
+| `query_id` | Query ID, or the typed empty value |
+| `gaussian_id` | Gaussian ID, or the typed empty value |
+| `state_version` | Gaussian state version |
+| `relation_id` | Relation ID shared by related forward and adjoint work |
+| `consumer_id` | Local-consumer instance ID |
+| `reduction_key` | Query or Gaussian reduction key |
+| `resource_class` | Target execution resource |
+| `dependency_begin`, `dependency_count` | Range in the dependency array |
+| `template_id` | Exact arithmetic-template ID |
+| `field_mask` | Gaussian fields accessed |
+| `address_token` | Deterministic SRAM or DRAM address-layout token |
+| `payload_offset` | Numerical payload range needed for replay |
 
-设备缓冲区满时，使用 CUDA stream 将完整 chunk 异步复制到固定页内存。CPU 周期线程消费上一个 chunk，GPU 同时生成下一个 chunk。追踪格式使用按列 NumPy 数组或 Arrow IPC，字段类型由 `gala-clamp-events-v2` schema 固定。`UPDATE_BEGIN` 与 `UPDATE_END` 包围优化器提交或集合修改事务；`UPDATE_END.field_mask == 0` 是不推进状态版本的控制屏障，非零掩码才关闭旧版本并推进状态。禁止逐事件 JSON 和逐事件 Python 回调。
+When a device buffer fills, a CUDA stream copies the completed chunk to pinned
+host memory. The CPU consumes the preceding chunk while the GPU produces the
+next. The columnar NumPy or Arrow IPC format is frozen by field type as
+`gala-clamp-events-v2`. `UPDATE_BEGIN` and `UPDATE_END` enclose an optimizer
+commit or set mutation. `UPDATE_END.field_mask == 0` is a no-op version barrier:
+it closes the old version and advances state without a zero-mask write. Per-event
+JSON output and per-event Python callbacks are prohibited.
 
-对于 R²-Gaussian 的密集 raster/voxel 查询，追踪层还提供
-`gala-trace-virtual-packet-v1` 工作缓冲区表示。每个包保留官方 CUDA 输出的
-`point_list`、`point_key` 和完整 `uint32` valid-mask，不保存展开后的关系事件；
-置位 bit 与真实 Gaussian-query relation 一一对应。`VirtualTracePacket` 只属于
-生产端的有界工作包，不能直接作为周期 trace 或跳过生命周期检查。后续的有界
-事件展开器必须为所有事件分配全局连续 `event_id`，保留全局依赖 ID、跨包状态版本、
-未完成缓存读和语义工作集 sidecar，再将全局事件包交给 validator 和周期执行器。
-当前实现已经覆盖一个查询包的候选、关系、缓存请求/返回、前向、查询归约、消费者、
-伴随和梯度归约前缀；更新事务、集合修改和跨迭代状态仍必须由上层生命周期展开器提供。
-`VirtualTraceLifecycleValidator` 保留当前迭代的候选/关系/反向计数、活动 Gaussian
-集合、状态版本和更新事务，并在迭代关闭时写出有界 ledger；它拒绝跨迭代的开放事务、
-失效 Gaussian、重复 lineage 或版本跳变。该 ledger 只记录状态和计数，不替代事件包中的
-真实依赖、缓存读写或 Ramulator 返回。
-生产线程与消费线程之间最多保留配置数量的包；生产、消费、关系数量、物理包字节数
-和峰值驻留字节数写入运行记录。任一生产或消费方向连续五分钟没有进展时，运行必须
-停止并标记失败，不得把工作缓冲包当作已完成的正式 trace。
+For dense R²-Gaussian raster and voxel queries, the producer may also emit
+`gala-trace-virtual-packet-v1` work buffers containing the official CUDA
+`point_list`, `point_key`, and complete `uint32` valid masks. A set bit denotes
+a real Gaussian/query relation. `VirtualTracePacket` is a producer-side work
+package, not a cycle trace and not a substitute for lifecycle validation.
 
-## 5. 周期执行器
+The event materializer assigns globally contiguous `event_id` values, preserves
+global dependency IDs and cross-packet versions, and emits candidate, relation,
+cache, forward, query, consumer, adjoint, and gradient chains. Update and set
+mutation events still come from the upper lifecycle materializer.
+`VirtualTraceLifecycleValidator` tracks per-iteration candidate/relation/adjoint
+counts, active Gaussians, versions, and updates, and writes a compact ledger at
+closure. It rejects open cross-iteration work, inactive Gaussians, duplicate
+lineage, and version jumps. The ledger never replaces real dependencies, cache
+traffic, or memory returns.
 
-周期执行器以模块下一次状态变化为调度粒度。全局内核维护少量模块唤醒项，每个硬件模块维护自己的输入队列、在途项、完成队列和可用资源周期。调度器从当前最早唤醒周期跳到下一周期，并批量处理同周期事件。
+Production/consumption distance is bounded by the configured in-flight packet
+count. Produced and consumed packets, relations, physical bytes, and peak bytes
+are recorded. An incomplete work-buffer packet fails the run and may not be
+treated as a complete formal trace.
 
-模块实现统一提供以下接口。
+## 5. Cycle Executor
+
+The cycle executor advances to the next module state transition. The global
+kernel maintains a small wakeup heap; each hardware module maintains its input,
+in-flight, completion, and resource-availability state.
 
 ```python
 class CycleModule(Protocol):
@@ -125,22 +147,39 @@ class CycleModule(Protocol):
     def snapshot_counters(self) -> CounterBlock: ...
 ```
 
-`accept` 必须返回接纳、拒绝和阻塞原因。`advance` 只处理该周期发生的流水完成、资源释放、状态更新和输出事件。模块不得通过读取全局未来状态绕过端口、队列或反压。
+`accept` reports acceptance, rejection, and blocking causes. `advance` emits
+only pipeline completion, resource release, state update, and output events that
+occur at the given cycle. A module may not inspect global future state to bypass
+ports, queues, or backpressure.
 
-## 6. 数值与周期重放
+## 6. Numerical and Cycle Replay
 
-绝大多数优化只改变事件起始周期，不改变数值结果。归约事件的提交顺序可能影响 FP32 舍入，因此周期执行器为查询归约、高斯梯度归约和更新提交输出有序日志。功能执行器以该日志执行确定性重放，得到完整 GALA 质量结果。
+Most optimizations change event start cycles without changing numerical output.
+Because reduction submission order can affect FP32 rounding, the cycle executor
+records query reduction, Gaussian gradient reduction, and update order. The
+functional executor performs deterministic replay from that log and produces
+the full GALA quality result.
 
-调试模式允许在短真实样例上逐事件对照。正式模式只保存归约提交顺序、模块统计和可选采样 trace，不保存全部数值 payload，以控制磁盘与内存占用。
+Debug mode permits per-event comparison on a short real sample. Formal mode
+stores submission order, module statistics, and optional sampled traces without
+retaining every numerical payload.
 
-## 7. 运行模式
+## 7. Operating Modes
 
-| 模式 | 用途 | 允许的简化 |
+| Mode | Purpose | Allowed simplification |
 | --- | --- | --- |
-| `native-reference` | 运行官方 CUDA 并产生参考质量和端到端时间 | 不产生 GALA 周期 |
-| `trace-capture` | 运行真实数值并生成完整事件 | 可关闭非必要可视化和中间检查点 |
-| `cycle-replay` | 从已验证 trace 运行一个或多个消融配置 | 不重复 GPU 数值执行 |
-| `functional-replay` | 按选定周期顺序重放归约并输出质量 | 不重新捕获关系 |
-| `campaign` | 串联参考、追踪、七项正式消融和质量汇总 | 不允许跳过验收门 |
+| `native-reference` | Run official CUDA and produce reference quality and end-to-end time | No GALA cycle simulation |
+| `trace-capture` | Run real numerical work and produce complete events | Optional visualization and intermediate checkpoints may be disabled |
+| `cycle-replay` | Run one or more variants from a validated trace | Does not repeat GPU numerical execution |
+| `functional-replay` | Replay reductions in selected cycle order and produce quality output | Does not recapture events |
+| `campaign` | Sequence reference, trace, seven variants, and quality summary | May not bypass an acceptance gate |
 
-同一个经过校验的 trace 可以用于七项正式消融，从而避免重复运行昂贵的模型前向和反向。正式位型固定为 `0000`、`1000`、`1010`、`0100`、`0101`、`1100`、`1111`；硬件 C 必须消费编译 A 生成的信息，硬件 D 必须消费编译 B 生成的信息。trace 只有在模型提交、数据校验值、训练配置、适配器版本和 CLAMP schema 完全一致时才能复用。稳定 Gaussian ID、父子 lineage、跨迭代 `UPDATE_END` 依赖和状态版本级缓存驻留均由 validator 校验；查询关闭不会释放缓存，只有真实写入的更新结束才释放旧版本。周期入口对同一份 mmap trace 只执行一次结构校验，随后用 NumPy 压缩反向依赖索引按固定顺序重放七个正式变体。
+One validated trace can serve all seven canonical variants and avoid repeating
+expensive forward and backward model execution. Reuse requires identical model
+commit, dataset checksum, training configuration, adapter version, and CLAMP
+schema. Validation covers stable Gaussian IDs, parent/child lineage,
+cross-update dependencies, and state-version caching. Query closure does not
+release cached state; an old version is released only after its update writeback
+completes. For one memory-mapped trace, the cycle entry point performs one
+structural validation and then resets the seven variants in canonical order
+using the compact NumPy dependency index.

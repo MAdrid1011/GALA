@@ -9,6 +9,7 @@ from __future__ import annotations
 import hashlib
 import json
 from pathlib import Path
+import subprocess
 from typing import Any
 
 
@@ -48,3 +49,15 @@ def sha256_tree(root: Path) -> str:
         digest.update(relative)
         digest.update(sha256_file(path).encode("ascii"))
     return digest.hexdigest()
+
+
+def git_commit(root: Path) -> str | None:
+    """Return a repository commit when Git metadata is available."""
+
+    try:
+        return subprocess.check_output(
+            ["git", "-C", str(root), "rev-parse", "HEAD"],
+            text=True, stderr=subprocess.DEVNULL,
+        ).strip()
+    except (FileNotFoundError, subprocess.CalledProcessError):
+        return None

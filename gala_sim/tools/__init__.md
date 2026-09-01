@@ -1,11 +1,12 @@
 # tools/__init__.py
 
-导出周期预检、原生官方预检、GPU 采样、运行时间预测、可移植 GPU 校准、Nsight 阶段产物解析、GPU profiling campaign 校验和 local/Orin 阶段归一化接口，不包含被模拟硬件。
-
 ## External Interfaces
 
-公开 `run_native_preflight`、`sample_gpustat`、`run_cycle_preflight` 及其记录类型和决策 helpers。
+The package exports native and cycle preflight records, GPU sampling and
+calibration helpers, profiler artifact parsers, throughput diagnostics, and
+relation-capacity validation.
 
 ## Internal Helpers
 
-无内部实现；具体行为分别位于 `preflight.py`、`cycle_preflight.py`、`gpu_calibration.py`、`gpu_profile_artifacts.py`、`gpu_profile_campaign.py`、`gpu_ncu_plan.py`、`gpu_ncu_runner.py`、`gpu_ncu_sampling.py` 和 `gpu_normalization.py`。
+Implementations remain in focused modules. Tooling produces software evidence
+and local diagnostics; it does not add simulated hardware resources.

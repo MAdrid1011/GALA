@@ -1,0 +1,30 @@
+schema_version: gala-model-source-v1
+id: gr_gaussian
+name: GR-Gaussian
+implementation: independent_reimplementation
+paper_title: "GR-Gaussian: Graph-Based Radiative Gaussian Splatting for Sparse-View Tomographic Reconstruction"
+paper_doi: 10.1109/TCI.2026.3701585
+evidence_level: B
+license: Apache-2.0
+official_commands:
+  train:
+    - "{python_executable}"
+    - -m
+    - gala_sim.adapters.gr_gaussian
+    - --dataset
+    - "{dataset_root}"
+    - --output
+    - "{output_root}"
+  evaluate:
+    - "{python_executable}"
+    - -m
+    - gala_sim.adapters.gr_gaussian
+    - --evaluate
+    - "{output_root}/gr_gaussian_state.npz"
+stage_boundaries:
+  - graph_construction
+  - radiative_splatting
+  - graph_regularization
+  - backward
+  - optimizer_step
+  - adaptive_gaussian_update

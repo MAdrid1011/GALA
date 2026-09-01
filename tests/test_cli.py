@@ -14,6 +14,9 @@ from gala_sim.trace import VirtualPacketArchiveWriter
 from tests.test_virtual_capture import _packet
 
 
+ROOT = Path(__file__).resolve().parents[1]
+
+
 def test_cli_validates_trace_and_reports_frozen_config(tmp_path: Path, capsys) -> None:
     trace_root = tmp_path / "trace"
     TraceWriter().write(_trace(), trace_root)
@@ -23,6 +26,34 @@ def test_cli_validates_trace_and_reports_frozen_config(tmp_path: Path, capsys) -
     result = json.loads(capsys.readouterr().out)
     assert result["ready"] is True
     assert result["pending"] == []
+
+
+def test_cli_checks_workspace_and_plans_all_assets(tmp_path: Path, capsys) -> None:
+    workspace = tmp_path / "workspace"
+    assert main(["workspace-check", "--workspace", str(workspace)]) == 0
+    checked = json.loads(capsys.readouterr().out)
+    assert checked["ready"] is True
+    assert workspace.is_dir()
+
+    dry_workspace = tmp_path / "dry-workspace"
+    assert main([
+        "acquire", "--all", "--dry-run", "--workspace", str(dry_workspace),
+    ]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["dry_run"] is True
+    assert len(report["items"]) == 7
+    assert not dry_workspace.exists()
+
+
+def test_repository_option_resolves_config_outside_current_directory(
+    monkeypatch, tmp_path: Path, capsys,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    assert main([
+        "--repository", str(ROOT), "config-check",
+        "--config", "configs/architecture/gala.yaml",
+    ]) == 0
+    assert json.loads(capsys.readouterr().out)["ready"] is True
 
 
 def test_cli_validates_compact_packet_archive_without_false_formal_promotion(

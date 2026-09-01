@@ -1,10 +1,29 @@
 schema_version: gala-model-source-v1
+id: r2_gaussian
 name: R2-Gaussian
+implementation: upstream
 repository: https://github.com/Ruyi-Zha/r2_gaussian.git
 commit: f2579bfddd9aac009cb797c8503bef8119bbd022
 evidence_level: A
 license: research-only-inherited-from-upstream
 official_commands:
   environment: environment.yml
-  train: python train.py -s <chest-data-root>
-  evaluate: python test.py -m <model-output>
+  train:
+    - "{python_executable}"
+    - train.py
+    - -s
+    - "{dataset_root}"
+    - -m
+    - "{output_root}"
+  evaluate:
+    - "{python_executable}"
+    - test.py
+    - -m
+    - "{output_root}"
+stage_boundaries:
+  - projection_load
+  - gaussian_rasterization
+  - loss_evaluation
+  - backward
+  - optimizer_step
+  - adaptive_gaussian_update

@@ -1,50 +1,65 @@
-# 质量验证与验收
+# Quality Validation and Acceptance
 
-## 1. 数值参考
+## Numerical Reference
 
-每个组合先运行固定提交的官方 CUDA 路径，保存最终体、模型状态、训练日志和随机种子。trace 模式在相同输入和种子下运行。未启用 trace 时，修改后的上游代码必须与官方输出逐项一致。
+An official-source model adapter executes its pinned author path with the
+catalogued dataset, training configuration, and random state. The independent
+GR-Gaussian implementation executes the published equations under its own
+identified implementation provenance.
 
-周期调度可能改变 FP32 归约次序。功能重放按周期执行器提交的查询归约、高斯梯度归约和版本更新顺序运行，并生成 GALA 输出体。质量指标比较该输出体与数据集参考体，同时报告相对于官方 CUDA 输出的差异。
+Trace capture uses the same numerical inputs. With tracing disabled, an
+official-source adapter must follow the uninstrumented author path. Functional
+replay follows the legal reduction and update order emitted by the cycle model.
 
-## 2. 指标口径
+## Unified Quality Protocol
 
-PSNR 在完整三维体上计算，数据范围使用数据清单中的参考体范围。SSIM 使用固定三维窗口、标准差和边界策略，全部参数来自配置。LPIPS 使用预先冻结的三个正交方向切片列表，按统一归一化映射到网络输入，最后对全部切片求均值。
+PSNR is evaluated over the complete reference volume using the data range in
+the dataset manifest. SSIM uses the configured 3D window, sigma, covariance,
+and boundary policy. LPIPS uses configured orthogonal slices, normalization,
+network, and weight identities.
 
-模型官方提供的二维或体指标可以附加输出，但不能替代上述统一口径。切片位置、数据范围和窗口参数在查看 GALA 结果前冻结。
+The default common settings are a data range of `[0, 1]`, SSIM window 11,
+sigma 1.5, reflected boundaries, and LPIPS AlexNet version 0.1. Dataset
+manifests may provide a different physical input range, but normalization and
+the evaluated range are recorded before execution.
 
-首个 R²-Gaussian + Chest 组合使用以下冻结口径。
+Model-specific metrics may be added but do not replace the common protocol.
+Predictions are not silently clipped unless the dataset manifest explicitly
+defines clipping as part of preprocessing.
 
-- 参考体为数据清单中 SHA-256 为 `c895f1f7127a2ba7b25330240e16cd28b75286e037d4bcd9419a63282bd5dedd` 的 `vol_gt.npy`。其格式为 little-endian `float32[256,256,256]`，有限值范围为 `[0,1]`；参考体与重建体按数组 X、Y、Z 轴直接对齐，不使用 mask 或重采样。
-- PSNR 在完整体上以 FP64 差值计算 MSE，动态范围固定为 `1.0`。预测值不裁剪，完全相同时报告正无穷。
-- SSIM 使用 scikit-image `0.21.0` 的原生三维 Gaussian 口径：窗口 `11`、sigma `1.5`、`reflect` 边界、population covariance、无 channel 轴。预测值不裁剪。
-- LPIPS 使用 `lpips 0.1.4` 的预训练 `alex` 网络和校准版本 `0.1`。每个灰度切片先裁剪到 `[0,1]`，线性映射到 `[-1,1]`，复制为三个通道，并在 CPU eval/inference 模式下计算。
-- X、Y、Z 三轴均使用切片 `[42,85,128,170,213]`，共十五张并取算术平均。位置来自固定上游提交训练可视化的 `np.linspace(0,256,7).astype(int)[1:-1]`，在查看任何 GALA 功能重放结果前扩展并冻结到三个正交轴。
+## Trace Validation
 
-LPIPS 的 AlexNet ImageNet trunk checkpoint SHA-256 为 `7be5be791159472b1fbf3c69796f7cb30dca7ad8466c2df70058c37116cdee02`，LPIPS v0.1 `alex` calibration 权重 SHA-256 为 `df73285e35b22355a2df87cdb6b70b343713b667eddbda73e1977e0c860835c0`。正式运行记录实际 NumPy、scikit-image、PyTorch、torchvision 和 lpips 版本；权重身份不匹配时不得生成正式质量结果。
+Validation checks unique IDs, existing dependencies, relation lineage,
+monotonic state versions, query and gradient closure, consumer ordering,
+release after final use, update after old-version drain, and complete set
+mutation. Structural checks apply to every event; payload sampling is an
+additional numerical audit.
 
-## 3. Trace 验证
+Streaming and materialized validation must agree. A malformed or incomplete
+packet stops the run and cannot be counted as complete evidence.
 
-每个真实 smoke 样例检查事件编号唯一、依赖存在、状态版本单调、关系关闭不早于最后关系、伴随不早于消费者完成、释放不早于最后读取和更新不早于旧版本排空。事件数量还要与官方模型中的关系、查询、消费者和更新计数对照。
+## Cycle Validation
 
-正式 trace 只抽样检查具体 payload，但对全部事件执行结构、范围和状态转移检查。失败时保存最小事件窗口，避免生成重复的全量审计产物。
+Module tests cover port limits, queue capacity, bank conflicts, backpressure,
+completion order, cache release, update barriers, and memory return ordering.
+Repeated replay of the same trace and configuration must produce identical
+cycles.
 
-## 4. 周期验证
+The canonical ablation set is
+`0000,1000,1010,0100,0101,1100,1111`. C requires A, D requires B, every row
+preserves the mathematical event set, and `1111` matches the full entry point.
 
-模块级测试使用从首个真实 trace 截取的事件窗口。每个模块检查端口上限、队列容量、Bank 冲突、反压传播、完成顺序和释放条件。Ramulator 2 请求数、读写字节和返回周期由桥接层逐请求核对。
+## Acceptance Gates
 
-端到端运行必须满足正式配置集合和顺序严格为 `0000,1000,1010,0100,0101,1100,1111`，`1111` 与完整入口周期一致，七项消融的数学事件集合一致，资源占用不超过硬件合同，重复运行周期完全一致。验证器还必须确认 C 从不脱离 A 启用、D 从不脱离 B 启用。Oracle 单独验证其未扩大端口、容量、带宽或发射宽度。
-
-## 5. 验收门
-
-| 验收项 | 条件 |
+| Gate | Condition |
 | --- | --- |
-| 功能 | 官方模型完整训练与重建成功 |
-| 质量 | PSNR、SSIM、LPIPS 均不超过目标差异 |
-| Trace | 真实事件完整，依赖、版本和释放检查通过 |
-| Base ASIC | 输出绝对周期与完整模块分解 |
-| Oracle | 保留全部资源约束并给出可达上界 |
-| 实际机制 | 相对于 Base ASIC 的收益可解释且不超过 Oracle |
-| 消融 | 七项正式配置齐全且顺序固定，C 依赖 A、D 依赖 B，`1111` 完全一致 |
-| 平台基线 | 本地原始时间可追溯；Orin 分阶段换算仅在同套件实测可用时验收，否则为 `unavailable` 且不阻塞 ASIC 主线 |
+| Input | Source, data, configuration, and license identities validate |
+| Functional | The model completes its configured numerical path |
+| Quality | Common metric differences remain within configured limits |
+| Trace | Dependencies, versions, lineage, and event coverage validate |
+| Cycle | Module accounting closes and resource limits are respected |
+| Ablation | Canonical variants, prerequisites, and baselines are correct |
 
-任何质量失败优先于性能结论。Oracle 达不到目标时进入工程优化回路。实际机制超过 Oracle 表明模型或计数错误，必须停止该结果并检查。
+Quality failure invalidates a performance conclusion. A result that violates a
+resource bound, exceeds its constrained Oracle, or changes the event set is a
+modeling error and must be diagnosed before use.

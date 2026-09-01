@@ -1,3 +1,6 @@
 # _trace_buffers.cpp
 
-PyTorch C++ 扩展绑定，暴露官方 CUDA work buffer 解码和 raw trace terminal 扫描接口。所有输入必须是连续 CUDA tensor，布局和范围错误会抛出参数异常。
+This PyTorch extension exposes read-only decoding of CUDA raster and voxel work
+buffers and a terminal-event scan interface. Inputs must be contiguous CUDA
+tensors with schema-compatible strides and offsets; invalid layouts raise a
+Python exception.

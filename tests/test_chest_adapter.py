@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 
 import numpy as np
 
@@ -37,11 +38,11 @@ def test_r2_adapter_preserves_frozen_python_interpreter(tmp_path: Path) -> None:
     source = tmp_path / "source"
     source.mkdir()
     adapter = R2GaussianChestAdapter(
-        source, tmp_path, tmp_path / "output", "a" * 40, Path("/usr/bin/python3"),
+        source, tmp_path, tmp_path / "output", "a" * 40, Path(sys.executable),
     )
     config = load_config(Path(__file__).parents[1] / "configs/architecture/gala.yaml")
     run = adapter.prepare(None, config)
-    assert run.official_command[0] == str(Path("/usr/bin/python3").resolve())
+    assert run.official_command[0] == str(Path(sys.executable).resolve())
 
 
 def test_trace_identity_is_bound_before_cycle_handoff(tmp_path: Path) -> None:
@@ -53,7 +54,7 @@ def test_trace_identity_is_bound_before_cycle_handoff(tmp_path: Path) -> None:
     run_dataset = tmp_path / "dataset"
     run_dataset.mkdir()
     adapter = R2GaussianChestAdapter(
-        source, run_dataset, tmp_path / "output", "b" * 40, Path("/usr/bin/python3"),
+        source, run_dataset, tmp_path / "output", "b" * 40, Path(sys.executable),
     )
     run = adapter.prepare(None, load_config(Path(__file__).parents[1] / "configs/architecture/gala.yaml"))
     bound = _bind_trace_identity(trace, run, adapter.model_commit, "c" * 40)

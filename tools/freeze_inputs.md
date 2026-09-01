@@ -1,11 +1,15 @@
 # freeze_inputs.py
 
-生成首个 R²-Gaussian + Chest input-freeze，不下载数据或启动训练。
-
 ## External Interface
 
-命令要求固定上游源码、Chest 数据或不可用原因，以及官方训练的绝对 Python 解释器。存在真实数据时还要求 `--model-output`，输出为带 self-hash 的 `gala-input-freeze-v3` JSON。
+The command creates a local input identity document for any registered model
+and dataset pair. It validates the prepared dataset, pinned source checkout,
+architecture configuration, interpreter, and official command binding. The
+default output is under `workspace/cache/input-freeze/`; it does not download
+assets or execute training.
 
 ## Internal Helpers
 
-数据检查器验证文件完备性、几何、投影、参考体和初始化数组；manifest helpers校验源码、训练参数、质量协议与环境身份。
+Manifest helpers serialize repository and workspace paths as portable
+references while preserving explicit external paths. Source, dataset,
+configuration, environment, and command identities are content-addressed.

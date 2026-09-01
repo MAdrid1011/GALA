@@ -86,15 +86,21 @@ def test_dataset_record_contains_file_inventory(tmp_path: Path) -> None:
     }
 
 
-def test_freeze_record_hash_is_recorded_without_content_verification() -> None:
+def test_freeze_record_hash_is_recorded_without_content_verification(
+    tmp_path: Path,
+) -> None:
     dataset = dataset_record(None, "Chest", "https://data.example/chest", "https://license.example",
                              "fixture_not_downloaded")
     config = load_config(ROOT / "configs/architecture/gala.yaml")
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    license_path = source_root / "LICENSE.md"
+    license_path.write_text("fixture", encoding="utf-8")
     source = {
         "name": "fixture", "url": "https://source.example", "commit": "c" * 40,
-        "root": "/tmp/source", "tree_sha256": "a" * 64,
+        "root": str(source_root), "tree_sha256": "a" * 64,
         "upstream_patch_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
-        "license_path": "/tmp/source/LICENSE.md", "license_sha256": "b" * 64,
+        "license_path": str(license_path), "license_sha256": "b" * 64,
     }
     from gala_sim.manifest import SourceRecord
     training = {
@@ -120,7 +126,8 @@ def test_freeze_record_hash_is_recorded_without_content_verification() -> None:
 
 
 def test_training_profile_matches_locked_upstream(tmp_path: Path) -> None:
-    source_root = Path("/home/madrid/Desktop/GALA-runtime/upstream/r2_gaussian")
+    from gala_sim.workspace import WorkspacePaths
+    source_root = WorkspacePaths.discover().upstream / "r2_gaussian"
     if not (source_root / ".git").exists():
         pytest.skip("external locked source checkout is not available")
     from gala_sim.manifest import source_record
@@ -147,13 +154,18 @@ def test_training_profile_matches_locked_upstream(tmp_path: Path) -> None:
     assert len(training["command"]["sha256"]) == 64
 
 
-def test_freeze_record_rejects_seed_override() -> None:
+def test_freeze_record_rejects_seed_override(tmp_path: Path) -> None:
     dataset = dataset_record(None, "Chest", "https://data.example/chest", "https://license.example",
                              "fixture_not_downloaded")
     config = load_config(ROOT / "configs/architecture/gala.yaml")
     from gala_sim.manifest import SourceRecord
-    source = SourceRecord("fixture", "https://source.example", "c" * 40, "/tmp/source",
-                          "a" * 64, "e" * 64, "/tmp/LICENSE.md", "b" * 64)
+    source_root = tmp_path / "source"
+    source_root.mkdir()
+    license_path = source_root / "LICENSE.md"
+    license_path.write_text("fixture", encoding="utf-8")
+    source = SourceRecord("fixture", "https://source.example", "c" * 40,
+                          str(source_root), "a" * 64, "e" * 64,
+                          str(license_path), "b" * 64)
     training = {
         "profile": {"random_state": {
             "python_random_seed": 0, "numpy_seed": 0, "torch_seed": 0,
@@ -164,22 +176,30 @@ def test_freeze_record_rejects_seed_override() -> None:
         build_freeze_record(config, source, dataset, training, 1, ROOT)
 
 
-def test_freeze_command_records_unavailable_data(tmp_path: Path) -> None:
-    source = Path("/home/madrid/Desktop/GALA-runtime/upstream/r2_gaussian")
-    if not (source / ".git").exists():
-        pytest.skip("external locked source checkout is not available")
+def test_freeze_command_records_generic_portable_campaign(tmp_path: Path) -> None:
+    dataset = tmp_path / "walnut"
+    projections = dataset / "projections"
+    projections.mkdir(parents=True)
+    np.save(projections / "000.npy", np.ones((2, 3), dtype=np.float32))
+    np.save(projections / "001.npy", np.ones((2, 3), dtype=np.float32))
+    (dataset / "metadata.json").write_text(json.dumps({
+        "angles_degrees": [0.0, 1.0], "detector_shape": [2, 3],
+        "volume_shape": [2, 2, 2], "DSO": 50.0, "DSD": 100.0,
+    }), encoding="utf-8")
     output = tmp_path / "freeze.json"
     result = subprocess.run([
         sys.executable, str(ROOT / "tools/freeze_inputs.py"),
-        "--source-root", str(source), "--dataset-reason", "fixture_not_downloaded",
-        "--python-executable", sys.executable,
+        "--repository", str(ROOT), "--workspace", str(tmp_path / "workspace"),
+        "--model", "gr_gaussian", "--dataset", "walnut",
+        "--dataset-root", str(dataset),
         "--output", str(output),
-    ], cwd=ROOT, text=True, capture_output=True)
+    ], cwd=tmp_path, text=True, capture_output=True)
     assert result.returncode == 0, result.stderr
     record = json.loads(output.read_text(encoding="utf-8"))
-    assert record["status"] == "unavailable_data"
-    assert record["schema_version"] == "gala-input-freeze-v3"
-    assert record["model"]["commit"] == "f2579bfddd9aac009cb797c8503bef8119bbd022"
-    assert record["training"]["effective_arguments"]["iterations"] == 30000
-    assert record["environment"]["python_executable"] == str(Path(sys.executable).resolve())
-    assert len(record["run_manifest_sha256"]) == 64
+    assert record["schema_version"] == "gala-campaign-freeze-v1"
+    assert record["model"]["id"] == "gr_gaussian"
+    assert record["dataset"]["id"] == "walnut"
+    assert record["dataset"]["projection_count"] == 2
+    assert record["repository"]["root"] == "repo://"
+    assert record["execution"]["output_root"] == "workspace://results/gr_gaussian/walnut"
+    assert len(record["identity_sha256"]) == 64

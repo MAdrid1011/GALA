@@ -1,13 +1,15 @@
 # validator.py
 
-验证结构化 trace 的事件编号、依赖范围、查询/关系链、缓存请求、消费者、反向梯度、状态版本、更新事务和 capture audit。
-
 ## External Interfaces
 
-`TraceValidationConfig(scan_events, index_directory)` 配置全量 raw trace 的软件扫描块和临时紧凑索引目录。
-
-`validate_trace(trace, *, config=None)` 返回 `TraceValidationReport`；普通 trace 使用完整生命周期状态机，capture-audit v4 raw trace 使用磁盘紧凑索引和分块向量检查。任何结构、身份、版本或审计不一致均抛出 `TraceValidationError`。
+`TraceValidationConfig` selects scan chunk size and an optional temporary index
+directory. `validate_trace()` returns `TraceValidationReport` or raises
+`TraceValidationError` for structural, identity, dependency, lineage, version,
+or lifecycle violations.
 
 ## Internal Helpers
 
-流式结构 pass 把跨事件回查限制为按实际 domain 压缩的 kind/query/Gaussian/relation 字段，并使用紧凑 relation index；Gaussian domain 包含 initial 集合和实际 child 事件，但 active 状态仍由生命周期 pass 精确重建。生命周期 pass 再以有界向量状态检查当前版本、活动 Gaussian、缓存读完成、梯度到 optimizer 或 collection 的精确 epoch、update begin/end、Clone/Split/Prune lineage 和后继查询屏障。合法的 backward 完成顺序可以不同，但 gradient 集合不得遗漏、重复或错配 relation。
+Vectorized structural passes check ranges and typed domains. The lifecycle
+state machine reconstructs active Gaussians, cache fills, consumers, gradients,
+updates, clone/split/prune lineage, and cross-iteration barriers without
+assuming one legal backward completion order.

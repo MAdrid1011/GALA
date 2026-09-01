@@ -1,0 +1,31 @@
+schema_version: gala-dataset-source-v1
+id: walnut
+name: FIPS Walnut
+provider: zenodo
+record: 6986012
+source_url: https://zenodo.org/records/6986012
+license: CC-BY-4.0
+license_url: https://creativecommons.org/licenses/by/4.0/
+input_format: TIFF projections and scanner metadata
+center_shift_pixels: -5
+conversion:
+  reconstruction_shape: [512, 512, 512]
+  test_view_stride: 8
+  angles: AngleFirst + view_index * AngleInterval
+  object_extent: min(detector_shape) * PixelSize * DistanceSourceOrigin / DistanceSourceDetector
+  intensity_transform: negative_log
+files:
+  - {name: 20201111_walnut_.txt, size: 728, md5: b8a8049a7318e3158456d02e4570c19f}
+  - {name: 20201111_walnut_projections_1.zip, size: 586938649, md5: 444ca44888869350f3691f2494880fd8}
+  - {name: 20201111_walnut_projections_2.zip, size: 589322001, md5: 772558ae698646abf54ad8a21a450e71}
+  - {name: 20201111_walnut_projections_3.zip, size: 585348273, md5: 4e9f9fb73411683988de5b5613d909a4}
+  - {name: 20201111_walnut_projections_4.zip, size: 590007448, md5: 05452e406cf2266077b723506c642608}
+  - {name: 20201111_walnut_projections_5.zip, size: 587828225, md5: 7614d7a1a1ec3be9137621d1cbc7543b}
+  - {name: 20201111_walnut_projections_6.zip, size: 589492689, md5: 2a8b2f59c2ffc42faeab2954c92a98ae}
+  - {name: 20201111_walnut_projections_7.zip, size: 586804079, md5: b1ba468417cbecf52360e0f12da003fc}
+  - {name: 20201111_walnut_projections_8.zip, size: 124490894, md5: 0deabeccc10a524b141292d770180670}
+required_metadata:
+  - detector_pixel_count
+  - detector_pixel_size
+  - source_object_distance
+  - source_detector_distance

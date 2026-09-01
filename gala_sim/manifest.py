@@ -1,4 +1,4 @@
-"""Input-freeze records for the first R²-Gaussian + Chest combination."""
+"""Auditable input-freeze records for model and dataset campaigns."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ from typing import Any
 
 import numpy as np
 
-from gala_sim.config import GalaConfig
+from gala_sim.config import GalaConfig, load_config
 from gala_sim.config.loader import _yaml_load
 from gala_sim.identity import canonical_json, sha256_bytes, sha256_file, sha256_tree
 
@@ -482,6 +482,118 @@ def build_freeze_record(config: GalaConfig, source: SourceRecord, dataset: Datas
 def write_freeze_record(record: dict[str, Any], output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     output.write_text(json.dumps(record, ensure_ascii=True, sort_keys=True, indent=2) + "\n", encoding="utf-8")
+
+
+def build_campaign_freeze_record(
+    *,
+    workspace: "WorkspacePaths",
+    model_id: str,
+    dataset_id: str,
+    config_path: Path,
+    source_root: Path | None = None,
+    dataset_root: Path | None = None,
+    output_root: Path | None = None,
+    python_executable: Path | None = None,
+) -> dict[str, Any]:
+    """Build a portable identity record for any registered campaign pair."""
+
+    from gala_sim.adapters import get_dataset_adapter, get_model_adapter
+    from gala_sim.assets import AssetCatalog
+
+    catalog = AssetCatalog.load(workspace.repository / "configs")
+    try:
+        model_asset = catalog.models[model_id]
+        dataset_asset = catalog.datasets[dataset_id]
+    except KeyError as error:
+        raise ValueError(f"unknown campaign asset: {error.args[0]}") from error
+
+    config = load_config(_repository_path(workspace.repository, config_path))
+    selected_dataset = (dataset_root or workspace.datasets / dataset_id).resolve()
+    dataset_manifest = get_dataset_adapter(dataset_id).load(selected_dataset)
+    selected_output = (output_root or workspace.results / model_id / dataset_id).resolve()
+    selected_python = (python_executable or Path(sys.executable)).resolve()
+    if not selected_python.is_file() or not os.access(selected_python, os.X_OK):
+        raise ValueError(f"Python interpreter is not executable: {selected_python}")
+
+    selected_source = (
+        source_root
+        or (workspace.upstream / model_id if model_asset.repository else workspace.repository)
+    ).resolve()
+    source_identity: dict[str, Any]
+    if model_asset.repository:
+        if not (selected_source / ".git").exists():
+            raise ValueError(f"model source is not a Git checkout: {selected_source}")
+        actual_commit = _command("git", "-C", str(selected_source), "rev-parse", "HEAD")
+        if actual_commit != model_asset.commit:
+            raise ValueError(f"model checkout does not match pinned commit: {model_id}")
+        source_identity = {
+            "repository": model_asset.repository,
+            "commit": actual_commit,
+            "root": _portable_or_absolute(workspace, selected_source),
+        }
+    else:
+        implementation = workspace.repository / "gala_sim/adapters/gr_gaussian.py"
+        source_identity = {
+            "paper_doi": model_asset.paper_doi,
+            "implementation": "independent_reimplementation",
+            "root": workspace.reference(workspace.repository),
+            "implementation_sha256": sha256_file(implementation),
+        }
+
+    adapter = get_model_adapter(
+        model_id, workspace=workspace, output_root=selected_output,
+        python_executable=selected_python,
+    )
+    command = adapter.build_command(selected_dataset, selected_output)
+    record: dict[str, Any] = {
+        "schema_version": "gala-campaign-freeze-v1",
+        "model": {
+            "id": model_asset.id,
+            "name": model_asset.name,
+            "manifest": workspace.reference(model_asset.manifest),
+            "manifest_sha256": sha256_file(model_asset.manifest),
+            "source": source_identity,
+            "stage_boundaries": list(model_asset.stage_boundaries),
+        },
+        "dataset": {
+            "id": dataset_asset.id,
+            "name": dataset_asset.name,
+            "manifest": workspace.reference(dataset_asset.manifest),
+            "manifest_sha256": sha256_file(dataset_asset.manifest),
+            "root": _portable_or_absolute(workspace, selected_dataset),
+            "content_sha256": sha256_tree(selected_dataset),
+            "projection_count": len(dataset_manifest.projections),
+            "detector_shape": list(dataset_manifest.geometry.detector_shape),
+            "volume_shape": list(dataset_manifest.geometry.volume_shape),
+        },
+        "architecture": {
+            "path": _portable_or_absolute(workspace, config.path),
+            "sha256": config.sha256,
+        },
+        "execution": {
+            "output_root": _portable_or_absolute(workspace, selected_output),
+            "command": list(command),
+            "python_executable": str(selected_python),
+        },
+        "repository": {
+            "root": workspace.reference(workspace.repository),
+            "commit": _command("git", "-C", str(workspace.repository), "rev-parse", "HEAD"),
+        },
+        "environment": environment_snapshot(str(selected_python)),
+    }
+    record["identity_sha256"] = sha256_bytes(canonical_json(record))
+    return record
+
+
+def _repository_path(repository: Path, path: Path) -> Path:
+    return path if path.is_absolute() else repository / path
+
+
+def _portable_or_absolute(workspace: "WorkspacePaths", path: Path) -> str:
+    try:
+        return workspace.reference(path)
+    except ValueError:
+        return str(path.resolve())
 
 
 def verify_freeze_record(record: dict[str, Any]) -> None:
