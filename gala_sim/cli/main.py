@@ -123,6 +123,15 @@ def _parser() -> argparse.ArgumentParser:
         metavar="START:END",
         help="official trace window; execution stops when this window closes",
     )
+    campaign.add_argument(
+        "--gpu-measurement-root",
+        type=Path,
+        default=None,
+        help=(
+            "root containing MODEL/DATASET/gpu-compiler-measurement.json; "
+            "official campaigns reject missing or mismatched evidence"
+        ),
+    )
     config = commands.add_parser("config-check")
     config.add_argument("--config", type=Path, required=True)
     preflight = commands.add_parser("cycle-preflight")
@@ -503,6 +512,7 @@ def main(argv: list[str] | None = None) -> int:
                 representative_archive=args.representative_archive,
                 official_trace=args.official_trace,
                 capture_iteration_range=args.capture_iteration_range,
+                gpu_measurement_root=args.gpu_measurement_root,
             )
             print(json.dumps({
                 "status": "passed",
@@ -530,6 +540,7 @@ def main(argv: list[str] | None = None) -> int:
                         "oracle_speedups_vs_base_asic": dict(
                             item.oracle_speedups_vs_base_asic
                         ),
+                        "gpu_base_speedups": dict(item.gpu_base_speedups),
                     }
                     for item in results
                 ],

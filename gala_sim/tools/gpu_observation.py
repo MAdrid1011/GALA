@@ -55,7 +55,7 @@ def sample_gpu_snapshot(
         gpu_lines = _output_lines(runner(
             [
                 "nvidia-smi",
-                "--query-gpu=uuid,utilization.gpu,memory.used",
+                "--query-gpu=uuid,utilization.gpu,memory.used,memory.total",
                 "--format=csv,noheader,nounits",
                 "--id=0",
             ],
@@ -66,11 +66,12 @@ def sample_gpu_snapshot(
         if len(gpu_lines) != 1:
             raise GpuObservationError("nvidia-smi did not return one GPU 0 row")
         gpu_values = [item.strip() for item in next(csv.reader([gpu_lines[0]]))]
-        if len(gpu_values) != 3:
+        if len(gpu_values) != 4:
             raise GpuObservationError("nvidia-smi GPU output is malformed")
-        gpu_uuid, utilization_text, memory_text = gpu_values
+        gpu_uuid, utilization_text, memory_text, memory_total_text = gpu_values
         utilization = int(utilization_text)
         memory_used = int(memory_text)
+        memory_total = int(memory_total_text)
         process_output = runner(
             [
                 "nvidia-smi",
@@ -89,6 +90,7 @@ def sample_gpu_snapshot(
         "gpu_uuid": gpu_uuid,
         "utilization_percent": utilization,
         "memory_used_mib": memory_used,
+        "memory_total_mib": memory_total,
         "compute_processes": _parse_compute_processes(process_output, gpu_uuid),
     }
 

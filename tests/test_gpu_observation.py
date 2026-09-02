@@ -12,7 +12,7 @@ from gala_sim.tools.gpu_observation import (
 
 def test_gpu_snapshot_filters_compute_processes_to_gpu_zero() -> None:
     responses = iter((
-        "GPU-0, 17, 123\n",
+        "GPU-0, 17, 123, 4096\n",
         "GPU-0, 99, train, 456\nGPU-1, 88, other, 789\n",
     ))
 
@@ -22,6 +22,7 @@ def test_gpu_snapshot_filters_compute_processes_to_gpu_zero() -> None:
     snapshot = sample_gpu_snapshot(runner=runner)
     assert snapshot["utilization_percent"] == 17
     assert snapshot["memory_used_mib"] == 123
+    assert snapshot["memory_total_mib"] == 4096
     assert snapshot["compute_processes"] == [
         {"pid": 99, "process_name": "train", "memory_used_mib": 456},
     ]

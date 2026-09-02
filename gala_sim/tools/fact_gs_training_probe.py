@@ -31,8 +31,13 @@ import yaml
 
 from gala_sim.ablation.anchors import compiler_target_speedups
 from gala_sim.adapters.fact_low_memory import install_fact_low_memory_overlay
+from gala_sim.gpu_measurement import build_gpu_compiler_measurement
 from gala_sim.tools.gpu_observation import GpuObservationError, ensure_gpu_isolated
-from gala_sim.tools.r2_gaussian_training_probe import GpuWatchdog, _gpu_summary
+from gala_sim.tools.gpu_probe_watchdog import (
+    GpuWatchdog,
+    ensure_host_memory_reserve,
+    gpu_summary as _gpu_summary,
+)
 
 
 COMPILER_VARIANTS = ("gpu_base", "1000", "0100", "1100")
@@ -525,6 +530,7 @@ def run_probe(
     progress_interval: int,
     inactivity_timeout_seconds: float,
     compiler_variant: str,
+    dataset_id: str,
     profile_stages: bool = False,
 ) -> ProbeObservation:
     """Run a bounded official FaCT-GS prefix from the common initial state."""
@@ -536,8 +542,9 @@ def run_probe(
     if compiler_variant not in BACKWARD_PATHS:
         raise FactTrainingProbeError(f"unsupported compiler variant: {compiler_variant}")
     try:
+        ensure_host_memory_reserve()
         gpu_isolation = ensure_gpu_isolated()
-    except GpuObservationError as error:
+    except (GpuObservationError, RuntimeError) as error:
         raise FactTrainingProbeError(str(error)) from error
     artifact_root.mkdir(parents=True)
     model_root = artifact_root / "model"
@@ -630,13 +637,8 @@ def run_probe(
                 except _PrefixComplete:
                     pass
         except KeyboardInterrupt as error:
-            if watchdog.contention_detected:
-                raise FactTrainingProbeError("gpu_contention_detected") from error
-            if watchdog.timed_out:
-                raise FactTrainingProbeError(
-                    "GPU and iteration progress were both idle for "
-                    f"{inactivity_timeout_seconds:g} seconds"
-                ) from error
+            if watchdog.failure is not None:
+                raise FactTrainingProbeError(watchdog.failure) from error
             raise
         finally:
             watchdog.stop()
@@ -651,8 +653,8 @@ def run_probe(
 
     if completed_iterations != requested_iterations or cuda_elapsed_ms is None:
         raise FactTrainingProbeError("official FaCT-GS prefix did not complete")
-    if watchdog.contention_detected:
-        raise FactTrainingProbeError("gpu_contention_detected")
+    if watchdog.failure is not None:
+        raise FactTrainingProbeError(watchdog.failure)
     if final_arrays is None:
         raise FactTrainingProbeError("official FaCT-GS prefix did not expose final state")
     if final_gradients is None:
@@ -666,7 +668,9 @@ def run_probe(
         "formal_performance_eligible": False,
         "workload": {
             "model": "FaCT-GS",
-            "dataset": "Walnut",
+            "model_id": "fact_gs",
+            "dataset": dataset_id,
+            "dataset_id": dataset_id,
             "compiler_variant": compiler_variant,
             "comparison_baseline": "gpu_base",
             "requested_iterations": requested_iterations,
@@ -694,6 +698,7 @@ def run_probe(
         "watchdog": {
             "timeout_seconds": inactivity_timeout_seconds,
             "timed_out": watchdog.timed_out,
+            "failure": watchdog.failure,
         },
         "provenance": {
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -789,6 +794,7 @@ def summarize_matrix(
 
 def run_matrix(
     *, source_root: Path, dataset_root: Path, output: Path,
+    dataset_id: str,
     requested_iterations: int, warmup_iterations: int, repeats: int,
     progress_interval: int, inactivity_timeout_seconds: float,
     relative_tolerance: float, absolute_tolerance: float,
@@ -817,6 +823,7 @@ def run_matrix(
                     progress_interval=progress_interval,
                     inactivity_timeout_seconds=inactivity_timeout_seconds,
                     compiler_variant=variant,
+                    dataset_id=dataset_id,
                     profile_stages=profile_stages,
                 )
                 observations[variant].append(observation)
@@ -836,6 +843,35 @@ def run_matrix(
         (output / "matrix.json").write_text(
             json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8",
         )
+        summary = result["summary"]
+        standard = build_gpu_compiler_measurement(
+            model_id="fact_gs",
+            dataset_id=dataset_id,
+            iteration_range=(warmup_iterations + 1, requested_iterations),
+            included_training_operations=list(
+                observations["gpu_base"][0].record["workload"]
+                ["included_training_operations"]
+            ),
+            median_gpu_ms={
+                variant: float(summary[variant]["median_cuda_elapsed_ms"])
+                for variant in COMPILER_VARIANTS
+            },
+            sample_counts={
+                variant: len(observations[variant])
+                for variant in COMPILER_VARIANTS
+            },
+            source_probe={
+                "schema_version": result["schema_version"],
+                "result_scope": result["result_scope"],
+                "matrix": "matrix.json",
+            },
+            gpu_isolated=bool(result["performance_comparison_eligible"]),
+            same_workload_across_variants=True,
+            numerical_equivalence_passed=True,
+        )
+        (output / "gpu-compiler-measurement.json").write_text(
+            json.dumps(standard, indent=2, sort_keys=False) + "\n", encoding="utf-8",
+        )
         return result
     finally:
         observations.clear()
@@ -846,6 +882,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--source-root", type=Path, required=True)
     parser.add_argument("--dataset-root", type=Path, required=True)
+    parser.add_argument(
+        "--dataset-id", choices=("chest", "walnut", "hdtomo_usb"), required=True,
+    )
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--iterations", type=int, default=8)
     parser.add_argument("--warmup-iterations", type=int, default=2)
@@ -860,6 +899,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         result = run_matrix(
             source_root=args.source_root.resolve(),
             dataset_root=args.dataset_root.resolve(),
+            dataset_id=args.dataset_id,
             output=args.output.resolve(),
             requested_iterations=args.iterations,
             warmup_iterations=args.warmup_iterations,

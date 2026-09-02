@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -9,8 +12,10 @@ from gala_sim.tools.fact_gs_training_probe import (
     FactTrainingProbeError,
     ProbeObservation,
     compare_states,
+    run_matrix,
     summarize_matrix,
 )
+from gala_sim.gpu_measurement import load_gpu_compiler_measurement
 
 
 def _observation(variant: str, elapsed_ms: float, value: float = 1.0) -> ProbeObservation:
@@ -93,3 +98,57 @@ def test_matrix_rejects_numerically_changed_variant() -> None:
         summarize_matrix(
             observations, relative_tolerance=1.0e-4, absolute_tolerance=1.0e-6,
         )
+
+
+def test_matrix_writes_campaign_measurement_with_dataset_identity(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gala_sim.tools.fact_gs_training_probe as probe
+
+    def fake_probe(**kwargs):
+        variant = kwargs["compiler_variant"]
+        assert kwargs["dataset_id"] == "hdtomo_usb"
+        observation = _observation(variant, {
+            "gpu_base": 100.0,
+            "1000": 75.0,
+            "0100": 70.0,
+            "1100": 60.0,
+        }[variant])
+        observation.record["workload"].update({
+            "model_id": "fact_gs",
+            "dataset": "hdtomo_usb",
+            "dataset_id": "hdtomo_usb",
+            "warmup_iterations": 0,
+            "measured_iterations": 1,
+            "included_training_operations": ["forward", "backward", "optimizer_step"],
+        })
+        return observation
+
+    monkeypatch.setattr(probe, "run_probe", fake_probe)
+    output = tmp_path / "fact_gs" / "hdtomo_usb"
+    run_matrix(
+        source_root=tmp_path,
+        dataset_root=tmp_path,
+        dataset_id="hdtomo_usb",
+        output=output,
+        requested_iterations=1,
+        warmup_iterations=0,
+        repeats=1,
+        progress_interval=1,
+        inactivity_timeout_seconds=300.0,
+        relative_tolerance=1.0e-4,
+        absolute_tolerance=1.0e-6,
+    )
+
+    document = json.loads(
+        (output / "gpu-compiler-measurement.json").read_text(encoding="utf-8")
+    )
+    assert document["model_id"] == "fact_gs"
+    assert document["dataset_id"] == "hdtomo_usb"
+    loaded = load_gpu_compiler_measurement(
+        output / "gpu-compiler-measurement.json",
+        model_id="fact_gs",
+        dataset_id="hdtomo_usb",
+        iteration_range=(1, 1),
+    )
+    assert loaded.speedups_vs_gpu_base["1100"] == pytest.approx(5.0 / 3.0)

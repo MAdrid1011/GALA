@@ -27,6 +27,12 @@ from gala_sim.adapters.gr_gaussian import (
     _trace_from_ray_bundle,
 )
 from gala_sim.config import GalaConfig, load_config
+from gala_sim.gpu_measurement import (
+    COMPILER_BITS,
+    GpuCompilerMeasurement,
+    default_gpu_measurement_path,
+    load_gpu_compiler_measurement,
+)
 from gala_sim.identity import sha256_tree
 from gala_sim.timing import CycleConfig, CycleEngine
 from gala_sim.timing.bounds import analyze_cycle_lower_bounds
@@ -68,6 +74,7 @@ class CampaignResult:
     upper_bound_status: Mapping[str, str]
     oracle_cycles: Mapping[str, int]
     oracle_speedups_vs_base_asic: Mapping[str, float]
+    gpu_base_speedups: Mapping[str, float | None]
 
 
 def _first_prepared_root(paths: WorkspacePaths, dataset_id: str) -> Path | None:
@@ -630,6 +637,7 @@ def run_campaign(
     representative_archive: bool = False,
     official_trace: bool = False,
     capture_iteration_range: tuple[int, int] = (1, 1),
+    gpu_measurement_root: Path | None = None,
 ) -> CampaignResult:
     """Run one complete bounded trace, bound, and seven-variant matrix.
 
@@ -649,6 +657,7 @@ def run_campaign(
     gala_config = config or load_config(paths.repository / "configs/architecture/gala.yaml")
     dataset = prepared_dataset(paths, dataset_id)
     gpu_reference: Mapping[str, Any] | None = None
+    gpu_measurement: GpuCompilerMeasurement | None = None
     if official_trace:
         if iterations != 1:
             raise ValueError("official campaigns capture their real iteration window")
@@ -656,6 +665,25 @@ def run_campaign(
             paths, model_id, dataset_id, dataset, gala_config,
             capture_iteration_range,
         )
+        measurement_root = (
+            Path(gpu_measurement_root)
+            if gpu_measurement_root is not None
+            else paths.results / "gpu-measurements"
+        )
+        measurement_path = default_gpu_measurement_path(
+            measurement_root, model_id, dataset_id,
+        )
+        if measurement_path.is_file():
+            gpu_measurement = load_gpu_compiler_measurement(
+                measurement_path,
+                model_id=model_id,
+                dataset_id=dataset_id,
+                iteration_range=capture_iteration_range,
+            )
+        elif gpu_measurement_root is not None:
+            raise ValueError(
+                f"official GPU compiler measurement is missing: {measurement_path}"
+            )
     elif representative_archive:
         trace_root, trace = _trace_for_representative_archive_campaign(
             paths,
@@ -694,6 +722,11 @@ def run_campaign(
         )
         for run in runs
     }
+    gpu_base_speedups: dict[str, float | None] = {
+        bits: None for bits in COMPILER_BITS
+    }
+    if gpu_measurement is not None:
+        gpu_base_speedups.update(gpu_measurement.speedups_vs_gpu_base)
     targets = hardware_target_speedups()
     # Oracle policies retain the configured resources and dependencies while
     # exposing the best legal decision within one mechanism's scope.  Their
@@ -719,6 +752,34 @@ def run_campaign(
     )
     result_root.mkdir(parents=True, exist_ok=True)
     ablation_path = result_root / "ablation.json"
+    target_assessment: dict[str, dict[str, Any]] = {}
+    for bits in variant_order:
+        if bits == "0000":
+            observed_speedup = None
+            assessment_status = "not_measured_platform_baseline"
+        elif bits in COMPILER_BITS:
+            observed_speedup = gpu_base_speedups[bits]
+            if observed_speedup is None:
+                assessment_status = "not_measured_cpu_only"
+            elif observed_speedup >= anchors[bits].target_speedup:
+                assessment_status = "target_met_gpu_measurement"
+            else:
+                assessment_status = "below_target_gpu_measurement"
+        else:
+            observed_speedup = speedups_vs_base_asic[bits]
+            if (
+                observed_speedup is not None
+                and observed_speedup >= anchors[bits].target_speedup
+            ):
+                assessment_status = "target_met_cpu_validation"
+            else:
+                assessment_status = "below_target_cpu_validation"
+        target_assessment[bits] = {
+            "comparison_baseline": anchors[bits].comparison_baseline,
+            "target_speedup": anchors[bits].target_speedup,
+            "observed_speedup": observed_speedup,
+            "status": assessment_status,
+        }
     ablation_document = {
         "schema_version": "gala-campaign-ablation-v1",
         "model_id": model_id,
@@ -742,24 +803,7 @@ def run_campaign(
         },
         "cycles": cycles_by_variant,
         "speedup_vs_base_asic": speedups_vs_base_asic,
-        "target_assessment": {
-            bits: {
-                "comparison_baseline": anchors[bits].comparison_baseline,
-                "target_speedup": anchors[bits].target_speedup,
-                "observed_speedup": speedups_vs_base_asic[bits],
-                "status": (
-                    "not_measured_cpu_only"
-                    if bits in {"1000", "0100", "1100"}
-                    else (
-                        "target_met_cpu_validation"
-                        if speedups_vs_base_asic[bits] is not None
-                        and speedups_vs_base_asic[bits] >= anchors[bits].target_speedup
-                        else "below_target_cpu_validation"
-                    )
-                ),
-            }
-            for bits in variant_order
-        },
+        "target_assessment": target_assessment,
         "configured_oracle_diagnostics": {
             scenario: {
                 "cycles": oracle_cycles[scenario],
@@ -770,14 +814,21 @@ def run_campaign(
             }
             for scenario in oracle_cycles
         },
-        "gpu_base_speedups": {
-            bits: None for bits in ("1000", "0100", "1100")
-        },
+        "gpu_base_speedups": gpu_base_speedups,
         "gpu_reference_status": (
-            "captured_with_trace_overhead_not_gpu_base"
-            if gpu_reference is not None else "not_measured_cpu_only"
+            "measured_uninstrumented_official_training"
+            if gpu_measurement is not None else (
+                "captured_with_trace_overhead_not_gpu_base"
+                if gpu_reference is not None else "not_measured_cpu_only"
+            )
         ),
         "trace_capture_gpu_reference": dict(gpu_reference) if gpu_reference is not None else None,
+        "gpu_compiler_measurement": (
+            gpu_measurement.as_campaign_reference(
+                paths.reference(gpu_measurement.path),
+            )
+            if gpu_measurement is not None else None
+        ),
     }
     ablation_path.write_text(
         json.dumps(ablation_document, indent=2, sort_keys=True) + "\n",
@@ -807,10 +858,26 @@ def run_campaign(
     }
     bounds_document["gpu_compiler_bounds"] = {
         bits: {
-            "status": "not_measured_cpu_only",
+            "status": (
+                "not_measured_cpu_only"
+                if gpu_base_speedups[bits] is None
+                else (
+                    "target_met_gpu_measurement"
+                    if gpu_base_speedups[bits] >= anchors[bits].target_speedup
+                    else "engineering_optimization_required"
+                )
+            ),
             "comparison_baseline": "gpu_base",
+            "observed_speedup": gpu_base_speedups[bits],
+            "target_speedup": anchors[bits].target_speedup,
         }
-        for bits in ("1000", "0100", "1100")
+        for bits in COMPILER_BITS
+    }
+    bounds_document["base_asic_platform_bound"] = {
+        "status": "not_measured_platform_baseline",
+        "comparison_baseline": anchors["0000"].comparison_baseline,
+        "observed_speedup": None,
+        "target_speedup": anchors["0000"].target_speedup,
     }
     bounds_path.write_text(
         json.dumps(bounds_document, indent=2, sort_keys=True) + "\n",
@@ -830,6 +897,7 @@ def run_campaign(
         upper_bound_status=upper_status,
         oracle_cycles=oracle_cycles,
         oracle_speedups_vs_base_asic=oracle_speedups,
+        gpu_base_speedups=gpu_base_speedups,
     )
 
 
@@ -844,6 +912,7 @@ def run_campaigns(
     representative_archive: bool = False,
     official_trace: bool = False,
     capture_iteration_range: tuple[int, int] = (1, 1),
+    gpu_measurement_root: Path | None = None,
 ) -> tuple[CampaignResult, ...]:
     """Run selected campaigns in deterministic model/dataset order."""
 
@@ -858,6 +927,7 @@ def run_campaigns(
             iterations=iterations, representative_archive=representative_archive,
             official_trace=official_trace,
             capture_iteration_range=capture_iteration_range,
+            gpu_measurement_root=gpu_measurement_root,
         )
         for model_id, dataset_id in unique
     )

@@ -163,11 +163,21 @@ def test_campaign_writes_identity_bound_trace_and_seven_variant_result(tmp_path:
     assert ablation["target_assessment"]["1000"]["status"] == (
         "not_measured_cpu_only"
     )
+    assert ablation["target_assessment"]["0000"] == {
+        "comparison_baseline": "agx_orin_gpu_base_estimate",
+        "observed_speedup": None,
+        "status": "not_measured_platform_baseline",
+        "target_speedup": 2.43,
+    }
     assert ablation["target_assessment"]["1010"]["observed_speedup"] is not None
     oracle = ablation["configured_oracle_diagnostics"]
     assert set(oracle) == {"query", "residency"}
     assert all(item["status"] == "diagnostic_only" for item in oracle.values())
     assert set(result.oracle_cycles) == {"query", "residency"}
+    bounds = json.loads(result.bounds_path.read_text(encoding="utf-8"))
+    assert bounds["base_asic_platform_bound"]["status"] == (
+        "not_measured_platform_baseline"
+    )
 
 
 def test_representative_archive_campaign_uses_packet_archive_contract(

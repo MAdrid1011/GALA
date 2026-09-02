@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import argparse
-import _thread
 from contextlib import contextmanager
-from dataclasses import dataclass
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
@@ -14,7 +12,6 @@ import os
 from pathlib import Path
 import subprocess
 import sys
-import threading
 import time
 from types import ModuleType
 from typing import Any, Iterator, Sequence
@@ -22,8 +19,11 @@ from typing import Any, Iterator, Sequence
 from gala_sim.tools.gpu_observation import (
     GpuObservationError,
     ensure_gpu_isolated,
-    external_compute_processes,
-    sample_gpu_snapshot,
+)
+from gala_sim.tools.gpu_probe_watchdog import (
+    GpuWatchdog,
+    ensure_host_memory_reserve,
+    gpu_summary as _gpu_summary,
 )
 
 
@@ -196,85 +196,6 @@ def _compiler_variant_environment(variant: str) -> Iterator[None]:
                 os.environ[name] = value
 
 
-def _gpu_sample() -> dict[str, int] | None:
-    try:
-        sample = sample_gpu_snapshot()
-    except GpuObservationError:
-        return None
-    return sample
-
-
-@dataclass
-class GpuWatchdog:
-    timeout_seconds: float
-    sample_interval_seconds: float = 1.0
-    owner_pid: int | None = None
-
-    def __post_init__(self) -> None:
-        if self.timeout_seconds <= 0 or self.sample_interval_seconds <= 0:
-            raise ValueError("watchdog intervals must be positive")
-        self.samples: list[dict[str, Any]] = []
-        self.last_progress_at = time.monotonic()
-        self.last_gpu_active_at = self.last_progress_at
-        self.timed_out = False
-        self.contention_detected = False
-        self.external_compute_processes: list[dict[str, Any]] = []
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._run, daemon=True)
-
-    def start(self) -> None:
-        self._thread.start()
-
-    def progress(self) -> None:
-        self.last_progress_at = time.monotonic()
-
-    def stop(self) -> None:
-        self._stop.set()
-        self._thread.join(timeout=self.sample_interval_seconds * 2)
-
-    def _run(self) -> None:
-        started = time.monotonic()
-        while not self._stop.wait(self.sample_interval_seconds):
-            now = time.monotonic()
-            sample = _gpu_sample()
-            if sample is not None:
-                sample["elapsed_seconds"] = now - started
-                self.samples.append(sample)
-                if self.owner_pid is not None:
-                    try:
-                        external = external_compute_processes(
-                            sample, owner_pid=self.owner_pid,
-                        )
-                    except GpuObservationError:
-                        external = []
-                    if external:
-                        self.contention_detected = True
-                        self.external_compute_processes.extend(external)
-                        _thread.interrupt_main()
-                        return
-                if sample["utilization_percent"] > 0:
-                    self.last_gpu_active_at = now
-            if now - max(self.last_progress_at, self.last_gpu_active_at) >= self.timeout_seconds:
-                self.timed_out = True
-                _thread.interrupt_main()
-                return
-
-
-def _gpu_summary(samples: Sequence[dict[str, Any]]) -> dict[str, Any]:
-    if not samples:
-        return {"sample_count": 0, "status": "unavailable"}
-    utilization = [int(item["utilization_percent"]) for item in samples]
-    memory = [int(item["memory_used_mib"]) for item in samples]
-    return {
-        "sample_count": len(samples),
-        "status": "measured",
-        "mean_utilization_percent": sum(utilization) / len(utilization),
-        "maximum_utilization_percent": max(utilization),
-        "maximum_memory_used_mib": max(memory),
-        "samples": list(samples),
-    }
-
-
 def _state_fingerprint(gaussians: Any) -> dict[str, Any]:
     tensors = {
         "xyz": gaussians._xyz,
@@ -314,6 +235,7 @@ def run_probe(
     inactivity_timeout_seconds: float,
     telemetry_mode: str,
     compiler_variant: str,
+    dataset_id: str = "chest",
 ) -> dict[str, Any]:
     if not 0 <= warmup_iterations < requested_iterations <= PUBLISHED_ITERATIONS:
         raise TrainingProbeError("require 0 <= warmup < requested <= 30000 iterations")
@@ -328,6 +250,10 @@ def run_probe(
     source_path = source_root / "train.py"
     if not source_path.is_file() or not dataset_root.is_dir() or not initial_state.is_file():
         raise TrainingProbeError("source, dataset, or initial state is unavailable")
+    try:
+        ensure_host_memory_reserve()
+    except RuntimeError as error:
+        raise TrainingProbeError(str(error)) from error
     try:
         gpu_isolation = ensure_gpu_isolated()
     except GpuObservationError as error:
@@ -443,12 +369,8 @@ def run_probe(
             except StopAfterPrefix:
                 pass
         except KeyboardInterrupt as error:
-            if watchdog.contention_detected:
-                raise TrainingProbeError("gpu_contention_detected") from error
-            if watchdog.timed_out:
-                raise TrainingProbeError(
-                    f"GPU and iteration progress were both idle for {inactivity_timeout_seconds:g} seconds"
-                ) from error
+            if watchdog.failure is not None:
+                raise TrainingProbeError(watchdog.failure) from error
             raise
         finally:
             watchdog.stop()
@@ -458,8 +380,8 @@ def run_probe(
 
     if completed_iterations != requested_iterations or cuda_elapsed_ms is None or final_state is None:
         raise TrainingProbeError("official training loop did not complete the requested prefix")
-    if watchdog.contention_detected:
-        raise TrainingProbeError("gpu_contention_detected")
+    if watchdog.failure is not None:
+        raise TrainingProbeError(watchdog.failure)
     measured_iterations = requested_iterations - warmup_iterations
     seconds_per_iteration = cuda_elapsed_ms / 1000.0 / measured_iterations
     return {
@@ -469,7 +391,9 @@ def run_probe(
         "formal_performance_eligible": False,
         "workload": {
             "model": "R2-Gaussian",
-            "dataset": "Chest",
+            "model_id": "r2_gaussian",
+            "dataset": dataset_id,
+            "dataset_id": dataset_id,
             "compiler_variant": compiler_variant,
             "comparison_baseline": "gpu_base",
             "published_iterations": PUBLISHED_ITERATIONS,
@@ -499,6 +423,7 @@ def run_probe(
         "watchdog": {
             "timeout_seconds": inactivity_timeout_seconds,
             "timed_out": watchdog.timed_out,
+            "failure": watchdog.failure,
         },
         "provenance": {
             "timestamp_utc": datetime.now(timezone.utc).isoformat(),
@@ -531,6 +456,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--source-root", required=True, type=Path)
     parser.add_argument("--extension-root", type=Path)
     parser.add_argument("--dataset-root", required=True, type=Path)
+    parser.add_argument(
+        "--dataset-id", choices=("chest", "walnut", "hdtomo_usb"), default="chest",
+    )
     parser.add_argument("--initial-state", required=True, type=Path)
     parser.add_argument("--artifact-root", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
@@ -560,6 +488,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             inactivity_timeout_seconds=args.inactivity_timeout_seconds,
             telemetry_mode=args.telemetry_mode,
             compiler_variant=args.compiler_variant,
+            dataset_id=args.dataset_id,
         )
     except (OSError, ValueError, TrainingProbeError) as error:
         print(f"R2-Gaussian training probe failed: {error}", file=sys.stderr)
