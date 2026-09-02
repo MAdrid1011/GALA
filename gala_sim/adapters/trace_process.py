@@ -105,6 +105,12 @@ def run_trace_process(
             raise TraceProcessError("gpu_busy_external")
         if sample_index == 0:
             sleep_fn(sample_interval_seconds)
+    initial_host_memory = host_memory_fn()
+    if (
+        initial_host_memory is not None
+        and initial_host_memory < minimum_available_host_memory_bytes
+    ):
+        raise TraceProcessError("host_memory_reserve_exhausted")
     if prepare_fn is not None:
         prepare_fn()
 

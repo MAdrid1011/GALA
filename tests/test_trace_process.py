@@ -236,6 +236,7 @@ def test_trace_process_stops_before_exhausting_host_memory_reserve(
         _sample(), _sample(),
         _sample(processes=(ComputeProcess("GPU-fixture", 4242, "train", 1),)),
     ))
+    host_memory = iter((9, 7))
     monkeypatch.setattr("gala_sim.adapters.trace_process.subprocess.Popen", Process)
 
     with pytest.raises(TraceProcessError, match="host_memory_reserve_exhausted"):
@@ -243,8 +244,32 @@ def test_trace_process_stops_before_exhausting_host_memory_reserve(
             ("python", "train.py"), cwd=tmp_path, environment={},
             trace_root=tmp_path / "trace", sample_fn=lambda: next(samples),
             sample_interval_seconds=1.0, minimum_available_host_memory_bytes=8,
-            sleep_fn=lambda _seconds: None, host_memory_fn=lambda: 7,
+            sleep_fn=lambda _seconds: None, host_memory_fn=lambda: next(host_memory),
         )
     report = (tmp_path / "trace/capture_process.json").read_text(encoding="utf-8")
     assert '"host_memory_available_bytes": 7' in report
     assert '"failure": "host_memory_reserve_exhausted"' in report
+
+
+def test_trace_process_does_not_launch_below_initial_host_memory_reserve(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path,
+) -> None:
+    started = False
+
+    def unexpected_popen(*_args: object, **_kwargs: object) -> object:
+        nonlocal started
+        started = True
+        raise AssertionError("trace process must not start")
+
+    monkeypatch.setattr("gala_sim.adapters.trace_process.subprocess.Popen", unexpected_popen)
+
+    with pytest.raises(TraceProcessError, match="host_memory_reserve_exhausted"):
+        run_trace_process(
+            ("python", "train.py"), cwd=tmp_path, environment={},
+            trace_root=tmp_path / "trace", sample_fn=lambda: _sample(),
+            sample_interval_seconds=1.0, minimum_available_host_memory_bytes=8,
+            sleep_fn=lambda _seconds: None, host_memory_fn=lambda: 7,
+        )
+
+    assert not started
+    assert not (tmp_path / "trace").exists()
