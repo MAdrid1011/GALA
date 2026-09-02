@@ -16,6 +16,7 @@ import time
 from types import ModuleType
 from typing import Any, Iterator, Sequence
 
+from gala_sim.adapters.stage_profile import GpuStageProfileSession, IterationRange
 from gala_sim.tools.gpu_observation import (
     GpuObservationError,
     ensure_gpu_isolated,
@@ -236,6 +237,7 @@ def run_probe(
     telemetry_mode: str,
     compiler_variant: str,
     dataset_id: str = "chest",
+    profile_stages: bool = False,
 ) -> dict[str, Any]:
     if not 0 <= warmup_iterations < requested_iterations <= PUBLISHED_ITERATIONS:
         raise TrainingProbeError("require 0 <= warmup < requested <= 30000 iterations")
@@ -316,6 +318,22 @@ def run_probe(
         completed_iterations = 0
         cuda_elapsed_ms: float | None = None
         watchdog = GpuWatchdog(inactivity_timeout_seconds, owner_pid=os.getpid())
+        stage_profile: dict[str, Any] | None = None
+        profile_session = (
+            GpuStageProfileSession(
+                output=artifact_root / "stage-profile.json",
+                iteration_ranges=(
+                    IterationRange(warmup_iterations + 1, requested_iterations),
+                ),
+                run_identity={
+                    "model_id": "r2_gaussian",
+                    "dataset_id": dataset_id,
+                    "compiler_variant": compiler_variant,
+                    "diagnostic_only": True,
+                },
+            )
+            if profile_stages else None
+        )
 
         def initialize_from_checked_state(gaussians: Any, _dataset: Any, _loaded: Any = None) -> None:
             gaussians.load_ply(str(initial_state))
@@ -361,6 +379,9 @@ def run_probe(
             measurement_start.record()
         training.initialize_gaussian = initialize_from_checked_state
         training.training_report = report
+        if profile_session is not None:
+            profile_session.install()
+            profile_session.install_training_aliases(training)
         wall_started = time.perf_counter()
         watchdog.start()
         try:
@@ -376,6 +397,11 @@ def run_probe(
             watchdog.stop()
             training.initialize_gaussian = original_initialize
             training.training_report = original_report
+            if profile_session is not None:
+                try:
+                    stage_profile = profile_session.finish()
+                finally:
+                    profile_session.restore()
         wall_seconds = time.perf_counter() - wall_started
 
     if completed_iterations != requested_iterations or cuda_elapsed_ms is None or final_state is None:
@@ -414,6 +440,7 @@ def run_probe(
             "final_gaussians": final_gaussians,
             "final_losses": final_metrics,
             "final_state": final_state,
+            "stage_profile": stage_profile,
         },
         "gpu": {
             **_gpu_summary(watchdog.samples),
@@ -470,6 +497,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--compiler-variant", choices=tuple(COMPILER_VARIANT_FLAGS), default="gpu_base"
     )
+    parser.add_argument("--profile-stages", action="store_true")
     args = parser.parse_args(argv)
     if args.output.exists():
         parser.error("--output must not already exist")
@@ -489,6 +517,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             telemetry_mode=args.telemetry_mode,
             compiler_variant=args.compiler_variant,
             dataset_id=args.dataset_id,
+            profile_stages=args.profile_stages,
         )
     except (OSError, ValueError, TrainingProbeError) as error:
         print(f"R2-Gaussian training probe failed: {error}", file=sys.stderr)

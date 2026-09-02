@@ -23,6 +23,43 @@ class GpuMeasurementError(ValueError):
     """Raised when GPU compiler evidence is incomplete or not comparable."""
 
 
+def platform_identity_from_isolation(
+    isolation: Mapping[str, Any] | Any,
+) -> dict[str, str] | None:
+    """Extract one stable GPU identity from an isolation sampling report."""
+
+    if not isinstance(isolation, Mapping):
+        return None
+    samples = isolation.get("samples")
+    if not isinstance(samples, list) or not samples:
+        return None
+    identities = {
+        (str(item.get("gpu_name", "")), str(item.get("gpu_uuid", "")))
+        for item in samples
+        if isinstance(item, Mapping)
+    }
+    if len(identities) != 1:
+        return None
+    gpu_name, gpu_uuid = next(iter(identities))
+    if not gpu_name or not gpu_uuid:
+        return None
+    return {"gpu_name": gpu_name, "gpu_uuid": gpu_uuid}
+
+
+def _platform_identity(value: Any) -> dict[str, str] | None:
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise GpuMeasurementError("GPU platform identity is malformed")
+    gpu_name = value.get("gpu_name")
+    gpu_uuid = value.get("gpu_uuid")
+    if not isinstance(gpu_name, str) or not gpu_name:
+        raise GpuMeasurementError("GPU platform name is malformed")
+    if not isinstance(gpu_uuid, str) or not gpu_uuid:
+        raise GpuMeasurementError("GPU platform UUID is malformed")
+    return {"gpu_name": gpu_name, "gpu_uuid": gpu_uuid}
+
+
 def _positive_float(value: Any, label: str) -> float:
     try:
         number = float(value)
@@ -49,6 +86,7 @@ class GpuCompilerMeasurement:
     iteration_range: tuple[int, int]
     median_gpu_ms: Mapping[str, float]
     sample_counts: Mapping[str, int]
+    gpu_platform: Mapping[str, str] | None
     source_document: Mapping[str, Any]
 
     @property
@@ -70,6 +108,9 @@ class GpuCompilerMeasurement:
             "iteration_range": list(self.iteration_range),
             "median_gpu_ms": dict(self.median_gpu_ms),
             "sample_counts": dict(self.sample_counts),
+            "gpu_platform": (
+                dict(self.gpu_platform) if self.gpu_platform is not None else None
+            ),
         }
 
 
@@ -103,6 +144,7 @@ def load_gpu_compiler_measurement(
         raise GpuMeasurementError("GPU measurement model identity mismatch")
     if document.get("dataset_id") != dataset_id:
         raise GpuMeasurementError("GPU measurement dataset identity mismatch")
+    gpu_platform = _platform_identity(document.get("gpu_platform"))
 
     workload = document.get("workload")
     if not isinstance(workload, Mapping):
@@ -182,6 +224,7 @@ def load_gpu_compiler_measurement(
         iteration_range=iteration_range,
         median_gpu_ms=median_gpu_ms,
         sample_counts=sample_counts,
+        gpu_platform=gpu_platform,
         source_document=document,
     )
 
@@ -198,6 +241,7 @@ def build_gpu_compiler_measurement(
     gpu_isolated: bool,
     same_workload_across_variants: bool,
     numerical_equivalence_passed: bool,
+    gpu_platform: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
     """Build the stable artifact emitted by model-specific timing probes."""
 
@@ -244,6 +288,7 @@ def build_gpu_compiler_measurement(
             "same_workload_across_variants": bool(same_workload_across_variants),
             "numerical_equivalence_passed": bool(numerical_equivalence_passed),
         },
+        "gpu_platform": _platform_identity(gpu_platform),
         "variants": variants,
         "source_probe": dict(source_probe),
     }

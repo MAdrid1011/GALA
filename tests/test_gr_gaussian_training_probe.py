@@ -159,3 +159,61 @@ def test_gr_matrix_writes_campaign_measurement(
         iteration_range=(3, 10),
     )
     assert loaded.speedups_vs_gpu_base["1100"] == pytest.approx(5.0 / 3.0)
+
+
+def test_gr_matrix_keeps_stage_profile_out_of_four_way_timing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gala_sim.tools.gr_gaussian_training_probe as probe
+
+    calls: list[tuple[str, bool]] = []
+
+    def fake_probe(**kwargs):
+        variant = kwargs["compiler_variant"]
+        profiled = kwargs["profile_stages"]
+        calls.append((variant, profiled))
+        result = _observation(variant, 100.0)
+        if profiled:
+            result.record["measurement"]["stage_profile"] = {
+                "summaries": {
+                    "query_weights": {"total_ms": 20.0},
+                    "prediction_and_graph_loss": {"total_ms": 10.0},
+                    "backward": {"total_ms": 30.0},
+                }
+            }
+        return result
+
+    monkeypatch.setattr(probe, "run_probe", fake_probe)
+    output = tmp_path / "profiled-matrix"
+    result = run_matrix(
+        bundle=tmp_path / "bundle.npz",
+        dataset_id="walnut",
+        output=output,
+        requested_iterations=10,
+        warmup_iterations=2,
+        repeats=1,
+        learning_rate=0.05,
+        graph_weight=0.01,
+        inactivity_timeout_seconds=300.0,
+        relative_tolerance=1.0e-5,
+        absolute_tolerance=1.0e-8,
+        profile_stages=True,
+    )
+
+    assert calls == [
+        ("gpu_base", False),
+        ("1000", False),
+        ("0100", False),
+        ("1100", False),
+        ("gpu_base", True),
+    ]
+    bounds = result["compiler_coverage_bounds"]["bounds"]
+    assert bounds["1000"]["maximum_possible_speedup_vs_gpu_base"] == pytest.approx(
+        1.25
+    )
+    assert bounds["0100"]["maximum_possible_speedup_vs_gpu_base"] == pytest.approx(
+        5.0 / 3.0
+    )
+    assert bounds["1100"]["maximum_possible_speedup_vs_gpu_base"] == pytest.approx(
+        2.5
+    )

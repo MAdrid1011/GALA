@@ -34,6 +34,7 @@ def _document() -> dict:
         gpu_isolated=True,
         same_workload_across_variants=True,
         numerical_equivalence_passed=True,
+        gpu_platform={"gpu_name": "NVIDIA Test GPU", "gpu_uuid": "GPU-test"},
     )
 
 
@@ -80,6 +81,9 @@ def test_gpu_measurement_derives_compiler_speedups_from_gpu_base(tmp_path: Path)
         "0100": pytest.approx(1.25),
         "1100": pytest.approx(5.0 / 3.0),
     }
+    assert measurement.gpu_platform == {
+        "gpu_name": "NVIDIA Test GPU", "gpu_uuid": "GPU-test",
+    }
 
 
 @pytest.mark.parametrize(
@@ -105,6 +109,7 @@ def test_gpu_measurement_derives_compiler_speedups_from_gpu_base(tmp_path: Path)
             ),
             "inconsistent speedup",
         ),
+        (lambda value: value.update(gpu_platform={"gpu_name": ""}), "platform name"),
     ],
 )
 def test_gpu_measurement_rejects_noncomparable_evidence(

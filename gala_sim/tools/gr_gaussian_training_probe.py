@@ -17,7 +17,11 @@ import numpy as np
 
 from gala_sim.ablation.anchors import compiler_target_speedups
 from gala_sim.adapters.gr_gaussian import build_knn_graph
-from gala_sim.gpu_measurement import build_gpu_compiler_measurement
+from gala_sim.gpu_coverage import analyze_gpu_compiler_coverage
+from gala_sim.gpu_measurement import (
+    build_gpu_compiler_measurement,
+    platform_identity_from_isolation,
+)
 from gala_sim.tools.gpu_observation import GpuObservationError, ensure_gpu_isolated
 from gala_sim.tools.gpu_probe_watchdog import (
     GpuWatchdog,
@@ -50,6 +54,69 @@ class GRTrainingProbeError(RuntimeError):
 class ProbeObservation:
     record: Mapping[str, Any]
     densities: np.ndarray
+
+
+@dataclass
+class _StageInterval:
+    stage: str
+    start: Any
+    end: Any
+
+
+class _CudaStageProfiler:
+    """Collect non-overlapping CUDA intervals for the measured GR prefix."""
+
+    def __init__(self, torch_module: Any, enabled: bool) -> None:
+        self._torch = torch_module
+        self._enabled = enabled
+        self._active = False
+        self._intervals: list[_StageInterval] = []
+
+    def begin(self) -> None:
+        self._active = self._enabled
+
+    def end(self) -> None:
+        self._active = False
+
+    def measure(self, stage: str, call: Any) -> Any:
+        if not self._active:
+            return call()
+        start = self._torch.cuda.Event(enable_timing=True)
+        end = self._torch.cuda.Event(enable_timing=True)
+        start.record()
+        try:
+            return call()
+        finally:
+            end.record()
+            self._intervals.append(_StageInterval(stage, start, end))
+
+    def result(self) -> dict[str, Any] | None:
+        if not self._enabled:
+            return None
+        self._torch.cuda.synchronize()
+        records = [
+            {
+                "stage": interval.stage,
+                "milliseconds": float(interval.start.elapsed_time(interval.end)),
+            }
+            for interval in self._intervals
+        ]
+        grouped: dict[str, list[float]] = {}
+        for record in records:
+            grouped.setdefault(str(record["stage"]), []).append(
+                float(record["milliseconds"])
+            )
+        return {
+            "records": records,
+            "summaries": {
+                stage: {
+                    "call_count": len(values),
+                    "total_ms": sum(values),
+                    "median_ms": statistics.median(values),
+                }
+                for stage, values in sorted(grouped.items())
+            },
+        }
 
 
 def _weights(torch: Any, origins: Any, directions: Any, means: Any, scales: Any) -> Any:
@@ -129,6 +196,7 @@ def run_probe(
     learning_rate: float,
     graph_weight: float,
     inactivity_timeout_seconds: float,
+    profile_stages: bool = False,
 ) -> ProbeObservation:
     """Run one complete bounded density-optimization path on CUDA."""
 
@@ -166,36 +234,61 @@ def run_probe(
     measurement_start = torch.cuda.Event(enable_timing=True)
     measurement_end = torch.cuda.Event(enable_timing=True)
     watchdog = GpuWatchdog(inactivity_timeout_seconds, owner_pid=os.getpid())
+    profiler = _CudaStageProfiler(torch, profile_stages)
     final_loss = 0.0
     wall_started = time.monotonic()
     watchdog.start()
     try:
         if warmup_iterations == 0:
             measurement_start.record()
+            profiler.begin()
         for iteration in range(1, requested_iterations + 1):
             weights = cached_weights
             if weights is None:
-                weights = _weights(torch, origins, directions, means, scales)
-            if closed_form_semantic:
-                loss, gradient = _closed_form_gradient(
-                    torch, weights, densities, target, edges, graph_weight,
+                weights = profiler.measure(
+                    "query_weights",
+                    lambda: _weights(torch, origins, directions, means, scales),
                 )
-                densities = torch.clamp_min(densities - learning_rate * gradient, 0.0)
+            if closed_form_semantic:
+                loss, gradient = profiler.measure(
+                    "closed_form_gradient",
+                    lambda: _closed_form_gradient(
+                        torch, weights, densities, target, edges, graph_weight,
+                    ),
+                )
+                densities = profiler.measure(
+                    "optimizer",
+                    lambda: torch.clamp_min(
+                        densities - learning_rate * gradient, 0.0
+                    ),
+                )
             else:
                 densities = densities.detach().requires_grad_(True)
-                prediction = _prediction(torch, weights, densities)
-                loss = torch.mean((prediction - target) ** 2) + graph_weight * _graph_loss(
-                    torch, densities, edges,
+
+                def prediction_and_loss() -> Any:
+                    prediction = _prediction(torch, weights, densities)
+                    return (
+                        torch.mean((prediction - target) ** 2)
+                        + graph_weight * _graph_loss(torch, densities, edges)
+                    )
+
+                loss = profiler.measure(
+                    "prediction_and_graph_loss", prediction_and_loss,
                 )
-                loss.backward()
+                profiler.measure("backward", loss.backward)
                 with torch.no_grad():
-                    densities = torch.clamp_min(
-                        densities - learning_rate * densities.grad, 0.0,
+                    densities = profiler.measure(
+                        "optimizer",
+                        lambda: torch.clamp_min(
+                            densities - learning_rate * densities.grad, 0.0,
+                        ),
                     )
             if iteration == warmup_iterations:
                 measurement_start.record()
+                profiler.begin()
             watchdog.progress()
         measurement_end.record()
+        profiler.end()
         measurement_end.synchronize()
         elapsed_ms = float(measurement_start.elapsed_time(measurement_end))
         final_loss = float(loss.detach().cpu())
@@ -230,6 +323,7 @@ def run_probe(
             "wall_seconds_including_initialization": time.monotonic() - wall_started,
             "final_loss": final_loss,
             "final_density_sum": float(final_densities.sum()),
+            "stage_profile": profiler.result(),
         },
         "compiler_paths": {
             "hoisted_query_weights": hoist_query,
@@ -331,6 +425,7 @@ def run_matrix(
     inactivity_timeout_seconds: float,
     relative_tolerance: float,
     absolute_tolerance: float,
+    profile_stages: bool = False,
 ) -> dict[str, Any]:
     if output.exists() or repeats <= 0:
         raise GRTrainingProbeError("matrix output must be new and repeats must be positive")
@@ -350,6 +445,7 @@ def run_matrix(
                 learning_rate=learning_rate,
                 graph_weight=graph_weight,
                 inactivity_timeout_seconds=inactivity_timeout_seconds,
+                profile_stages=False,
             )
             observations[variant].append(observation)
             sample_path = output / "samples" / variant / f"repeat_{repeat + 1}.json"
@@ -363,6 +459,37 @@ def run_matrix(
         relative_tolerance=relative_tolerance,
         absolute_tolerance=absolute_tolerance,
     )
+    if profile_stages:
+        diagnostic = run_probe(
+            bundle=bundle,
+            dataset_id=dataset_id,
+            compiler_variant="gpu_base",
+            requested_iterations=requested_iterations,
+            warmup_iterations=warmup_iterations,
+            learning_rate=learning_rate,
+            graph_weight=graph_weight,
+            inactivity_timeout_seconds=inactivity_timeout_seconds,
+            profile_stages=True,
+        )
+        diagnostic_path = output / "gpu-base-stage-profile.json"
+        diagnostic_path.write_text(
+            json.dumps(diagnostic.record, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        stage_profile = diagnostic.record["measurement"]["stage_profile"]
+        if not isinstance(stage_profile, Mapping):
+            raise GRTrainingProbeError("GR-Gaussian stage profile is missing")
+        result["compiler_coverage_bounds"] = analyze_gpu_compiler_coverage(
+            total_gpu_ms=float(diagnostic.record["measurement"]["cuda_elapsed_ms"]),
+            stage_profile=stage_profile,
+            coverable_stages={
+                "1000": ("query_weights",),
+                "0100": ("prediction_and_graph_loss", "backward"),
+                "1100": (
+                    "query_weights", "prediction_and_graph_loss", "backward",
+                ),
+            },
+        )
     (output / "matrix.json").write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8",
     )
@@ -387,6 +514,9 @@ def run_matrix(
         gpu_isolated=bool(result["performance_comparison_eligible"]),
         same_workload_across_variants=True,
         numerical_equivalence_passed=True,
+        gpu_platform=platform_identity_from_isolation(
+            observations["gpu_base"][0].record["gpu"].get("isolation")
+        ),
     )
     (output / "gpu-compiler-measurement.json").write_text(
         json.dumps(standard, indent=2, sort_keys=False) + "\n", encoding="utf-8",
@@ -409,6 +539,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--inactivity-timeout-seconds", type=float, default=300.0)
     parser.add_argument("--relative-tolerance", type=float, default=1.0e-5)
     parser.add_argument("--absolute-tolerance", type=float, default=1.0e-7)
+    parser.add_argument("--profile-stages", action="store_true")
     args = parser.parse_args(argv)
     try:
         result = run_matrix(
@@ -423,6 +554,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             inactivity_timeout_seconds=args.inactivity_timeout_seconds,
             relative_tolerance=args.relative_tolerance,
             absolute_tolerance=args.absolute_tolerance,
+            profile_stages=args.profile_stages,
         )
     except (OSError, ValueError, GRTrainingProbeError) as error:
         print(f"GR-Gaussian compiler matrix failed: {error}", file=sys.stderr)

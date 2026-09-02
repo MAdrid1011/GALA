@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 import gc
 import hashlib
@@ -19,7 +20,11 @@ from typing import Any, Iterator, Mapping, Sequence
 
 from gala_sim.ablation.anchors import compiler_target_speedups
 from gala_sim.adapters.fact_low_memory import install_exact_low_memory_overlay
-from gala_sim.gpu_measurement import build_gpu_compiler_measurement
+from gala_sim.gpu_measurement import (
+    build_gpu_compiler_measurement,
+    platform_identity_from_isolation,
+)
+from gala_sim.gpu_coverage import analyze_gpu_compiler_coverage
 from gala_sim.tools.gpu_probe_watchdog import (
     GpuWatchdog,
     ensure_host_memory_reserve,
@@ -118,6 +123,108 @@ class _PrefixComplete(RuntimeError):
     """Stop after the measured optimizer transaction, before endpoint work."""
 
 
+@dataclass
+class _StageInterval:
+    stage: str
+    start: Any
+    end: Any
+
+
+class _ExactStageProfiler:
+    """Optional CUDA-event characterization of a measured Exact-GS prefix."""
+
+    def __init__(self, torch_module: Any) -> None:
+        self._torch = torch_module
+        self._active = False
+        self._intervals: list[_StageInterval] = []
+        self._patches: list[tuple[Any, str, Any]] = []
+
+    def begin(self) -> None:
+        self._active = True
+
+    def end(self) -> None:
+        self._active = False
+
+    def measure(self, stage: str, call: Any) -> Any:
+        if not self._active:
+            return call()
+        start = self._torch.cuda.Event(enable_timing=True)
+        end = self._torch.cuda.Event(enable_timing=True)
+        start.record()
+        try:
+            return call()
+        finally:
+            end.record()
+            self._intervals.append(_StageInterval(stage, start, end))
+
+    def install(self, training: ModuleType) -> None:
+        self._patch(
+            training, "render_exact",
+            lambda original: self._wrap(original, "projection_forward"),
+        )
+        self._patch(
+            training, "l2_loss",
+            lambda original: self._wrap(original, "projection_loss"),
+        )
+        self._patch(
+            training, "ssim",
+            lambda original: self._wrap(original, "projection_loss"),
+        )
+        self._patch(
+            self._torch.Tensor, "backward",
+            lambda original: self._wrap(original, "backward"),
+        )
+        self._patch(
+            training.GaussianModel, "add_densification_stats",
+            lambda original: self._wrap(original, "adaptive_control"),
+        )
+        self._patch(
+            training.GaussianModel, "densify_and_prune",
+            lambda original: self._wrap(original, "densification"),
+        )
+
+    def restore(self) -> None:
+        while self._patches:
+            owner, name, original = self._patches.pop()
+            setattr(owner, name, original)
+
+    def result(self) -> dict[str, Any]:
+        self._torch.cuda.synchronize()
+        records = [
+            {
+                "stage": item.stage,
+                "milliseconds": float(item.start.elapsed_time(item.end)),
+            }
+            for item in self._intervals
+        ]
+        grouped: dict[str, list[float]] = {}
+        for record in records:
+            grouped.setdefault(str(record["stage"]), []).append(
+                float(record["milliseconds"])
+            )
+        return {
+            "records": records,
+            "summaries": {
+                stage: {
+                    "call_count": len(values),
+                    "total_ms": sum(values),
+                    "median_ms": statistics.median(values),
+                }
+                for stage, values in sorted(grouped.items())
+            },
+        }
+
+    def _patch(self, owner: Any, name: str, factory: Any) -> None:
+        original = getattr(owner, name)
+        setattr(owner, name, factory(original))
+        self._patches.append((owner, name, original))
+
+    def _wrap(self, original: Any, stage: str) -> Any:
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            return self.measure(stage, lambda: original(*args, **kwargs))
+        return wrapped
+
+
 def render_training_overlay(source: str) -> tuple[str, list[dict[str, str]]]:
     transformed = source
     manifest: list[dict[str, str]] = []
@@ -204,6 +311,7 @@ def run_probe(
     warmup_iterations: int,
     inactivity_timeout_seconds: float,
     compiler_variant: str,
+    profile_stages: bool = False,
 ) -> ProbeObservation:
     _validate_inputs(
         source_root, extension_root, dataset_root, initial_state, artifact_root,
@@ -227,6 +335,7 @@ def run_probe(
 
     final_arrays: dict[str, Any] | None = None
     final_gradients: dict[str, Any] | None = None
+    stage_profile: dict[str, Any] | None = None
     cuda_elapsed_ms: float | None = None
     completed_iterations = 0
     with _working_directory(source_root), _compiler_variant_environment(compiler_variant):
@@ -271,6 +380,7 @@ def run_probe(
         measurement_start = torch.cuda.Event(enable_timing=True)
         measurement_end = torch.cuda.Event(enable_timing=True)
         watchdog = GpuWatchdog(inactivity_timeout_seconds, owner_pid=os.getpid())
+        profiler = _ExactStageProfiler(torch) if profile_stages else None
         gradient_tensors: dict[str, Any] | None = None
         optimizer_steps = 0
 
@@ -304,7 +414,11 @@ def run_probe(
                     gradient_tensors = {
                         name: value.detach().clone() for name, value in names.items()
                     }
-                return original_step(*args, **kwargs)
+                if profiler is None:
+                    return original_step(*args, **kwargs)
+                return profiler.measure(
+                    "optimizer", lambda: original_step(*args, **kwargs)
+                )
 
             gaussians.optimizer.step = step
 
@@ -323,9 +437,13 @@ def run_probe(
             watchdog.progress()
             if iteration == warmup_iterations:
                 measurement_start.record()
+                if profiler is not None:
+                    profiler.begin()
             if iteration != requested_iterations:
                 return
             measurement_end.record()
+            if profiler is not None:
+                profiler.end()
             measurement_end.synchronize()
             cuda_elapsed_ms = float(measurement_start.elapsed_time(measurement_end))
             final_arrays = _snapshot_state(scene.gaussians)
@@ -339,11 +457,15 @@ def run_probe(
 
         if warmup_iterations == 0:
             measurement_start.record()
+            if profiler is not None:
+                profiler.begin()
         training.initialize_gaussian = initialize
         training.Scene.creatVol_gt = lambda _scene, _query: None
         training.Scene.loadVol_gt = lambda _scene: None
         training.training_report = report
         training.GaussianModel.training_setup = setup
+        if profiler is not None:
+            profiler.install(training)
         wall_started = time.monotonic()
         watchdog.start()
         try:
@@ -364,6 +486,12 @@ def run_probe(
             training.Scene.loadVol_gt = original_load_volume
             training.training_report = original_report
             training.GaussianModel.training_setup = original_training_setup
+            if profiler is not None:
+                profiler.end()
+                try:
+                    stage_profile = profiler.result()
+                finally:
+                    profiler.restore()
             low_memory_overlay.restore()
         wall_seconds = time.monotonic() - wall_started
 
@@ -397,6 +525,7 @@ def run_probe(
             "seconds_per_iteration": (
                 cuda_elapsed_ms / 1000.0 / (requested_iterations - warmup_iterations)
             ),
+            "stage_profile": stage_profile,
         },
         "gpu": {
             **_gpu_summary(watchdog.samples),
@@ -502,6 +631,7 @@ def run_matrix(
     inactivity_timeout_seconds: float,
     relative_tolerance: float,
     absolute_tolerance: float,
+    profile_stages: bool = False,
 ) -> dict[str, Any]:
     if output.exists() or repeats <= 0:
         raise ExactTrainingProbeError("matrix output must be new and repeats must be positive")
@@ -523,6 +653,7 @@ def run_matrix(
                     warmup_iterations=warmup_iterations,
                     inactivity_timeout_seconds=inactivity_timeout_seconds,
                     compiler_variant=variant,
+                    profile_stages=False,
                 )
                 observations[variant].append(observation)
                 sample_path = output / "samples" / variant / f"repeat_{repeat + 1}.json"
@@ -537,6 +668,39 @@ def run_matrix(
             relative_tolerance=relative_tolerance,
             absolute_tolerance=absolute_tolerance,
         )
+        if profile_stages:
+            diagnostic = run_probe(
+                source_root=source_root,
+                extension_root=extension_root,
+                dataset_root=dataset_root,
+                initial_state=initial_state,
+                artifact_root=output / "artifacts" / "gpu_base_stage_profile",
+                dataset_id=dataset_id,
+                requested_iterations=requested_iterations,
+                warmup_iterations=warmup_iterations,
+                inactivity_timeout_seconds=inactivity_timeout_seconds,
+                compiler_variant="gpu_base",
+                profile_stages=True,
+            )
+            diagnostic_path = output / "gpu-base-stage-profile.json"
+            diagnostic_path.write_text(
+                json.dumps(diagnostic.record, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            stage_profile = diagnostic.record["measurement"]["stage_profile"]
+            if not isinstance(stage_profile, Mapping):
+                raise ExactTrainingProbeError("Exact-GS stage profile is missing")
+            result["compiler_coverage_bounds"] = analyze_gpu_compiler_coverage(
+                total_gpu_ms=float(
+                    diagnostic.record["measurement"]["cuda_elapsed_ms"]
+                ),
+                stage_profile=stage_profile,
+                coverable_stages={
+                    "1000": ("backward",),
+                    "0100": ("backward",),
+                    "1100": ("backward",),
+                },
+            )
         (output / "matrix.json").write_text(
             json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8",
         )
@@ -561,6 +725,9 @@ def run_matrix(
             gpu_isolated=bool(result["performance_comparison_eligible"]),
             same_workload_across_variants=True,
             numerical_equivalence_passed=True,
+            gpu_platform=platform_identity_from_isolation(
+                observations["gpu_base"][0].record["gpu"].get("isolation")
+            ),
         )
         (output / "gpu-compiler-measurement.json").write_text(
             json.dumps(standard, indent=2, sort_keys=False) + "\n", encoding="utf-8",
@@ -587,6 +754,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--inactivity-timeout-seconds", type=float, default=300.0)
     parser.add_argument("--relative-tolerance", type=float, default=1.0e-4)
     parser.add_argument("--absolute-tolerance", type=float, default=1.0e-3)
+    parser.add_argument("--profile-stages", action="store_true")
     args = parser.parse_args(argv)
     try:
         result = run_matrix(
@@ -602,6 +770,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             inactivity_timeout_seconds=args.inactivity_timeout_seconds,
             relative_tolerance=args.relative_tolerance,
             absolute_tolerance=args.absolute_tolerance,
+            profile_stages=args.profile_stages,
         )
     except (OSError, ValueError, ExactTrainingProbeError) as error:
         print(f"Exact-GS compiler matrix failed: {error}", file=sys.stderr)

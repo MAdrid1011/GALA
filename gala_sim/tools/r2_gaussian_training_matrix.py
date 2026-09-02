@@ -12,7 +12,11 @@ import sys
 from typing import Any, Mapping, Sequence
 
 from gala_sim.ablation.anchors import compiler_target_speedups
-from gala_sim.gpu_measurement import build_gpu_compiler_measurement
+from gala_sim.gpu_coverage import analyze_gpu_compiler_coverage
+from gala_sim.gpu_measurement import (
+    build_gpu_compiler_measurement,
+    platform_identity_from_isolation,
+)
 from gala_sim.tools.r2_gaussian_training_probe import (
     COMPILER_VARIANT_FLAGS,
     TrainingProbeError,
@@ -179,6 +183,7 @@ def run_matrix(
     inactivity_timeout_seconds: float,
     relative_tolerance: float,
     absolute_tolerance: float,
+    profile_stages: bool = False,
 ) -> dict[str, Any]:
     if repeats <= 0:
         raise TrainingProbeError("matrix repeats must be positive")
@@ -203,6 +208,7 @@ def run_matrix(
                 telemetry_mode="cuda_opt",
                 compiler_variant=variant,
                 dataset_id=dataset_id,
+                profile_stages=False,
             )
             records[variant].append(record)
             sample_path = output / "samples" / variant / f"repeat_{repeat + 1}.json"
@@ -216,6 +222,39 @@ def run_matrix(
         relative_tolerance=relative_tolerance,
         absolute_tolerance=absolute_tolerance,
     )
+    if profile_stages:
+        diagnostic = run_probe(
+            source_root=source_root,
+            extension_root=extension_root,
+            dataset_root=dataset_root,
+            initial_state=initial_state,
+            artifact_root=output / "artifacts" / "gpu_base_stage_profile",
+            requested_iterations=requested_iterations,
+            warmup_iterations=warmup_iterations,
+            progress_interval=progress_interval,
+            inactivity_timeout_seconds=inactivity_timeout_seconds,
+            telemetry_mode="cuda_opt",
+            compiler_variant="gpu_base",
+            dataset_id=dataset_id,
+            profile_stages=True,
+        )
+        diagnostic_path = output / "gpu-base-stage-profile.json"
+        diagnostic_path.write_text(
+            json.dumps(diagnostic, indent=2, sort_keys=True) + "\n",
+            encoding="utf-8",
+        )
+        stage_profile = diagnostic["measurement"]["stage_profile"]
+        if not isinstance(stage_profile, Mapping):
+            raise TrainingProbeError("R2-Gaussian stage profile is missing")
+        result["compiler_coverage_bounds"] = analyze_gpu_compiler_coverage(
+            total_gpu_ms=float(diagnostic["measurement"]["cuda_elapsed_ms"]),
+            stage_profile=stage_profile,
+            coverable_stages={
+                "1000": ("backward",),
+                "0100": ("backward",),
+                "1100": ("backward",),
+            },
+        )
     (output / "matrix.json").write_text(
         json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8",
     )
@@ -240,6 +279,9 @@ def run_matrix(
         gpu_isolated=bool(result["performance_comparison_eligible"]),
         same_workload_across_variants=True,
         numerical_equivalence_passed=True,
+        gpu_platform=platform_identity_from_isolation(
+            records["gpu_base"][0]["gpu"].get("isolation")
+        ),
     )
     (output / "gpu-compiler-measurement.json").write_text(
         json.dumps(standard, indent=2, sort_keys=False) + "\n", encoding="utf-8",
@@ -264,6 +306,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--inactivity-timeout-seconds", type=float, default=300.0)
     parser.add_argument("--relative-tolerance", type=float, default=1.0e-4)
     parser.add_argument("--absolute-tolerance", type=float, default=1.0e-3)
+    parser.add_argument("--profile-stages", action="store_true")
     args = parser.parse_args(argv)
     try:
         result = run_matrix(
@@ -282,6 +325,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             inactivity_timeout_seconds=args.inactivity_timeout_seconds,
             relative_tolerance=args.relative_tolerance,
             absolute_tolerance=args.absolute_tolerance,
+            profile_stages=args.profile_stages,
         )
     except (OSError, ValueError, TrainingProbeError) as error:
         print(f"R2-Gaussian compiler matrix failed: {error}", file=sys.stderr)

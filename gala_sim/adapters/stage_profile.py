@@ -121,6 +121,30 @@ class GpuStageProfileSession:
         self._original_synchronize = torch.cuda.synchronize
         self._patch(torch.cuda, "synchronize", self._wrap_synchronize)
 
+    def install_training_aliases(self, training: Any) -> None:
+        """Instrument functions imported directly by the training entrypoint."""
+
+        self._patch(
+            training, "render",
+            lambda original: self._wrap_query(original, "projection"),
+        )
+        self._patch(
+            training, "query",
+            lambda original: self._wrap_query(original, "volume"),
+        )
+        self._patch(
+            training, "l1_loss",
+            lambda original: self._wrap_loss(original, "projection_loss"),
+        )
+        self._patch(
+            training, "ssim",
+            lambda original: self._wrap_loss(original, "projection_loss"),
+        )
+        self._patch(
+            training, "tv_3d_loss",
+            lambda original: self._wrap_loss(original, "volume_loss"),
+        )
+
     def restore(self) -> None:
         if self._cuda_profiler_active:
             self._stop_cuda_profiler()

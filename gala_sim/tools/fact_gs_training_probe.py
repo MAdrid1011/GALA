@@ -31,7 +31,11 @@ import yaml
 
 from gala_sim.ablation.anchors import compiler_target_speedups
 from gala_sim.adapters.fact_low_memory import install_fact_low_memory_overlay
-from gala_sim.gpu_measurement import build_gpu_compiler_measurement
+from gala_sim.gpu_measurement import (
+    build_gpu_compiler_measurement,
+    platform_identity_from_isolation,
+)
+from gala_sim.gpu_coverage import analyze_gpu_compiler_coverage
 from gala_sim.tools.gpu_observation import GpuObservationError, ensure_gpu_isolated
 from gala_sim.tools.gpu_probe_watchdog import (
     GpuWatchdog,
@@ -95,10 +99,19 @@ class _FactStageProfiler:
 
     def __init__(self, torch_module: Any) -> None:
         self._torch = torch_module
+        self._active = False
         self._intervals: list[_StageInterval] = []
         self._patches: list[tuple[Any, str, Any]] = []
 
+    def begin(self) -> None:
+        self._active = True
+
+    def end(self) -> None:
+        self._active = False
+
     def measure(self, stage: str, call: Any) -> Any:
+        if not self._active:
+            return call()
         start = self._torch.cuda.Event(enable_timing=True)
         end = self._torch.cuda.Event(enable_timing=True)
         start.record()
@@ -603,6 +616,8 @@ def run_probe(
             watchdog.progress()
             if completed_iterations == warmup_iterations:
                 measurement_start.record()
+                if profiler is not None:
+                    profiler.begin()
             if (
                 completed_iterations % progress_interval == 0
                 or completed_iterations == requested_iterations
@@ -616,6 +631,8 @@ def run_probe(
             if completed_iterations != requested_iterations:
                 return None
             measurement_end.record()
+            if profiler is not None:
+                profiler.end()
             measurement_end.synchronize()
             cuda_elapsed_ms = float(measurement_start.elapsed_time(measurement_end))
             final_arrays = _snapshot_state(scene.gaussians)
@@ -623,6 +640,8 @@ def run_probe(
 
         if warmup_iterations == 0:
             measurement_start.record()
+            if profiler is not None:
+                profiler.begin()
         low_memory_overlay = install_fact_low_memory_overlay()
         training.log_training_status = status
         training.GaussianModel.training_setup = setup_with_gradient_capture
@@ -645,8 +664,11 @@ def run_probe(
             training.log_training_status = original_status
             training.GaussianModel.training_setup = original_training_setup
             if profiler is not None:
-                stage_profile = profiler.result()
-                profiler.restore()
+                profiler.end()
+                try:
+                    stage_profile = profiler.result()
+                finally:
+                    profiler.restore()
             low_memory_overlay.restore()
             torch.cuda.empty_cache()
         wall_seconds = time.perf_counter() - wall_started
@@ -824,7 +846,7 @@ def run_matrix(
                     inactivity_timeout_seconds=inactivity_timeout_seconds,
                     compiler_variant=variant,
                     dataset_id=dataset_id,
-                    profile_stages=profile_stages,
+                    profile_stages=False,
                 )
                 observations[variant].append(observation)
                 sample_output = output / "samples" / variant / f"repeat_{repeat + 1}.json"
@@ -840,6 +862,38 @@ def run_matrix(
             relative_tolerance=relative_tolerance,
             absolute_tolerance=absolute_tolerance,
         )
+        if profile_stages:
+            diagnostic = run_probe(
+                source_root=source_root,
+                dataset_root=dataset_root,
+                artifact_root=output / "artifacts" / "gpu_base_stage_profile",
+                requested_iterations=requested_iterations,
+                warmup_iterations=warmup_iterations,
+                progress_interval=progress_interval,
+                inactivity_timeout_seconds=inactivity_timeout_seconds,
+                compiler_variant="gpu_base",
+                dataset_id=dataset_id,
+                profile_stages=True,
+            )
+            diagnostic_path = output / "gpu-base-stage-profile.json"
+            diagnostic_path.write_text(
+                json.dumps(diagnostic.record, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+            stage_profile = diagnostic.record["measurement"]["stage_profile"]
+            if not isinstance(stage_profile, Mapping):
+                raise FactTrainingProbeError("FaCT-GS stage profile is missing")
+            result["compiler_coverage_bounds"] = analyze_gpu_compiler_coverage(
+                total_gpu_ms=float(
+                    diagnostic.record["measurement"]["cuda_elapsed_ms"]
+                ),
+                stage_profile=stage_profile,
+                coverable_stages={
+                    "1000": ("backward",),
+                    "0100": ("backward",),
+                    "1100": ("backward",),
+                },
+            )
         (output / "matrix.json").write_text(
             json.dumps(result, indent=2, sort_keys=True) + "\n", encoding="utf-8",
         )
@@ -868,6 +922,9 @@ def run_matrix(
             gpu_isolated=bool(result["performance_comparison_eligible"]),
             same_workload_across_variants=True,
             numerical_equivalence_passed=True,
+            gpu_platform=platform_identity_from_isolation(
+                observations["gpu_base"][0].record["gpu"].get("isolation")
+            ),
         )
         (output / "gpu-compiler-measurement.json").write_text(
             json.dumps(standard, indent=2, sort_keys=False) + "\n", encoding="utf-8",

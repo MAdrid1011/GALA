@@ -55,7 +55,7 @@ def sample_gpu_snapshot(
         gpu_lines = _output_lines(runner(
             [
                 "nvidia-smi",
-                "--query-gpu=uuid,utilization.gpu,memory.used,memory.total",
+                "--query-gpu=name,uuid,utilization.gpu,memory.used,memory.total",
                 "--format=csv,noheader,nounits",
                 "--id=0",
             ],
@@ -66,9 +66,17 @@ def sample_gpu_snapshot(
         if len(gpu_lines) != 1:
             raise GpuObservationError("nvidia-smi did not return one GPU 0 row")
         gpu_values = [item.strip() for item in next(csv.reader([gpu_lines[0]]))]
-        if len(gpu_values) != 4:
+        if len(gpu_values) != 5:
             raise GpuObservationError("nvidia-smi GPU output is malformed")
-        gpu_uuid, utilization_text, memory_text, memory_total_text = gpu_values
+        (
+            gpu_name,
+            gpu_uuid,
+            utilization_text,
+            memory_text,
+            memory_total_text,
+        ) = gpu_values
+        if not gpu_name:
+            raise GpuObservationError("nvidia-smi GPU name is unavailable")
         utilization = int(utilization_text)
         memory_used = int(memory_text)
         memory_total = int(memory_total_text)
@@ -87,6 +95,7 @@ def sample_gpu_snapshot(
     except (OSError, subprocess.SubprocessError, ValueError, csv.Error) as error:
         raise GpuObservationError("nvidia-smi GPU observation is unavailable") from error
     return {
+        "gpu_name": gpu_name,
         "gpu_uuid": gpu_uuid,
         "utilization_percent": utilization,
         "memory_used_mib": memory_used,

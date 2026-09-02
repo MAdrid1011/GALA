@@ -154,3 +154,56 @@ def test_r2_matrix_writes_campaign_measurement(
         iteration_range=(1, 1),
     )
     assert loaded.speedups_vs_gpu_base["1000"] == pytest.approx(4.0 / 3.0)
+
+
+def test_r2_matrix_keeps_stage_profile_out_of_four_way_timing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import gala_sim.tools.r2_gaussian_training_matrix as matrix
+
+    calls: list[tuple[str, bool]] = []
+
+    def fake_probe(**kwargs):
+        variant = kwargs["compiler_variant"]
+        profiled = kwargs["profile_stages"]
+        calls.append((variant, profiled))
+        record = _record(variant, 100.0)
+        record["workload"].update({
+            "measured_iterations": 2,
+            "included_training_operations": ["forward", "backward", "optimizer"],
+        })
+        if profiled:
+            record["measurement"]["stage_profile"] = {
+                "stage_summaries": {"backward": {"total_ms": 40.0}}
+            }
+        return record
+
+    monkeypatch.setattr(matrix, "run_probe", fake_probe)
+    output = tmp_path / "profiled-matrix"
+    result = run_matrix(
+        source_root=tmp_path,
+        extension_root=None,
+        dataset_root=tmp_path,
+        initial_state=tmp_path / "init.npy",
+        dataset_id="walnut",
+        output=output,
+        requested_iterations=2,
+        warmup_iterations=0,
+        repeats=1,
+        progress_interval=1,
+        inactivity_timeout_seconds=300.0,
+        relative_tolerance=1.0e-4,
+        absolute_tolerance=1.0e-6,
+        profile_stages=True,
+    )
+
+    assert calls == [
+        ("gpu_base", False),
+        ("1000", False),
+        ("0100", False),
+        ("1100", False),
+        ("gpu_base", True),
+    ]
+    assert result["compiler_coverage_bounds"]["bounds"]["1100"][
+        "maximum_possible_speedup_vs_gpu_base"
+    ] == pytest.approx(5.0 / 3.0)
