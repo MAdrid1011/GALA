@@ -114,7 +114,7 @@ def test_r2_reference_metrics_include_unified_and_official_values(
     )
     run = PreparedRun(
         "R2-Gaussian", "Chest", tmp_path, tmp_path, "a" * 64,
-        quality_config, 0, ("python", "train.py"),
+        quality_config, 0, ("python", "train.py"), tmp_path / "output",
     )
     monkeypatch.setattr(
         "gala_sim.adapters.r2_gaussian.load_chest_manifest",

@@ -14,6 +14,11 @@ official_commands:
     - train_recon.py
     - "model.data_source_path={dataset_root}"
     - "model.model_path={output_root}"
+    - "model.init_mode={initialization_mode}"
+    - "model.eval={evaluation_enabled}"
+    - "eval.eval_in_training={evaluation_enabled}"
+    - "eval.eval_start={evaluation_enabled}"
+    - "eval.eval_end={evaluation_enabled}"
   evaluate:
     - "{python_executable}"
     - test_model.py

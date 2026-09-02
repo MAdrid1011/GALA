@@ -52,7 +52,7 @@ def test_preflight_rejects_invalid_prediction() -> None:
 def test_gpustat_sample_distinguishes_compute_processes(monkeypatch) -> None:
     gpustat = json.dumps({"gpus": [{
         "index": 0, "uuid": "GPU-fixture", "utilization.gpu": 97,
-        "memory.used": 256,
+        "memory.used": 256, "memory.total": 4096,
     }]})
     compute = "GPU-fixture, 42, /opt/external-work, 128\n"
 
@@ -65,6 +65,7 @@ def test_gpustat_sample_distinguishes_compute_processes(monkeypatch) -> None:
     assert sample.compute_processes == (
         ComputeProcess("GPU-fixture", 42, "/opt/external-work", 128 * 1024 * 1024),
     )
+    assert sample.memory_total_bytes == 4096 * 1024 * 1024
 
 
 def _freeze(config: GalaConfig, root: Path, script: Path) -> dict[str, object]:

@@ -39,6 +39,7 @@ class GpuSample:
     gpu_index: int = 0
     gpu_uuid: str | None = None
     compute_processes: tuple[ComputeProcess, ...] = ()
+    memory_total_bytes: int | None = None
 
 
 @dataclass(frozen=True)
@@ -107,6 +108,7 @@ def sample_gpustat(gpu_index: int = 0) -> GpuSample:
         gpu = next(item for item in data["gpus"] if int(item["index"]) == gpu_index)
         utilization = float(gpu["utilization.gpu"])
         memory_used = int(gpu["memory.used"]) * 1024 * 1024
+        memory_total = int(gpu["memory.total"]) * 1024 * 1024
         gpu_uuid = str(gpu["uuid"])
         compute_output = subprocess.check_output([
             "nvidia-smi",
@@ -128,7 +130,7 @@ def sample_gpustat(gpu_index: int = 0) -> GpuSample:
         raise RuntimeError("gpustat JSON sample is unavailable or invalid") from error
     return GpuSample(
         time.time(), utilization, memory_used, None, None, None, None,
-        gpu_index, gpu_uuid, tuple(compute_processes),
+        gpu_index, gpu_uuid, tuple(compute_processes), memory_total,
     )
 
 

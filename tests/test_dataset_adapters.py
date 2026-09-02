@@ -210,6 +210,26 @@ def test_prepared_dataset_manifest_reloads_without_discovering_auxiliary_arrays(
     assert len(reloaded.projections) == 2
     assert reloaded.train_indices == converted.train_indices
     assert reloaded.test_indices == converted.test_indices
+    upstream = json.loads(
+        (converted.root / "meta_data.json").read_text(encoding="utf-8")
+    )
+    assert upstream["scanner"]["mode"] == "cone"
+    assert upstream["reference_volume_available"] is False
+    sentinel = converted.root / upstream["vol"]
+    assert sentinel.name == ".gala_no_ground_truth.npy"
+    assert np.load(sentinel).shape == (1, 1, 1)
+    assert converted.initialization is not None
+    initialization = np.load(converted.initialization, mmap_mode="r")
+    assert initialization.shape == (50_000, 4)
+    assert np.isfinite(initialization).all()
+    provenance = json.loads(
+        converted.initialization.with_suffix(".provenance.json").read_text(
+            encoding="utf-8"
+        )
+    )
+    assert provenance["method"] == "deterministic_projection_sample_lattice"
+    assert provenance["projection_count"] == 1
+    assert reloaded.initialization == converted.initialization
 
 
 def test_chest_conversion_preserves_physical_scanner_geometry(tmp_path: Path) -> None:

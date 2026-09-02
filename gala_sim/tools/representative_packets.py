@@ -26,13 +26,58 @@ from gala_sim.trace.virtual import (
 
 def plan_representative_packet_groups(
     archive_root: Path,
-    profiling_campaign: Path,
+    profiling_campaign: Path | None,
     *,
     expected_group_count: int,
     live_prefix: bool = False,
+    single_iteration: int | None = None,
 ) -> dict[str, Any]:
+    """Choose median-cost tiles from phase windows or one closed iteration.
+
+    A one-iteration capture cannot supply an adjacent training window, but it
+    still contains the complete forward, loss, backward, and optimizer
+    lifecycle of that iteration.  ``single_iteration`` therefore provides a
+    bounded, real-trace input for rapid end-to-end cycle validation without
+    pretending that it is a multi-phase performance result.
+    """
     if expected_group_count <= 0:
         raise ValueError("representative packet group count must be positive")
+    if single_iteration is not None and single_iteration <= 0:
+        raise ValueError("single representative iteration must be positive")
+    reader = VirtualPacketArchiveReader(Path(archive_root))
+    source_identity = _archive_source_identity(reader.manifest)
+    if single_iteration is not None:
+        descriptors = {
+            (descriptor.iteration_id, descriptor.template_id): descriptor
+            for descriptor in reader.packet_descriptors(iterations={single_iteration})
+        }
+        if not descriptors:
+            raise ValueError(
+                f"representative single iteration {single_iteration} has no packets"
+            )
+        groups = _single_iteration_groups(descriptors, reader, single_iteration)
+        if len(groups) != expected_group_count:
+            raise ValueError(
+                f"representative single iteration produced {len(groups)} groups, "
+                f"expected {expected_group_count}"
+            )
+        return {
+            "schema_version": "gala-representative-packet-plan-v1",
+            "result_scope": "representative_speedup_validation",
+            "formal_performance_eligible": False,
+            "campaign_complete": False,
+            "live_prefix": bool(live_prefix),
+            "single_iteration": True,
+            "archive": str(Path(archive_root).resolve()),
+            "profiling_campaign": None,
+            "source_identity": source_identity,
+            "group_count": len(groups),
+            "iteration_count": 1,
+            "iterations": [single_iteration],
+            "groups": groups,
+        }
+    if profiling_campaign is None:
+        raise ValueError("phase-window planning requires a profiling campaign")
     campaign = yaml.safe_load(Path(profiling_campaign).read_text(encoding="utf-8"))
     if not isinstance(campaign, dict):
         raise ValueError("profiling campaign root is not a mapping")
@@ -50,7 +95,6 @@ def plan_representative_packet_groups(
         windows.append((iteration - 1, iteration, roles))
     if not windows:
         raise ValueError("profiling campaign has no adjacent representative windows")
-    reader = VirtualPacketArchiveReader(Path(archive_root))
     campaign_window_count = len(windows)
     if live_prefix:
         prefix = reader.manifest.get("metadata", {}).get("live_prefix", {})
@@ -131,13 +175,82 @@ def plan_representative_packet_groups(
         "formal_performance_eligible": False,
         "campaign_complete": len(windows) == campaign_window_count,
         "live_prefix": bool(live_prefix),
+        "single_iteration": False,
         "archive": str(Path(archive_root).resolve()),
         "profiling_campaign": str(Path(profiling_campaign).resolve()),
+        "source_identity": source_identity,
         "group_count": len(groups),
         "iteration_count": len(target_iterations),
         "iterations": sorted(target_iterations),
         "groups": groups,
     }
+
+
+def _archive_source_identity(manifest: dict[str, Any]) -> dict[str, str] | None:
+    """Return a capture identity only when its stable identifiers are present."""
+
+    metadata = manifest.get("metadata")
+    if not isinstance(metadata, dict):
+        return None
+    model_id = metadata.get("model_id")
+    dataset_id = metadata.get("dataset_id")
+    if not isinstance(model_id, str) or not model_id.strip():
+        return None
+    if not isinstance(dataset_id, str) or not dataset_id.strip():
+        return None
+    model = metadata.get("model")
+    dataset = metadata.get("dataset")
+    return {
+        "model_id": model_id,
+        "model": model if isinstance(model, str) and model.strip() else model_id,
+        "dataset_id": dataset_id,
+        "dataset": (
+            dataset if isinstance(dataset, str) and dataset.strip() else dataset_id
+        ),
+    }
+
+
+def _single_iteration_groups(
+    descriptors: dict[tuple[int, int], Any],
+    reader: VirtualPacketArchiveReader,
+    iteration: int,
+) -> list[dict[str, Any]]:
+    """Select one nonempty median packet tile per template in an iteration."""
+
+    groups: list[dict[str, Any]] = []
+    template_ids = sorted(
+        template_id for packet_iteration, template_id in descriptors
+        if packet_iteration == iteration
+    )
+    for template_id in template_ids:
+        statistics = packed_tile_statistics(
+            reader.packet(descriptors[(iteration, template_id)])
+        )
+        nonempty = statistics.physical_packet_counts > 0
+        tiles = statistics.tile_ids[nonempty]
+        if tiles.size == 0:
+            raise ValueError(
+                f"representative single iteration {iteration} template "
+                f"{template_id} has no nonempty tile"
+            )
+        physical_packets = statistics.physical_packet_counts[nonempty]
+        median_packets = float(np.median(physical_packets))
+        tile_order = np.lexsort((
+            tiles,
+            np.abs(physical_packets.astype(np.float64) - median_packets),
+        ))
+        tile_id = int(tiles[tile_order[0]])
+        groups.append({
+            "group_index": len(groups),
+            "iterations": [iteration],
+            "roles": ["single_iteration"],
+            "template_id": template_id,
+            "tile_id": tile_id,
+            "selection": "nonempty_tile_nearest_median_physical_packets",
+            "median_physical_packets": median_packets,
+            "packets": [_tile_record(iteration, statistics, tile_id)],
+        })
+    return groups
 
 
 def _tile_record(
@@ -161,8 +274,15 @@ def build_representative_packet_trace(
     window_index: int,
     max_events: int,
     query_lanes: int,
+    model_id: str | None = None,
+    dataset_id: str | None = None,
 ) -> Trace:
-    """Expand one planned adjacent-iteration window for quick cycle replay."""
+    """Expand one planned window for quick cycle replay.
+
+    Single-iteration groups receive a dependency-closed no-op optimizer
+    transaction after their backward frontier.  This preserves the complete
+    execution shape without inventing a second iteration or a state change.
+    """
 
     if window_index < 0 or max_events <= 0 or not 0 < query_lanes <= 8:
         raise ValueError("representative packet trace limits are invalid")
@@ -172,10 +292,13 @@ def build_representative_packet_trace(
     groups = plan.get("groups")
     if not isinstance(groups, list) or not groups:
         raise ValueError("representative packet plan has no groups")
-    windows: list[tuple[int, int]] = []
+    identity = _resolve_source_identity(
+        plan.get("source_identity"), model_id=model_id, dataset_id=dataset_id,
+    )
+    windows: list[tuple[int, ...]] = []
     for group in groups:
         iterations = tuple(int(value) for value in group.get("iterations", ()))
-        if len(iterations) != 2:
+        if len(iterations) not in {1, 2}:
             raise ValueError("representative packet group has an invalid window")
         if iterations not in windows:
             windows.append(iterations)
@@ -260,7 +383,7 @@ def build_representative_packet_trace(
                 "query_count": packet.query_count,
                 "query_shape": list(packet.query_shape),
             })
-        if iteration_index + 1 < len(window):
+        if len(window) == 1 or iteration_index + 1 < len(window):
             barrier_dependencies = (
                 *iteration_gradient_frontier,
                 *iteration_zero_relation_consumers,
@@ -286,8 +409,10 @@ def build_representative_packet_trace(
         np.empty(0, dtype=np.dtype("<f4")),
         {
             "schema_version": "gala-clamp-events-v2",
-            "model": "R2-Gaussian",
-            "dataset": "Chest",
+            "model": identity["model"],
+            "model_id": identity["model_id"],
+            "dataset": identity["dataset"],
+            "dataset_id": identity["dataset_id"],
             "initial_gaussian_count": max_gaussian_id + 1,
             "state_record_bytes": 128,
             "trace_sample": {
@@ -295,7 +420,11 @@ def build_representative_packet_trace(
                 "result_scope": "quick_cycle_validation",
                 "formal_performance_eligible": False,
                 "quality_eligible": False,
-                "selection": "phase_window_common_median_physical_tile",
+                "selection": (
+                    "single_iteration_median_physical_tile"
+                    if len(window) == 1
+                    else "phase_window_common_median_physical_tile"
+                ),
                 "cross_iteration_barrier": "validated_noop_optimizer_transaction",
                 "source_plan": str(Path(plan_path).resolve()),
                 "window_index": window_index,
@@ -312,6 +441,39 @@ def build_representative_packet_trace(
             },
         },
     )
+
+
+def _resolve_source_identity(
+    plan_identity: Any, *, model_id: str | None, dataset_id: str | None,
+) -> dict[str, str]:
+    """Use immutable capture provenance, or require explicit legacy identity."""
+
+    identity = (
+        dict(plan_identity) if isinstance(plan_identity, dict) else {}
+    )
+    archived_model_id = identity.get("model_id")
+    archived_dataset_id = identity.get("dataset_id")
+    if archived_model_id is not None and model_id not in {None, archived_model_id}:
+        raise ValueError("explicit model_id conflicts with archive provenance")
+    if archived_dataset_id is not None and dataset_id not in {None, archived_dataset_id}:
+        raise ValueError("explicit dataset_id conflicts with archive provenance")
+    resolved_model_id = archived_model_id or model_id
+    resolved_dataset_id = archived_dataset_id or dataset_id
+    if not isinstance(resolved_model_id, str) or not resolved_model_id.strip():
+        raise ValueError("representative trace requires a model_id provenance")
+    if not isinstance(resolved_dataset_id, str) or not resolved_dataset_id.strip():
+        raise ValueError("representative trace requires a dataset_id provenance")
+    model = identity.get("model")
+    dataset = identity.get("dataset")
+    return {
+        "model_id": resolved_model_id,
+        "model": model if isinstance(model, str) and model.strip() else resolved_model_id,
+        "dataset_id": resolved_dataset_id,
+        "dataset": (
+            dataset if isinstance(dataset, str) and dataset.strip()
+            else resolved_dataset_id
+        ),
+    }
 
 
 def _select_tile_packet(

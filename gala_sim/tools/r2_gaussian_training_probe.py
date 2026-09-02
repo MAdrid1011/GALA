@@ -19,6 +19,13 @@ import time
 from types import ModuleType
 from typing import Any, Iterator, Sequence
 
+from gala_sim.tools.gpu_observation import (
+    GpuObservationError,
+    ensure_gpu_isolated,
+    external_compute_processes,
+    sample_gpu_snapshot,
+)
+
 
 PUBLISHED_ITERATIONS = 30_000
 OVERLAY_FILENAME = "train_cuda_opt_probe.py"
@@ -191,27 +198,17 @@ def _compiler_variant_environment(variant: str) -> Iterator[None]:
 
 def _gpu_sample() -> dict[str, int] | None:
     try:
-        output = subprocess.check_output(
-            [
-                "nvidia-smi",
-                "--query-gpu=utilization.gpu,memory.used",
-                "--format=csv,noheader,nounits",
-                "--id=0",
-            ],
-            text=True,
-            stderr=subprocess.DEVNULL,
-            timeout=5,
-        ).strip().splitlines()[0]
-        utilization, memory = (int(item.strip()) for item in output.split(","))
-    except (OSError, subprocess.SubprocessError, ValueError, IndexError):
+        sample = sample_gpu_snapshot()
+    except GpuObservationError:
         return None
-    return {"utilization_percent": utilization, "memory_used_mib": memory}
+    return sample
 
 
 @dataclass
 class GpuWatchdog:
     timeout_seconds: float
     sample_interval_seconds: float = 1.0
+    owner_pid: int | None = None
 
     def __post_init__(self) -> None:
         if self.timeout_seconds <= 0 or self.sample_interval_seconds <= 0:
@@ -220,6 +217,8 @@ class GpuWatchdog:
         self.last_progress_at = time.monotonic()
         self.last_gpu_active_at = self.last_progress_at
         self.timed_out = False
+        self.contention_detected = False
+        self.external_compute_processes: list[dict[str, Any]] = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
 
@@ -241,6 +240,18 @@ class GpuWatchdog:
             if sample is not None:
                 sample["elapsed_seconds"] = now - started
                 self.samples.append(sample)
+                if self.owner_pid is not None:
+                    try:
+                        external = external_compute_processes(
+                            sample, owner_pid=self.owner_pid,
+                        )
+                    except GpuObservationError:
+                        external = []
+                    if external:
+                        self.contention_detected = True
+                        self.external_compute_processes.extend(external)
+                        _thread.interrupt_main()
+                        return
                 if sample["utilization_percent"] > 0:
                     self.last_gpu_active_at = now
             if now - max(self.last_progress_at, self.last_gpu_active_at) >= self.timeout_seconds:
@@ -317,6 +328,10 @@ def run_probe(
     source_path = source_root / "train.py"
     if not source_path.is_file() or not dataset_root.is_dir() or not initial_state.is_file():
         raise TrainingProbeError("source, dataset, or initial state is unavailable")
+    try:
+        gpu_isolation = ensure_gpu_isolated()
+    except GpuObservationError as error:
+        raise TrainingProbeError(str(error)) from error
     artifact_root.mkdir(parents=True, exist_ok=False)
     model_root = artifact_root / "model"
     model_root.mkdir()
@@ -374,7 +389,7 @@ def run_probe(
         final_state: dict[str, Any] | None = None
         completed_iterations = 0
         cuda_elapsed_ms: float | None = None
-        watchdog = GpuWatchdog(inactivity_timeout_seconds)
+        watchdog = GpuWatchdog(inactivity_timeout_seconds, owner_pid=os.getpid())
 
         def initialize_from_checked_state(gaussians: Any, _dataset: Any, _loaded: Any = None) -> None:
             gaussians.load_ply(str(initial_state))
@@ -428,6 +443,8 @@ def run_probe(
             except StopAfterPrefix:
                 pass
         except KeyboardInterrupt as error:
+            if watchdog.contention_detected:
+                raise TrainingProbeError("gpu_contention_detected") from error
             if watchdog.timed_out:
                 raise TrainingProbeError(
                     f"GPU and iteration progress were both idle for {inactivity_timeout_seconds:g} seconds"
@@ -441,6 +458,8 @@ def run_probe(
 
     if completed_iterations != requested_iterations or cuda_elapsed_ms is None or final_state is None:
         raise TrainingProbeError("official training loop did not complete the requested prefix")
+    if watchdog.contention_detected:
+        raise TrainingProbeError("gpu_contention_detected")
     measured_iterations = requested_iterations - warmup_iterations
     seconds_per_iteration = cuda_elapsed_ms / 1000.0 / measured_iterations
     return {
@@ -472,7 +491,11 @@ def run_probe(
             "final_losses": final_metrics,
             "final_state": final_state,
         },
-        "gpu": _gpu_summary(watchdog.samples),
+        "gpu": {
+            **_gpu_summary(watchdog.samples),
+            "isolation": gpu_isolation,
+            "external_compute_processes": watchdog.external_compute_processes,
+        },
         "watchdog": {
             "timeout_seconds": inactivity_timeout_seconds,
             "timed_out": watchdog.timed_out,

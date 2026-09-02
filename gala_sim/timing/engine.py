@@ -2943,7 +2943,31 @@ class CycleEngine:
                 self._joint_query_mode_selections += 1
             else:
                 self._joint_semantic_mode_selections += 1
-                return [semantic_group[0]], {}
+                # A semantic multicast consumes one Fusion control word, not
+                # every candidate slot.  Keep its leader visible to the
+                # scheduler, but also expose compatible query heads that can
+                # use the remaining physical issue ports in this cycle.  The
+                # later coordinated-bundle pass supplies the followers only
+                # after the leader is accepted, so rejected heads cannot
+                # perturb FIFO state or create speculative cache work.
+                leader = semantic_group[0]
+                hybrid = [leader]
+                for packet in selected:
+                    if packet.event_id == leader.event_id:
+                        continue
+                    if not self._fusion_packets_compatible(
+                        packet, tuple(hybrid),
+                    ):
+                        continue
+                    hybrid.append(packet)
+                    if len(hybrid) >= self.config.candidate_lanes:
+                        break
+                hybrid_ids = {packet.event_id for packet in hybrid}
+                return hybrid, {
+                    event_id: commit
+                    for event_id, commit in borrowed.items()
+                    if event_id in hybrid_ids
+                }
         return selected, borrowed
 
     def _semantic_fusion_bundle(
@@ -3121,6 +3145,8 @@ class CycleEngine:
         return self.modules[module_name].timing.ports
 
     def _has_query_resources(self) -> bool:
+        """Return whether packetized query semantics are configured at all."""
+
         return self.config.query_reduction_banks is not None
 
     def _new_query_replay_lane_scheduler(self) -> _QueryReplayLaneScheduler | None:
@@ -4228,10 +4254,22 @@ class CycleEngine:
         relation_seed_inflight = 0
         bank_busy: dict[tuple[object, ...], int] = {}
         shared_sram_address_busy: dict[tuple[int, int], set[str]] = {}
+        # Query compilation can expose duplicate requests that are already
+        # in flight.  Keep a transient directory for that path, but release
+        # each record as soon as its current readers drain; persistent
+        # cross-request residency remains exclusive to the residency bit.
+        transient_cache_coalescing = (
+            self.selection.query_load_rules
+            and not self.selection.semantic_worksets
+            and not self.selection.semantic_residency
+        )
         residency_enabled = self.selection.semantic_residency
         cache_states = (
             self._residency_states()
-            if residency_enabled and self.config.cache_instances is not None
+            if (
+                (residency_enabled or transient_cache_coalescing)
+                and self.config.cache_instances is not None
+            )
             else {}
         )
         async_memory = callable(getattr(self.config.memory, "submit_async", None))
@@ -4377,6 +4415,10 @@ class CycleEngine:
                     state.close(key)
             elif semantic_worksets is not None:
                 if bool(semantic_worksets.for_event(request_event_id)["last_use"]):
+                    state.close(key)
+            elif transient_cache_coalescing:
+                record = state.active.get(key)
+                if record is not None and int(record["active_reads"]) == 0:
                     state.close(key)
             if int(trace.events[return_event_id]["state_version"]) in closed_versions:
                 state.close(key)

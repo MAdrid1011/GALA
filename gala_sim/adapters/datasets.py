@@ -2,17 +2,22 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import math
 from pathlib import Path
 import re
 import struct
-from typing import Any, Mapping, Protocol
+from typing import Any, Callable, Mapping, Protocol
 
 import numpy as np
 
+from gala_sim.identity import sha256_tree
+
 from .chest import load_chest_manifest
+
+
+_CONVERSION_STATE = ".gala_conversion.json"
 
 
 @dataclass(frozen=True)
@@ -88,23 +93,28 @@ class _DatasetAdapterBase:
     def convert(self, manifest: DatasetManifest, output: Path) -> DatasetManifest:
         self.validate(manifest)
         output = Path(output)
-        if output.exists() and any(output.iterdir()):
-            raise ValueError("dataset conversion output must be empty")
+        _initialize_conversion_state(manifest, output)
         converted: list[DatasetProjection] = []
         for index, projection in enumerate(manifest.projections):
-            array = _apply_intensity_transform(_read_array(
-                projection.path, frame_index=projection.frame_index,
-            ), manifest.intensity_transform)
-            if not np.isfinite(array).all():
-                raise ValueError(f"projection contains non-finite values: {projection.path}")
             target = _projection_target(manifest, output, index)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            np.save(target, array, allow_pickle=False)
+            array = _convert_projection(
+                projection, target,
+                lambda: _apply_intensity_transform(
+                    _read_array(
+                        projection.path, frame_index=projection.frame_index,
+                    ),
+                    manifest.intensity_transform,
+                ),
+            )
             converted.append(DatasetProjection(
                 target, projection.angle_radians, tuple(array.shape), str(array.dtype),
             ))
-        reference = _copy_reference_volume(manifest.reference_volume, output)
-        initialization = _prepare_initialization(manifest, output, reference)
+        reference = _copy_reference_volume(
+            manifest.reference_volume, output, manifest.geometry.volume_shape,
+        )
+        initialization = _prepare_initialization(
+            manifest, output, reference, projections=tuple(converted),
+        )
         staged = DatasetManifest(
             manifest.id, output, tuple(converted), manifest.geometry,
             manifest.train_indices, manifest.test_indices, reference,
@@ -156,23 +166,30 @@ class WalnutDatasetAdapter(_DatasetAdapterBase):
         self.validate(manifest)
         shift = int(manifest.metadata.get("center_shift_pixels", -5))
         output = Path(output)
-        if output.exists() and any(output.iterdir()):
-            raise ValueError("dataset conversion output must be empty")
+        _initialize_conversion_state(manifest, output)
         shifted = []
         for index, projection in enumerate(manifest.projections):
-            array = _apply_intensity_transform(np.roll(
-                _read_array(projection.path, frame_index=projection.frame_index),
-                shift, axis=-1,
-            ), manifest.intensity_transform)
-            if not np.isfinite(array).all():
-                raise ValueError(f"projection contains non-finite values: {projection.path}")
             target = _projection_target(manifest, output, index)
-            target.parent.mkdir(parents=True, exist_ok=True)
-            np.save(target, array, allow_pickle=False)
+            array = _convert_projection(
+                projection, target,
+                lambda projection=projection: _apply_intensity_transform(
+                    np.roll(
+                        _read_array(
+                            projection.path, frame_index=projection.frame_index,
+                        ),
+                        shift, axis=-1,
+                    ),
+                    manifest.intensity_transform,
+                ),
+            )
             shifted.append(DatasetProjection(target, projection.angle_radians,
                                                tuple(array.shape), str(array.dtype)))
-        reference = _copy_reference_volume(manifest.reference_volume, output)
-        initialization = _prepare_initialization(manifest, output, reference)
+        reference = _copy_reference_volume(
+            manifest.reference_volume, output, manifest.geometry.volume_shape,
+        )
+        initialization = _prepare_initialization(
+            manifest, output, reference, projections=tuple(shifted),
+        )
         staged = DatasetManifest(
             manifest.id, output, tuple(shifted), manifest.geometry,
             manifest.train_indices, manifest.test_indices,
@@ -230,6 +247,112 @@ def _write_prepared_metadata(manifest: DatasetManifest) -> DatasetManifest:
         manifest.train_indices, manifest.test_indices, manifest.reference_volume,
         manifest.intensity_transform, document, manifest.initialization,
     )
+
+
+def ensure_official_dataset_layout(manifest: DatasetManifest) -> None:
+    """Refresh the shared upstream layout for a converted dataset cache."""
+
+    if not (manifest.root / "metadata.json").is_file():
+        return
+    _write_r2_metadata(manifest)
+
+
+def initialize_conversion_cache(
+    manifest: DatasetManifest,
+    output: Path,
+    source_sha256: str,
+) -> None:
+    """Bind a prepared cache directory to one immutable source tree."""
+
+    _initialize_conversion_state(manifest, output, source_sha256=source_sha256)
+
+
+def ensure_projection_initialization(manifest: DatasetManifest) -> DatasetManifest:
+    """Ensure a prepared dataset has a deterministic initializer when needed.
+
+    Existing prepared caches may predate the no-reference initialization path.
+    This refresh is deliberately idempotent and only changes the cache metadata
+    when it creates the missing initialization artifact.
+    """
+
+    initialization = _prepare_initialization(
+        manifest, manifest.root, manifest.reference_volume,
+        projections=manifest.projections,
+    )
+    if initialization == manifest.initialization:
+        return manifest
+    return _write_prepared_metadata(replace(manifest, initialization=initialization))
+
+
+def _conversion_document(
+    manifest: DatasetManifest, source_sha256: str,
+) -> dict[str, Any]:
+    return {
+        "schema_version": "gala-dataset-conversion-v1",
+        "dataset_id": manifest.id,
+        "source_sha256": source_sha256,
+        "intensity_transform": manifest.intensity_transform,
+        "projection_count": len(manifest.projections),
+        "detector_shape": list(manifest.geometry.detector_shape),
+        "volume_shape": list(manifest.geometry.volume_shape),
+    }
+
+
+def _initialize_conversion_state(
+    manifest: DatasetManifest,
+    output: Path,
+    *,
+    source_sha256: str | None = None,
+) -> None:
+    output = Path(output)
+    output.mkdir(parents=True, exist_ok=True)
+    state_path = output / _CONVERSION_STATE
+    existing = None
+    if state_path.is_file():
+        try:
+            existing = json.loads(state_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError) as error:
+            raise ValueError("dataset conversion state is invalid") from error
+        if not isinstance(existing, dict):
+            raise ValueError("dataset conversion state is invalid")
+        source_sha256 = source_sha256 or str(existing.get("source_sha256", ""))
+    elif source_sha256 is None:
+        source_sha256 = sha256_tree(manifest.root)
+    assert source_sha256 is not None
+    expected = _conversion_document(manifest, source_sha256)
+    if existing is not None:
+        if existing != expected:
+            raise ValueError("dataset conversion cache belongs to different inputs")
+        return
+    files = [path for path in output.rglob("*") if path.is_file()]
+    if files:
+        if output.name != source_sha256[:16]:
+            raise ValueError("unidentified partial dataset conversion cache")
+        expected_paths = {
+            _projection_target(manifest, output, index)
+            for index in range(len(manifest.projections))
+        }
+        expected_paths.update({
+            output / "vol_gt.npy",
+            output / f"init_{output.name}.npy",
+            output / "metadata.json",
+            output / "meta_data.json",
+            output / ".gala_no_ground_truth.npy",
+        })
+        unexpected = [path for path in files if path not in expected_paths]
+        if unexpected:
+            raise ValueError(
+                f"partial dataset conversion contains an unexpected file: {unexpected[0]}"
+            )
+    _atomic_write_json(state_path, expected)
+
+
+def _atomic_write_json(path: Path, document: Mapping[str, Any]) -> None:
+    temporary = path.with_name(f".{path.name}.tmp")
+    temporary.write_text(
+        json.dumps(document, sort_keys=True, indent=2) + "\n", encoding="utf-8",
+    )
+    temporary.replace(path)
 
 
 def _load_exported_dataset(
@@ -469,10 +592,65 @@ def _apply_intensity_transform(array: np.ndarray, transform: str) -> np.ndarray:
     return -np.log(np.clip(values, floor, incident) / incident).astype(np.float32)
 
 
-def _copy_reference_volume(source: Path | None, output: Path) -> Path | None:
+def _complete_npy(
+    path: Path,
+    expected_shape: tuple[int, ...],
+    *,
+    expected_dtype: np.dtype[Any] = np.dtype(np.float32),
+) -> np.ndarray | None:
+    if not path.is_file():
+        return None
+    try:
+        values = np.load(path, mmap_mode="r", allow_pickle=False)
+    except (OSError, ValueError):
+        return None
+    if tuple(values.shape) != tuple(expected_shape) or values.dtype != expected_dtype:
+        return None
+    offset = int(getattr(values, "offset", 0))
+    if path.stat().st_size != offset + int(values.nbytes):
+        return None
+    return values
+
+
+def _atomic_save_array(path: Path, values: np.ndarray) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_name(f".{path.stem}.part.npy")
+    with temporary.open("wb") as stream:
+        np.save(stream, values, allow_pickle=False)
+    temporary.replace(path)
+
+
+def _convert_projection(
+    projection: DatasetProjection,
+    target: Path,
+    convert: Callable[[], np.ndarray],
+) -> np.ndarray:
+    existing = _complete_npy(target, projection.shape)
+    if existing is not None:
+        return existing
+    array = np.asarray(convert(), dtype=np.float32)
+    if tuple(array.shape) != projection.shape:
+        raise ValueError(f"projection shape changed during conversion: {projection.path}")
+    if not np.isfinite(array).all():
+        raise ValueError(f"projection contains non-finite values: {projection.path}")
+    _atomic_save_array(target, array)
+    loaded = _complete_npy(target, projection.shape)
+    if loaded is None:
+        raise RuntimeError(f"converted projection failed validation: {target}")
+    return loaded
+
+
+def _copy_reference_volume(
+    source: Path | None,
+    output: Path,
+    expected_shape: tuple[int, int, int],
+) -> Path | None:
     if source is None:
         return None
     target = output / "vol_gt.npy"
+    if _complete_npy(target, expected_shape) is not None:
+        return target
+    temporary = target.with_name(f".{target.stem}.part.npy")
     if source.is_dir():
         slices = _tiff_stack_paths(source)
         if not slices:
@@ -480,8 +658,11 @@ def _copy_reference_volume(source: Path | None, output: Path) -> Path | None:
         first = _read_array(slices[0])
         if first.ndim != 2:
             raise ValueError("reference reconstruction slices must be two-dimensional")
+        shape = (len(slices), *first.shape)
+        if shape != expected_shape:
+            raise ValueError("reference reconstruction shape changed during conversion")
         volume = np.lib.format.open_memmap(
-            target, mode="w+", dtype=np.float32, shape=(len(slices), *first.shape),
+            temporary, mode="w+", dtype=np.float32, shape=shape,
         )
         for index, path in enumerate(slices):
             array = _read_array(path)
@@ -492,7 +673,13 @@ def _copy_reference_volume(source: Path | None, output: Path) -> Path | None:
         del volume
     else:
         volume = _read_array(source).astype(np.float32, copy=False)
-        np.save(target, volume, allow_pickle=False)
+        if tuple(volume.shape) != expected_shape:
+            raise ValueError("reference reconstruction shape changed during conversion")
+        with temporary.open("wb") as stream:
+            np.save(stream, volume, allow_pickle=False)
+    temporary.replace(target)
+    if _complete_npy(target, expected_shape) is None:
+        raise RuntimeError("converted reference volume failed validation")
     return target
 
 
@@ -508,14 +695,31 @@ def _projection_target(manifest: DatasetManifest, output: Path, index: int) -> P
 
 def _prepare_initialization(
     manifest: DatasetManifest, output: Path, reference: Path | None,
+    *, projections: tuple[DatasetProjection, ...] | None = None,
 ) -> Path | None:
     target = output / f"init_{output.name}.npy"
+    if target.is_file():
+        try:
+            existing = np.load(target, mmap_mode="r", allow_pickle=False)
+        except (OSError, ValueError):
+            existing = None
+        if (
+            existing is not None
+            and existing.ndim == 2
+            and existing.shape[1] == 4
+            and existing.shape[0] > 0
+            and target.stat().st_size
+            == int(getattr(existing, "offset", 0)) + int(existing.nbytes)
+        ):
+            return target
     if manifest.initialization is not None:
         values = np.load(manifest.initialization, allow_pickle=False)
-        np.save(target, values, allow_pickle=False)
+        _atomic_save_array(target, values)
         return target
     if reference is None:
-        return None
+        return _projection_derived_initialization(
+            manifest, output, projections or manifest.projections,
+        )
     from .gr_gaussian import denoised_point_cloud_initialization
 
     volume = np.load(reference, mmap_mode="r", allow_pickle=False)
@@ -529,7 +733,79 @@ def _prepare_initialization(
     state = denoised_point_cloud_initialization(
         sample, min(50_000, sample.size), density_threshold=threshold,
     )
-    np.save(target, np.column_stack((state.means, state.densities)), allow_pickle=False)
+    _atomic_save_array(target, np.column_stack((state.means, state.densities)))
+    return target
+
+
+def _projection_derived_initialization(
+    manifest: DatasetManifest, output: Path,
+    projections: tuple[DatasetProjection, ...],
+) -> Path:
+    """Create a bounded, deterministic point cloud from real input projections.
+
+    This is an initialization artifact for a reconstruction with no publisher
+    reference volume.  It intentionally samples a small, fixed subset of the
+    converted projections instead of constructing a full FDK volume.
+    """
+
+    if not projections or not manifest.train_indices:
+        raise ValueError("projection-derived initialization requires training views")
+    target = output / f"init_{output.name}.npy"
+    point_count = 50_000
+    side = math.ceil(point_count ** (1.0 / 3.0))
+    lattice_size = side ** 3
+    lattice = np.rint(np.linspace(0, lattice_size - 1, point_count)).astype(np.int64)
+    z = lattice // (side * side)
+    y = (lattice // side) % side
+    x = lattice % side
+    normalized = (np.column_stack((z, y, x)).astype(np.float32) + 0.5) / side
+    scanner = manifest.metadata.get("scanner", {})
+    if not isinstance(scanner, Mapping):
+        scanner = {}
+    voxel_size = _physical_spacing(
+        manifest.metadata, scanner, "voxel_size", "dVoxel", "sVoxel",
+        manifest.geometry.volume_shape,
+    ).astype(np.float32)
+    extent = voxel_size * np.asarray(manifest.geometry.volume_shape, dtype=np.float32)
+    offset = np.asarray(
+        manifest.metadata.get("offOrigin", scanner.get("offOrigin", (0.0, 0.0, 0.0))),
+        dtype=np.float32,
+    )
+    positions = normalized * extent - extent / 2 + offset
+
+    train_views = tuple(projections[index] for index in manifest.train_indices)
+    selected_count = min(9, len(train_views))
+    selected = tuple(train_views[index] for index in np.rint(
+        np.linspace(0, len(train_views) - 1, selected_count)
+    ).astype(int))
+    samples = np.empty(point_count, dtype=np.float32)
+    for view_index, projection in enumerate(selected):
+        target_indices = np.arange(view_index, point_count, selected_count)
+        image = _read_array(
+            projection.path, mmap=True, frame_index=projection.frame_index,
+        )
+        rows = (target_indices * 17 + view_index * 13) % projection.shape[0]
+        columns = (target_indices * 31 + view_index * 7) % projection.shape[1]
+        samples[target_indices] = np.asarray(image[rows, columns], dtype=np.float32)
+        del image
+    finite = samples[np.isfinite(samples) & (samples > 0)]
+    scale = float(np.quantile(finite, 0.9)) if finite.size else 1.0
+    if not math.isfinite(scale) or scale <= 0:
+        scale = 1.0
+    densities = np.clip(samples / scale, 1e-4, 1.0).astype(np.float32) * 0.15
+    _atomic_save_array(target, np.column_stack((positions, densities)))
+    provenance = {
+        "schema_version": "gala-projection-initialization-v1",
+        "method": "deterministic_projection_sample_lattice",
+        "point_count": point_count,
+        "projection_count": selected_count,
+        "input_projections": [
+            item.path.relative_to(output).as_posix() for item in selected
+        ],
+    }
+    target.with_suffix(".provenance.json").write_text(
+        json.dumps(provenance, sort_keys=True, indent=2) + "\n", encoding="utf-8",
+    )
     return target
 
 
@@ -549,8 +825,11 @@ def _write_r2_metadata(manifest: DatasetManifest) -> None:
     )
     if voxel_size.shape != (3,) or detector_pixel_size.shape != (2,):
         raise ValueError("voxel and detector pixel sizes have invalid shapes")
+    mode = str(metadata.get("mode", scanner_source.get("mode", "cone"))).lower()
+    if mode not in {"cone", "parallel"}:
+        raise ValueError(f"unsupported scanner mode: {mode}")
     scanner = {
-        "mode": str(metadata.get("mode", scanner_source.get("mode", "cone"))),
+        "mode": mode,
         "DSD": geometry.source_detector_distance,
         "DSO": geometry.source_object_distance,
         "nDetector": list(geometry.detector_shape),
@@ -573,10 +852,20 @@ def _write_r2_metadata(manifest: DatasetManifest) -> None:
          "angle": item.angle_radians}
         for item in manifest.projections
     ]
+    reference_available = manifest.reference_volume is not None
+    if reference_available:
+        assert manifest.reference_volume is not None
+        volume_path = manifest.reference_volume.relative_to(manifest.root).as_posix()
+    else:
+        sentinel = manifest.root / ".gala_no_ground_truth.npy"
+        if not sentinel.is_file():
+            np.save(sentinel, np.zeros((1, 1, 1), dtype=np.float32), allow_pickle=False)
+        volume_path = sentinel.name
     document = {
         "scanner": scanner,
         "bbox": metadata.get("bbox", [[-1.0, -1.0, -1.0], [1.0, 1.0, 1.0]]),
-        "vol": "vol_gt.npy",
+        "vol": volume_path,
+        "reference_volume_available": reference_available,
         "proj_train": [records[index] for index in manifest.train_indices],
         "proj_test": [records[index] for index in manifest.test_indices],
     }

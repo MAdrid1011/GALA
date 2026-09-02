@@ -12,7 +12,12 @@ import sys
 
 from gala_sim.mechanisms import ONLINE_POLICY_NAMES
 
-from .trace_capture import TraceSession
+from .fact_low_memory import (
+    install_exact_low_memory_overlay,
+    install_fact_low_memory_overlay,
+    install_r2_low_memory_overlay,
+)
+from .trace_capture import TRACE_HOOK_PROFILES, TraceCaptureComplete, TraceSession
 
 
 def _iteration_range(value: str) -> tuple[int, int]:
@@ -31,8 +36,12 @@ def _iteration_range(value: str) -> tuple[int, int]:
 
 
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="gala-r2-trace-runner")
+    parser = argparse.ArgumentParser(prog="gala-trace-runner")
     parser.add_argument("--trace-output", type=Path, required=True)
+    parser.add_argument(
+        "--model-id", choices=tuple(TRACE_HOOK_PROFILES), default="r2_gaussian",
+    )
+    parser.add_argument("--dataset-id", default="Chest")
     parser.add_argument(
         "--stream-only", action="store_true",
         help="keep validated capture columns in bounded chunks without final mmap merge",
@@ -64,6 +73,10 @@ def _parser() -> argparse.ArgumentParser:
         "--capture-iteration-range", type=_iteration_range, default=None,
         metavar="START:END",
         help="capture an inclusive validation window while executing all training iterations",
+    )
+    parser.add_argument(
+        "--stop-after-capture-range", action="store_true",
+        help="stop official execution after the selected validation window closes",
     )
     parser.add_argument(
         "--online-cycle-config", type=Path, default=None,
@@ -107,6 +120,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("GALA_TRACE_PROGRESS_INTERVAL_SECONDS must be positive")
     if args.virtual_capture and args.stream_only:
         raise ValueError("--virtual-capture and --stream-only are mutually exclusive")
+    if args.stop_after_capture_range and args.capture_iteration_range is None:
+        raise ValueError("--stop-after-capture-range requires --capture-iteration-range")
     if args.packet_archive_root is not None and not args.virtual_capture:
         raise ValueError("--packet-archive-root requires --virtual-capture")
     if args.capture_config is not None and not args.virtual_capture:
@@ -215,9 +230,11 @@ def main(argv: list[str] | None = None) -> int:
         if archive_chunk_bytes <= 0 or archive_max_inflight_chunks <= 0:
             raise ValueError("trace archive chunk capacities must be positive")
     session = TraceSession(
-        args.trace_output, state_record_bytes=state_record_bytes,
+        args.trace_output, model_id=args.model_id, dataset_name=args.dataset_id,
+        state_record_bytes=state_record_bytes,
         chunk_events=chunk_events, stream_only=args.stream_only,
         capture_iteration_range=args.capture_iteration_range,
+        stop_after_capture_range=args.stop_after_capture_range,
         virtual_capture=args.virtual_capture,
         virtual_packet_consumer_factory=consumer_factory,
         virtual_packet_archive_root=args.packet_archive_root,
@@ -226,15 +243,38 @@ def main(argv: list[str] | None = None) -> int:
         inactivity_timeout_seconds=inactivity_timeout_seconds,
         progress_interval_seconds=progress_interval_seconds,
     )
-    session.install()
+    low_memory_overlay = None
+    exact_runtime_overlay = None
     original_argv = sys.argv
     completed = False
+    installed = False
     try:
+        session.install()
+        installed = True
+        if args.model_id == "r2_gaussian":
+            low_memory_overlay = install_r2_low_memory_overlay()
+        elif args.model_id == "fact_gs":
+            # Both upstream loaders eagerly upload all projections.  Keep the
+            # selected camera path while materializing only its image.
+            low_memory_overlay = install_fact_low_memory_overlay()
+        elif args.model_id == "exact_gs":
+            from .exact_runtime import install_exact_runtime_overlay
+
+            exact_runtime_overlay = install_exact_runtime_overlay()
+            low_memory_overlay = install_exact_low_memory_overlay()
         sys.argv = [str(args.train_script), *args.train_args]
-        runpy.run_path(str(args.train_script), run_name="__main__")
+        try:
+            runpy.run_path(str(args.train_script), run_name="__main__")
+        except TraceCaptureComplete:
+            pass
         completed = True
     finally:
-        session.restore()
+        if low_memory_overlay is not None:
+            low_memory_overlay.restore()
+        if exact_runtime_overlay is not None:
+            exact_runtime_overlay.restore()
+        if installed:
+            session.restore()
         try:
             if completed:
                 session.finish()

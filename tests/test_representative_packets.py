@@ -160,6 +160,27 @@ def test_representative_plan_enforces_requested_group_count(tmp_path: Path) -> N
         )
 
 
+def test_representative_plan_selects_one_closed_iteration_without_campaign(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    _archive(archive)
+
+    report = plan_representative_packet_groups(
+        archive, None, expected_group_count=2, single_iteration=1,
+    )
+
+    assert report["single_iteration"] is True
+    assert report["campaign_complete"] is False
+    assert report["iterations"] == [1]
+    assert [group["iterations"] for group in report["groups"]] == [[1], [1]]
+    assert [group["template_id"] for group in report["groups"]] == [1, 2]
+    assert all(
+        group["selection"] == "nonempty_tile_nearest_median_physical_packets"
+        for group in report["groups"]
+    )
+
+
 def test_representative_plan_can_select_only_closed_live_prefix_windows(
     tmp_path: Path,
 ) -> None:
@@ -216,6 +237,8 @@ def test_representative_packet_trace_expands_one_complete_window(
         window_index=1,
         max_events=128,
         query_lanes=8,
+        model_id="fixture_model",
+        dataset_id="fixture_dataset",
     )
 
     validate_trace(trace)
@@ -238,3 +261,39 @@ def test_representative_packet_trace_expands_one_complete_window(
         trace.dependency_ids(row).tolist() == update_end.tolist()
         for row in next_candidates
     )
+
+
+def test_representative_packet_trace_preserves_single_iteration_update(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "archive"
+    _archive(archive)
+    plan = plan_representative_packet_groups(
+        archive, None, expected_group_count=2, single_iteration=1,
+    )
+    plan_path = tmp_path / "single-plan.json"
+    plan_path.write_text(json.dumps(plan), encoding="utf-8")
+
+    trace = build_representative_packet_trace(
+        archive, plan_path, window_index=0, max_events=128, query_lanes=8,
+        model_id="fixture_model", dataset_id="fixture_dataset",
+    )
+
+    validate_trace(trace)
+    assert trace.metadata["trace_sample"]["iterations"] == [1]
+    assert trace.metadata["model_id"] == "fixture_model"
+    assert trace.metadata["dataset_id"] == "fixture_dataset"
+    assert (
+        trace.metadata["trace_sample"]["selection"]
+        == "single_iteration_median_physical_tile"
+    )
+    update_begin = np.flatnonzero(
+        trace.events["primitive_kind"] == int(PrimitiveKind.UPDATE_BEGIN)
+    )
+    update_end = np.flatnonzero(
+        trace.events["primitive_kind"] == int(PrimitiveKind.UPDATE_END)
+    )
+    assert update_begin.size == update_end.size == 1
+    assert trace.dependency_ids(trace.events[update_end[0]]).tolist() == [
+        int(trace.events[update_begin[0]]["event_id"]),
+    ]

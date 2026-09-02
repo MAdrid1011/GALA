@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import importlib
 from pathlib import Path
 from typing import Any, Callable
 
@@ -24,6 +25,12 @@ from gala_sim.trace import (
 
 from .buffer_decoder import (
     decode_raster_virtual_packet, decode_voxel_virtual_packet, load_buffer_decoder,
+)
+from .fact_buffer_decoder import (
+    decode_fact_raster_records,
+    decode_fact_raster_virtual_packet,
+    decode_fact_voxel_records,
+    decode_fact_voxel_virtual_packet,
 )
 from .virtual_capture import VirtualCaptureConsumer
 
@@ -49,6 +56,70 @@ LOSS_SSIM = 1 << 1
 LOSS_TV = 1 << 2
 RASTER_BLOCK = (16, 16)
 VOXEL_BLOCK = (8, 8, 8)
+
+
+class TraceCaptureComplete(SystemExit):
+    """Bypass framework exception handlers after a selected trace window."""
+
+
+@dataclass(frozen=True)
+class TraceHookProfile:
+    """Import-level bindings for one official model's CUDA capture hooks."""
+
+    model_id: str
+    display_name: str
+    raster_extension: str
+    voxel_extension: str
+    gaussian_model_module: str
+    loss_module: str
+    pointwise_loss: str
+    ssim_loss: str | None = "ssim"
+    tv_loss: str | None = None
+    ssim_module: str | None = None
+    capture_backend: str = "opaque_buffers"
+
+
+TRACE_HOOK_PROFILES: dict[str, TraceHookProfile] = {
+    "r2_gaussian": TraceHookProfile(
+        model_id="r2_gaussian",
+        display_name="R2-Gaussian",
+        raster_extension="xray_gaussian_rasterization_voxelization",
+        voxel_extension="xray_gaussian_rasterization_voxelization",
+        gaussian_model_module="r2_gaussian.gaussian.gaussian_model",
+        loss_module="r2_gaussian.utils.loss_utils",
+        pointwise_loss="l1_loss",
+        tv_loss="tv_3d_loss",
+    ),
+    "exact_gs": TraceHookProfile(
+        model_id="exact_gs",
+        display_name="Exact-GS",
+        raster_extension="exact_gaussian_rasterization",
+        voxel_extension="xray_gaussian_rasterization_voxelization",
+        gaussian_model_module="exact_gs.gaussian.gaussian_model",
+        loss_module="exact_gs.utils.loss_utils",
+        pointwise_loss="l2_loss",
+    ),
+    "fact_gs": TraceHookProfile(
+        model_id="fact_gs",
+        display_name="FaCT-GS",
+        raster_extension="gs_ct_rasterizer.rasterize",
+        voxel_extension="gs_voxelizer.voxelize",
+        gaussian_model_module="fact_gs.r2_gaussian.gaussian.gaussian_model",
+        loss_module="fact_gs.r2_gaussian.utils.loss_utils",
+        pointwise_loss="l1_loss",
+        ssim_loss="fused_ssim",
+        tv_loss="tv_3d_loss",
+        ssim_module="fused_ssim",
+        capture_backend="fact_split",
+    ),
+}
+
+
+def get_trace_hook_profile(model_id: str) -> TraceHookProfile:
+    try:
+        return TRACE_HOOK_PROFILES[model_id]
+    except KeyError as error:
+        raise ValueError(f"trace hooks are not implemented for model: {model_id}") from error
 
 
 @dataclass
@@ -89,11 +160,14 @@ class TraceSession:
     """Capture real extension buffers and Python call boundaries in one process."""
 
     output_root: Path
+    model_id: str = "r2_gaussian"
+    dataset_name: str = "Chest"
     state_record_bytes: int = 128
     relation_candidate_bytes: int = 0
     chunk_events: int = 65536
     stream_only: bool = False
     capture_iteration_range: tuple[int, int] | None = None
+    stop_after_capture_range: bool = False
     virtual_capture: bool = False
     virtual_packet_consumer: Any | None = None
     virtual_packet_consumer_factory: Callable[[int], Any] | None = None
@@ -137,8 +211,13 @@ class TraceSession:
     _virtual_consumer: VirtualCaptureConsumer | None = field(default=None, init=False)
     _virtual_collection_begin: bool = field(default=False, init=False)
     _iteration_event_counts: dict[int, int] = field(default_factory=dict, init=False)
+    _profile: TraceHookProfile = field(init=False)
 
     def __post_init__(self) -> None:
+        self.output_root = Path(self.output_root)
+        if self.stop_after_capture_range and self.capture_iteration_range is None:
+            raise ValueError("capture-range early stop requires an iteration range")
+        self._profile = get_trace_hook_profile(self.model_id)
         if self.capture_iteration_range is not None:
             start, end = self.capture_iteration_range
             if start <= 0 or end < start:
@@ -168,29 +247,29 @@ class TraceSession:
                 packet_archive_max_inflight_chunks=(
                     self.virtual_packet_archive_max_inflight_chunks
                 ),
+                model_id=self._profile.model_id,
+                model_name=self._profile.display_name,
+                dataset_id=self.dataset_name,
             )
 
     def install(self) -> None:
         if self._installed:
             return
-        import xray_gaussian_rasterization_voxelization as extension
+        raster_extension = importlib.import_module(self._profile.raster_extension)
+        voxel_extension = importlib.import_module(self._profile.voxel_extension)
+        gaussian_module = importlib.import_module(self._profile.gaussian_model_module)
+        loss_utils = importlib.import_module(self._profile.loss_module)
 
-        self._decoder = load_buffer_decoder()
-        self._patch(
-            extension.GaussianRasterizer, "forward",
-            lambda original: self._wrap_query_forward(original, "raster"),
-        )
-        self._patch(
-            extension.GaussianVoxelizer, "forward",
-            lambda original: self._wrap_query_forward(original, "voxel"),
-        )
-        self._patch(extension._C, "rasterize_gaussians", self._wrap_rasterize)
-        self._patch(extension._C, "voxelize_gaussians", self._wrap_voxelize)
-        self._patch(extension._C, "rasterize_gaussians_backward", self._wrap_rasterize_backward)
-        self._patch(extension._C, "voxelize_gaussians_backward", self._wrap_voxel_backward)
+        if self._profile.capture_backend == "opaque_buffers":
+            self._install_opaque_buffer_hooks(raster_extension, voxel_extension)
+        elif self._profile.capture_backend == "fact_split":
+            self._install_fact_split_hooks(raster_extension, voxel_extension)
+        else:
+            raise ValueError(
+                f"unsupported trace capture backend: {self._profile.capture_backend}"
+            )
 
-        from r2_gaussian.gaussian.gaussian_model import GaussianModel
-        from r2_gaussian.utils import loss_utils
+        GaussianModel = gaussian_module.GaussianModel
 
         self._patch(GaussianModel, "update_learning_rate", self._wrap_learning_rate)
         self._patch(GaussianModel, "training_setup", self._wrap_training_setup)
@@ -199,10 +278,81 @@ class TraceSession:
         self._patch(GaussianModel, "densify_and_clone", self._wrap_densify_clone)
         self._patch(GaussianModel, "densify_and_split", self._wrap_densify_split)
         self._patch(GaussianModel, "densify_and_prune", self._wrap_densify_and_prune)
-        self._patch(loss_utils, "l1_loss", lambda original: self._wrap_loss(original, LOSS_L1))
-        self._patch(loss_utils, "ssim", lambda original: self._wrap_loss(original, LOSS_SSIM))
-        self._patch(loss_utils, "tv_3d_loss", lambda original: self._wrap_loss(original, LOSS_TV))
+        self._patch(
+            loss_utils, self._profile.pointwise_loss,
+            lambda original: self._wrap_loss(original, LOSS_L1),
+        )
+        if self._profile.ssim_loss is not None:
+            ssim_utils = (
+                importlib.import_module(self._profile.ssim_module)
+                if self._profile.ssim_module is not None
+                else loss_utils
+            )
+            self._patch(
+                ssim_utils, self._profile.ssim_loss,
+                lambda original: self._wrap_loss(original, LOSS_SSIM),
+            )
+        if self._profile.tv_loss is not None:
+            self._patch(
+                loss_utils, self._profile.tv_loss,
+                lambda original: self._wrap_loss(original, LOSS_TV),
+            )
         self._installed = True
+
+    def _install_opaque_buffer_hooks(
+        self, raster_extension: Any, voxel_extension: Any,
+    ) -> None:
+        self._decoder = load_buffer_decoder()
+        self._patch(
+            raster_extension.GaussianRasterizer, "forward",
+            lambda original: self._wrap_query_forward(original, "raster"),
+        )
+        self._patch(
+            voxel_extension.GaussianVoxelizer, "forward",
+            lambda original: self._wrap_query_forward(original, "voxel"),
+        )
+        self._patch(raster_extension._C, "rasterize_gaussians", self._wrap_rasterize)
+        self._patch(voxel_extension._C, "voxelize_gaussians", self._wrap_voxelize)
+        self._patch(
+            raster_extension._C, "rasterize_gaussians_backward",
+            self._wrap_rasterize_backward,
+        )
+        self._patch(
+            voxel_extension._C, "voxelize_gaussians_backward",
+            self._wrap_voxel_backward,
+        )
+
+    def _install_fact_split_hooks(
+        self, raster_extension: Any, voxel_extension: Any,
+    ) -> None:
+        self._patch(
+            raster_extension, "rasterize_gaussians",
+            lambda original: self._wrap_query_function(original, "raster"),
+        )
+        self._patch(
+            voxel_extension, "voxelize_gaussians",
+            lambda original: self._wrap_query_function(original, "voxel"),
+        )
+        self._patch(
+            raster_extension._C, "rasterize_forward", self._wrap_fact_rasterize,
+        )
+        self._patch(
+            voxel_extension._C, "voxelize_forward", self._wrap_fact_voxelize,
+        )
+        for name in ("rasterize_backward", "rasterize_backward_per_gaussian"):
+            self._patch(
+                raster_extension._C, name,
+                lambda original, *, _voxel=False: self._wrap_fact_backward(
+                    original, voxel=_voxel,
+                ),
+            )
+        for name in ("voxelize_backward", "voxelize_backward_per_gaussian"):
+            self._patch(
+                voxel_extension._C, name,
+                lambda original, *, _voxel=True: self._wrap_fact_backward(
+                    original, voxel=_voxel,
+                ),
+            )
 
     def restore(self) -> None:
         for owner, name, original in reversed(self._originals):
@@ -232,9 +382,14 @@ class TraceSession:
         audit.setdefault("relation_record_device_chunks", 0)
         audit.setdefault("relation_record_d2h_chunks", 0)
         metadata: dict[str, object] = {
-            "model": "R2-Gaussian",
-            "dataset": "Chest",
-            "capture_backend": "official_cuda_buffers_and_call_hooks",
+            "model": self._profile.display_name,
+            "model_id": self._profile.model_id,
+            "dataset": self.dataset_name,
+            "capture_backend": (
+                "official_fact_split_tensors_and_call_hooks"
+                if self._profile.capture_backend == "fact_split"
+                else "official_cuda_buffers_and_call_hooks"
+            ),
             "state_record_bytes": self.state_record_bytes,
             "trace_chunk_events": self.chunk_events,
             "trace_capture_status": "real_extension_buffers",
@@ -297,6 +452,29 @@ class TraceSession:
             return result
         return wrapped
 
+    def _wrap_fact_rasterize(self, original: Any) -> Any:
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            result = original(*args, **kwargs)
+            if self._capture_enabled():
+                self._capture_fact_raster(args, result)
+            return result
+        return wrapped
+
+    def _wrap_fact_voxelize(self, original: Any) -> Any:
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            result = original(*args, **kwargs)
+            if self._capture_enabled():
+                self._capture_fact_voxel(args, result)
+            return result
+        return wrapped
+
+    def _wrap_fact_backward(self, original: Any, *, voxel: bool) -> Any:
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            result = original(*args, **kwargs)
+            self._capture_backward(int(args[1].data_ptr()), voxel=voxel)
+            return result
+        return wrapped
+
     def _wrap_query_forward(self, original: Any, query_kind: str) -> Any:
         def wrapped(rasterizer: Any, *args: Any, **kwargs: Any) -> Any:
             previous = self._query_capture_allowed
@@ -317,6 +495,30 @@ class TraceSession:
                 self._audit_increment(f"excluded_no_grad_{query_kind}_kernel_calls")
             try:
                 return original(rasterizer, *args, **kwargs)
+            finally:
+                self._query_capture_allowed = previous
+        return wrapped
+
+    def _wrap_query_function(self, original: Any, query_kind: str) -> Any:
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            previous = self._query_capture_allowed
+            import torch
+
+            grad_enabled = bool(torch.is_grad_enabled())
+            iteration_selected = self._iteration_capture_enabled()
+            self._query_capture_allowed = grad_enabled and iteration_selected
+            self._audit_increment(f"official_{query_kind}_kernel_calls")
+            if self._query_capture_allowed:
+                self._audit_increment(f"captured_{query_kind}_kernel_calls")
+                self._audit_increment("captured_query_kernel_calls")
+            elif not iteration_selected:
+                self._audit_increment(
+                    f"excluded_iteration_window_{query_kind}_kernel_calls"
+                )
+            else:
+                self._audit_increment(f"excluded_no_grad_{query_kind}_kernel_calls")
+            try:
+                return original(*args, **kwargs)
             finally:
                 self._query_capture_allowed = previous
         return wrapped
@@ -376,6 +578,15 @@ class TraceSession:
         def wrapped(model: Any, iteration: int, *args: Any, **kwargs: Any) -> Any:
             self._flush_pending_queries()
             self._close_virtual_iteration()
+            if (
+                self.stop_after_capture_range
+                and self.capture_iteration_range is not None
+                and int(iteration) > self.capture_iteration_range[1]
+            ):
+                self._audit_increment("capture_range_early_stops")
+                raise TraceCaptureComplete(
+                    "selected trace iteration range completed"
+                )
             self._iteration = int(iteration)
             self._ensure_gaussians(int(model.get_xyz.shape[0]))
             if self._iteration_capture_enabled():
@@ -623,11 +834,67 @@ class TraceSession:
             ),
         )
 
+    def _capture_fact_raster(self, args: tuple[Any, ...], output: Any) -> None:
+        image_shape = tuple(int(value) for value in args[0])
+        gaussian_ids_sorted, tile_bins, pos2d, conics_mu, intensities = args[1:6]
+        rendered = int(gaussian_ids_sorted.numel())
+        self._audit_increment("cuda_relation_candidates", rendered)
+        self._capture_query(
+            pos2d, gaussian_ids_sorted, output, rendered, image_shape,
+            lambda: decode_fact_raster_records(
+                gaussian_ids_sorted, tile_bins, pos2d, conics_mu, intensities,
+                image_shape, 0, rendered,
+            ),
+            template_id=RASTER_TEMPLATE_ID,
+            field_mask=STATE_FIELD_MASK,
+            record_chunk_fn=lambda start, count: decode_fact_raster_records(
+                gaussian_ids_sorted, tile_bins, pos2d, conics_mu, intensities,
+                image_shape, int(start), int(count),
+            ),
+            record_candidate_chunk=2048,
+            virtual_packet_fn=lambda query_base: decode_fact_raster_virtual_packet(
+                gaussian_ids_sorted, tile_bins, pos2d, conics_mu, intensities,
+                image_shape, iteration_id=self._iteration,
+                template_id=RASTER_TEMPLATE_ID, query_base=query_base,
+                state_version=self._state_version, field_mask=STATE_FIELD_MASK,
+            ),
+        )
+
+    def _capture_fact_voxel(self, args: tuple[Any, ...], output: Any) -> None:
+        upstream_shape = tuple(int(value) for value in args[0])
+        if len(upstream_shape) != 3:
+            raise ValueError("FaCT voxelizer volume shape must be three-dimensional")
+        volume_shape = (upstream_shape[2], upstream_shape[1], upstream_shape[0])
+        gaussian_ids_sorted, tile_bins, pos3d_radii, conics, intensities = args[1:6]
+        rendered = int(gaussian_ids_sorted.numel())
+        self._audit_increment("cuda_relation_candidates", rendered)
+        self._capture_query(
+            pos3d_radii, gaussian_ids_sorted, output, rendered, volume_shape,
+            lambda: decode_fact_voxel_records(
+                gaussian_ids_sorted, tile_bins, pos3d_radii, conics, intensities,
+                volume_shape, 0, rendered,
+            ),
+            template_id=VOXEL_TEMPLATE_ID,
+            field_mask=STATE_FIELD_MASK,
+            record_chunk_fn=lambda start, count: decode_fact_voxel_records(
+                gaussian_ids_sorted, tile_bins, pos3d_radii, conics, intensities,
+                volume_shape, int(start), int(count),
+            ),
+            record_candidate_chunk=512,
+            virtual_packet_fn=lambda query_base: decode_fact_voxel_virtual_packet(
+                gaussian_ids_sorted, tile_bins, pos3d_radii, conics, intensities,
+                volume_shape, iteration_id=self._iteration,
+                template_id=VOXEL_TEMPLATE_ID, query_base=query_base,
+                state_version=self._state_version, field_mask=STATE_FIELD_MASK,
+            ),
+        )
+
     def _capture_query(
         self, means: Any, binning: Any, output: Any, rendered: int,
         query_shape: tuple[int, ...], records_fn: Callable[[], Any],
         *, template_id: int, field_mask: int,
         record_chunk_fn: Callable[[int, int], Any] | None = None,
+        record_candidate_chunk: int | None = None,
         virtual_packet_fn: Callable[[int], Any] | None = None,
     ) -> None:
         if rendered < 0 or not query_shape or any(value <= 0 for value in query_shape):
@@ -671,6 +938,7 @@ class TraceSession:
         if rendered > 0 and record_chunk_fn is not None:
             candidate_records_path, relation_records_path = self._capture_record_chunks(
                 query_base, rendered, record_chunk_fn,
+                candidate_chunk_size=record_candidate_chunk,
             )
             self._audit_increment("relation_record_device_batches")
             self._audit_increment("relation_record_d2h_batches")
@@ -810,14 +1078,18 @@ class TraceSession:
     def _capture_record_chunks(
         self, query_base: int, rendered: int,
         record_chunk_fn: Callable[[int, int], Any],
+        *, candidate_chunk_size: int | None = None,
     ) -> tuple[Path, Path]:
         root = self.output_root / ".capture_records"
         root.mkdir(parents=True, exist_ok=True)
         candidate_path = root / f"{query_base:020d}.candidates.raw"
         relation_path = root / f"{query_base:020d}.relations.raw"
         with candidate_path.open("wb") as candidate_output, relation_path.open("wb") as relation_output:
-            for start in range(0, rendered, self.chunk_events):
-                end = min(start + self.chunk_events, rendered)
+            chunk_size = candidate_chunk_size or self.chunk_events
+            if chunk_size <= 0:
+                raise ValueError("relation record candidate chunk must be positive")
+            for start in range(0, rendered, chunk_size):
+                end = min(start + chunk_size, rendered)
                 records = record_chunk_fn(start, end - start)
                 if hasattr(records, "detach"):
                     records = records.detach().cpu().numpy()

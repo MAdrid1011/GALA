@@ -83,6 +83,7 @@ class R2GaussianChestAdapter:
                 str(self.python_executable.resolve()) if self.python_executable is not None else "python",
                 "train.py", "-s", str(self.dataset_root), "-m", str(self.output_root),
             ),
+            output_root=self.output_root.resolve(),
         )
 
     def run_reference(self, run: PreparedRun) -> ReferenceArtifact:

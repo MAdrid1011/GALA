@@ -20,12 +20,13 @@ class PreparedRun:
     quality_config: QualityConfig
     seed: int
     official_command: tuple[str, ...]
+    output_root: Path
 
 
 @dataclass(frozen=True)
 class ReferenceArtifact:
     output_root: Path
-    volume_path: Path
+    volume_path: Path | None
     metrics: dict[str, float]
     gpu_reference: dict[str, Any]
 

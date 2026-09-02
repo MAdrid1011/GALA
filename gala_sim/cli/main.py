@@ -13,6 +13,9 @@ import time
 from gala_sim.ablation import (
     run_archive_matrix, run_archive_speedup_diagnostic, run_matrix,
 )
+from gala_sim.campaign import (
+    ALL_COMBINATIONS, DATASET_IDS, MODEL_IDS, run_campaigns,
+)
 from gala_sim.config import load_config, pending_parameters
 from gala_sim.results import (
     AblationRow, asic_speedup, comparison_baseline, write_ablation_csv,
@@ -56,6 +59,19 @@ from gala_sim.trace import (
 )
 
 
+def _iteration_range(value: str) -> tuple[int, int]:
+    start_text, separator, end_text = value.partition(":")
+    if not separator:
+        raise argparse.ArgumentTypeError("iteration range must use START:END")
+    try:
+        start, end = int(start_text), int(end_text)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("iteration range bounds must be integers") from error
+    if start <= 0 or end < start:
+        raise argparse.ArgumentTypeError("iteration range must have 1 <= START <= END")
+    return start, end
+
+
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gala-sim")
     parser.add_argument(
@@ -72,6 +88,41 @@ def _parser() -> argparse.ArgumentParser:
     acquire.add_argument("--datasets", type=_csv_ids, default=())
     acquire.add_argument("--dry-run", action="store_true")
     acquire.add_argument("--no-resume", action="store_true")
+    campaign = commands.add_parser(
+        "campaign-ablation",
+        help="run bounded CPU trace, bound, and seven-variant validation campaigns",
+    )
+    campaign.add_argument("--workspace", type=Path, default=None)
+    campaign.add_argument("--models", type=_csv_ids, default=())
+    campaign.add_argument("--datasets", type=_csv_ids, default=())
+    campaign.add_argument("--all", dest="campaign_all", action="store_true")
+    campaign.add_argument("--parallel-workers", type=int, default=1)
+    campaign_modes = campaign.add_mutually_exclusive_group()
+    campaign_modes.add_argument(
+        "--representative-archive",
+        action="store_true",
+        help=(
+            "exercise the packet-archive and representative replay path for "
+            "bounded CPU validation"
+        ),
+    )
+    campaign_modes.add_argument(
+        "--official-trace",
+        action="store_true",
+        help=(
+            "capture a model-specific trace through the official entrypoint "
+            "before bounds and ablations"
+        ),
+    )
+    campaign.add_argument(
+        "--iterations", type=int, default=1,
+        help="repeat the bounded optimizer transaction for amortized validation",
+    )
+    campaign.add_argument(
+        "--capture-iteration-range", type=_iteration_range, default=(1, 1),
+        metavar="START:END",
+        help="official trace window; execution stops when this window closes",
+    )
     config = commands.add_parser("config-check")
     config.add_argument("--config", type=Path, required=True)
     preflight = commands.add_parser("cycle-preflight")
@@ -112,8 +163,12 @@ def _parser() -> argparse.ArgumentParser:
     archive_snapshot.add_argument("--through-iteration", type=int, default=None)
     representative = commands.add_parser("representative-packet-plan")
     representative.add_argument("--archive", type=Path, required=True)
-    representative.add_argument("--campaign", type=Path, required=True)
+    representative.add_argument("--campaign", type=Path)
     representative.add_argument("--expected-groups", type=int, required=True)
+    representative.add_argument(
+        "--single-iteration", type=int,
+        help="select all templates from one closed iteration instead of a phase window",
+    )
     representative.add_argument(
         "--live-prefix", action="store_true",
         help="plan only campaign windows closed by a live archive snapshot",
@@ -124,6 +179,14 @@ def _parser() -> argparse.ArgumentParser:
     representative_trace.add_argument("--window-index", type=int, required=True)
     representative_trace.add_argument("--max-events", type=int, required=True)
     representative_trace.add_argument("--query-lanes", type=int, required=True)
+    representative_trace.add_argument(
+        "--model-id",
+        help="required only for an archive captured before provenance metadata",
+    )
+    representative_trace.add_argument(
+        "--dataset-id",
+        help="required only for an archive captured before provenance metadata",
+    )
     representative_trace.add_argument("--output", type=Path, required=True)
     representative.add_argument("--output", type=Path, required=True)
     sample = commands.add_parser("trace-sample")
@@ -422,6 +485,56 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(json.dumps(report.as_dict(), sort_keys=True))
             return 0
+        if args.command == "campaign-ablation":
+            if args.campaign_all:
+                selections = ALL_COMBINATIONS
+            else:
+                models = args.models or MODEL_IDS
+                datasets = args.datasets or DATASET_IDS
+                selections = tuple((model, dataset) for model in models for dataset in datasets)
+            paths = WorkspacePaths.discover(
+                repository=args.repository, workspace=args.workspace,
+            )
+            results = run_campaigns(
+                selections,
+                workspace=paths,
+                parallel_workers=args.parallel_workers,
+                iterations=args.iterations,
+                representative_archive=args.representative_archive,
+                official_trace=args.official_trace,
+                capture_iteration_range=args.capture_iteration_range,
+            )
+            print(json.dumps({
+                "status": "passed",
+                "result_scope": (
+                    "official_model_trace_validation"
+                    if args.official_trace else (
+                        "quick_cpu_packet_archive_validation"
+                        if args.representative_archive
+                        else "quick_cpu_trace_validation"
+                    )
+                ),
+                "formal_performance_eligible": False,
+                "iterations": args.iterations,
+                "campaigns": [
+                    {
+                        "model_id": item.model_id,
+                        "dataset_id": item.dataset_id,
+                        "trace": paths.reference(item.trace_root),
+                        "bounds": paths.reference(item.bounds_path),
+                        "ablation": paths.reference(item.ablation_path),
+                        "base_cycles": item.base_cycles,
+                        "cycles": dict(item.ablation_cycles),
+                        "upper_bound_status": dict(item.upper_bound_status),
+                        "oracle_cycles": dict(item.oracle_cycles),
+                        "oracle_speedups_vs_base_asic": dict(
+                            item.oracle_speedups_vs_base_asic
+                        ),
+                    }
+                    for item in results
+                ],
+            }, sort_keys=True))
+            return 0
         if args.command == "config-check":
             config = load_config(_repository_path(args.config, args.repository))
             print(json.dumps({"sha256": config.sha256, "ready": config.ready,
@@ -523,6 +636,7 @@ def main(argv: list[str] | None = None) -> int:
                 args.campaign,
                 expected_group_count=args.expected_groups,
                 live_prefix=args.live_prefix,
+                single_iteration=args.single_iteration,
             )
             write_json(report, args.output)
             print(json.dumps({
@@ -540,6 +654,8 @@ def main(argv: list[str] | None = None) -> int:
                 window_index=args.window_index,
                 max_events=args.max_events,
                 query_lanes=args.query_lanes,
+                model_id=args.model_id,
+                dataset_id=args.dataset_id,
             )
             TraceWriter().write(trace, args.output)
             sample = trace.metadata["trace_sample"]

@@ -12,6 +12,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from gala_sim.ablation.anchors import compiler_target_speedups
+
 
 RUNNER_VARIANTS = ("A0B0", "A1B0", "A0B1", "A1B1")
 BITS_BY_VARIANT = {
@@ -20,7 +22,7 @@ BITS_BY_VARIANT = {
     "A0B1": "0100",
     "A1B1": "1100",
 }
-TARGET_SPEEDUPS = {"1000": 1.254, "0100": 1.282, "1100": 1.482}
+TARGET_SPEEDUPS = compiler_target_speedups()
 EXACT_WORKLOAD_FIELDS = (
     "query_count",
     "active_gaussians",

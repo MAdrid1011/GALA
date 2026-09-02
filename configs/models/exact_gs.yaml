@@ -15,6 +15,7 @@ official_commands:
     - train.py
     - --method=Exact_GS
     - "--source_path={dataset_root}"
+    - "--ply_path={initialization_path}"
   evaluate:
     - "{python_executable}"
     - test.py

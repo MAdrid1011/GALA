@@ -56,6 +56,53 @@ def test_repository_option_resolves_config_outside_current_directory(
     assert json.loads(capsys.readouterr().out)["ready"] is True
 
 
+def test_campaign_cli_propagates_representative_archive_scope(
+    monkeypatch, tmp_path: Path, capsys,
+) -> None:
+    cli = importlib.import_module("gala_sim.cli.main")
+    captured: dict[str, object] = {}
+
+    def fake_run_campaigns(selections, **kwargs):
+        captured["selections"] = tuple(selections)
+        captured.update(kwargs)
+        return ()
+
+    monkeypatch.setattr(cli, "run_campaigns", fake_run_campaigns)
+    assert cli.main([
+        "campaign-ablation", "--models", "exact_gs", "--datasets", "walnut",
+        "--workspace", str(tmp_path / "workspace"), "--representative-archive",
+    ]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert captured["selections"] == (("exact_gs", "walnut"),)
+    assert captured["representative_archive"] is True
+    assert report["result_scope"] == "quick_cpu_packet_archive_validation"
+    assert report["formal_performance_eligible"] is False
+
+
+def test_campaign_cli_propagates_official_trace_scope(
+    monkeypatch, tmp_path: Path, capsys,
+) -> None:
+    cli = importlib.import_module("gala_sim.cli.main")
+    captured: dict[str, object] = {}
+
+    def fake_run_campaigns(selections, **kwargs):
+        captured["selections"] = tuple(selections)
+        captured.update(kwargs)
+        return ()
+
+    monkeypatch.setattr(cli, "run_campaigns", fake_run_campaigns)
+    assert cli.main([
+        "campaign-ablation", "--models", "fact_gs", "--datasets", "chest",
+        "--workspace", str(tmp_path / "workspace"), "--official-trace",
+    ]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert captured["selections"] == (("fact_gs", "chest"),)
+    assert captured["official_trace"] is True
+    assert captured["capture_iteration_range"] == (1, 1)
+    assert report["result_scope"] == "official_model_trace_validation"
+    assert report["formal_performance_eligible"] is False
+
+
 def test_cli_validates_compact_packet_archive_without_false_formal_promotion(
     tmp_path: Path, capsys,
 ) -> None:

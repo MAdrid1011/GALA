@@ -6,7 +6,8 @@ from .native_reference import NativeReferenceError, run_native_reference
 from .chest import ChestDatasetManifest, ProjectionRecord, load_chest_manifest
 from .datasets import (
     DatasetAdapter, DatasetDescriptor, DatasetManifest, DatasetProjection,
-    ScannerGeometry, dataset_descriptors, get_dataset_adapter,
+    ScannerGeometry, dataset_descriptors, ensure_projection_initialization,
+    get_dataset_adapter,
 )
 from .registry import (
     CommandModelAdapter, ModelDescriptor, get_model_adapter, model_descriptors,
@@ -18,6 +19,7 @@ __all__ = ["ModelAdapter", "PreparedRun", "ReferenceArtifact", "TraceArtifact",
            "run_native_reference", "ChestDatasetManifest", "ProjectionRecord",
            "load_chest_manifest", "DatasetAdapter", "DatasetDescriptor",
            "DatasetManifest", "DatasetProjection", "ScannerGeometry",
-           "dataset_descriptors", "get_dataset_adapter", "CommandModelAdapter",
+           "dataset_descriptors", "ensure_projection_initialization",
+           "get_dataset_adapter", "CommandModelAdapter",
            "ModelDescriptor", "get_model_adapter", "model_descriptors",
            "prepare_campaign"]

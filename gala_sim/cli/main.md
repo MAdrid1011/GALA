@@ -20,6 +20,12 @@ Trace transformation commands include `trace-sample`, `trace-query-packets`,
 representative-packet planning commands. They preserve event identities and
 mark any intentionally bounded output in its generated manifest.
 
+`campaign-ablation` composes trace capture, necessary-bound analysis, and the
+seven canonical ablations. Its default and `--representative-archive` modes are
+bounded CPU engineering checks. `--official-trace` uses the registered model's
+official entrypoint and retains the model-specific trace in the ignored
+workspace; capture wall time is not treated as GPU Base performance.
+
 Cycle commands include `cycle-replay`, `cycle-bounds`, `ablation`, and
 `archive-ablation`. Archive ablation requires explicit `--model` and
 `--dataset` identifiers. Variant order and compiler/hardware prerequisites are

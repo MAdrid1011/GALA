@@ -54,6 +54,9 @@ class VirtualCaptureConsumer:
     packet_archive_root: Path | None = None
     packet_archive_chunk_bytes: int | None = None
     packet_archive_max_inflight_chunks: int = 1
+    model_id: str | None = None
+    model_name: str | None = None
+    dataset_id: str | None = None
     _expander: VirtualQueryEventExpander = field(init=False)
     _event_validator: VirtualEventStreamValidator = field(
         default_factory=VirtualEventStreamValidator, init=False
@@ -83,6 +86,10 @@ class VirtualCaptureConsumer:
             raise ValueError("virtual capture inactivity timeout must be positive")
         if self.progress_interval_seconds <= 0:
             raise ValueError("virtual capture progress interval must be positive")
+        for field_name in ("model_id", "model_name", "dataset_id"):
+            value = getattr(self, field_name)
+            if value is not None and not str(value).strip():
+                raise ValueError(f"virtual capture {field_name} cannot be empty")
         self.output_root = Path(self.output_root)
         self._expander = VirtualQueryEventExpander(
             max_events=self.max_events,
@@ -201,7 +208,13 @@ class VirtualCaptureConsumer:
         archive_manifest = None
         if self._packet_archive is not None:
             archive_manifest = self._packet_archive.finish(
-                metadata={"capture_audit": dict(sorted((capture_audit or {}).items()))},
+                metadata={
+                    "model_id": self.model_id,
+                    "model": self.model_name or self.model_id,
+                    "dataset_id": self.dataset_id,
+                    "dataset": self.dataset_id,
+                    "capture_audit": dict(sorted((capture_audit or {}).items())),
+                },
             )
         elapsed = time.monotonic() - self._started_at
         archive_eligible = bool(
@@ -238,6 +251,12 @@ class VirtualCaptureConsumer:
             ),
             "iterations": [ledger.__dict__ for ledger in ledgers],
             "capture_audit": dict(sorted((capture_audit or {}).items())),
+            "source_identity": {
+                "model_id": self.model_id,
+                "model": self.model_name or self.model_id,
+                "dataset_id": self.dataset_id,
+                "dataset": self.dataset_id,
+            },
         }
         if archive_manifest is not None:
             result["packet_archive"] = archive_manifest

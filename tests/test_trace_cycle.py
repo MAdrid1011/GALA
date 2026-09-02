@@ -763,9 +763,10 @@ def test_online_query_packet_rejects_infeasible_relation_store_wavefront() -> No
 
 def test_query_reduction_banks_serialize_same_bank_and_parallelize_distinct_banks() -> None:
     config_path = Path(__file__).parents[1] / "configs/architecture/gala.yaml"
-    engine = CycleEngine(CycleConfig.from_gala(
-        load_config(config_path), _Memory(),
-    ))
+    engine = CycleEngine(
+        CycleConfig.from_gala(load_config(config_path), _Memory()),
+        policy="variant:1010",
+    )
     rows = np.empty(3, dtype=event_dtype())
     rows[:] = TraceEvent(
         primitive_kind=int(PrimitiveKind.FORWARD), query_id=0,
@@ -1555,16 +1556,21 @@ def test_shared_sram_replays_same_address_read_against_fill_write() -> None:
             return arrival_cycle
 
     builder = TraceBuilder()
-    builder.emit(TraceEvent(
+    fill_request = builder.emit(TraceEvent(
         primitive_kind=int(PrimitiveKind.CACHE_REQUEST), query_id=0,
         gaussian_id=2, state_version=0, address_token=0, data_bytes=64,
         resource_class=int(ResourceClass.CACHE),
     ))
     builder.emit(TraceEvent(
-        primitive_kind=int(PrimitiveKind.CACHE_RETURN), query_id=1,
+        primitive_kind=int(PrimitiveKind.CACHE_RETURN), query_id=0,
+        gaussian_id=2, state_version=0, address_token=0, data_bytes=64,
+        resource_class=int(ResourceClass.CACHE),
+    ), dependencies=[fill_request])
+    builder.emit(TraceEvent(
+        primitive_kind=int(PrimitiveKind.CACHE_REQUEST), query_id=1,
         gaussian_id=3, state_version=0, address_token=0, data_bytes=64,
         resource_class=int(ResourceClass.CACHE),
-    ))
+    ), dependencies=[fill_request])
     timing = ModuleTiming(
         latency=1, initiation_interval=1, queue_capacity=8, ports=2, banks=2,
     )
@@ -1577,10 +1583,14 @@ def test_shared_sram_replays_same_address_read_against_fill_write() -> None:
         memory=_ImmediateMemory(), clock_frequency_hz=500_000_000,
         relation_seed_fifo_entries=8, candidate_lanes=3,
         cache_instances=2,
+        cache_capacity_per_instance=2,
+        cache_directory_banks=1,
+        cache_sector_bytes=64,
+        cache_multicast_destinations=1,
         shared_sram_read_ports_per_bank=1,
         shared_sram_write_ports_per_bank=1,
     )
-    result = CycleEngine(config, policy="variant:0000").run(
+    result = CycleEngine(config, policy="variant:0101").run(
         builder.finish(), validate_input=False,
     )
 
@@ -2070,10 +2080,13 @@ def test_semantic_ready_group_priority_selects_ready_leader_in_joint_variant() -
 
     assert candidates("variant:0101") == [10]
     assert candidates("variant:0100") == [10, 1, 11]
-    assert candidates("variant:1111") == [10]
-    assert candidates("variant:1111", current_support=208) == [10]
-    assert candidates("variant:1111", current_support=209) == [10]
-    assert candidates("variant:1111", previous_support=True) == [10]
+    # Full keeps the semantic leader, then uses its otherwise idle candidate
+    # slots for compatible query work.  The semantic followers remain behind
+    # the leader until the later coordinated-control admission succeeds.
+    assert candidates("variant:1111") == [10, 1, 11]
+    assert candidates("variant:1111", current_support=208) == [10, 1, 11]
+    assert candidates("variant:1111", current_support=209) == [10, 1, 11]
+    assert candidates("variant:1111", previous_support=True) == [10, 1, 11]
     assert candidates("variant:0000") == [10, 1, 11]
     assert candidates("variant:1010") == [10, 1, 11]
 
@@ -2350,7 +2363,7 @@ def test_relation_constructor_separates_append_banks_and_dynamic_support_lanes()
         ),
         _Memory(),
     )
-    engine = CycleEngine(config)
+    engine = CycleEngine(config, policy="variant:1010")
     dtype = TraceBuilder().finish().events.dtype
 
     def row(kind: PrimitiveKind, query_id: int, gaussian_id: int = 0):
@@ -2647,6 +2660,30 @@ def test_cycle_policy_preserves_independent_mechanism_bits(
         selection.overlap_guided_issue,
         selection.semantic_residency,
     ) == expected
+
+
+def test_hardware_mechanisms_require_compiler_metadata_without_changing_resources() -> None:
+    config_path = Path(__file__).parents[1] / "configs/architecture/gala.yaml"
+    config = CycleConfig.from_gala(load_config(config_path), _Memory())
+    base = CycleEngine(config, policy="variant:0000")
+    query_compiler_only = CycleEngine(config, policy="variant:1000")
+    query_hardware = CycleEngine(config, policy="variant:1010")
+    semantic_compiler_only = CycleEngine(config, policy="variant:0100")
+    semantic_hardware = CycleEngine(config, policy="variant:0101")
+
+    assert base._has_query_resources()
+    assert not base.selection.overlap_guided_issue
+    assert query_hardware.selection.overlap_guided_issue
+    assert not query_compiler_only.selection.overlap_guided_issue
+    assert not base.selection.semantic_residency
+    assert not semantic_compiler_only.selection.semantic_residency
+    assert semantic_hardware.selection.semantic_residency
+    assert base._module_partition_count("relation_constructor") == (
+        query_hardware._module_partition_count("relation_constructor")
+    )
+    assert base._module_partition_count("semantic_cache") == (
+        semantic_hardware._module_partition_count("semantic_cache")
+    )
 
 
 @pytest.mark.parametrize(

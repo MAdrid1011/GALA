@@ -434,6 +434,49 @@ def test_trace_runner_virtual_capture_requires_explicit_online_or_audit_scope(
             "--packet-archive-root", str(tmp_path / "archive"),
             "--archive-max-inflight-chunks", "0", "train.py",
         ])
+    with pytest.raises(ValueError, match="requires --capture-iteration-range"):
+        main([
+            "--trace-output", str(tmp_path / "trace"),
+            "--stop-after-capture-range", "train.py",
+        ])
+
+
+def test_trace_runner_finishes_after_controlled_capture_range_stop(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from gala_sim.adapters import trace_runner
+
+    calls: list[str] = []
+
+    class Session:
+        def __init__(self, *_args, **_kwargs) -> None:
+            pass
+
+        def install(self) -> None:
+            calls.append("install")
+
+        def restore(self) -> None:
+            calls.append("restore")
+
+        def finish(self) -> None:
+            calls.append("finish")
+
+    def stop(*_args, **_kwargs) -> None:
+        raise trace_runner.TraceCaptureComplete("complete")
+
+    monkeypatch.setattr(trace_runner, "TraceSession", Session)
+    monkeypatch.setattr(
+        trace_runner, "install_r2_low_memory_overlay",
+        lambda: SimpleNamespace(restore=lambda: calls.append("overlay_restore")),
+    )
+    monkeypatch.setattr(trace_runner.runpy, "run_path", stop)
+
+    assert trace_runner.main([
+        "--trace-output", str(tmp_path / "trace"),
+        "--capture-iteration-range", "1:1",
+        "--stop-after-capture-range", str(tmp_path / "train.py"),
+    ]) == 0
+    assert calls == ["install", "overlay_restore", "restore", "finish"]
 
 
 def test_trace_runner_decouples_archive_compression_from_cycle_frontier(
@@ -457,6 +500,10 @@ def test_trace_runner_decouples_archive_compression_from_cycle_frontier(
             pass
 
     monkeypatch.setattr(trace_runner, "TraceSession", Session)
+    monkeypatch.setattr(
+        trace_runner, "install_r2_low_memory_overlay",
+        lambda: SimpleNamespace(restore=lambda: None),
+    )
     monkeypatch.setattr(trace_runner.runpy, "run_path", lambda *_args, **_kwargs: None)
     config_path = Path(__file__).parents[1] / "configs/architecture/gala.yaml"
 
@@ -1014,7 +1061,7 @@ def test_clone_and_split_wrappers_follow_official_tensor_order(tmp_path: Path) -
     session._finish_collection_transaction()
 
     trace = session._builder.finish(metadata={"initial_gaussian_count": 4})
-    assert validate_trace(trace).event_count == 9
+    assert validate_trace(trace).event_count == 10
     assert session._gaussian_ids == [0, 3, 4, 5, 6, 7, 8]
     split_children = _rows(trace, PrimitiveKind.SET_MODIFICATION)
     split_children = split_children[split_children["flags"] == MOD_SPLIT_CHILD]
@@ -1063,9 +1110,13 @@ def test_trace_runner_does_not_finish_after_official_failure(
         raise RuntimeError("official training failed")
 
     monkeypatch.setattr(trace_runner, "TraceSession", Session)
+    monkeypatch.setattr(
+        trace_runner, "install_r2_low_memory_overlay",
+        lambda: SimpleNamespace(restore=lambda: calls.append("overlay_restore")),
+    )
     monkeypatch.setattr(trace_runner.runpy, "run_path", fail_run_path)
     with pytest.raises(RuntimeError, match="official training failed"):
         trace_runner.main([
             "--trace-output", str(tmp_path / "trace"), str(tmp_path / "train.py")
         ])
-    assert calls == ["install", "restore"]
+    assert calls == ["install", "overlay_restore", "restore"]
