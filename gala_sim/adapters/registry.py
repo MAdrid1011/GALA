@@ -165,7 +165,19 @@ class CommandModelAdapter:
         repository_root = Path(__file__).resolve().parents[2]
         train_script = run.source_root / run.official_command[1]
         train_arguments = list(run.official_command[2:])
-        if self.descriptor.id == "exact_gs":
+        if self.descriptor.id == "fact_gs":
+            trace_only_flags = {
+                "model.eval",
+                "eval.eval_in_training",
+                "eval.eval_start",
+                "eval.eval_end",
+            }
+            train_arguments = [
+                f"{key}=false" if key in trace_only_flags else argument
+                for argument in train_arguments
+                for key in (argument.partition("=")[0],)
+            ]
+        elif self.descriptor.id == "exact_gs":
             # Exact-GS evaluates at iteration one by default.  Keep evaluation
             # outside the bounded trace window, especially for datasets that
             # deliberately have no reference reconstruction.

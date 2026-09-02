@@ -288,6 +288,8 @@ def test_fact_capture_runs_official_entry_with_split_pipeline_hooks(
     )
     config = load_config(ROOT / "configs/architecture/gala.yaml")
     run = adapter.prepare(SimpleNamespace(root=dataset_root, id="chest"), config)
+    assert "model.eval=true" in run.official_command
+    assert "eval.eval_start=true" in run.official_command
     captured: dict[str, object] = {}
 
     def fake_trace_process(command, **kwargs):
@@ -329,7 +331,11 @@ def test_fact_capture_runs_official_entry_with_split_pipeline_hooks(
     assert command[command.index("--capture-iteration-range") + 1] == "1:1"
     assert "--stop-after-capture-range" in command
     assert "model.init_mode=precomputed" in command
-    assert "model.eval=true" in command
+    assert "model.eval=false" in command
+    assert "eval.eval_in_training=false" in command
+    assert "eval.eval_start=false" in command
+    assert "eval.eval_end=false" in command
+    assert "model.eval=true" not in command
     assert captured["cwd"] == source.resolve()
     assert callable(captured["preflight_fn"])
     assert artifact.trace.metadata["model_commit"] == model_descriptors()["fact_gs"].commit
