@@ -11,6 +11,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import importlib
+import mmap
 from pathlib import Path
 from types import ModuleType
 from typing import Any, Callable
@@ -34,7 +35,21 @@ class LazyProjection:
             )
         # This matches ``np.load(path) * scene_scale`` in the upstream reader
         # while keeping the allocation limited to the selected training view.
-        return np.ascontiguousarray(np.asarray(values, dtype=np.float32) * self.scale)
+        result = np.ascontiguousarray(
+            np.asarray(values, dtype=np.float32) * self.scale
+        )
+        # The result owns its storage.  Advise the kernel that the read-only
+        # mapping can be reclaimed before the next view is loaded; this keeps
+        # multi-iteration probes from accumulating projection page cache.
+        mapped = getattr(values, "_mmap", None)
+        advice = getattr(mmap, "MADV_DONTNEED", None)
+        if mapped is not None and advice is not None and hasattr(mapped, "madvise"):
+            try:
+                mapped.madvise(advice)
+            except (OSError, ValueError):
+                pass
+        del values
+        return result
 
 
 def _lazy_read_cameras(
@@ -104,6 +119,7 @@ def _build_lazy_camera(
     torch_module.nn.Module.__init__(camera)
     camera.uid = uid
     camera.colmap_id = colmap_id
+    camera.scanner_cfg = scanner_cfg
     camera.R = R
     camera.T = T
     camera.angle = angle

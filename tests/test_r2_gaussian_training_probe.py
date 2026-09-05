@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import Path
 
 import pytest
 
@@ -10,6 +11,7 @@ from gala_sim.tools.r2_gaussian_training_probe import (
     TrainingProbeError,
     _compiler_variant_environment,
     _gpu_summary,
+    _load_training,
     render_training_overlay,
 )
 
@@ -69,3 +71,18 @@ def test_compiler_variant_environment_sets_independent_mechanisms(
 
 def test_compiler_variants_all_use_gpu_base_comparison() -> None:
     assert set(COMPILER_VARIANT_FLAGS) == {"gpu_base", "1000", "0100", "1100"}
+
+
+def test_load_training_discovers_built_simple_knn_submodule(tmp_path: Path) -> None:
+    source_root = tmp_path / "r2"
+    package_root = source_root / "r2_gaussian/submodules/simple-knn/build/lib.linux"
+    package = package_root / "simple_knn"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("marker = 'submodule'\n", encoding="utf-8")
+    training = source_root / "train.py"
+    training.parent.mkdir(parents=True, exist_ok=True)
+    training.write_text("import simple_knn\nmarker = simple_knn.marker\n", encoding="utf-8")
+
+    module = _load_training(training, source_root, None)
+
+    assert module.marker == "submodule"

@@ -208,7 +208,7 @@ def run_probe(
         raise GRTrainingProbeError("GR-Gaussian probe controls are invalid")
     try:
         ensure_host_memory_reserve()
-        isolation = ensure_gpu_isolated()
+        isolation = ensure_gpu_isolated(owner_pid=os.getpid())
     except (GpuObservationError, RuntimeError) as error:
         raise GRTrainingProbeError(str(error)) from error
     arrays = _load_bundle(bundle)

@@ -8,6 +8,7 @@ import pytest
 from gala_sim.tools.exact_gs_compiler_overlay import (
     _QUERY_TARGETS,
     _SEMANTIC_TARGETS,
+    _SEMANTIC_ORDER_SENSITIVE_TARGETS,
     ExactCompilerOverlayError,
     build_overlay,
     prepare_overlay,
@@ -23,12 +24,15 @@ def _source() -> str:
     return (
         "#include <cooperative_groups/reduce.h>\n"
         "namespace cg = cooperative_groups;\n"
+        "template <uint32_t C>\n"
+        "__global__ void __launch_bounds__\n"
         "void kernel(\n"
         "    const  float   DSD\n"
         "\t) {\n"
         f"{atomics}\n"
         "}\n"
         "void launch() {\n"
+        "\trenderCUDA<NUM_CHANNELS> << <grid, block >> >(\n"
         "        DSO,  \n"
         "        DSD\n"
         "\t\t);\n"
@@ -39,11 +43,19 @@ def _source() -> str:
 def test_exact_overlay_adds_independent_query_and_semantic_controls() -> None:
     transformed, transforms = render_exact_backward_overlay(_source())
 
-    assert transformed.count("compiler_accumulate(semantic_aggregate") == 11
-    assert transformed.count("compiler_accumulate(query_aggregate") == 2
+    assert transformed.count("compiler_accumulate<SemanticAggregate>(") == 6
+    assert transformed.count("compiler_accumulate_query_pair<QueryAggregate>(") == 1
+    assert transformed.count("atomicAdd(&dL_dmeans[global_id]") == 3
+    assert transformed.count("atomicAdd(&(dL_dopacity[global_id])") == 1
+    assert transformed.count("atomicAdd(&(dL_dmu[global_id])") == 1
+    assert "renderCUDA<NUM_CHANNELS, true, false>" in transformed
     assert "GALA_QUERY_WARP_REDUCE" in transformed
     assert "GALA_SEMANTIC_WARP_REDUCE" in transformed
-    assert len(transforms) == 16
+    assert "__match_any_sync(active_mask, target_label)" in transformed
+    assert "if (__popc(target_mask) == 1)" in transformed
+    assert "__shfl_sync" in transformed
+    assert "cg::reduce(matching_target" not in transformed
+    assert len(transforms) == 13
 
 
 def test_exact_overlay_rejects_source_drift_without_hash_gate() -> None:

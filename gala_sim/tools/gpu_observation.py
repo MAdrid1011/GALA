@@ -108,6 +108,7 @@ def ensure_gpu_isolated(
     *,
     sample_count: int = 2,
     sample_interval_seconds: float = 1.0,
+    owner_pid: int | None = None,
     sample_fn: Callable[[], dict[str, Any]] = sample_gpu_snapshot,
     sleep_fn: Callable[[float], None] = time.sleep,
 ) -> dict[str, Any]:
@@ -121,7 +122,11 @@ def ensure_gpu_isolated(
         processes = sample.get("compute_processes")
         if not isinstance(processes, list):
             raise GpuObservationError("GPU observation has no compute-process inventory")
-        if processes:
+        external = (
+            external_compute_processes(sample, owner_pid=owner_pid)
+            if owner_pid is not None else processes
+        )
+        if external:
             raise GpuObservationError("gpu_busy_external")
         samples.append(sample)
         if index + 1 < sample_count:
@@ -129,6 +134,7 @@ def ensure_gpu_isolated(
     return {
         "status": "isolated",
         "sample_count": sample_count,
+        "owner_pid": owner_pid,
         "samples": samples,
     }
 

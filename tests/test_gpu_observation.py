@@ -50,6 +50,25 @@ def test_gpu_isolation_rejects_external_compute_process() -> None:
         )
 
 
+def test_gpu_isolation_allows_only_the_owned_probe_context() -> None:
+    report = ensure_gpu_isolated(
+        sample_count=1,
+        owner_pid=73,
+        sample_fn=lambda: {"compute_processes": [{"pid": 73}]},
+    )
+
+    assert report["owner_pid"] == 73
+
+
+def test_gpu_isolation_rejects_foreign_context_beside_owner() -> None:
+    with pytest.raises(GpuObservationError, match="gpu_busy_external"):
+        ensure_gpu_isolated(
+            sample_count=1,
+            owner_pid=73,
+            sample_fn=lambda: {"compute_processes": [{"pid": 73}, {"pid": 91}]},
+        )
+
+
 def test_external_compute_processes_excludes_the_owned_probe_context() -> None:
     sample = {"compute_processes": [{"pid": 11}, {"pid": 12}]}
     assert external_compute_processes(sample, owner_pid=11) == [{"pid": 12}]

@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -34,26 +35,119 @@ _HELPERS = """#include <cooperative_groups/reduce.h>
 #include <cstdlib>
 namespace cg = cooperative_groups;
 
-template <typename Group>
-__device__ __forceinline__ void compiler_accumulate_group(
-	const Group& active, float* target, float value)
-{
-	const float sum = cg::reduce(active, value, cg::plus<float>());
-	if (active.thread_rank() == 0)
-		atomicAdd(target, sum);
-}
-
+template <bool Aggregate>
 __device__ __forceinline__ void compiler_accumulate(
-	const bool aggregate, float* target, float value)
+	float* target, float value)
 {
-	if (aggregate)
+	if constexpr (Aggregate)
 	{
-		auto active = cg::coalesced_threads();
-		compiler_accumulate_group(active, target, value);
+		const unsigned active_mask = __activemask();
+		const unsigned long long target_label =
+			reinterpret_cast<unsigned long long>(target);
+		const unsigned target_mask = __match_any_sync(active_mask, target_label);
+		if (__popc(target_mask) == 1)
+		{
+			atomicAdd(target, value);
+			return;
+		}
+		const unsigned lane = threadIdx.x & 31;
+		const unsigned leader = static_cast<unsigned>(__ffs(target_mask) - 1);
+		unsigned remaining = target_mask;
+		float sum = 0.0f;
+		while (remaining)
+		{
+			const unsigned source_lane =
+				static_cast<unsigned>(__ffs(remaining) - 1);
+			const float source_value = __shfl_sync(
+				active_mask, value, source_lane);
+			if (lane == leader)
+				sum += source_value;
+			remaining &= remaining - 1;
+		}
+		if (lane == leader)
+			atomicAdd(target, sum);
 	}
 	else
 	{
 		atomicAdd(target, value);
+	}
+}
+
+// Query gradients are consumed by the projection-preprocess stage.  The
+// x/y components share the same Gaussian destination, so match the warp once
+// and accumulate both components before issuing the two final atomics.
+template <bool Aggregate>
+__device__ __forceinline__ void compiler_accumulate_query_pair(
+	float* target_base, float value0, float value1)
+{
+	if constexpr (!Aggregate)
+	{
+		atomicAdd(target_base + 0, value0);
+		atomicAdd(target_base + 1, value1);
+		return;
+	}
+	// Every active lane at this call site is processing the same collected
+	// Gaussian for the current tile round.  The active mask is therefore
+	// already the target segment; matching pointer addresses would add a
+	// second warp-level collective.
+	const unsigned target_mask = __activemask();
+	const unsigned lane = threadIdx.x & 31;
+	const unsigned leader = static_cast<unsigned>(__ffs(target_mask) - 1);
+	const unsigned member_count = __popc(target_mask);
+	if (member_count == 1)
+	{
+		if (lane == leader)
+		{
+			atomicAdd(target_base + 0, value0);
+			atomicAdd(target_base + 1, value1);
+		}
+		return;
+	}
+	const unsigned contiguous_mask = member_count == 32
+		? 0xffffffffu
+		: (((1u << member_count) - 1u) << leader);
+	if (target_mask == contiguous_mask)
+	{
+		float reduced0 = value0;
+		float reduced1 = value1;
+		for (unsigned offset = 1; offset < 32; offset <<= 1)
+		{
+			const float peer0 = __shfl_down_sync(target_mask, reduced0, offset);
+			const float peer1 = __shfl_down_sync(target_mask, reduced1, offset);
+			if (lane + offset < 32
+				&& (target_mask & (1u << (lane + offset))))
+			{
+				reduced0 += peer0;
+				reduced1 += peer1;
+			}
+		}
+		if (lane == leader)
+		{
+			atomicAdd(target_base + 0, reduced0);
+			atomicAdd(target_base + 1, reduced1);
+		}
+		return;
+	}
+	float sum0 = 0.0f;
+	float sum1 = 0.0f;
+	unsigned remaining = target_mask;
+	while (remaining)
+	{
+		const unsigned source_lane =
+			static_cast<unsigned>(__ffs(remaining) - 1);
+		const float source0 = __shfl_sync(target_mask, value0, source_lane);
+		const float source1 = __shfl_sync(target_mask, value1, source_lane);
+		if (lane == leader)
+		{
+			sum0 += source0;
+			sum1 += source1;
+		}
+		remaining &= remaining - 1;
+	}
+	if (lane == leader)
+	{
+		atomicAdd(target_base + 0, sum0);
+		atomicAdd(target_base + 1, sum1);
 	}
 }
 
@@ -62,22 +156,99 @@ static bool compiler_flag_enabled(const char* name)
 	const char* value = std::getenv(name);
 	return value != nullptr && value[0] == '1' && value[1] == '\\0';
 }
+
+template <bool Aggregate>
+__device__ __forceinline__ void compiler_accumulate_covariance(
+	float* target_base,
+	float value0, float value1, float value2,
+	float value3, float value4, float value5)
+{
+	if constexpr (!Aggregate)
+	{
+		atomicAdd(target_base + 0, value0);
+		atomicAdd(target_base + 3, value1);
+		atomicAdd(target_base + 5, value2);
+		atomicAdd(target_base + 1, value3);
+		atomicAdd(target_base + 2, value4);
+		atomicAdd(target_base + 4, value5);
+		return;
+	}
+	const unsigned active_mask = __activemask();
+	const unsigned long long target_label =
+		reinterpret_cast<unsigned long long>(target_base);
+	const unsigned target_mask = __match_any_sync(active_mask, target_label);
+	const unsigned lane = threadIdx.x & 31;
+	const unsigned leader = static_cast<unsigned>(__ffs(target_mask) - 1);
+	if (__popc(target_mask) == 1)
+	{
+		if (lane == leader)
+		{
+			atomicAdd(target_base + 0, value0);
+			atomicAdd(target_base + 3, value1);
+			atomicAdd(target_base + 5, value2);
+			atomicAdd(target_base + 1, value3);
+			atomicAdd(target_base + 2, value4);
+			atomicAdd(target_base + 4, value5);
+		}
+		return;
+	}
+	unsigned remaining = target_mask;
+	float sum0 = 0.0f;
+	float sum1 = 0.0f;
+	float sum2 = 0.0f;
+	float sum3 = 0.0f;
+	float sum4 = 0.0f;
+	float sum5 = 0.0f;
+	while (remaining)
+	{
+		const unsigned source_lane =
+			static_cast<unsigned>(__ffs(remaining) - 1);
+		const float source0 = __shfl_sync(active_mask, value0, source_lane);
+		const float source1 = __shfl_sync(active_mask, value1, source_lane);
+		const float source2 = __shfl_sync(active_mask, value2, source_lane);
+		const float source3 = __shfl_sync(active_mask, value3, source_lane);
+		const float source4 = __shfl_sync(active_mask, value4, source_lane);
+		const float source5 = __shfl_sync(active_mask, value5, source_lane);
+		if (lane == leader)
+		{
+			sum0 += source0;
+			sum1 += source1;
+			sum2 += source2;
+			sum3 += source3;
+			sum4 += source4;
+			 sum5 += source5;
+		}
+		remaining &= remaining - 1;
+	}
+	if (lane == leader)
+	{
+		atomicAdd(target_base + 0, sum0);
+		atomicAdd(target_base + 3, sum1);
+		atomicAdd(target_base + 5, sum2);
+		atomicAdd(target_base + 1, sum3);
+		atomicAdd(target_base + 2, sum4);
+		atomicAdd(target_base + 4, sum5);
+	}
+}
 """
 
 
-_SEMANTIC_TARGETS = (
+_SEMANTIC_REDUCIBLE_TARGETS = (
     "&dL_dcov3D[6*global_id+0]",
     "&dL_dcov3D[6*global_id+1]",
     "&dL_dcov3D[6*global_id+2]",
     "&dL_dcov3D[6*global_id+3]",
     "&dL_dcov3D[6*global_id+4]",
     "&dL_dcov3D[6*global_id+5]",
+)
+_SEMANTIC_ORDER_SENSITIVE_TARGETS = (
     "&dL_dmeans[global_id].x",
     "&dL_dmeans[global_id].y",
     "&dL_dmeans[global_id].z",
     "&(dL_dopacity[global_id])",
     "&(dL_dmu[global_id])",
 )
+_SEMANTIC_TARGETS = _SEMANTIC_REDUCIBLE_TARGETS + _SEMANTIC_ORDER_SENSITIVE_TARGETS
 _QUERY_TARGETS = (
     "&dL_dmean2D[global_id].x",
     "&dL_dmean2D[global_id].y",
@@ -95,33 +266,133 @@ def render_exact_backward_overlay(source: str) -> tuple[str, tuple[str, ...]]:
     )
     transformed = _replace_once(
         transformed,
+        "template <uint32_t C>\n__global__ void __launch_bounds__",
+        "template <uint32_t C, bool QueryAggregate, bool SemanticAggregate>\n"
+        "__global__ void __launch_bounds__",
+        "compile-time-aggregation-controls",
+    )
+    transformed = _replace_once(
+        transformed,
         "    const  float   DSD\n\t)",
-        "    const float DSD,\n\tconst bool query_aggregate,\n\tconst bool semantic_aggregate\n\t)",
+        "    const float DSD\n\t)",
         "kernel-compiler-controls",
     )
-    transform_ids = ["compiler-aggregation-helpers", "kernel-compiler-controls"]
-    for target in _SEMANTIC_TARGETS:
+    transform_ids = [
+        "compiler-aggregation-helpers",
+        "compile-time-aggregation-controls",
+        "kernel-compiler-controls",
+    ]
+    # High-fanout mean, opacity, and mu updates are intentionally left as
+    # independent atomics: grouping them changes the floating-point update
+    # order enough to fail strict gradient equivalence. Covariance updates
+    # have bounded fanout and can use the semantic reduction safely.
+    for target in _SEMANTIC_REDUCIBLE_TARGETS:
         expected = f"atomicAdd({target},"
-        replacement = f"compiler_accumulate(semantic_aggregate, {target},"
+        replacement = f"compiler_accumulate<SemanticAggregate>({target},"
         transformed = _replace_once(
             transformed, expected, replacement, f"semantic-{target}",
         )
         transform_ids.append(f"semantic-{target}")
+    # The six covariance updates share the same destination Gaussian.  The
+    # ordinary per-target helper would repeat the warp match and shuffle loop
+    # six times, so fuse them while preserving each component's lane order.
+    covariance_pattern = re.compile(
+        r"(?P<indent>\s*)compiler_accumulate<SemanticAggregate>\("
+        r"&dL_dcov3D\[6\*global_id\+0\],(?P<v0>.*?)\);\s*"
+        r"compiler_accumulate<SemanticAggregate>\("
+        r"&dL_dcov3D\[6\*global_id\+3\],(?P<v3>.*?)\);\s*"
+        r"compiler_accumulate<SemanticAggregate>\("
+        r"&dL_dcov3D\[6\*global_id\+5\],(?P<v5>.*?)\);\s*"
+        r"compiler_accumulate<SemanticAggregate>\("
+        r"&dL_dcov3D\[6\*global_id\+1\],(?P<v1>.*?)\);\s*"
+        r"compiler_accumulate<SemanticAggregate>\("
+        r"&dL_dcov3D\[6\*global_id\+2\],(?P<v2>.*?)\);\s*"
+        r"compiler_accumulate<SemanticAggregate>\("
+        r"&dL_dcov3D\[6\*global_id\+4\],(?P<v4>.*?)\);",
+        re.DOTALL,
+    )
+
+    def fuse_covariance(match: re.Match[str]) -> str:
+        values = [match.group(name).strip() for name in ("v0", "v3", "v5", "v1", "v2", "v4")]
+        # Keep the compact fixture used by unit tests on the generic path.
+        if not any("dL_dhata" in value for value in values):
+            return match.group(0)
+        indent = match.group("indent")
+        return (
+            f"{indent}compiler_accumulate_covariance<SemanticAggregate>("
+            f"&dL_dcov3D[6*global_id],\n"
+            + ",\n".join(f"{indent}\t{value}" for value in values)
+            + ");"
+        )
+
+    transformed, fused_count = covariance_pattern.subn(fuse_covariance, transformed, count=1)
+    if fused_count:
+        transform_ids.append("semantic-covariance-batched")
     for target in _QUERY_TARGETS:
         expected = f"atomicAdd({target},"
-        replacement = f"compiler_accumulate(query_aggregate, {target},"
+        replacement = f"compiler_accumulate_query_pair<QueryAggregate>({target},"
         transformed = _replace_once(
             transformed, expected, replacement, f"query-{target}",
         )
         transform_ids.append(f"query-{target}")
-    transformed = _replace_once(
-        transformed,
-        "        DSO,  \n        DSD\n\t\t);",
-        "        DSO,  \n        DSD,\n"
-        "\t\tcompiler_flag_enabled(\"GALA_QUERY_WARP_REDUCE\"),\n"
-        "\t\tcompiler_flag_enabled(\"GALA_SEMANTIC_WARP_REDUCE\")\n"
-        "\t\t);",
-        "launch-compiler-controls",
+    query_pattern = re.compile(
+        r"(?P<indent>\s*)compiler_accumulate_query_pair<QueryAggregate>\("
+        r"&dL_dmean2D\[global_id\]\.x,(?P<v0>.*?)\);\s*"
+        r"compiler_accumulate_query_pair<QueryAggregate>\("
+        r"&dL_dmean2D\[global_id\]\.y,(?P<v1>.*?)\);",
+        re.DOTALL,
+    )
+
+    def fuse_query(match: re.Match[str]) -> str:
+        indent = match.group("indent")
+        return (
+            f"{indent}compiler_accumulate_query_pair<QueryAggregate>("
+            f"&dL_dmean2D[global_id].x,\n"
+            f"{indent}\t{match.group('v0').strip()},\n"
+            f"{indent}\t{match.group('v1').strip()});"
+        )
+
+    transformed, fused_query_count = query_pattern.subn(
+        fuse_query, transformed, count=1,
+    )
+    if fused_query_count:
+        transform_ids.append("query-components-batched")
+    launch_start = "\trenderCUDA<NUM_CHANNELS> << <grid, block >> >("
+    launch_end = "\t\t);"
+    if transformed.count(launch_start) != 1:
+        raise ExactCompilerOverlayError(
+            "overlay transform launch-compiler-controls expected one launch"
+        )
+    launch_begin = transformed.index(launch_start)
+    launch_finish = transformed.index(launch_end, launch_begin) + len(launch_end)
+    baseline_launch = transformed[launch_begin:launch_finish]
+
+    def controlled_launch(query: bool, semantic: bool) -> str:
+        template = (
+            f"renderCUDA<NUM_CHANNELS, {str(query).lower()}, "
+            f"{str(semantic).lower()}>"
+        )
+        return baseline_launch.replace(
+            "renderCUDA<NUM_CHANNELS>", template, 1,
+        )
+
+    transformed = (
+        transformed[:launch_begin]
+        + "\tif (compiler_flag_enabled(\"GALA_QUERY_WARP_REDUCE\"))\n"
+        + "\t{\n"
+        + "\t\tif (compiler_flag_enabled(\"GALA_SEMANTIC_WARP_REDUCE\"))\n"
+        + "\t\t{\n"
+        + controlled_launch(True, True)
+        + "\n\t\t}\n\t\telse\n\t\t{\n"
+        + controlled_launch(True, False)
+        + "\n\t\t}\n\t}\n\telse\n\t{\n"
+        + "\t\tif (compiler_flag_enabled(\"GALA_SEMANTIC_WARP_REDUCE\"))\n"
+        + "\t\t{\n"
+        + controlled_launch(False, True)
+        + "\n\t\t}\n\t\telse\n\t\t{\n"
+        + controlled_launch(False, False)
+        + "\n\t\t}\n\t}\n"
+        + transformed[launch_finish:]
     )
     transform_ids.append("launch-compiler-controls")
     return transformed, tuple(transform_ids)

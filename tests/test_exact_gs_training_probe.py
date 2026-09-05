@@ -12,6 +12,7 @@ from gala_sim.tools.exact_gs_training_probe import (
     ExactTrainingProbeError,
     OVERLAY_TRANSFORMS,
     ProbeObservation,
+    _extension_import_roots,
     render_training_overlay,
     run_matrix,
     summarize_matrix,
@@ -49,6 +50,41 @@ def test_exact_training_overlay_removes_observer_synchronization() -> None:
     assert "torch.cuda.synchronize()" not in transformed
     assert ".item()" not in transformed
     assert [item["id"] for item in manifest] == [item[0] for item in OVERLAY_TRANSFORMS]
+
+
+def test_exact_training_overlay_ignores_comment_only_scalar_reads() -> None:
+    source = _training_source() + "# loss['total'].item()\n"
+
+    transformed, _ = render_training_overlay(source)
+
+    assert "# loss['total'].item()" in transformed
+
+
+def test_exact_training_overlay_rejects_executable_scalar_reads() -> None:
+    source = _training_source() + "loss['total'].item()\n"
+
+    with pytest.raises(ExactTrainingProbeError, match="host synchronization"):
+        render_training_overlay(source)
+
+
+def test_exact_extension_import_roots_prefer_built_package(tmp_path: Path) -> None:
+    source_package = tmp_path / "exact_gaussian_rasterization"
+    source_package.mkdir()
+    built_package = (
+        tmp_path / "build/lib.linux-x86_64-cpython-310"
+        / "exact_gaussian_rasterization"
+    )
+    built_package.mkdir(parents=True)
+    (built_package / "_C.cpython-310-x86_64-linux-gnu.so").touch()
+
+    assert _extension_import_roots(tmp_path) == (
+        tmp_path / "build/lib.linux-x86_64-cpython-310",
+    )
+
+
+def test_exact_extension_import_roots_reject_missing_binary(tmp_path: Path) -> None:
+    with pytest.raises(ExactTrainingProbeError, match="compiled CUDA extension"):
+        _extension_import_roots(tmp_path)
 
 
 def test_exact_training_overlay_rejects_source_drift() -> None:

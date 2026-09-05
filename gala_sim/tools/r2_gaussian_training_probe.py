@@ -162,7 +162,15 @@ def _working_directory(path: Path) -> Iterator[None]:
 def _load_training(
     path: Path, source_root: Path, extension_root: Path | None,
 ) -> ModuleType:
-    search_paths = [str(source_root)]
+    # The official checkout keeps simple-knn as a separately built editable
+    # submodule.  Discover its build/lib directory beside the source so a
+    # clean invocation does not depend on the caller's site-packages state.
+    search_roots = [source_root]
+    simple_knn_root = source_root / "r2_gaussian/submodules/simple-knn"
+    if simple_knn_root.is_dir():
+        search_roots.extend(sorted(simple_knn_root.glob("build/lib.*")))
+        search_roots.append(simple_knn_root)
+    search_paths = [str(root) for root in search_roots]
     if extension_root is not None:
         search_paths.insert(0, str(extension_root))
     sys.path[:0] = search_paths
@@ -257,7 +265,7 @@ def run_probe(
     except RuntimeError as error:
         raise TrainingProbeError(str(error)) from error
     try:
-        gpu_isolation = ensure_gpu_isolated()
+        gpu_isolation = ensure_gpu_isolated(owner_pid=os.getpid())
     except GpuObservationError as error:
         raise TrainingProbeError(str(error)) from error
     artifact_root.mkdir(parents=True, exist_ok=False)

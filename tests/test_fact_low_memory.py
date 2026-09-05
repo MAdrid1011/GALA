@@ -6,6 +6,7 @@ import numpy as np
 
 from gala_sim.adapters.fact_low_memory import (
     LazyProjection,
+    _build_lazy_camera,
     _lazy_read_cameras,
     install_exact_low_memory_overlay,
     install_r2_low_memory_overlay,
@@ -71,6 +72,71 @@ def test_lazy_camera_reader_retains_projection_records_and_geometry(tmp_path) ->
     assert record.width == 3
     assert record.height == 2
     assert record.mode == 1
+
+
+def test_lazy_camera_retains_scanner_geometry_for_exact_renderer(tmp_path) -> None:
+    path = tmp_path / "view.npy"
+    np.save(path, np.ones((2, 3), dtype=np.float32))
+
+    class Tensor:
+        def transpose(self, *_args):
+            return self
+
+        def cuda(self):
+            return self
+
+        def unsqueeze(self, *_args):
+            return self
+
+        def bmm(self, _other):
+            return self
+
+        def squeeze(self, *_args):
+            return self
+
+        def inverse(self):
+            return self
+
+        def __getitem__(self, _index):
+            return self
+
+    class Module:
+        def __init__(self):
+            pass
+
+    class Torch:
+        @staticmethod
+        def device(value):
+            return value
+
+        @staticmethod
+        def tensor(_value):
+            return Tensor()
+
+    Torch.nn = type("NN", (), {"Module": Module})
+    Torch.cuda = type("Cuda", (), {"is_available": staticmethod(lambda: False)})
+
+    class Camera(Module):
+        pass
+
+    class Graphics:
+        @staticmethod
+        def getWorld2View2(*_args):
+            return np.eye(4)
+
+        @staticmethod
+        def getProjectionMatrix(**_kwargs):
+            return Tensor()
+
+    scanner = {"DSO": 10.0, "DSD": 20.0, "dDetector": [1.0, 1.0]}
+    camera = _build_lazy_camera(
+        Camera, Graphics, Torch,
+        colmap_id=1, scanner_cfg=scanner, R=np.eye(3), T=np.zeros(3),
+        angle=0.0, mode=1, FoVx=0.2, FoVy=0.3,
+        projection=LazyProjection(path, 1.0, (2, 3)), image_name="view", uid=2,
+    )
+
+    assert camera.scanner_cfg is scanner
 
 
 def test_exact_low_memory_overlay_uses_exact_module_boundaries(monkeypatch) -> None:

@@ -9,12 +9,14 @@ from datetime import datetime, timezone
 import gc
 import hashlib
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
 import statistics
 import sys
 import time
+import tokenize
 from types import ModuleType
 from typing import Any, Iterator, Mapping, Sequence
 
@@ -241,7 +243,15 @@ def render_training_overlay(source: str) -> tuple[str, list[dict[str, str]]]:
                 expected.encode("utf-8")
             ).hexdigest(),
         })
-    if "torch.cuda.synchronize()" in transformed or ".item()" in transformed:
+    tokens = tuple(tokenize.generate_tokens(io.StringIO(transformed).readline))
+    executable_host_sync = any(
+        previous.type == tokenize.OP
+        and previous.string == "."
+        and token.type == tokenize.NAME
+        and token.string in {"item", "synchronize"}
+        for previous, token in zip(tokens, tokens[1:])
+    )
+    if executable_host_sync:
         raise ExactTrainingProbeError(
             "Exact-GS overlay retains a per-iteration host synchronization"
         )
@@ -259,7 +269,11 @@ def _working_directory(path: Path) -> Iterator[None]:
 
 
 def _load_training(path: Path, source_root: Path, extension_root: Path) -> ModuleType:
-    search_paths = [str(extension_root), str(source_root)]
+    search_paths = [
+        *(str(root) for root in _extension_import_roots(extension_root)),
+        str(extension_root),
+        str(source_root),
+    ]
     sys.path[:0] = search_paths
     try:
         spec = importlib.util.spec_from_file_location("gala_exact_training_probe", path)
@@ -271,6 +285,25 @@ def _load_training(path: Path, source_root: Path, extension_root: Path) -> Modul
     finally:
         for search_path in search_paths:
             sys.path.remove(search_path)
+
+
+def _extension_import_roots(extension_root: Path) -> tuple[Path, ...]:
+    """Locate package roots that contain Exact-GS's compiled CUDA extension."""
+
+    package = "exact_gaussian_rasterization"
+    roots = [
+        extension_root,
+        *sorted(extension_root.glob("build/lib.*")),
+    ]
+    available = tuple(
+        root for root in roots
+        if any((root / package).glob("_C*.so"))
+    )
+    if not available:
+        raise ExactTrainingProbeError(
+            "Exact-GS compiled CUDA extension is unavailable"
+        )
+    return available
 
 
 def _validate_inputs(
@@ -287,6 +320,7 @@ def _validate_inputs(
         raise ExactTrainingProbeError("Exact-GS train.py is unavailable")
     if not (extension_root / "exact_gaussian_rasterization").is_dir():
         raise ExactTrainingProbeError("Exact-GS compiler overlay is unavailable")
+    _extension_import_roots(extension_root)
     if not dataset_root.is_dir() or not initial_state.is_file():
         raise ExactTrainingProbeError("Exact-GS dataset or initialization is unavailable")
     if artifact_root.exists():
@@ -321,7 +355,7 @@ def run_probe(
         raise ExactTrainingProbeError(f"unsupported compiler variant: {compiler_variant}")
     try:
         ensure_host_memory_reserve()
-        gpu_isolation = ensure_gpu_isolated()
+        gpu_isolation = ensure_gpu_isolated(owner_pid=os.getpid())
     except (GpuObservationError, RuntimeError) as error:
         raise ExactTrainingProbeError(str(error)) from error
     artifact_root.mkdir(parents=True)
@@ -493,7 +527,16 @@ def run_probe(
                 finally:
                     profiler.restore()
             low_memory_overlay.restore()
+            # Release allocator-held device blocks before the next serial
+            # variant; otherwise a matrix can exhaust resources even though
+            # each individual probe has already completed its transaction.
+            torch.cuda.empty_cache()
         wall_seconds = time.monotonic() - wall_started
+
+    # The generated entry module is process-local and must not pin the prior
+    # training graph or its imported objects across matrix variants.
+    sys.modules.pop("gala_exact_training_probe", None)
+    gc.collect()
 
     if completed_iterations != requested_iterations or cuda_elapsed_ms is None:
         raise ExactTrainingProbeError("Exact-GS official prefix did not complete")

@@ -556,7 +556,7 @@ def run_probe(
         raise FactTrainingProbeError(f"unsupported compiler variant: {compiler_variant}")
     try:
         ensure_host_memory_reserve()
-        gpu_isolation = ensure_gpu_isolated()
+        gpu_isolation = ensure_gpu_isolated(owner_pid=os.getpid())
     except (GpuObservationError, RuntimeError) as error:
         raise FactTrainingProbeError(str(error)) from error
     artifact_root.mkdir(parents=True)
