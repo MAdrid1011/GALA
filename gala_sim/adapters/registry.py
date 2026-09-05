@@ -20,6 +20,7 @@ from gala_sim.workspace import WorkspacePaths
 
 from .gr_gaussian import GRGaussianAdapter
 from .protocol import PreparedRun, ReferenceArtifact, TraceArtifact
+from .r2_gaussian import R2GaussianAdapter
 from .trace_capture import TRACE_HOOK_PROFILES
 from .trace_process import TraceProcessError, run_trace_process
 
@@ -134,8 +135,19 @@ class CommandModelAdapter:
     def run_reference(self, run: PreparedRun) -> ReferenceArtifact:
         execution_output = self._prepare_output(run.dataset_root)
         started = time.monotonic()
+        repository_root = Path(__file__).resolve().parents[2]
+        train_script = run.source_root / run.official_command[1]
+        command = (
+            run.official_command[0], "-m", "gala_sim.adapters.reference_runner",
+            "--model-id", self.descriptor.id, str(train_script),
+            *run.official_command[2:],
+        )
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = os.pathsep.join(
+            item for item in (str(repository_root), environment.get("PYTHONPATH")) if item
+        )
         completed = subprocess.run(
-            run.official_command, cwd=run.source_root, check=False,
+            command, cwd=run.source_root, env=environment, check=False,
             text=True, capture_output=True,
         )
         if completed.returncode:
@@ -148,6 +160,7 @@ class CommandModelAdapter:
             execution_output, volume, {}, {
                 "wall_seconds": time.monotonic() - started,
                 "command": list(run.official_command),
+                "execution_command": list(command),
             },
         )
 
@@ -368,6 +381,15 @@ def get_model_adapter(
     selected_python = python_executable or (
         workspace_python if workspace_python.is_file() else Path(sys.executable)
     )
+    if model_id == "r2_gaussian":
+        return R2GaussianAdapter(
+            paths.upstream / model_id,
+            paths.datasets / "chest",
+            output,
+            descriptor.commit or "",
+            selected_python,
+            descriptor,
+        )
     return CommandModelAdapter(
         descriptor, paths.upstream / model_id, output,
         selected_python, capture_iteration_range,

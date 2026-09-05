@@ -38,6 +38,7 @@ from gala_sim.gpu_measurement import (
 from gala_sim.gpu_coverage import analyze_gpu_compiler_coverage
 from gala_sim.tools.gpu_observation import GpuObservationError, ensure_gpu_isolated
 from gala_sim.tools.gpu_probe_watchdog import (
+    DEFAULT_MINIMUM_AVAILABLE_HOST_MEMORY_BYTES,
     GpuWatchdog,
     ensure_host_memory_reserve,
     gpu_summary as _gpu_summary,
@@ -545,6 +546,7 @@ def run_probe(
     compiler_variant: str,
     dataset_id: str,
     profile_stages: bool = False,
+    minimum_available_host_memory_bytes: int = DEFAULT_MINIMUM_AVAILABLE_HOST_MEMORY_BYTES,
 ) -> ProbeObservation:
     """Run a bounded official FaCT-GS prefix from the common initial state."""
 
@@ -555,7 +557,7 @@ def run_probe(
     if compiler_variant not in BACKWARD_PATHS:
         raise FactTrainingProbeError(f"unsupported compiler variant: {compiler_variant}")
     try:
-        ensure_host_memory_reserve()
+        ensure_host_memory_reserve(minimum_available_host_memory_bytes)
         gpu_isolation = ensure_gpu_isolated(owner_pid=os.getpid())
     except (GpuObservationError, RuntimeError) as error:
         raise FactTrainingProbeError(str(error)) from error
@@ -586,7 +588,11 @@ def run_probe(
         original_training_setup = training.GaussianModel.training_setup
         measurement_start = torch.cuda.Event(enable_timing=True)
         measurement_end = torch.cuda.Event(enable_timing=True)
-        watchdog = GpuWatchdog(inactivity_timeout_seconds, owner_pid=os.getpid())
+        watchdog = GpuWatchdog(
+            inactivity_timeout_seconds,
+            owner_pid=os.getpid(),
+            minimum_available_host_memory_bytes=minimum_available_host_memory_bytes,
+        )
         profiler = _FactStageProfiler(torch) if profile_stages else None
 
         def setup_with_gradient_capture(gaussians: Any, optimization: Any) -> None:
@@ -821,6 +827,7 @@ def run_matrix(
     progress_interval: int, inactivity_timeout_seconds: float,
     relative_tolerance: float, absolute_tolerance: float,
     profile_stages: bool = False,
+    minimum_available_host_memory_bytes: int = DEFAULT_MINIMUM_AVAILABLE_HOST_MEMORY_BYTES,
 ) -> dict[str, Any]:
     """Run the four official paths serially and write an auditable matrix."""
 
@@ -847,6 +854,7 @@ def run_matrix(
                     compiler_variant=variant,
                     dataset_id=dataset_id,
                     profile_stages=False,
+                    minimum_available_host_memory_bytes=minimum_available_host_memory_bytes,
                 )
                 observations[variant].append(observation)
                 sample_output = output / "samples" / variant / f"repeat_{repeat + 1}.json"
@@ -874,6 +882,7 @@ def run_matrix(
                 compiler_variant="gpu_base",
                 dataset_id=dataset_id,
                 profile_stages=True,
+                minimum_available_host_memory_bytes=minimum_available_host_memory_bytes,
             )
             diagnostic_path = output / "gpu-base-stage-profile.json"
             diagnostic_path.write_text(
@@ -951,6 +960,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--relative-tolerance", type=float, default=1.0e-4)
     parser.add_argument("--absolute-tolerance", type=float, default=1.0e-3)
     parser.add_argument("--profile-stages", action="store_true")
+    parser.add_argument(
+        "--minimum-host-memory-mib", type=int,
+        default=DEFAULT_MINIMUM_AVAILABLE_HOST_MEMORY_BYTES // (1024 * 1024),
+        help="host memory reserve in MiB",
+    )
     args = parser.parse_args(argv)
     try:
         result = run_matrix(
@@ -966,6 +980,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             relative_tolerance=args.relative_tolerance,
             absolute_tolerance=args.absolute_tolerance,
             profile_stages=args.profile_stages,
+            minimum_available_host_memory_bytes=args.minimum_host_memory_mib * 1024 * 1024,
         )
     except FactTrainingProbeError as error:
         parser.error(str(error))

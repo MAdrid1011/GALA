@@ -1,7 +1,7 @@
 """Model adapter contracts; concrete adapters must preserve official math."""
 
 from .protocol import ModelAdapter, PreparedRun, ReferenceArtifact, TraceArtifact
-from .r2_gaussian import R2GaussianChestAdapter, TraceCaptureUnavailable
+from .r2_gaussian import R2GaussianAdapter, R2GaussianChestAdapter, TraceCaptureUnavailable
 from .native_reference import NativeReferenceError, run_native_reference
 from .chest import ChestDatasetManifest, ProjectionRecord, load_chest_manifest
 from .datasets import (
@@ -15,7 +15,7 @@ from .registry import (
 )
 
 __all__ = ["ModelAdapter", "PreparedRun", "ReferenceArtifact", "TraceArtifact",
-           "R2GaussianChestAdapter", "TraceCaptureUnavailable", "NativeReferenceError",
+           "R2GaussianAdapter", "R2GaussianChestAdapter", "TraceCaptureUnavailable", "NativeReferenceError",
            "run_native_reference", "ChestDatasetManifest", "ProjectionRecord",
            "load_chest_manifest", "DatasetAdapter", "DatasetDescriptor",
            "DatasetManifest", "DatasetProjection", "ScannerGeometry",

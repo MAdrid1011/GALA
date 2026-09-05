@@ -7,7 +7,7 @@ import json
 
 import numpy as np
 
-from gala_sim.adapters import get_model_adapter, model_descriptors, prepare_campaign
+from gala_sim.adapters import R2GaussianAdapter, get_model_adapter, model_descriptors, prepare_campaign
 from gala_sim.adapters.trace_capture import get_trace_hook_profile
 from gala_sim.clamp import PrimitiveKind, TraceBuilder, TraceEvent
 from gala_sim.config import load_config
@@ -26,6 +26,20 @@ def test_model_registry_exposes_four_distinct_implementations(tmp_path: Path) ->
     for model_id in descriptors:
         adapter = get_model_adapter(model_id, workspace=workspace)
         assert adapter.descriptor.id == model_id
+
+
+def test_r2_adapter_reuses_official_entry_for_non_chest_dataset(tmp_path: Path) -> None:
+    workspace = WorkspacePaths.discover(repository=ROOT, workspace=tmp_path / "workspace")
+    (workspace.upstream / "r2_gaussian").mkdir(parents=True)
+    adapter = get_model_adapter("r2_gaussian", workspace=workspace)
+    assert isinstance(adapter, R2GaussianAdapter)
+    dataset = tmp_path / "walnut"
+    dataset.mkdir()
+    run = adapter.prepare(SimpleNamespace(root=dataset, id="walnut"), load_config(
+        ROOT / "configs/architecture/gala.yaml"
+    ))
+    assert run.dataset_name == "walnut"
+    assert str(dataset.resolve()) in run.official_command
 
 
 def test_official_adapter_builds_command_without_repository_cwd(tmp_path: Path) -> None:

@@ -6,6 +6,7 @@ from dataclasses import dataclass
 import os
 from pathlib import Path
 import subprocess
+import sys
 import time
 from typing import Any
 
@@ -61,27 +62,30 @@ def _bind_trace_identity(
 
 
 @dataclass(frozen=True)
-class R2GaussianChestAdapter:
+class _R2GaussianAdapterBase:
     source_root: Path
     dataset_root: Path
     output_root: Path
     model_commit: str
     python_executable: Path | None = None
+    descriptor: Any | None = None
 
     def prepare(self, dataset: Any, config: GalaConfig) -> PreparedRun:
-        if not self.source_root.is_dir() or not self.dataset_root.is_dir():
-            raise FileNotFoundError("R²-Gaussian source or Chest root is unavailable")
+        dataset_root = Path(getattr(dataset, "root", self.dataset_root)).resolve()
+        dataset_name = str(getattr(dataset, "id", "chest"))
+        if not self.source_root.is_dir() or not dataset_root.is_dir():
+            raise FileNotFoundError(f"R²-Gaussian dataset root is unavailable: {dataset_root}")
         return PreparedRun(
             model_name="R2-Gaussian",
-            dataset_name="Chest",
+            dataset_name=dataset_name,
             source_root=self.source_root.resolve(),
-            dataset_root=self.dataset_root.resolve(),
+            dataset_root=dataset_root,
             config_sha256=config.sha256,
             quality_config=QualityConfig.from_gala(config),
             seed=0,
             official_command=(
                 str(self.python_executable.resolve()) if self.python_executable is not None else "python",
-                "train.py", "-s", str(self.dataset_root), "-m", str(self.output_root),
+                "train.py", "-s", str(dataset_root), "-m", str(self.output_root),
             ),
             output_root=self.output_root.resolve(),
         )
@@ -89,9 +93,20 @@ class R2GaussianChestAdapter:
     def run_reference(self, run: PreparedRun) -> ReferenceArtifact:
         self.output_root.parent.mkdir(parents=True, exist_ok=True)
         started = time.monotonic()
+        repository_root = Path(__file__).resolve().parents[2]
+        command = (
+            run.official_command[0], "-m", "gala_sim.adapters.reference_runner",
+            "--model-id", "r2_gaussian", str(run.source_root / "train.py"),
+            *run.official_command[2:],
+        )
+        environment = os.environ.copy()
+        environment["PYTHONPATH"] = os.pathsep.join(
+            item for item in (str(repository_root), environment.get("PYTHONPATH")) if item
+        )
         completed = subprocess.run(
-            list(run.official_command),
+            list(command),
             cwd=run.source_root,
+            env=environment,
             check=False,
             text=True,
             capture_output=True,
@@ -112,10 +127,50 @@ class R2GaussianChestAdapter:
             gpu_reference={
                 "wall_seconds": elapsed,
                 "command": list(run.official_command),
+                "execution_command": list(command),
                 "stdout_sha256": _text_sha256(completed.stdout),
                 "stderr_sha256": _text_sha256(completed.stderr),
             },
         )
+
+    def preflight_environment(self, environment: dict[str, str] | None = None) -> None:
+        """Verify R² imports with CUDA hidden before launching official training."""
+
+        imports = (
+            "torch",
+            "r2_gaussian.gaussian.gaussian_model",
+            "xray_gaussian_rasterization_voxelization",
+        )
+        check_environment = dict(environment or os.environ)
+        check_environment["CUDA_VISIBLE_DEVICES"] = ""
+        script = (
+            "import importlib;"
+            + ";".join(f"importlib.import_module({name!r})" for name in imports)
+        )
+        executable = str(self.python_executable or Path(sys.executable))
+        try:
+            completed = subprocess.run(
+                (executable, "-c", script), cwd=self.source_root,
+                env=check_environment, check=False, text=True,
+                capture_output=True, timeout=60.0,
+            )
+        except (OSError, subprocess.TimeoutExpired) as error:
+            raise TraceCaptureUnavailable("R²-Gaussian environment preflight failed") from error
+        if completed.returncode:
+            detail = (completed.stderr or completed.stdout).strip().splitlines()
+            suffix = f": {detail[-1]}" if detail else ""
+            raise TraceCaptureUnavailable(
+                "R²-Gaussian environment preflight failed" + suffix
+            )
+
+
+class R2GaussianAdapter(_R2GaussianAdapterBase):
+    """Official R²-Gaussian adapter for every prepared GALA dataset.
+
+    The historical ``R2GaussianChestAdapter`` name remains as a compatibility
+    alias.  Preparation is dataset-driven, so Walnut and HDTomo-USB use the
+    same command, trace identity, and output discovery contract as Chest.
+    """
 
     def capture_trace(self, run: PreparedRun, sink: DeviceTraceSink) -> TraceArtifact:
         trace_root = self.output_root / "trace"
@@ -181,6 +236,11 @@ class R2GaussianChestAdapter:
         )
 
 
+# Compatibility name retained for callers that imported the Chest-specific
+# adapter before R² support was generalized to all prepared datasets.
+R2GaussianChestAdapter = R2GaussianAdapter
+
+
 def _text_sha256(value: str) -> str:
     import hashlib
 
@@ -243,8 +303,28 @@ def _read_latest_metrics(root: Path) -> dict[str, float]:
 
 
 def _read_metrics(run: PreparedRun, volume_path: Path, output_root: Path) -> dict[str, float]:
-    dataset = load_chest_manifest(run.dataset_root)
-    reference = np.load(dataset.volume_path, mmap_mode="r", allow_pickle=False)
+    # Resolve the reference through the shared dataset contract.  This keeps
+    # the R² adapter usable for Walnut and HDTomo-USB, whose source formats are
+    # different from the original Chest metadata layout.
+    from .datasets import get_dataset_adapter
+
+    dataset_id = {
+        "chest": "chest",
+        "walnut": "walnut",
+        "fips walnut": "walnut",
+        "hdtomo_usb": "hdtomo_usb",
+        "hdtomo-usb": "hdtomo_usb",
+    }.get(run.dataset_name.lower(), run.dataset_name.lower().replace("-", "_"))
+    try:
+        manifest = get_dataset_adapter(dataset_id).load(run.dataset_root)
+    except (KeyError, ValueError, OSError):
+        manifest = load_chest_manifest(run.dataset_root)
+    reference_path = getattr(
+        manifest, "reference_volume", getattr(manifest, "volume_path", None)
+    )
+    if reference_path is None:
+        return _read_latest_metrics(output_root)
+    reference = np.load(reference_path, mmap_mode="r", allow_pickle=False)
     candidate = np.load(volume_path, mmap_mode="r", allow_pickle=False)
     quality = measure_quality(reference, candidate, run.quality_config)
     return {

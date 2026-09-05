@@ -28,6 +28,7 @@ from gala_sim.gpu_measurement import (
 )
 from gala_sim.gpu_coverage import analyze_gpu_compiler_coverage
 from gala_sim.tools.gpu_probe_watchdog import (
+    DEFAULT_MINIMUM_AVAILABLE_HOST_MEMORY_BYTES,
     GpuWatchdog,
     ensure_host_memory_reserve,
     gpu_summary as _gpu_summary,
@@ -346,6 +347,7 @@ def run_probe(
     inactivity_timeout_seconds: float,
     compiler_variant: str,
     profile_stages: bool = False,
+    minimum_available_host_memory_bytes: int = DEFAULT_MINIMUM_AVAILABLE_HOST_MEMORY_BYTES,
 ) -> ProbeObservation:
     _validate_inputs(
         source_root, extension_root, dataset_root, initial_state, artifact_root,
@@ -354,7 +356,7 @@ def run_probe(
     if compiler_variant not in COMPILER_VARIANTS:
         raise ExactTrainingProbeError(f"unsupported compiler variant: {compiler_variant}")
     try:
-        ensure_host_memory_reserve()
+        ensure_host_memory_reserve(minimum_available_host_memory_bytes)
         gpu_isolation = ensure_gpu_isolated(owner_pid=os.getpid())
     except (GpuObservationError, RuntimeError) as error:
         raise ExactTrainingProbeError(str(error)) from error
@@ -413,7 +415,11 @@ def run_probe(
         low_memory_overlay = install_exact_low_memory_overlay()
         measurement_start = torch.cuda.Event(enable_timing=True)
         measurement_end = torch.cuda.Event(enable_timing=True)
-        watchdog = GpuWatchdog(inactivity_timeout_seconds, owner_pid=os.getpid())
+        watchdog = GpuWatchdog(
+            inactivity_timeout_seconds,
+            owner_pid=os.getpid(),
+            minimum_available_host_memory_bytes=minimum_available_host_memory_bytes,
+        )
         profiler = _ExactStageProfiler(torch) if profile_stages else None
         gradient_tensors: dict[str, Any] | None = None
         optimizer_steps = 0
@@ -675,6 +681,7 @@ def run_matrix(
     relative_tolerance: float,
     absolute_tolerance: float,
     profile_stages: bool = False,
+    minimum_available_host_memory_bytes: int = DEFAULT_MINIMUM_AVAILABLE_HOST_MEMORY_BYTES,
 ) -> dict[str, Any]:
     if output.exists() or repeats <= 0:
         raise ExactTrainingProbeError("matrix output must be new and repeats must be positive")
@@ -697,6 +704,7 @@ def run_matrix(
                     inactivity_timeout_seconds=inactivity_timeout_seconds,
                     compiler_variant=variant,
                     profile_stages=False,
+                    minimum_available_host_memory_bytes=minimum_available_host_memory_bytes,
                 )
                 observations[variant].append(observation)
                 sample_path = output / "samples" / variant / f"repeat_{repeat + 1}.json"
@@ -724,6 +732,7 @@ def run_matrix(
                 inactivity_timeout_seconds=inactivity_timeout_seconds,
                 compiler_variant="gpu_base",
                 profile_stages=True,
+                minimum_available_host_memory_bytes=minimum_available_host_memory_bytes,
             )
             diagnostic_path = output / "gpu-base-stage-profile.json"
             diagnostic_path.write_text(
@@ -798,6 +807,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--relative-tolerance", type=float, default=1.0e-4)
     parser.add_argument("--absolute-tolerance", type=float, default=1.0e-3)
     parser.add_argument("--profile-stages", action="store_true")
+    parser.add_argument(
+        "--minimum-host-memory-mib", type=int,
+        default=DEFAULT_MINIMUM_AVAILABLE_HOST_MEMORY_BYTES // (1024 * 1024),
+        help="host memory reserve in MiB",
+    )
     args = parser.parse_args(argv)
     try:
         result = run_matrix(
@@ -814,6 +828,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             relative_tolerance=args.relative_tolerance,
             absolute_tolerance=args.absolute_tolerance,
             profile_stages=args.profile_stages,
+            minimum_available_host_memory_bytes=args.minimum_host_memory_mib * 1024 * 1024,
         )
     except (OSError, ValueError, ExactTrainingProbeError) as error:
         print(f"Exact-GS compiler matrix failed: {error}", file=sys.stderr)
