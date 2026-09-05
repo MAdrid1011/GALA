@@ -5,7 +5,12 @@ from pathlib import Path
 
 import pytest
 
-from gala_sim.ablation import AblationVariant, all_variants, validate_matrix
+from gala_sim.ablation import (
+    AblationVariant,
+    all_variants,
+    composition_assessment,
+    validate_matrix,
+)
 from gala_sim.results import (
     AblationRow, asic_speedup, comparison_baseline, gpu_speedup,
     write_ablation_csv,
@@ -117,3 +122,15 @@ def test_base_asic_has_distinct_platform_baseline() -> None:
     assert comparison_baseline("0000") == "agx_orin_gpu_base_estimate"
     assert comparison_baseline("1000") == "gpu_base"
     assert comparison_baseline("1010") == "base_asic"
+
+
+def test_joint_gpu_mechanism_assessment_reports_regression() -> None:
+    report = composition_assessment(
+        {"1000": 1.4, "0100": 1.3, "1100": 1.2},
+        combined="1100",
+        first="1000",
+        second="0100",
+    )
+    assert report["status"] == "regression_detected"
+    assert report["monotonic"] is False
+    assert report["ideal_product_speedup"] == pytest.approx(1.82)

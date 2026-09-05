@@ -29,6 +29,7 @@ from typing import Any, Iterator, Mapping, Sequence
 
 import yaml
 
+from gala_sim.ablation import composition_assessment
 from gala_sim.ablation.anchors import compiler_target_speedups
 from gala_sim.adapters.fact_low_memory import install_fact_low_memory_overlay
 from gala_sim.gpu_measurement import (
@@ -799,6 +800,12 @@ def summarize_matrix(
         item["speedup_vs_gpu_base"] = speedup
         item["target_speedup_vs_gpu_base"] = target
         item["target_met"] = target is None or speedup >= target
+    composition = composition_assessment(
+        {variant: float(item["speedup_vs_gpu_base"]) for variant, item in summary.items()},
+        combined="1100",
+        first="1000",
+        second="0100",
+    )
     performance_comparison_eligible = all(
         sample.record.get("gpu", {}).get("isolation", {}).get("status") == "isolated"
         and not sample.record.get("gpu", {}).get("external_compute_processes")
@@ -812,6 +819,7 @@ def summarize_matrix(
         "formal_performance_eligible": False,
         "performance_comparison_eligible": performance_comparison_eligible,
         "comparison_baseline": "gpu_base",
+        "joint_mechanism_assessment": composition,
         "numerical_tolerance": {
             "relative": relative_tolerance,
             "absolute": absolute_tolerance,
