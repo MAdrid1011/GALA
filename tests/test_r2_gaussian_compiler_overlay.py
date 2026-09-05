@@ -51,7 +51,7 @@ def test_r2_overlay_adds_independent_query_and_semantic_controls() -> None:
     voxel, voxel_transforms = render_voxel_backward_overlay(_voxel_source())
 
     assert raster.count("accumulate_gaussian_gradient(active,") == 7
-    assert voxel.count("accumulate_gaussian_gradient(active,") == 10
+    assert voxel.count("accumulate_gaussian_gradient_batch(active,") == 1
     assert "GALA_QUERY_WARP_REDUCE" in raster
     assert "GALA_SEMANTIC_WARP_REDUCE" in voxel
     assert "renderCUDA<NUM_CHANNELS, true>" in raster

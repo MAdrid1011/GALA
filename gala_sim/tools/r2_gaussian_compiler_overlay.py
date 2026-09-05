@@ -7,6 +7,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
@@ -99,12 +100,81 @@ __device__ __forceinline__ void accumulate_gaussian_gradient(
 \t\tatomicAdd(target, sum);
 }
 
+template <typename Group>
+__device__ __forceinline__ void accumulate_gaussian_gradient_batch(
+\tconst Group& active,
+\tfloat* target0, float value0, float* target1, float value1,
+\tfloat* target2, float value2, float* target3, float value3,
+\tfloat* target4, float value4, float* target5, float value5,
+\tfloat* target6, float value6, float* target7, float value7,
+\tfloat* target8, float value8, float* target9, float value9)
+{
+\tconst unsigned mask = __activemask();
+\tif (__popc(mask) == 1)
+\t{
+\t\tatomicAdd(target0, value0); atomicAdd(target1, value1);
+\t\tatomicAdd(target2, value2); atomicAdd(target3, value3);
+\t\tatomicAdd(target4, value4); atomicAdd(target5, value5);
+\t\tatomicAdd(target6, value6); atomicAdd(target7, value7);
+\t\tatomicAdd(target8, value8); atomicAdd(target9, value9);
+\t\treturn;
+\t}
+\tconst unsigned lane =
+\t\t(threadIdx.x + blockDim.x * threadIdx.y +
+\t\t blockDim.x * blockDim.y * threadIdx.z) & 31u;
+\tconst unsigned leader = static_cast<unsigned>(__ffs(mask) - 1);
+\tfloat sum0 = value0, sum1 = value1, sum2 = value2, sum3 = value3;
+\tfloat sum4 = value4, sum5 = value5, sum6 = value6, sum7 = value7;
+\tfloat sum8 = value8, sum9 = value9;
+\tfor (unsigned offset = 1; offset < 32; offset <<= 1)
+\t{
+\t\tconst float peer0 = __shfl_down_sync(mask, sum0, offset);
+\t\tconst float peer1 = __shfl_down_sync(mask, sum1, offset);
+\t\tconst float peer2 = __shfl_down_sync(mask, sum2, offset);
+\t\tconst float peer3 = __shfl_down_sync(mask, sum3, offset);
+\t\tconst float peer4 = __shfl_down_sync(mask, sum4, offset);
+\t\tconst float peer5 = __shfl_down_sync(mask, sum5, offset);
+\t\tconst float peer6 = __shfl_down_sync(mask, sum6, offset);
+\t\tconst float peer7 = __shfl_down_sync(mask, sum7, offset);
+\t\tconst float peer8 = __shfl_down_sync(mask, sum8, offset);
+\t\tconst float peer9 = __shfl_down_sync(mask, sum9, offset);
+\t\tif (lane + offset < 32 && (mask & (1u << (lane + offset))))
+\t\t{
+\t\t\tsum0 += peer0; sum1 += peer1; sum2 += peer2; sum3 += peer3;
+\t\t\tsum4 += peer4; sum5 += peer5; sum6 += peer6; sum7 += peer7;
+\t\t\tsum8 += peer8; sum9 += peer9;
+\t\t}
+\t}
+\tif (lane == leader)
+\t{
+\t\tatomicAdd(target0, sum0); atomicAdd(target1, sum1);
+\t\tatomicAdd(target2, sum2); atomicAdd(target3, sum3);
+\t\tatomicAdd(target4, sum4); atomicAdd(target5, sum5);
+\t\tatomicAdd(target6, sum6); atomicAdd(target7, sum7);
+\t\tatomicAdd(target8, sum8); atomicAdd(target9, sum9);
+\t}
+}
+
 static bool compiler_flag_enabled(const char* name)
 {
 \tconst char* value = std::getenv(name);
 \treturn value != nullptr && value[0] == '1' && value[1] == '\\0';
 }
 """
+
+# The legacy checked-out source already has the common helper block.  Keep
+# the batch helper separately addressable so an idempotent rebuild can inject
+# only the new definition when it has the fused call but not its definition.
+_BATCH_HELPER = _HELPERS.split(
+    "template <typename Group>\n__device__ __forceinline__ void accumulate_gaussian_gradient_batch",
+    1,
+)[1]
+_BATCH_HELPER = (
+    "template <typename Group>\n__device__ __forceinline__ void "
+    "accumulate_gaussian_gradient_batch" + _BATCH_HELPER.split(
+        "static bool compiler_flag_enabled", 1
+    )[0]
+)
 
 _LEGACY_REDUCTION = """\tconst float sum = cg::reduce(active, value, cg::plus<float>());
 \tif (active.thread_rank() == 0)
@@ -176,21 +246,64 @@ _QUERY_AGGREGATE_BLOCK = """\t\t\tif constexpr (Aggregate)
 _SEMANTIC_AGGREGATE_BLOCK = """\t\t\tif constexpr (Aggregate)
 \t\t\t{
 \t\t\t\tauto active = cg::coalesced_threads();
-\t\t\t\taccumulate_gaussian_gradient(active, &dL_dmean3D_norm[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
-\t\t\t\taccumulate_gaussian_gradient(active, &dL_dmean3D_norm[global_id].y, dL_dG * dG_ddely * ddely_dy);
-\t\t\t\taccumulate_gaussian_gradient(active, &dL_dmean3D_norm[global_id].z, dL_dG * dG_ddelz * ddelz_dz);
-\t\t\t\taccumulate_gaussian_gradient(active, &dL_dconic3D[global_id * 6 + 0], -0.5f * gdx * d.x * dL_dG);
-\t\t\t\taccumulate_gaussian_gradient(active, &dL_dconic3D[global_id * 6 + 1], -1.0f * gdx * d.y * dL_dG);
-\t\t\t\taccumulate_gaussian_gradient(active, &dL_dconic3D[global_id * 6 + 2], -1.0f * gdx * d.z * dL_dG);
-\t\t\t\taccumulate_gaussian_gradient(active, &dL_dconic3D[global_id * 6 + 3], -0.5f * gdy * d.y * dL_dG);
-\t\t\t\taccumulate_gaussian_gradient(active, &dL_dconic3D[global_id * 6 + 4], -1.0f * gdy * d.z * dL_dG);
-\t\t\t\taccumulate_gaussian_gradient(active, &dL_dconic3D[global_id * 6 + 5], -0.5f * gdz * d.z * dL_dG);
-\t\t\t\taccumulate_gaussian_gradient(active, &dL_dopacity[global_id], G * dL_dalpha);
+\t\t\t\taccumulate_gaussian_gradient_batch(active,
+\t\t\t\t\t&dL_dmean3D_norm[global_id].x, dL_dG * dG_ddelx * ddelx_dx,
+\t\t\t\t\t&dL_dmean3D_norm[global_id].y, dL_dG * dG_ddely * ddely_dy,
+\t\t\t\t\t&dL_dmean3D_norm[global_id].z, dL_dG * dG_ddelz * ddelz_dz,
+\t\t\t\t\t&dL_dconic3D[global_id * 6 + 0], -0.5f * gdx * d.x * dL_dG,
+\t\t\t\t\t&dL_dconic3D[global_id * 6 + 1], -1.0f * gdx * d.y * dL_dG,
+\t\t\t\t\t&dL_dconic3D[global_id * 6 + 2], -1.0f * gdx * d.z * dL_dG,
+\t\t\t\t\t&dL_dconic3D[global_id * 6 + 3], -0.5f * gdy * d.y * dL_dG,
+\t\t\t\t\t&dL_dconic3D[global_id * 6 + 4], -1.0f * gdy * d.z * dL_dG,
+\t\t\t\t\t&dL_dconic3D[global_id * 6 + 5], -0.5f * gdz * d.z * dL_dG,
+\t\t\t\t\t&dL_dopacity[global_id], G * dL_dalpha);
 \t\t\t}
 \t\t\telse
 \t\t\t{
 {baseline}
 \t\t\t}"""
+
+
+_LEGACY_SEMANTIC_TARGETS = (
+    "&dL_dmean3D_norm[global_id].x",
+    "&dL_dmean3D_norm[global_id].y",
+    "&dL_dmean3D_norm[global_id].z",
+    "&dL_dconic3D[global_id * 6 + 0]",
+    "&dL_dconic3D[global_id * 6 + 1]",
+    "&dL_dconic3D[global_id * 6 + 2]",
+    "&dL_dconic3D[global_id * 6 + 3]",
+    "&dL_dconic3D[global_id * 6 + 4]",
+    "&dL_dconic3D[global_id * 6 + 5]",
+    "&dL_dopacity[global_id]",
+)
+
+
+def _fuse_legacy_semantic_calls(source: str) -> str:
+    """Fuse the earlier ten-call semantic block when rebuilding an overlay."""
+
+    matches: list[re.Match[str]] = []
+    for target in _LEGACY_SEMANTIC_TARGETS:
+        match = re.search(
+            r"(?P<indent>[ \\t]*)accumulate_gaussian_gradient\(active,\s*"
+            + re.escape(target)
+            + r",\s*(?P<value>[^;]+)\);",
+            source,
+        )
+        if match is None:
+            return source
+        matches.append(match)
+    matches.sort(key=lambda item: item.start())
+    values = [match.group("value").strip() for match in matches]
+    indent = matches[0].group("indent")
+    replacement = (
+        f"{indent}accumulate_gaussian_gradient_batch(active,\n"
+        + ",\n".join(
+            f"{indent}\t{target}, {value}"
+            for target, value in zip(_LEGACY_SEMANTIC_TARGETS, values)
+        )
+        + ");"
+    )
+    return source[:matches[0].start()] + replacement + source[matches[-1].end():]
 
 
 def _render_backward_overlay(
@@ -218,6 +331,22 @@ def _render_backward_overlay(
             raise R2CompilerOverlayError(
                 "overlay transform compiler-aggregation-helpers expected one source fragment"
             )
+        if environment_control == "GALA_SEMANTIC_WARP_REDUCE":
+            transformed = _fuse_legacy_semantic_calls(transformed)
+            if (
+                "accumulate_gaussian_gradient_batch" in transformed
+                and transformed.count("accumulate_gaussian_gradient_batch") == 1
+            ):
+                namespace_anchor = "namespace cg = cooperative_groups;\n"
+                if transformed.count(namespace_anchor) != 1:
+                    raise R2CompilerOverlayError(
+                        "overlay transform compiler-aggregation-helpers expected one namespace anchor"
+                    )
+                transformed = transformed.replace(
+                    namespace_anchor,
+                    namespace_anchor + "\n" + _BATCH_HELPER,
+                    1,
+                )
         return transformed, (
             "compiler-aggregation-helpers",
             "compile-time-aggregation-control",
