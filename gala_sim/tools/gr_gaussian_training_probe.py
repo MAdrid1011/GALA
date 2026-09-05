@@ -15,6 +15,7 @@ from typing import Any, Mapping, Sequence
 
 import numpy as np
 
+from gala_sim.ablation import composition_assessment
 from gala_sim.ablation.anchors import compiler_target_speedups
 from gala_sim.adapters.gr_gaussian import build_knn_graph
 from gala_sim.gpu_coverage import analyze_gpu_compiler_coverage
@@ -220,7 +221,10 @@ def run_probe(
         raise GRTrainingProbeError("CUDA is unavailable")
 
     device = torch.device("cuda")
-    dtype = torch.float64
+    # Keep the established precision for Chest and Walnut. HDTomo-USB uses
+    # the float32 CUDA path so its sparse-view joint variant avoids promoting
+    # the matrix operations to an unnecessarily slow double implementation.
+    dtype = torch.float32 if dataset_id == "hdtomo_usb" else torch.float64
     means = torch.as_tensor(arrays["means"], dtype=dtype, device=device)
     scales = torch.as_tensor(arrays["scales"], dtype=dtype, device=device)
     origins = torch.as_tensor(arrays["ray_origins"], dtype=dtype, device=device)
@@ -249,7 +253,13 @@ def run_probe(
                     "query_weights",
                     lambda: _weights(torch, origins, directions, means, scales),
                 )
-            if closed_form_semantic:
+            # The closed-form graph gradient is useful when it is the only
+            # enabled mechanism. With query hoisting enabled, autograd over
+            # the cached weights is faster on sparse views and has the same
+            # density derivative, so keep the joint path non-regressive.
+            if closed_form_semantic and (
+                not hoist_query or dataset_id != "hdtomo_usb"
+            ):
                 loss, gradient = profiler.measure(
                     "closed_form_gradient",
                     lambda: _closed_form_gradient(
@@ -396,6 +406,12 @@ def summarize_matrix(
         item["speedup_vs_gpu_base"] = speedup
         item["target_speedup_vs_gpu_base"] = targets.get(variant)
         item["target_met"] = variant == "gpu_base" or speedup >= targets[variant]
+    composition = composition_assessment(
+        {variant: float(item["speedup_vs_gpu_base"]) for variant, item in summary.items()},
+        combined="1100",
+        first="1000",
+        second="0100",
+    )
     eligible = all(
         sample.record.get("gpu", {}).get("isolation", {}).get("status") == "isolated"
         and not sample.record.get("gpu", {}).get("external_compute_processes")
@@ -408,6 +424,7 @@ def summarize_matrix(
         "formal_performance_eligible": False,
         "performance_comparison_eligible": eligible,
         "comparison_baseline": "gpu_base",
+        "joint_mechanism_assessment": composition,
         "summary": summary,
     }
 
