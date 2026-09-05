@@ -4258,9 +4258,12 @@ class CycleEngine:
         # in flight.  Keep a transient directory for that path, but release
         # each record as soon as its current readers drain; persistent
         # cross-request residency remains exclusive to the residency bit.
+        # Compiler worksets annotate semantic lifetime, while query-load
+        # rules coalesce duplicate requests that are simultaneously live.
+        # They are complementary in 1100.  Only the hardware residency path
+        # replaces transient ownership with persistent cache state.
         transient_cache_coalescing = (
             self.selection.query_load_rules
-            and not self.selection.semantic_worksets
             and not self.selection.semantic_residency
         )
         residency_enabled = self.selection.semantic_residency
@@ -4413,7 +4416,10 @@ class CycleEngine:
                 oracle_remaining_cache_uses[key] = remaining_uses
                 if remaining_uses == 0:
                     state.close(key)
-            elif semantic_worksets is not None:
+            elif (
+                semantic_worksets is not None
+                and self.selection.semantic_residency
+            ):
                 if bool(semantic_worksets.for_event(request_event_id)["last_use"]):
                     state.close(key)
             elif transient_cache_coalescing:
@@ -5342,9 +5348,16 @@ class CycleEngine:
                                 )
                             oracle_requests.remove(event_id)
                         try:
+                            # Workset lifetime controls a persistent semantic
+                            # cache only when the hardware residency mechanism
+                            # exists.  Compiler-only 1100 keeps the query
+                            # path's transient merge ownership.
                             workset = (
                                 semantic_worksets.for_event(event_id)
-                                if semantic_worksets is not None else None
+                                if (
+                                    semantic_worksets is not None
+                                    and self.selection.semantic_residency
+                                ) else None
                             )
                             lookup = state.request(
                                 key,

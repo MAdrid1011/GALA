@@ -1401,6 +1401,44 @@ def test_semantic_residency_with_worksets_merges_repeated_state_reads() -> None:
     assert combined.module_counters["shared_sram"]["accepted"] == 3
 
 
+def test_joint_compiler_preserves_query_transient_cache_coalescing() -> None:
+    builder = TraceBuilder()
+    requests = [
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.CACHE_REQUEST), query_id=query_id,
+            gaussian_id=7, state_version=0, address_token=448, data_bytes=64,
+            resource_class=int(ResourceClass.CACHE),
+        ))
+        for query_id in range(2)
+    ]
+    for query_id, request_id in enumerate(requests):
+        builder.emit(TraceEvent(
+            primitive_kind=int(PrimitiveKind.CACHE_RETURN), query_id=query_id,
+            gaussian_id=7, state_version=0, address_token=448, data_bytes=64,
+            resource_class=int(ResourceClass.CACHE),
+        ), dependencies=[request_id])
+    config = CycleConfig(
+        modules={name: ModuleTiming(
+            latency=1, initiation_interval=1, queue_capacity=8, ports=2, banks=2,
+        ) for name in (
+            "relation_constructor", "fusion_issue", "semantic_cache", "compute_pod",
+            "bidirectional_query", "reconstruction_update", "shared_sram",
+        )},
+        memory=_Memory(), clock_frequency_hz=500_000_000,
+        relation_seed_fifo_entries=8, candidate_lanes=3,
+        cache_instances=1, cache_capacity_per_instance=2,
+        cache_directory_banks=2, cache_sector_bytes=64,
+        cache_multicast_destinations=1,
+    )
+    trace = builder.finish()
+    query = CycleEngine(config, policy="variant:1000").run(trace)
+    joint = CycleEngine(config, policy="variant:1100").run(trace)
+
+    assert query.module_counters["semantic_cache"]["memory_requests"] == 1
+    assert joint.module_counters["semantic_cache"]["memory_requests"] == 1
+    assert joint.total_cycles <= query.total_cycles
+
+
 def _semantic_fusion_bundle_fixture() -> tuple[Trace, CycleConfig]:
     builder = TraceBuilder()
     request_ids = [
