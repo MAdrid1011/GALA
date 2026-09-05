@@ -123,26 +123,55 @@ __device__ __forceinline__ void accumulate_gaussian_gradient_batch(
 \t\t(threadIdx.x + blockDim.x * threadIdx.y +
 \t\t blockDim.x * blockDim.y * threadIdx.z) & 31u;
 \tconst unsigned leader = static_cast<unsigned>(__ffs(mask) - 1);
+\tconst unsigned member_count = __popc(mask);
+\tconst unsigned contiguous_mask = member_count == 32
+\t\t? 0xffffffffu
+\t\t: (((1u << member_count) - 1u) << leader);
 \tfloat sum0 = value0, sum1 = value1, sum2 = value2, sum3 = value3;
 \tfloat sum4 = value4, sum5 = value5, sum6 = value6, sum7 = value7;
 \tfloat sum8 = value8, sum9 = value9;
-\tfor (unsigned offset = 1; offset < 32; offset <<= 1)
+\tif (mask == contiguous_mask)
 \t{
-\t\tconst float peer0 = __shfl_down_sync(mask, sum0, offset);
-\t\tconst float peer1 = __shfl_down_sync(mask, sum1, offset);
-\t\tconst float peer2 = __shfl_down_sync(mask, sum2, offset);
-\t\tconst float peer3 = __shfl_down_sync(mask, sum3, offset);
-\t\tconst float peer4 = __shfl_down_sync(mask, sum4, offset);
-\t\tconst float peer5 = __shfl_down_sync(mask, sum5, offset);
-\t\tconst float peer6 = __shfl_down_sync(mask, sum6, offset);
-\t\tconst float peer7 = __shfl_down_sync(mask, sum7, offset);
-\t\tconst float peer8 = __shfl_down_sync(mask, sum8, offset);
-\t\tconst float peer9 = __shfl_down_sync(mask, sum9, offset);
-\t\tif (lane + offset < 32 && (mask & (1u << (lane + offset))))
+\t\tfor (unsigned offset = 1; offset < 32; offset <<= 1)
 \t\t{
-\t\t\tsum0 += peer0; sum1 += peer1; sum2 += peer2; sum3 += peer3;
-\t\t\tsum4 += peer4; sum5 += peer5; sum6 += peer6; sum7 += peer7;
-\t\t\tsum8 += peer8; sum9 += peer9;
+\t\t\tconst float peer0 = __shfl_down_sync(mask, sum0, offset);
+\t\t\tconst float peer1 = __shfl_down_sync(mask, sum1, offset);
+\t\t\tconst float peer2 = __shfl_down_sync(mask, sum2, offset);
+\t\t\tconst float peer3 = __shfl_down_sync(mask, sum3, offset);
+\t\t\tconst float peer4 = __shfl_down_sync(mask, sum4, offset);
+\t\t\tconst float peer5 = __shfl_down_sync(mask, sum5, offset);
+\t\t\tconst float peer6 = __shfl_down_sync(mask, sum6, offset);
+\t\t\tconst float peer7 = __shfl_down_sync(mask, sum7, offset);
+\t\t\tconst float peer8 = __shfl_down_sync(mask, sum8, offset);
+\t\t\tconst float peer9 = __shfl_down_sync(mask, sum9, offset);
+\t\t\tif (lane + offset < 32 && (mask & (1u << (lane + offset))))
+\t\t\t{
+\t\t\t\tsum0 += peer0; sum1 += peer1; sum2 += peer2; sum3 += peer3;
+\t\t\t\tsum4 += peer4; sum5 += peer5; sum6 += peer6; sum7 += peer7;
+\t\t\t\tsum8 += peer8; sum9 += peer9;
+\t\t\t}
+\t\t}
+\t}
+\telse if (lane == leader)
+\t{
+\t\tsum0 = sum1 = sum2 = sum3 = sum4 = 0.0f;
+\t\tsum5 = sum6 = sum7 = sum8 = sum9 = 0.0f;
+\t\tunsigned remaining = mask;
+\t\twhile (remaining)
+\t\t{
+\t\t\tconst unsigned source_lane =
+\t\t\t\tstatic_cast<unsigned>(__ffs(remaining) - 1);
+\t\t\tsum0 += __shfl_sync(mask, value0, source_lane);
+\t\t\tsum1 += __shfl_sync(mask, value1, source_lane);
+\t\t\tsum2 += __shfl_sync(mask, value2, source_lane);
+\t\t\tsum3 += __shfl_sync(mask, value3, source_lane);
+\t\t\tsum4 += __shfl_sync(mask, value4, source_lane);
+\t\t\tsum5 += __shfl_sync(mask, value5, source_lane);
+\t\t\tsum6 += __shfl_sync(mask, value6, source_lane);
+\t\t\tsum7 += __shfl_sync(mask, value7, source_lane);
+\t\t\tsum8 += __shfl_sync(mask, value8, source_lane);
+\t\t\tsum9 += __shfl_sync(mask, value9, source_lane);
+\t\t\tremaining &= remaining - 1;
 \t\t}
 \t}
 \tif (lane == leader)
