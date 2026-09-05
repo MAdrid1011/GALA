@@ -19,6 +19,7 @@ from gala_sim.gpu_measurement import (
 )
 from gala_sim.tools.r2_gaussian_training_probe import (
     COMPILER_VARIANT_FLAGS,
+    DEFAULT_MINIMUM_AVAILABLE_HOST_MEMORY_BYTES,
     TrainingProbeError,
     run_probe,
 )
@@ -62,13 +63,22 @@ def _validate_numerical_equivalence(
             expected.get("shape") == actual.get("shape")
             and expected.get("dtype") == actual.get("dtype")
         )
-        numeric_passed = all(
-            _close(
-                expected.get(metric), actual.get(metric),
-                rtol=relative_tolerance, atol=absolute_tolerance,
+        # Signed sums can be close to zero despite large cancelling values
+        # (notably XYZ coordinates).  Use the field's absolute magnitude as
+        # the relative scale for both reported metrics.
+        try:
+            magnitude = max(
+                1.0,
+                abs(float(expected.get("absolute_sum", 0.0))),
+                abs(float(actual.get("absolute_sum", 0.0))),
             )
-            for metric in ("sum", "absolute_sum")
-        )
+            numeric_passed = all(
+                abs(float(expected.get(metric)) - float(actual.get(metric)))
+                <= absolute_tolerance + relative_tolerance * magnitude
+                for metric in ("sum", "absolute_sum")
+            )
+        except (TypeError, ValueError):
+            numeric_passed = False
         field_passed = identity_passed and numeric_passed
         checks[name] = {"passed": field_passed}
         passed = passed and field_passed
@@ -184,6 +194,9 @@ def run_matrix(
     relative_tolerance: float,
     absolute_tolerance: float,
     profile_stages: bool = False,
+    minimum_available_host_memory_bytes: int = (
+        DEFAULT_MINIMUM_AVAILABLE_HOST_MEMORY_BYTES
+    ),
 ) -> dict[str, Any]:
     if repeats <= 0:
         raise TrainingProbeError("matrix repeats must be positive")
@@ -209,6 +222,7 @@ def run_matrix(
                 compiler_variant=variant,
                 dataset_id=dataset_id,
                 profile_stages=False,
+                minimum_available_host_memory_bytes=minimum_available_host_memory_bytes,
             )
             records[variant].append(record)
             sample_path = output / "samples" / variant / f"repeat_{repeat + 1}.json"
@@ -237,6 +251,7 @@ def run_matrix(
             compiler_variant="gpu_base",
             dataset_id=dataset_id,
             profile_stages=True,
+            minimum_available_host_memory_bytes=minimum_available_host_memory_bytes,
         )
         diagnostic_path = output / "gpu-base-stage-profile.json"
         diagnostic_path.write_text(
@@ -307,6 +322,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--relative-tolerance", type=float, default=1.0e-4)
     parser.add_argument("--absolute-tolerance", type=float, default=1.0e-3)
     parser.add_argument("--profile-stages", action="store_true")
+    parser.add_argument(
+        "--minimum-host-memory-mib", type=int,
+        default=DEFAULT_MINIMUM_AVAILABLE_HOST_MEMORY_BYTES // (1024 * 1024),
+        help="host memory reserve in MiB (default: 8192; lower only after checking contention)",
+    )
     args = parser.parse_args(argv)
     try:
         result = run_matrix(
@@ -326,6 +346,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             relative_tolerance=args.relative_tolerance,
             absolute_tolerance=args.absolute_tolerance,
             profile_stages=args.profile_stages,
+            minimum_available_host_memory_bytes=args.minimum_host_memory_mib * 1024 * 1024,
         )
     except (OSError, ValueError, TrainingProbeError) as error:
         print(f"R2-Gaussian compiler matrix failed: {error}", file=sys.stderr)

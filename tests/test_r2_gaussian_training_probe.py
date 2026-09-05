@@ -11,6 +11,7 @@ from gala_sim.tools.r2_gaussian_training_probe import (
     TrainingProbeError,
     _compiler_variant_environment,
     _gpu_summary,
+    _initialize_from_state,
     _load_training,
     render_training_overlay,
 )
@@ -86,3 +87,24 @@ def test_load_training_discovers_built_simple_knn_submodule(tmp_path: Path) -> N
     module = _load_training(training, source_root, None)
 
     assert module.marker == "submodule"
+
+
+def test_initialize_from_state_preserves_official_npy_layout(tmp_path: Path) -> None:
+    import numpy as np
+
+    state = tmp_path / "init.npy"
+    expected = np.asarray([[1.0, 2.0, 3.0, 0.25]], dtype=np.float32)
+    np.save(state, expected)
+
+    class Gaussians:
+        def create_from_pcd(self, xyz, density, scale):
+            self.xyz = np.asarray(xyz).copy()
+            self.density = np.asarray(density).copy()
+            self.scale = scale
+
+    gaussians = Gaussians()
+    _initialize_from_state(gaussians, state)
+
+    assert np.array_equal(gaussians.xyz, expected[:, :3])
+    assert np.array_equal(gaussians.density, expected[:, 3:4])
+    assert gaussians.scale == 1.0

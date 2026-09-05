@@ -16,12 +16,16 @@ import time
 from types import ModuleType
 from typing import Any, Iterator, Sequence
 
+import numpy as np
+
+from gala_sim.adapters.fact_low_memory import install_r2_low_memory_overlay
 from gala_sim.adapters.stage_profile import GpuStageProfileSession, IterationRange
 from gala_sim.tools.gpu_observation import (
     GpuObservationError,
     ensure_gpu_isolated,
 )
 from gala_sim.tools.gpu_probe_watchdog import (
+    DEFAULT_MINIMUM_AVAILABLE_HOST_MEMORY_BYTES,
     GpuWatchdog,
     ensure_host_memory_reserve,
     gpu_summary as _gpu_summary,
@@ -231,6 +235,27 @@ def _state_fingerprint(gaussians: Any) -> dict[str, Any]:
     return {"sha256": digest.hexdigest(), "fields": fields}
 
 
+def _initialize_from_state(gaussians: Any, state_path: Path) -> None:
+    """Load either the official four-column NumPy seed or a pickle checkpoint."""
+
+    if state_path.suffix.lower() == ".npy":
+        point_cloud = np.load(state_path, mmap_mode="r", allow_pickle=False)
+        if point_cloud.ndim != 2 or point_cloud.shape[1] < 4:
+            raise TrainingProbeError(
+                "R2-Gaussian initialization must have at least four columns"
+            )
+        try:
+            gaussians.create_from_pcd(
+                np.asarray(point_cloud[:, :3]),
+                np.asarray(point_cloud[:, 3:4]),
+                1.0,
+            )
+        finally:
+            del point_cloud
+        return
+    gaussians.load_ply(str(state_path))
+
+
 def run_probe(
     *,
     source_root: Path,
@@ -246,6 +271,9 @@ def run_probe(
     compiler_variant: str,
     dataset_id: str = "chest",
     profile_stages: bool = False,
+    minimum_available_host_memory_bytes: int = (
+        DEFAULT_MINIMUM_AVAILABLE_HOST_MEMORY_BYTES
+    ),
 ) -> dict[str, Any]:
     if not 0 <= warmup_iterations < requested_iterations <= PUBLISHED_ITERATIONS:
         raise TrainingProbeError("require 0 <= warmup < requested <= 30000 iterations")
@@ -257,11 +285,13 @@ def run_probe(
         raise TrainingProbeError(
             "compiler variant must be gpu_base, 1000, 0100, or 1100"
         )
+    if minimum_available_host_memory_bytes < 0:
+        raise TrainingProbeError("minimum host memory reserve cannot be negative")
     source_path = source_root / "train.py"
     if not source_path.is_file() or not dataset_root.is_dir() or not initial_state.is_file():
         raise TrainingProbeError("source, dataset, or initial state is unavailable")
     try:
-        ensure_host_memory_reserve()
+        ensure_host_memory_reserve(minimum_available_host_memory_bytes)
     except RuntimeError as error:
         raise TrainingProbeError(str(error)) from error
     try:
@@ -325,7 +355,11 @@ def run_probe(
         final_state: dict[str, Any] | None = None
         completed_iterations = 0
         cuda_elapsed_ms: float | None = None
-        watchdog = GpuWatchdog(inactivity_timeout_seconds, owner_pid=os.getpid())
+        watchdog = GpuWatchdog(
+            inactivity_timeout_seconds,
+            owner_pid=os.getpid(),
+            minimum_available_host_memory_bytes=minimum_available_host_memory_bytes,
+        )
         stage_profile: dict[str, Any] | None = None
         profile_session = (
             GpuStageProfileSession(
@@ -344,7 +378,7 @@ def run_probe(
         )
 
         def initialize_from_checked_state(gaussians: Any, _dataset: Any, _loaded: Any = None) -> None:
-            gaussians.load_ply(str(initial_state))
+            _initialize_from_state(gaussians, initial_state)
             gaussians.max_radii2D = torch.zeros(gaussians.get_xyz.shape[0], device="cuda")
             gaussians.spatial_lr_scale = 1.0
 
@@ -391,6 +425,7 @@ def run_probe(
             profile_session.install()
             profile_session.install_training_aliases(training)
         wall_started = time.perf_counter()
+        low_memory_overlay = install_r2_low_memory_overlay()
         watchdog.start()
         try:
             try:
@@ -405,6 +440,7 @@ def run_probe(
             watchdog.stop()
             training.initialize_gaussian = original_initialize
             training.training_report = original_report
+            low_memory_overlay.restore()
             if profile_session is not None:
                 try:
                     stage_profile = profile_session.finish()
@@ -506,6 +542,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         "--compiler-variant", choices=tuple(COMPILER_VARIANT_FLAGS), default="gpu_base"
     )
     parser.add_argument("--profile-stages", action="store_true")
+    parser.add_argument(
+        "--minimum-host-memory-mib", type=int,
+        default=DEFAULT_MINIMUM_AVAILABLE_HOST_MEMORY_BYTES // (1024 * 1024),
+        help="host memory reserve in MiB (default: 8192; lower only with an explicit resource check)",
+    )
     args = parser.parse_args(argv)
     if args.output.exists():
         parser.error("--output must not already exist")
@@ -526,6 +567,7 @@ def main(argv: Sequence[str] | None = None) -> int:
             compiler_variant=args.compiler_variant,
             dataset_id=args.dataset_id,
             profile_stages=args.profile_stages,
+            minimum_available_host_memory_bytes=args.minimum_host_memory_mib * 1024 * 1024,
         )
     except (OSError, ValueError, TrainingProbeError) as error:
         print(f"R2-Gaussian training probe failed: {error}", file=sys.stderr)
