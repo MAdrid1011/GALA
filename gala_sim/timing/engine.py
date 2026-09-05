@@ -3520,6 +3520,10 @@ class CycleEngine:
                 module_name == "semantic_cache"
                 and self.selection.semantic_worksets
                 and not self.selection.semantic_residency
+                # In 1100 the query compiler owns admission priority.  A
+                # semantic-only ordering may still be used for 0100, but it
+                # must not override query load rules in the joint path.
+                and not self.selection.query_load_rules
             ),
             query_reduction_banks=(
                 self.config.query_reduction_banks
@@ -4502,10 +4506,6 @@ class CycleEngine:
                 if kind is PrimitiveKind.CACHE_REQUEST and stage == 0 and event_id in cache_event_state:
                     state, key, lookup = cache_event_state[event_id]
                     if lookup is CacheLookup.MISS:
-                        workset = (
-                            semantic_worksets.for_event(event_id)
-                            if semantic_worksets is not None else None
-                        )
                         pending = state.pending.get(key)
                         if pending is None:
                             raise CycleConfigurationError(

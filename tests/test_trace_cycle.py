@@ -2700,6 +2700,24 @@ def test_cycle_policy_preserves_independent_mechanism_bits(
     ) == expected
 
 
+def test_joint_compiler_keeps_query_priority_over_semantic_cache_order() -> None:
+    class RecordingQueue:
+        semantic_order: bool | None = None
+
+        def pop_acceptable(self, _width, _module_name, **kwargs):
+            self.semantic_order = kwargs["compiler_semantic_order"]
+            return []
+
+    for policy, expected in (("variant:0100", True), ("variant:1100", False)):
+        queue = RecordingQueue()
+        CycleEngine(_config(), policy=policy)._pop_ready_candidates(
+            queue, "semantic_cache", row_for=lambda _event_id: None,
+            physical_stage_for=lambda _event_id: None,
+            owner_gradients=None, query_replay=None,
+        )
+        assert queue.semantic_order is expected
+
+
 def test_hardware_mechanisms_require_compiler_metadata_without_changing_resources() -> None:
     config_path = Path(__file__).parents[1] / "configs/architecture/gala.yaml"
     config = CycleConfig.from_gala(load_config(config_path), _Memory())
