@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Mapping
 
 from gala_sim.mechanisms import CANONICAL_VARIANT_BITS, validate_variant_bits
 
@@ -39,6 +40,39 @@ def gpu_speedup(
     if gpu_base_seconds <= 0 or gpu_variant_seconds <= 0:
         raise ValueError("GPU times must be positive")
     return gpu_base_seconds / gpu_variant_seconds
+
+
+def composition_assessment(
+    speedups: Mapping[str, float],
+    *,
+    combined: str,
+    first: str,
+    second: str,
+    tolerance: float = 1.0e-9,
+) -> dict[str, float | str | bool | None]:
+    """Check that a joint mechanism does not regress either component.
+
+    The product is reported as a diagnostic because shared overhead can make
+    it an optimistic reference; monotonicity is the hard correctness check.
+    """
+
+    values = {name: float(speedups[name]) for name in (combined, first, second)}
+    component_max = max(values[first], values[second])
+    joint = values[combined]
+    product = values[first] * values[second]
+    return {
+        "combined_variant": combined,
+        "component_variants": f"{first},{second}",
+        "combined_speedup": joint,
+        "component_max_speedup": component_max,
+        "ideal_product_speedup": product,
+        "product_fraction": joint / product if product > 0 else None,
+        "monotonic": joint + tolerance >= component_max,
+        "status": (
+            "non_regressive"
+            if joint + tolerance >= component_max else "regression_detected"
+        ),
+    }
 
 
 @dataclass(frozen=True, order=True)

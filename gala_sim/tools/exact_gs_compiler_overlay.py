@@ -50,7 +50,9 @@ __device__ __forceinline__ void compiler_accumulate(
 			atomicAdd(target, value);
 			return;
 		}
-		const unsigned lane = threadIdx.x & 31;
+		const unsigned lane =
+			(threadIdx.x + blockDim.x * threadIdx.y +
+			 blockDim.x * blockDim.y * threadIdx.z) & 31u;
 		const unsigned leader = static_cast<unsigned>(__ffs(target_mask) - 1);
 		unsigned remaining = target_mask;
 		float sum = 0.0f;
@@ -91,7 +93,9 @@ __device__ __forceinline__ void compiler_accumulate_query_pair(
 	// already the target segment; matching pointer addresses would add a
 	// second warp-level collective.
 	const unsigned target_mask = __activemask();
-	const unsigned lane = threadIdx.x & 31;
+	const unsigned lane =
+		(threadIdx.x + blockDim.x * threadIdx.y +
+		 blockDim.x * blockDim.y * threadIdx.z) & 31u;
 	const unsigned leader = static_cast<unsigned>(__ffs(target_mask) - 1);
 	const unsigned member_count = __popc(target_mask);
 	if (member_count == 1)
@@ -151,6 +155,25 @@ __device__ __forceinline__ void compiler_accumulate_query_pair(
 	}
 }
 
+// Opacity and ray-attenuation gradients are scalar query outputs.  They use
+// the same coalesced-group reduction as the validated compiler path while
+// retaining a scalar helper so the non-aggregated variant remains identical
+// to the upstream atomics.
+template <bool Aggregate>
+__device__ __forceinline__ void compiler_accumulate_query_scalar(
+	float* target, float value)
+{
+	if constexpr (!Aggregate)
+	{
+		atomicAdd(target, value);
+		return;
+	}
+	auto active = cg::coalesced_threads();
+	const float sum = cg::reduce(active, value, cg::plus<float>());
+	if (active.thread_rank() == 0)
+		atomicAdd(target, sum);
+}
+
 static bool compiler_flag_enabled(const char* name)
 {
 	const char* value = std::getenv(name);
@@ -177,7 +200,9 @@ __device__ __forceinline__ void compiler_accumulate_covariance(
 	const unsigned long long target_label =
 		reinterpret_cast<unsigned long long>(target_base);
 	const unsigned target_mask = __match_any_sync(active_mask, target_label);
-	const unsigned lane = threadIdx.x & 31;
+	const unsigned lane =
+		(threadIdx.x + blockDim.x * threadIdx.y +
+		 blockDim.x * blockDim.y * threadIdx.z) & 31u;
 	const unsigned leader = static_cast<unsigned>(__ffs(target_mask) - 1);
 	if (__popc(target_mask) == 1)
 	{
@@ -282,10 +307,9 @@ def render_exact_backward_overlay(source: str) -> tuple[str, tuple[str, ...]]:
         "compile-time-aggregation-controls",
         "kernel-compiler-controls",
     ]
-    # High-fanout mean, opacity, and mu updates are intentionally left as
-    # independent atomics: grouping them changes the floating-point update
-    # order enough to fail strict gradient equivalence. Covariance updates
-    # have bounded fanout and can use the semantic reduction safely.
+    # High-fanout mean updates remain independent atomics because grouping
+    # them changes the floating-point update order. Covariance updates have
+    # bounded fanout and use the semantic reduction safely.
     for target in _SEMANTIC_REDUCIBLE_TARGETS:
         expected = f"atomicAdd({target},"
         replacement = f"compiler_accumulate<SemanticAggregate>({target},"
@@ -357,6 +381,13 @@ def render_exact_backward_overlay(source: str) -> tuple[str, tuple[str, ...]]:
     )
     if fused_query_count:
         transform_ids.append("query-components-batched")
+    for target in ("&(dL_dopacity[global_id])", "&(dL_dmu[global_id])"):
+        expected = f"atomicAdd({target},"
+        replacement = f"compiler_accumulate_query_scalar<QueryAggregate>({target},"
+        transformed = _replace_once(
+            transformed, expected, replacement, f"query-scalar-{target}",
+        )
+        transform_ids.append(f"query-scalar-{target}")
     launch_start = "\trenderCUDA<NUM_CHANNELS> << <grid, block >> >("
     launch_end = "\t\t);"
     if transformed.count(launch_start) != 1:

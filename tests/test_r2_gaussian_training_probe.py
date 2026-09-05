@@ -108,3 +108,28 @@ def test_initialize_from_state_preserves_official_npy_layout(tmp_path: Path) -> 
     assert np.array_equal(gaussians.xyz, expected[:, :3])
     assert np.array_equal(gaussians.density, expected[:, 3:4])
     assert gaussians.scale == 1.0
+
+
+def test_initialize_from_state_normalizes_raw_ct_density(tmp_path: Path) -> None:
+    import numpy as np
+
+    state = tmp_path / "raw.npy"
+    expected = np.asarray(
+        [[1.0, 2.0, 3.0, 1000.0], [4.0, 5.0, 6.0, 2000.0]],
+        dtype=np.float32,
+    )
+    np.save(state, expected)
+
+    class Gaussians:
+        def create_from_pcd(self, xyz, density, scale):
+            self.xyz = np.asarray(xyz).copy()
+            self.density = np.asarray(density).copy()
+            self.scale = scale
+
+    gaussians = Gaussians()
+    _initialize_from_state(gaussians, state)
+
+    assert np.array_equal(gaussians.xyz, expected[:, :3])
+    assert np.all(np.isfinite(gaussians.density))
+    assert float(gaussians.density.max()) <= 0.15 + 1.0e-6
+    assert float(gaussians.density.min()) > 0.0

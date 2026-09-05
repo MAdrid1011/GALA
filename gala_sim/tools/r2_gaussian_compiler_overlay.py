@@ -53,8 +53,49 @@ template <typename Group>
 __device__ __forceinline__ void accumulate_gaussian_gradient(
 \tconst Group& active, float* target, float value)
 {
-\tconst float sum = cg::reduce(active, value, cg::plus<float>());
-\tif (active.thread_rank() == 0)
+\t// The render loop has one logical Gaussian per active warp.  Use the
+\t// warp shuffle reduction to avoid constructing a cooperative-group object
+\t// for every Gaussian/pixel contribution while retaining the active mask.
+\tconst unsigned mask = __activemask();
+\tif (__popc(mask) == 1)
+\t{
+\t\tatomicAdd(target, value);
+\t\treturn;
+\t}
+\tconst unsigned leader = static_cast<unsigned>(__ffs(mask) - 1);
+\tconst unsigned member_count = __popc(mask);
+\tconst unsigned contiguous_mask = member_count == 32
+\t\t? 0xffffffffu
+\t\t: (((1u << member_count) - 1u) << leader);
+\tconst unsigned linear_lane =
+\t\t(threadIdx.x + blockDim.x * threadIdx.y +
+\t\t blockDim.x * blockDim.y * threadIdx.z) & 31u;
+\tfloat sum = value;
+\tif (mask == contiguous_mask)
+\t{
+\t\tfor (unsigned offset = 1; offset < 32; offset <<= 1)
+\t\t{
+\t\t\tconst float peer = __shfl_down_sync(mask, sum, offset);
+\t\t\tif (linear_lane + offset < 32
+\t\t\t\t&& (mask & (1u << (linear_lane + offset))))
+\t\t\t\tsum += peer;
+\t\t}
+\t}
+\telse
+\t{
+\t\tsum = 0.0f;
+\t\tunsigned remaining = mask;
+\t\twhile (remaining)
+\t\t{
+\t\t\tconst unsigned source_lane =
+\t\t\t\tstatic_cast<unsigned>(__ffs(remaining) - 1);
+\t\t\tconst float source_value = __shfl_sync(mask, value, source_lane);
+\t\t\tif (linear_lane == leader)
+\t\t\t\tsum += source_value;
+\t\t\tremaining &= remaining - 1;
+\t\t}
+\t}
+\tif (linear_lane == leader)
 \t\tatomicAdd(target, sum);
 }
 
@@ -64,6 +105,55 @@ static bool compiler_flag_enabled(const char* name)
 \treturn value != nullptr && value[0] == '1' && value[1] == '\\0';
 }
 """
+
+_LEGACY_REDUCTION = """\tconst float sum = cg::reduce(active, value, cg::plus<float>());
+\tif (active.thread_rank() == 0)
+\t\tatomicAdd(target, sum);"""
+
+_WARP_REDUCTION = """\t// The render loop has one logical Gaussian per active warp.  Use the
+\t// warp shuffle primitive to avoid constructing a cooperative-group object
+\t// for every Gaussian/pixel contribution while retaining the active mask.
+\tconst unsigned mask = __activemask();
+\tif (__popc(mask) == 1)
+\t{
+\t\tatomicAdd(target, value);
+\t\treturn;
+\t}
+\tconst unsigned linear_lane =
+\t\t(threadIdx.x + blockDim.x * threadIdx.y +
+\t\t blockDim.x * blockDim.y * threadIdx.z) & 31u;
+\tconst unsigned leader = static_cast<unsigned>(__ffs(mask) - 1);
+\tconst unsigned member_count = __popc(mask);
+\tconst unsigned contiguous_mask = member_count == 32
+\t\t? 0xffffffffu
+\t\t: (((1u << member_count) - 1u) << leader);
+\tif (mask == contiguous_mask)
+\t{
+\t\tfloat sum = value;
+\t\tfor (unsigned offset = 1; offset < 32; offset <<= 1)
+\t\t{
+\t\t\tconst float peer = __shfl_down_sync(mask, sum, offset);
+\t\t\tif (linear_lane + offset < 32
+\t\t\t\t&& (mask & (1u << (linear_lane + offset))))
+\t\t\t\tsum += peer;
+\t\t}
+\t\tif (linear_lane == leader)
+\t\t\tatomicAdd(target, sum);
+\t\treturn;
+\t}
+\tunsigned remaining = mask;
+\tfloat sum = 0.0f;
+\twhile (remaining)
+\t{
+\t\tconst unsigned source_lane =
+\t\t\tstatic_cast<unsigned>(__ffs(remaining) - 1);
+\t\tconst float source_value = __shfl_sync(mask, value, source_lane);
+\t\tif (linear_lane == leader)
+\t\t\tsum += source_value;
+\t\tremaining &= remaining - 1;
+\t}
+\tif (linear_lane == leader)
+\t\tatomicAdd(target, sum);"""
 
 
 _QUERY_AGGREGATE_BLOCK = """\t\t\tif constexpr (Aggregate)
@@ -111,18 +201,58 @@ def _render_backward_overlay(
     aggregate_template: str,
     environment_control: str,
 ) -> tuple[str, tuple[str, ...]]:
-    transformed = _replace_once(
-        source,
-        "#include <cooperative_groups/reduce.h>\nnamespace cg = cooperative_groups;\n",
-        _HELPERS,
-        "compiler-aggregation-helpers",
+    # Some checked-out R2 workspaces contain the earlier single-control
+    # overlay. Keep that source usable as an input: preserve its launch and
+    # compile-time control, but replace the expensive cooperative-group
+    # reduction with the native warp primitive. This makes rebuilding an
+    # overlay deterministic without requiring a destructive checkout reset.
+    if (
+        "template <uint32_t C, bool Aggregate>" in source
+        and "accumulate_gaussian_gradient" in source
+    ):
+        if source.count(_LEGACY_REDUCTION) == 1:
+            transformed = source.replace(_LEGACY_REDUCTION, _WARP_REDUCTION, 1)
+        elif "__reduce_add_sync" in source:
+            transformed = source
+        else:
+            raise R2CompilerOverlayError(
+                "overlay transform compiler-aggregation-helpers expected one source fragment"
+            )
+        return transformed, (
+            "compiler-aggregation-helpers",
+            "compile-time-aggregation-control",
+            "gradient-aggregation",
+            "launch-compiler-control",
+        )
+    helper_anchor = (
+        "#include <cooperative_groups/reduce.h>\n"
+        "namespace cg = cooperative_groups;\n"
     )
-    transformed = _replace_once(
-        transformed,
-        "template <uint32_t C>\n__global__ void __launch_bounds__",
-        "template <uint32_t C, bool Aggregate>\n__global__ void __launch_bounds__",
-        "compile-time-aggregation-control",
-    )
+    if source.count(helper_anchor) == 1:
+        transformed = _replace_once(
+            source, helper_anchor, _HELPERS, "compiler-aggregation-helpers",
+        )
+    else:
+        # The checked-out upstream submodule may already contain the earlier
+        # cooperative-group overlay. Replace only its reduction primitive so
+        # rebuilding remains deterministic and idempotent.
+        if source.count(_LEGACY_REDUCTION) != 1:
+            raise R2CompilerOverlayError(
+                "overlay transform compiler-aggregation-helpers expected one source fragment"
+            )
+        transformed = source.replace(_LEGACY_REDUCTION, _WARP_REDUCTION, 1)
+
+    template_anchor = "template <uint32_t C>\n__global__ void __launch_bounds__"
+    if transformed.count(template_anchor) == 1:
+        transformed = transformed.replace(
+            template_anchor,
+            "template <uint32_t C, bool Aggregate>\n__global__ void __launch_bounds__",
+            1,
+        )
+    elif "template <uint32_t C, bool Aggregate>" not in transformed:
+        raise R2CompilerOverlayError(
+            "overlay transform compile-time-aggregation-control expected one source fragment"
+        )
     if transformed.count(block_start) != 1 or transformed.count(block_end) != 1:
         raise R2CompilerOverlayError(
             "overlay transform gradient-aggregation expected one source span"
@@ -139,24 +269,25 @@ def _render_backward_overlay(
     )
     launch_start = "\trenderCUDA<NUM_CHANNELS> << <grid, block >> >("
     launch_end = "\t\t);"
-    if transformed.count(launch_start) != 1:
+    if transformed.count(launch_start) == 1:
+        launch_begin = transformed.index(launch_start)
+        launch_finish = transformed.index(launch_end, launch_begin) + len(launch_end)
+        baseline_launch = transformed[launch_begin:launch_finish]
+        enabled_launch = baseline_launch.replace(
+            "renderCUDA<NUM_CHANNELS>", "renderCUDA<NUM_CHANNELS, true>", 1,
+        )
+        disabled_launch = baseline_launch.replace(
+            "renderCUDA<NUM_CHANNELS>", "renderCUDA<NUM_CHANNELS, false>", 1,
+        )
+        controlled_launch = (
+            f"\tif (compiler_flag_enabled(\"{environment_control}\"))\n"
+            f"{enabled_launch}\n\telse\n{disabled_launch}"
+        )
+        transformed = transformed[:launch_begin] + controlled_launch + transformed[launch_finish:]
+    elif "renderCUDA<NUM_CHANNELS, true>" not in transformed:
         raise R2CompilerOverlayError(
             "overlay transform launch-compiler-control expected one source span"
         )
-    launch_begin = transformed.index(launch_start)
-    launch_finish = transformed.index(launch_end, launch_begin) + len(launch_end)
-    baseline_launch = transformed[launch_begin:launch_finish]
-    enabled_launch = baseline_launch.replace(
-        "renderCUDA<NUM_CHANNELS>", "renderCUDA<NUM_CHANNELS, true>", 1,
-    )
-    disabled_launch = baseline_launch.replace(
-        "renderCUDA<NUM_CHANNELS>", "renderCUDA<NUM_CHANNELS, false>", 1,
-    )
-    controlled_launch = (
-        f"\tif (compiler_flag_enabled(\"{environment_control}\"))\n"
-        f"{enabled_launch}\n\telse\n{disabled_launch}"
-    )
-    transformed = transformed[:launch_begin] + controlled_launch + transformed[launch_finish:]
     return transformed, (
         "compiler-aggregation-helpers",
         "compile-time-aggregation-control",

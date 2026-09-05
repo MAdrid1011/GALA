@@ -46,8 +46,12 @@ def test_exact_overlay_adds_independent_query_and_semantic_controls() -> None:
     assert transformed.count("compiler_accumulate<SemanticAggregate>(") == 6
     assert transformed.count("compiler_accumulate_query_pair<QueryAggregate>(") == 1
     assert transformed.count("atomicAdd(&dL_dmeans[global_id]") == 3
-    assert transformed.count("atomicAdd(&(dL_dopacity[global_id])") == 1
-    assert transformed.count("atomicAdd(&(dL_dmu[global_id])") == 1
+    assert transformed.count(
+        "compiler_accumulate_query_scalar<QueryAggregate>(&(dL_dopacity[global_id])"
+    ) == 1
+    assert transformed.count(
+        "compiler_accumulate_query_scalar<QueryAggregate>(&(dL_dmu[global_id])"
+    ) == 1
     assert "renderCUDA<NUM_CHANNELS, true, false>" in transformed
     assert "GALA_QUERY_WARP_REDUCE" in transformed
     assert "GALA_SEMANTIC_WARP_REDUCE" in transformed
@@ -55,7 +59,7 @@ def test_exact_overlay_adds_independent_query_and_semantic_controls() -> None:
     assert "if (__popc(target_mask) == 1)" in transformed
     assert "__shfl_sync" in transformed
     assert "cg::reduce(matching_target" not in transformed
-    assert len(transforms) == 13
+    assert len(transforms) == 15
 
 
 def test_exact_overlay_rejects_source_drift_without_hash_gate() -> None:

@@ -244,10 +244,22 @@ def _initialize_from_state(gaussians: Any, state_path: Path) -> None:
             raise TrainingProbeError(
                 "R2-Gaussian initialization must have at least four columns"
             )
+        density = np.asarray(point_cloud[:, 3:4], dtype=np.float32)
+        if not np.isfinite(density).all() or np.any(density < 0):
+            raise TrainingProbeError("R2-Gaussian initialization density is invalid")
+        # Some exported CT volumes retain uint16 attenuation values in the
+        # initializer.  R2-Gaussian expects normalized density; preserve
+        # already-normalized seeds and repair only raw-intensity seeds.
+        if float(np.max(density, initial=0.0)) > 1.0:
+            positive = density[density > 0]
+            scale = float(np.quantile(positive, 0.9)) if positive.size else 1.0
+            if not np.isfinite(scale) or scale <= 0:
+                raise TrainingProbeError("R2-Gaussian initialization scale is invalid")
+            density = np.clip(density / scale, 1.0e-4, 1.0) * 0.15
         try:
             gaussians.create_from_pcd(
                 np.asarray(point_cloud[:, :3]),
-                np.asarray(point_cloud[:, 3:4]),
+                density,
                 1.0,
             )
         finally:
@@ -290,6 +302,11 @@ def run_probe(
     source_path = source_root / "train.py"
     if not source_path.is_file() or not dataset_root.is_dir() or not initial_state.is_file():
         raise TrainingProbeError("source, dataset, or initial state is unavailable")
+    if compiler_variant != "gpu_base" and extension_root is None:
+        raise TrainingProbeError(
+            "compiler variants require an isolated R2 CUDA overlay; "
+            "pass --extension-root built by r2_gaussian_compiler_overlay"
+        )
     try:
         ensure_host_memory_reserve(minimum_available_host_memory_bytes)
     except RuntimeError as error:

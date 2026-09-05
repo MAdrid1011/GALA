@@ -6,6 +6,7 @@ import argparse
 import gc
 import json
 import math
+import os
 from pathlib import Path
 import statistics
 import sys
@@ -26,6 +27,45 @@ from gala_sim.tools.r2_gaussian_training_probe import (
 
 
 COMPILER_VARIANTS = tuple(COMPILER_VARIANT_FLAGS)
+
+
+def _resolve_extension_root(
+    source_root: Path, extension_root: Path | None,
+) -> Path | None:
+    """Resolve the compiler-controlled extension without using a host path.
+
+    The official checkout's installed extension is a valid GPU Base, but it
+    cannot respond to the GALA mechanism environment controls.  Prefer an
+    explicit root, then the workspace override, and finally the newest built
+    overlay beside ``workspace/upstream``.  Unit-test fixtures that do not
+    look like an official checkout retain the optional ``None`` behavior.
+    """
+
+    if extension_root is not None:
+        return Path(extension_root).resolve()
+    configured = os.environ.get("GALA_R2_EXTENSION_ROOT")
+    if configured:
+        candidate = Path(configured).expanduser().resolve()
+        if candidate.is_dir():
+            return candidate
+    source_root = Path(source_root).resolve()
+    workspace_root = source_root.parent.parent
+    build_root = workspace_root / "build"
+    candidates = [
+        path for path in build_root.glob("r2-gaussian-compiler-overlay-v*")
+        if path.is_dir()
+        and any(path.glob("xray_gaussian_rasterization_voxelization/_C*.so"))
+    ]
+    if candidates:
+        return max(candidates, key=lambda path: (path.stat().st_mtime_ns, path.as_posix()))
+    # A real checkout must not silently run all variants against the ordinary
+    # site-package extension.  Synthetic test roots generally have no train.py.
+    if (source_root / "train.py").is_file():
+        raise TrainingProbeError(
+            "R2 compiler matrix requires a built isolated CUDA overlay; "
+            "use --extension-root or GALA_R2_EXTENSION_ROOT"
+        )
+    return None
 
 
 def _close(expected: Any, observed: Any, *, rtol: float, atol: float) -> bool:
@@ -202,6 +242,7 @@ def run_matrix(
         raise TrainingProbeError("matrix repeats must be positive")
     if output.exists():
         raise TrainingProbeError(f"matrix output already exists: {output}")
+    resolved_extension_root = _resolve_extension_root(source_root, extension_root)
     records: dict[str, list[dict[str, Any]]] = {
         variant: [] for variant in COMPILER_VARIANTS
     }
@@ -210,7 +251,7 @@ def run_matrix(
         for variant in order:
             record = run_probe(
                 source_root=source_root,
-                extension_root=extension_root,
+                extension_root=resolved_extension_root,
                 dataset_root=dataset_root,
                 initial_state=initial_state,
                 artifact_root=output / "artifacts" / variant / f"repeat_{repeat + 1}",
@@ -239,7 +280,7 @@ def run_matrix(
     if profile_stages:
         diagnostic = run_probe(
             source_root=source_root,
-            extension_root=extension_root,
+            extension_root=resolved_extension_root,
             dataset_root=dataset_root,
             initial_state=initial_state,
             artifact_root=output / "artifacts" / "gpu_base_stage_profile",

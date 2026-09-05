@@ -7,6 +7,7 @@ import pytest
 
 from gala_sim.tools.r2_gaussian_training_matrix import (
     COMPILER_VARIANTS,
+    _resolve_extension_root,
     run_matrix,
     summarize_matrix,
 )
@@ -44,6 +45,45 @@ def _record(variant: str, elapsed_ms: float, *, state_sum: float = 3.0) -> dict:
             "external_compute_processes": [],
         },
     }
+
+
+def test_r2_matrix_discovers_isolated_overlay_for_official_checkout(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "workspace" / "upstream" / "r2_gaussian"
+    source_root.mkdir(parents=True)
+    (source_root / "train.py").write_text("# fixture\n", encoding="utf-8")
+    overlay = (
+        tmp_path / "workspace" / "build" / "r2-gaussian-compiler-overlay-v1"
+        / "xray_gaussian_rasterization_voxelization"
+    )
+    overlay.mkdir(parents=True)
+    (overlay / "_C.fixture.so").write_bytes(b"fixture")
+
+    assert _resolve_extension_root(source_root, None) == overlay.parent
+
+
+def test_r2_matrix_rejects_official_checkout_without_overlay(
+    tmp_path: Path,
+) -> None:
+    source_root = tmp_path / "workspace" / "upstream" / "r2_gaussian"
+    source_root.mkdir(parents=True)
+    (source_root / "train.py").write_text("# fixture\n", encoding="utf-8")
+
+    with pytest.raises(TrainingProbeError, match="isolated CUDA overlay"):
+        _resolve_extension_root(source_root, None)
+
+
+def test_r2_matrix_honors_explicit_overlay_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source_root = tmp_path / "workspace" / "upstream" / "r2_gaussian"
+    source_root.mkdir(parents=True)
+    explicit = tmp_path / "external-overlay"
+    explicit.mkdir()
+    monkeypatch.setenv("GALA_R2_EXTENSION_ROOT", str(explicit))
+
+    assert _resolve_extension_root(source_root, None) == explicit
 
 
 def test_r2_matrix_uses_gpu_base_and_checks_numerics() -> None:

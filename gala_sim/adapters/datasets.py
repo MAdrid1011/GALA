@@ -710,6 +710,12 @@ def _prepare_initialization(
             and existing.shape[0] > 0
             and target.stat().st_size
             == int(getattr(existing, "offset", 0)) + int(existing.nbytes)
+            and np.isfinite(existing).all()
+            and np.all(existing[:, 3] >= 0)
+            # Reference-volume initializers are consumed by the Gaussian
+            # model adapters, which expect normalized densities.  Older
+            # caches may contain raw uint16 attenuation values instead.
+            and (manifest.initialization is not None or float(np.max(existing[:, 3], initial=0.0)) <= 1.0)
         ):
             return target
     if manifest.initialization is not None:
@@ -733,7 +739,13 @@ def _prepare_initialization(
     state = denoised_point_cloud_initialization(
         sample, min(50_000, sample.size), density_threshold=threshold,
     )
-    _atomic_save_array(target, np.column_stack((state.means, state.densities)))
+    densities = np.asarray(state.densities, dtype=np.float32)
+    if float(np.max(densities, initial=0.0)) > 1.0:
+        scale = float(np.quantile(densities[densities > 0], 0.9))
+        if not math.isfinite(scale) or scale <= 0:
+            raise ValueError("reference-volume initialization scale is invalid")
+        densities = np.clip(densities / scale, 1.0e-4, 1.0) * 0.15
+    _atomic_save_array(target, np.column_stack((state.means, densities)))
     return target
 
 
