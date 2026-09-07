@@ -441,12 +441,6 @@ def _validate_large_capture_trace_streaming(
     )
     dependency_chunk_size = chunk_size
     event_index_dtype = _compact_unsigned_dtype(event_count)
-    event_key_dtype = np.dtype([
-        ("kind", np.dtype("u1")),
-        ("query", _compact_unsigned_dtype(query_count)),
-        ("gaussian", _compact_unsigned_dtype(gaussian_domain_count)),
-        ("relation", _compact_unsigned_dtype(relation_count)),
-    ], align=False)
     counts_array = np.zeros(len(PrimitiveKind) + 1, dtype=np.int64)
     relation_query_counts = np.zeros(query_count, dtype=np.uint64)
     query_close_seen = np.zeros(query_count, dtype=bool)
@@ -466,7 +460,6 @@ def _validate_large_capture_trace_streaming(
         relation_index_directory = str(config.index_directory)
     required_index_bytes = (
         relation_count * event_index_dtype.itemsize
-        + event_count * event_key_dtype.itemsize
     )
     if relation_index_directory is not None:
         stats = os.statvfs(relation_index_directory)
@@ -476,18 +469,24 @@ def _validate_large_capture_trace_streaming(
                 "trace validation index directory has insufficient free space: "
                 f"requires {required_index_bytes} bytes, has {available_index_bytes} bytes"
             )
-    with (
-        tempfile.TemporaryFile(dir=relation_index_directory) as relation_index_file,
-        tempfile.TemporaryFile(dir=relation_index_directory) as event_key_file,
-    ):
+    with tempfile.TemporaryFile(dir=relation_index_directory) as relation_index_file:
         relation_event_ids = np.memmap(
             relation_index_file, dtype=event_index_dtype, mode="w+", shape=(relation_count,)
         )
         missing_event_id = np.iinfo(event_index_dtype).max
         relation_event_ids[:] = missing_event_id
-        event_keys = np.memmap(
-            event_key_file, dtype=event_key_dtype, mode="w+", shape=(event_count,)
-        )
+        # The event columns already carry these identities.  A previous
+        # implementation copied four fields for every event into a second
+        # disk-backed structured array, which made multi-billion-event full
+        # captures spend minutes dirtying tens of gigabytes of page cache.
+        # Field views preserve the existing validation API without another
+        # allocation or write pass.
+        event_keys = {
+            "kind": events["primitive_kind"],
+            "query": events["query_id"],
+            "gaussian": events["gaussian_id"],
+            "relation": events["relation_id"],
+        }
         start = 0
         while start < event_count:
             end = min(start + chunk_size, event_count)
@@ -507,12 +506,6 @@ def _validate_large_capture_trace_streaming(
                 dep_counts = dep_counts[:bounded_count]
                 dep_ends = dep_ends[:bounded_count]
             event_ids = np.arange(start, end, dtype=np.uint64)
-            compact_keys = np.empty(rows.size, dtype=event_key_dtype)
-            compact_keys["kind"] = rows["primitive_kind"]
-            compact_keys["query"] = rows["query_id"]
-            compact_keys["gaussian"] = rows["gaussian_id"]
-            compact_keys["relation"] = rows["relation_id"]
-            event_keys[start:end] = compact_keys
             if not np.array_equal(rows["event_id"], event_ids):
                 mismatch = int(start + np.flatnonzero(rows["event_id"] != event_ids)[0])
                 raise TraceValidationError(

@@ -20,6 +20,13 @@ Trace transformation commands include `trace-sample`, `trace-query-packets`,
 representative-packet planning commands. They preserve event identities and
 mark any intentionally bounded output in its generated manifest.
 
+`representative-ablation` runs the complete seven-variant matrix over the
+calibrated phase-stratified representative windows. Apply the same strategy to
+all workload documents and verify their common provenance with
+`representative-matrix-audit`. The audit requires all twelve documents to
+embed the exact calibrated strategy contract and marks them as complete
+representative-window experiments; it does not relabel them as a quick path.
+
 `campaign-ablation` composes trace capture, necessary-bound analysis, and the
 seven canonical ablations. Its default and `--representative-archive` modes are
 bounded CPU engineering checks. `--official-trace` uses the registered model's
@@ -29,7 +36,11 @@ workspace; capture wall time is not treated as GPU Base performance.
 Cycle commands include `cycle-replay`, `cycle-bounds`, `ablation`, and
 `archive-ablation`. Archive ablation requires explicit `--model` and
 `--dataset` identifiers. Variant order and compiler/hardware prerequisites are
-validated by the ablation layer.
+validated by the ablation layer. `archive-ablation --adaptive-stop` (with the
+legacy alias `--stop-when-speedup-stable`) runs the same end-to-end replay while
+stopping at a common stable iteration boundary and emits an explicit full-run
+stability certificate; it never silently upgrades an incomplete source archive
+to formal performance eligibility.
 
 Every command prints machine-readable JSON on success where practical and
 returns exit code 2 with an explanatory stderr message for validation or

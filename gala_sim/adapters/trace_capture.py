@@ -165,6 +165,11 @@ class TraceSession:
     state_record_bytes: int = 128
     relation_candidate_bytes: int = 0
     chunk_events: int = 65536
+    # Fact-GS decoders perform a CUDA->host transfer for each candidate batch.
+    # Keep the batches bounded, but make the bound large enough to avoid a
+    # synchronization per few hundred candidates on dense voxel queries.
+    fact_raster_record_chunk: int = 4096
+    fact_voxel_record_chunk: int = 4096
     stream_only: bool = False
     capture_iteration_range: tuple[int, int] | None = None
     stop_after_capture_range: bool = False
@@ -226,6 +231,8 @@ class TraceSession:
             raise ValueError("capture inactivity timeout must be positive")
         if self.progress_interval_seconds <= 0:
             raise ValueError("capture progress interval must be positive")
+        if self.fact_raster_record_chunk <= 0 or self.fact_voxel_record_chunk <= 0:
+            raise ValueError("Fact-GS record chunk sizes must be positive")
         if self.virtual_packet_consumer is not None and self.virtual_packet_consumer_factory is not None:
             raise ValueError(
                 "virtual packet consumer and consumer factory are mutually exclusive"
@@ -381,6 +388,12 @@ class TraceSession:
         audit.setdefault("relation_record_d2h_batches", 0)
         audit.setdefault("relation_record_device_chunks", 0)
         audit.setdefault("relation_record_d2h_chunks", 0)
+        audit["stream_cache_reclaim_bytes"] = int(
+            self._builder.stream_reclaim_bytes
+        )
+        audit["stream_cache_reclaim_count"] = int(
+            getattr(self._builder, "_stream_reclaim_count", 0)
+        )
         metadata: dict[str, object] = {
             "model": self._profile.display_name,
             "model_id": self._profile.model_id,
@@ -392,6 +405,8 @@ class TraceSession:
             ),
             "state_record_bytes": self.state_record_bytes,
             "trace_chunk_events": self.chunk_events,
+            "fact_raster_record_chunk": self.fact_raster_record_chunk,
+            "fact_voxel_record_chunk": self.fact_voxel_record_chunk,
             "trace_capture_status": "real_extension_buffers",
             "capture_audit_schema_version": "gala-r2-capture-audit-v4",
             "initial_gaussian_count": self._initial_gaussian_count,
@@ -851,7 +866,7 @@ class TraceSession:
                 gaussian_ids_sorted, tile_bins, pos2d, conics_mu, intensities,
                 image_shape, int(start), int(count),
             ),
-            record_candidate_chunk=2048,
+            record_candidate_chunk=self.fact_raster_record_chunk,
             virtual_packet_fn=lambda query_base: decode_fact_raster_virtual_packet(
                 gaussian_ids_sorted, tile_bins, pos2d, conics_mu, intensities,
                 image_shape, iteration_id=self._iteration,
@@ -880,7 +895,7 @@ class TraceSession:
                 gaussian_ids_sorted, tile_bins, pos3d_radii, conics, intensities,
                 volume_shape, int(start), int(count),
             ),
-            record_candidate_chunk=512,
+            record_candidate_chunk=self.fact_voxel_record_chunk,
             virtual_packet_fn=lambda query_base: decode_fact_voxel_virtual_packet(
                 gaussian_ids_sorted, tile_bins, pos3d_radii, conics, intensities,
                 volume_shape, iteration_id=self._iteration,
@@ -1891,6 +1906,20 @@ class TraceSession:
             self._next_gaussian = count
             self._initial_gaussian_count = count
             self._gaussian_ids_initialized = True
+            return
+        # Exact-GS exposes a zero-sized placeholder from its learning-rate
+        # hook before training_setup installs the precomputed Gaussian state.
+        # Permit that one pre-capture transition, while keeping all later
+        # count changes strict so stable IDs cannot be silently re-based.
+        if (
+            not self._gaussian_ids
+            and count > 0
+            and not self._capture_window_started
+            and self._builder.next_event_id == 0
+        ):
+            self._gaussian_ids = list(range(count))
+            self._next_gaussian = count
+            self._initial_gaussian_count = count
             return
         if len(self._gaussian_ids) != count:
             raise RuntimeError(

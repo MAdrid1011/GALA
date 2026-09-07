@@ -84,7 +84,13 @@ def packed_tile_statistics(source: VirtualTracePacket) -> PackedTileStatistics:
     if bool((tiles < 0).any()) or bool((tiles >= tile_count).any()):
         raise ValueError("packed packet contains an out-of-domain tile")
     byte_masks = np.asarray(source.masks, dtype=np.dtype("<u4")).view(np.uint8)
-    byte_masks = byte_masks.reshape(source.candidate_count, -1)
+    # Empty CUDA queries are valid (for example, a sparse voxel tile).  NumPy
+    # cannot infer ``-1`` when the first dimension is zero, so derive the
+    # fixed mask width from the template's local query domain.
+    mask_bytes_per_candidate = source.local_query_count // 8
+    byte_masks = byte_masks.reshape(
+        source.candidate_count, mask_bytes_per_candidate,
+    )
     active_lanes = _POPCOUNT8[byte_masks]
     candidate_counts = np.bincount(tiles, minlength=tile_count).astype(
         np.uint64, copy=False,

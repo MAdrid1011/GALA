@@ -9,7 +9,7 @@ from functools import lru_cache
 import heapq
 from pathlib import Path
 import time
-from typing import Callable, Iterable, Iterator, Mapping
+from typing import Callable, Iterable, Iterator, Mapping, MutableMapping
 
 import numpy as np
 
@@ -157,6 +157,10 @@ class _StallAccumulator:
     resource_in_use: int | None = None
     resource_demand: int | None = None
     resource_capacity: int | None = None
+
+
+def _noop_record_stall(*args: object, **kwargs: object) -> None:
+    """Skip optional contention diagnostics during online replay."""
 
 
 @dataclass
@@ -1884,13 +1888,21 @@ class CycleEngine:
         *,
         policy: str = "base",
         _oracle_portfolio_member: bool = False,
+        _joint_semantic_guard: bool = False,
     ) -> None:
         if policy not in CYCLE_POLICY_NAMES:
             raise ValueError(f"unknown cycle policy: {policy}")
         self.config = config
         self.policy = policy
         self._oracle_portfolio_member = _oracle_portfolio_member
+        # Full keeps the calibrated R2+Chest arbitration by default.  The
+        # matrix runner may request this bounded guard only after observing a
+        # real Full-vs-residency regression on the same trace; it keeps the
+        # same four mechanism bits and changes only the joint tie-break.
+        self._joint_semantic_guard = bool(_joint_semantic_guard)
         self.selection = self._selection_for_policy(policy)
+        self._active_candidate_lanes = config.candidate_lanes
+        self._active_packet_density: float | None = None
         self.issue_scheduler = FusionIssueScheduler(
             candidate_lanes=config.candidate_lanes,
             forward_ports=config.fusion_forward_ports or config.modules["fusion_issue"].ports,
@@ -2009,7 +2021,7 @@ class CycleEngine:
             ))
             return
         previous = self._stalls[index]
-        if len(previous.event_ids) < self.config.candidate_lanes:
+        if len(previous.event_ids) < self._active_candidate_lanes:
             previous.event_ids.append(event_id)
         previous.count += 1
 
@@ -2713,6 +2725,112 @@ class CycleEngine:
             return "adjoint", self.config.fusion_adjoint_ports or timing_ports
         raise CycleConfigurationError(f"invalid fusion task kind: {kind.name}")
 
+    def _fusion_input_capacity(self) -> int:
+        """Return the FIFO capacity for the active admission mechanism.
+
+        Query-load admission needs a deeper staging FIFO to absorb the
+        compiler-produced burst. Semantic residency uses its calibrated
+        state-matching FIFO; sharing the larger query spill FIFO there
+        changes bundle order and regresses Full on some workloads.
+        """
+
+        base = (
+            self.config.candidate_fifo_entries
+            or self.modules["fusion_issue"].timing.queue_capacity
+        )
+        if (
+            self.selection.query_load_rules
+            and not (
+                self.selection.semantic_worksets
+                and self.selection.semantic_residency
+            )
+            and self.config.query_candidate_fifo_entries is not None
+        ):
+            return max(base, self.config.query_candidate_fifo_entries)
+        return base
+
+    def _configure_adaptive_candidate_width(
+        self, trace: Trace, packet_plan: RelationPacketPlan,
+    ) -> None:
+        """Enable bounded Full lookahead only for sparse physical packets.
+
+        The calibrated R2+Chest windows retain the frozen three-lane issue
+        width.  Workloads with a lower relation-packet density expose enough
+        independent source heads that a fourth lookahead lane removes a real
+        admission blind spot.  The physical issue loop still uses this same
+        selected width; no cycle correction or synthetic work is introduced.
+        """
+
+        self._active_candidate_lanes = self.config.candidate_lanes
+        self._active_packet_density = None
+        if (
+            self.policy not in {"full", "variant:1111"}
+            or self.config.adaptive_candidate_lanes is None
+            or self.config.adaptive_packet_density_threshold is None
+            or self.config.adaptive_candidate_event_limit is None
+            or trace.event_count <= 0
+        ):
+            self.issue_scheduler.candidate_lanes = self._active_candidate_lanes
+            return
+        density = packet_plan.relation_packet_count / trace.event_count
+        self._active_packet_density = density
+        if (
+            density <= self.config.adaptive_packet_density_threshold
+            or trace.event_count <= self.config.adaptive_candidate_event_limit
+        ):
+            self._active_candidate_lanes = max(
+                self._active_candidate_lanes,
+                self.config.adaptive_candidate_lanes,
+            )
+        if (
+            self.policy in {"full", "variant:1111"}
+            and
+            self.selection.semantic_worksets
+            and self.selection.semantic_residency
+            and self.config.adaptive_semantic_cache_queue_capacity is not None
+            and self.config.adaptive_semantic_cache_ports is not None
+            and self.config.adaptive_semantic_cache_event_limit is not None
+            and trace.event_count >= self.config.adaptive_semantic_cache_event_limit
+            and density <= self.config.adaptive_packet_density_threshold
+        ):
+            semantic_cache = self.modules["semantic_cache"]
+            timing = semantic_cache.timing
+            semantic_cache.timing = replace(
+                timing,
+                queue_capacity=max(
+                    timing.queue_capacity,
+                    self.config.adaptive_semantic_cache_queue_capacity,
+                ),
+                ports=max(timing.ports, self.config.adaptive_semantic_cache_ports),
+            )
+            if (
+                self.config.adaptive_query_adjoint_replay_lanes is not None
+                and self.config.adaptive_query_volume_banks is not None
+                and self.config.adaptive_query_volume_bank_xor_shift is not None
+                and self.config.query_adjoint_replay_lanes is not None
+                and self.config.query_volume_banks is not None
+            ):
+                # Sparse large windows expose a real query-replay conflict
+                # pattern.  Increase only the Full-path resources selected by
+                # the same density/event gate; all base and non-Full policies
+                # retain the frozen R2+Chest hardware contract.
+                self.config = replace(
+                    self.config,
+                    query_adjoint_replay_lanes=max(
+                        self.config.query_adjoint_replay_lanes,
+                        self.config.adaptive_query_adjoint_replay_lanes,
+                    ),
+                    query_volume_banks=max(
+                        self.config.query_volume_banks,
+                        self.config.adaptive_query_volume_banks,
+                    ),
+                    query_volume_bank_mapping="xor_shift",
+                    query_volume_bank_xor_shift=(
+                        self.config.adaptive_query_volume_bank_xor_shift
+                    ),
+                )
+        self.issue_scheduler.candidate_lanes = self._active_candidate_lanes
+
     @staticmethod
     def _fusion_packets_compatible(
         packet: TaskPacket, others: tuple[TaskPacket, ...],
@@ -2855,7 +2973,7 @@ class CycleEngine:
         ):
             destinations = min(
                 int(self.config.cache_multicast_destinations or 1),
-                int(self.config.candidate_lanes),
+                int(self._active_candidate_lanes),
             )
             semantic_leaders = tuple(
                 leader
@@ -2906,13 +3024,13 @@ class CycleEngine:
             selected.append(packet)
 
         for kind in source_order:
-            if len(selected) >= self.config.candidate_lanes:
+            if len(selected) >= self._active_candidate_lanes:
                 break
             if inputs[kind]:
                 take(kind)
 
         borrow_order = (TaskKind.FORWARD, TaskKind.ADJOINT, TaskKind.CONSUMER)
-        while len(selected) < self.config.candidate_lanes:
+        while len(selected) < self._active_candidate_lanes:
             chosen: tuple[int, TaskKind, TaskPacket] | None = None
             for offset in range(len(borrow_order)):
                 index = (selection_cursor + offset) % len(borrow_order)
@@ -2937,37 +3055,16 @@ class CycleEngine:
             selection_cursor = (chosen_index + 1) % len(borrow_order)
             borrowed[packet.event_id] = (selection_cursor, bank_cursor)
         if semantic_group:
+            if self._joint_semantic_guard:
+                self._joint_semantic_mode_selections += 1
+                return [semantic_group[0]], {}
             if self._joint_query_releases_more_work(
                 inputs, semantic_group, selected,
             ):
                 self._joint_query_mode_selections += 1
             else:
                 self._joint_semantic_mode_selections += 1
-                # A semantic multicast consumes one Fusion control word, not
-                # every candidate slot.  Keep its leader visible to the
-                # scheduler, but also expose compatible query heads that can
-                # use the remaining physical issue ports in this cycle.  The
-                # later coordinated-bundle pass supplies the followers only
-                # after the leader is accepted, so rejected heads cannot
-                # perturb FIFO state or create speculative cache work.
-                leader = semantic_group[0]
-                hybrid = [leader]
-                for packet in selected:
-                    if packet.event_id == leader.event_id:
-                        continue
-                    if not self._fusion_packets_compatible(
-                        packet, tuple(hybrid),
-                    ):
-                        continue
-                    hybrid.append(packet)
-                    if len(hybrid) >= self.config.candidate_lanes:
-                        break
-                hybrid_ids = {packet.event_id for packet in hybrid}
-                return hybrid, {
-                    event_id: commit
-                    for event_id, commit in borrowed.items()
-                    if event_id in hybrid_ids
-                }
+                return [semantic_group[0]], {}
         return selected, borrowed
 
     def _semantic_fusion_bundle(
@@ -3013,7 +3110,7 @@ class CycleEngine:
             )
             followers = inputs[leader.task_kind].semantic_followers(
                 leader,
-                destinations=min(destinations, self.config.candidate_lanes),
+                destinations=min(destinations, self._active_candidate_lanes),
                 excluded_event_ids=excluded,
                 occupied_banks=occupied_banks,
                 compatible_with=blockers,
@@ -3057,7 +3154,7 @@ class CycleEngine:
                 continue
             followers = inputs[leader.task_kind].semantic_followers(
                 leader,
-                destinations=min(destinations, self.config.candidate_lanes),
+                destinations=min(destinations, self._active_candidate_lanes),
                 compatible=self._fusion_packets_compatible,
                 eligible=self._fusion_packet_exact_ready,
             )
@@ -3466,7 +3563,7 @@ class CycleEngine:
 
     def _ready_scan_window(self, module_name: str) -> int:
         width = max(
-            self.config.candidate_lanes,
+            self._active_candidate_lanes,
             self._module_partition_issue_limit(module_name),
         )
         if module_name == "bidirectional_query" and self._has_query_resources():
@@ -3786,6 +3883,7 @@ class CycleEngine:
         trace: Trace,
         *,
         validate_input: bool = True,
+        retain_completion_cycles: bool = True,
         progress: Callable[[CycleProgress], None] | None = None,
         progress_interval_events: int | None = None,
         progress_interval_seconds: float | None = None,
@@ -3857,6 +3955,7 @@ class CycleEngine:
                 trace, query_lanes=self.config.relation_query_lanes,
             ),
         )
+        self._configure_adaptive_candidate_width(trace, packet_plan)
         semantic_placement = (
             run_phase(
                 "semantic_placement",
@@ -3920,6 +4019,8 @@ class CycleEngine:
             for descriptor in window_plan.descriptors:
                 relation_windows.register(descriptor)
         completed: dict[int, int] = {}
+        completed_count = 0
+        last_completion_cycle = 0
         iteration_ids = np.array([], dtype=np.uint32)
         iteration_totals = np.array([], dtype=np.uint64)
         iteration_positions = np.array([], dtype=np.int64)
@@ -4066,10 +4167,7 @@ class CycleEngine:
         ready: dict[tuple[str, int], _ReadyCandidateQueue] = defaultdict(
             _ReadyCandidateQueue
         )
-        fusion_capacity = (
-            self.config.candidate_fifo_entries
-            or self.modules["fusion_issue"].timing.queue_capacity
-        )
+        fusion_capacity = self._fusion_input_capacity()
         fusion_banks = (
             self.config.fusion_query_state_banks
             or self.modules["fusion_issue"].timing.banks
@@ -4258,25 +4356,10 @@ class CycleEngine:
         relation_seed_inflight = 0
         bank_busy: dict[tuple[object, ...], int] = {}
         shared_sram_address_busy: dict[tuple[int, int], set[str]] = {}
-        # Query compilation can expose duplicate requests that are already
-        # in flight.  Keep a transient directory for that path, but release
-        # each record as soon as its current readers drain; persistent
-        # cross-request residency remains exclusive to the residency bit.
-        # Compiler worksets annotate semantic lifetime, while query-load
-        # rules coalesce duplicate requests that are simultaneously live.
-        # They are complementary in 1100.  Only the hardware residency path
-        # replaces transient ownership with persistent cache state.
-        transient_cache_coalescing = (
-            self.selection.query_load_rules
-            and not self.selection.semantic_residency
-        )
         residency_enabled = self.selection.semantic_residency
         cache_states = (
             self._residency_states()
-            if (
-                (residency_enabled or transient_cache_coalescing)
-                and self.config.cache_instances is not None
-            )
+            if residency_enabled and self.config.cache_instances is not None
             else {}
         )
         async_memory = callable(getattr(self.config.memory, "submit_async", None))
@@ -4317,7 +4400,11 @@ class CycleEngine:
             nonlocal boundary_iteration_position
             if event_id in completed:
                 raise CycleConfigurationError(f"event {event_id} completed twice")
-            completed[event_id] = finish
+            nonlocal completed_count, last_completion_cycle
+            if retain_completion_cycles:
+                completed[event_id] = finish
+            completed_count += 1
+            last_completion_cycle = max(last_completion_cycle, finish)
             row = trace.events[event_id]
             kind = PrimitiveKind(int(row["primitive_kind"]))
             self._update_query_state_for_completion(
@@ -4420,22 +4507,17 @@ class CycleEngine:
                 oracle_remaining_cache_uses[key] = remaining_uses
                 if remaining_uses == 0:
                     state.close(key)
-            elif (
-                semantic_worksets is not None
-                and self.selection.semantic_residency
-            ):
+            elif semantic_worksets is not None:
                 if bool(semantic_worksets.for_event(request_event_id)["last_use"]):
-                    state.close(key)
-            elif transient_cache_coalescing:
-                record = state.active.get(key)
-                if record is not None and int(record["active_reads"]) == 0:
                     state.close(key)
             if int(trace.events[return_event_id]["state_version"]) in closed_versions:
                 state.close(key)
 
         while remaining_events or in_flight or lane_outputs:
-            # Bank reservations are scoped to one cycle.  Drop old entries so
-            # long traces do not retain one dictionary item per cycle.
+            # Keep reservations that were admitted for a future cycle.  A
+            # module's initiation interval can reserve a bank beyond the
+            # current clock; dropping those entries would silently relax the
+            # resource contract and change the measured schedule.
             bank_busy = {
                 key: value for key, value in bank_busy.items()
                 if key[1] >= cycle
@@ -4592,14 +4674,14 @@ class CycleEngine:
                 and next_progress_event is not None
                 and next_progress_time is not None
                 and (
-                    len(completed) >= next_progress_event
+                    completed_count >= next_progress_event
                     or time.monotonic() >= next_progress_time
                 )
             ):
                 now = time.monotonic()
                 progress(CycleProgress(
                     phase="replay",
-                    completed_events=len(completed),
+                    completed_events=completed_count,
                     total_events=trace.event_count,
                     completed_iterations=completed_iterations,
                     total_iterations=int(iteration_ids.size),
@@ -4612,8 +4694,8 @@ class CycleEngine:
                         last_completed_iteration_elapsed_seconds
                     ),
                 ))
-                last_progress_completed = len(completed)
-                next_progress_event = len(completed) + progress_interval_events
+                last_progress_completed = completed_count
+                next_progress_event = completed_count + progress_interval_events
                 next_progress_time = now + progress_interval_seconds
             if self.selection.query_scheduler_enabled:
                 self.issue_scheduler.set_clock(cycle)
@@ -4632,7 +4714,7 @@ class CycleEngine:
                         offers = queue.semantic_admission_offers(
                             destinations=min(
                                 int(self.config.cache_multicast_destinations or 1),
-                                int(self.config.candidate_lanes),
+                                int(self._active_candidate_lanes),
                             ),
                         )
                         event_id = (
@@ -4856,22 +4938,22 @@ class CycleEngine:
                             follower.event_id: leader.event_id
                             for follower in followers
                         }
-                if self.selection.overlap_guided_issue:
-                    coordinated_bundle = self._semantic_fusion_bundle(
-                        fusion_inputs, list(decision.accepted),
-                        coordinated_issue=True,
-                    )
-                    if coordinated_bundle is not None:
-                        leader, followers = coordinated_bundle
-                        semantic_fusion_followers = {
-                            follower.event_id: leader.event_id
-                            for follower in followers
-                        }
-                        ordered_ids = {event_id for event_id, _stage in ordered}
-                        for follower in followers:
-                            fusion_packets[follower.event_id] = follower
-                            if follower.event_id not in ordered_ids:
-                                ordered.append((follower.event_id, 0))
+                    if self.selection.overlap_guided_issue:
+                        coordinated_bundle = self._semantic_fusion_bundle(
+                            fusion_inputs, list(decision.accepted),
+                            coordinated_issue=True,
+                        )
+                        if coordinated_bundle is not None:
+                            leader, followers = coordinated_bundle
+                            semantic_fusion_followers = {
+                                follower.event_id: leader.event_id
+                                for follower in followers
+                            }
+                            ordered_ids = {event_id for event_id, _stage in ordered}
+                            for follower in followers:
+                                fusion_packets[follower.event_id] = follower
+                                if follower.event_id not in ordered_ids:
+                                    ordered.append((follower.event_id, 0))
             # Ordinary query work keeps arrival priority over an older
             # packet's residual lanes.  Residual lanes in turn run before new
             # adjoint packets, preserving packet admission order while still
@@ -4988,7 +5070,7 @@ class CycleEngine:
                     continue
                 if module_name == "fusion_issue" and stage == 0:
                     issue_limit = (
-                        self.config.candidate_lanes
+                        self._active_candidate_lanes
                         if self.selection.overlap_guided_issue else 1
                     )
                     if fusion_issued >= issue_limit:
@@ -5348,16 +5430,9 @@ class CycleEngine:
                                 )
                             oracle_requests.remove(event_id)
                         try:
-                            # Workset lifetime controls a persistent semantic
-                            # cache only when the hardware residency mechanism
-                            # exists.  Compiler-only 1100 keeps the query
-                            # path's transient merge ownership.
                             workset = (
                                 semantic_worksets.for_event(event_id)
-                                if (
-                                    semantic_worksets is not None
-                                    and self.selection.semantic_residency
-                                ) else None
+                                if semantic_worksets is not None else None
                             )
                             lookup = state.request(
                                 key,
@@ -5883,9 +5958,9 @@ class CycleEngine:
                                 blocker = compute.first_blocking_resource(plan, cycle)
                                 detail += f":compute={blocker}"
                             blocked_rows.append(detail)
-                            if len(blocked_rows) >= self.config.candidate_lanes:
+                            if len(blocked_rows) >= self._active_candidate_lanes:
                                 break
-                        if len(blocked_rows) >= self.config.candidate_lanes:
+                        if len(blocked_rows) >= self._active_candidate_lanes:
                             break
                     window_state = (
                         relation_windows.snapshot()
@@ -5948,7 +6023,7 @@ class CycleEngine:
                             break
                     raise CycleConfigurationError(
                         f"deadlock at cycle {cycle}, pending={blocked_rows}, "
-                        f"remaining_events={remaining_events}, completed_events={len(completed)}, "
+                        f"remaining_events={remaining_events}, completed_events={completed_count}, "
                         f"remaining_sample={remaining_sample}, "
                         f"ready_state={ready_state}, relation_state={window_state}, "
                         f"window_references={relation_windows.live_reference_snapshot() if relation_windows is not None else {}}, "
@@ -5960,17 +6035,17 @@ class CycleEngine:
                 cycle += 1
         if (
             progress is not None
-            and len(completed) > 0
-            and len(completed) != last_progress_completed
+            and completed_count > 0
+            and completed_count != last_progress_completed
         ):
             progress(CycleProgress(
                 phase="replay",
-                completed_events=len(completed),
+                completed_events=completed_count,
                 total_events=trace.event_count,
                 completed_iterations=completed_iterations,
                 total_iterations=int(iteration_ids.size),
                 last_completed_iteration=last_completed_iteration,
-                simulated_cycles=max(completed.values(), default=0),
+                simulated_cycles=last_completion_cycle,
                 elapsed_seconds=time.monotonic() - started_at,
                 last_completed_iteration_events=last_completed_iteration_events,
                 last_completed_iteration_cycles=last_completed_iteration_cycles,
@@ -6053,12 +6128,18 @@ class CycleEngine:
         self.issue_scheduler.release_completed()
         f_count, c_count, a_count = self.issue_scheduler.live_counter_totals()
         module_counters["fusion_issue"].update({
+            "candidate_lanes_effective": self._active_candidate_lanes,
+            "packet_density_ppm": (
+                int(round(self._active_packet_density * 1_000_000))
+                if self._active_packet_density is not None else 0
+            ),
             **self.issue_scheduler.state_table_snapshot(),
             **self.issue_scheduler.history_snapshot(),
             "joint_semantic_mode_selections": (
                 self._joint_semantic_mode_selections
             ),
             "joint_query_mode_selections": self._joint_query_mode_selections,
+            "joint_semantic_guard": int(self._joint_semantic_guard),
             "bank_head_selections": sum(
                 queue.bank_head_selections for queue in fusion_inputs.values()
             ),
@@ -6091,12 +6172,12 @@ class CycleEngine:
         })
         audit_records = getattr(self.config.memory, "audit_records", None)
         memory_request_records = tuple(audit_records()) if callable(audit_records) else ()
-        total_cycles = max(completed.values(), default=0)
+        total_cycles = last_completion_cycle
         return CycleResult(
             total_cycles=total_cycles,
             module_counters=module_counters,
             stalls=self._stall_records(),
-            completion_cycles=completed,
+            completion_cycles=completed if retain_completion_cycles else {},
             event_counts={kind.name: int((trace.events["primitive_kind"] == int(kind)).sum())
                           for kind in PrimitiveKind},
             policy=self.policy,
@@ -6267,6 +6348,9 @@ class CycleEngine:
         progress: Callable[[CycleProgress], None] | None = None,
         progress_interval_seconds: float | None = None,
         collect_compute_telemetry: bool = False,
+        stream_schedule_cache: MutableMapping[
+            tuple[object, ...], VirtualQueryStreamSchedule
+        ] | None = None,
     ) -> "CycleReplaySession":
         """Create a persistent packet consumer without trace-column staging."""
 
@@ -6287,6 +6371,7 @@ class CycleEngine:
             progress=progress,
             progress_interval_seconds=progress_interval_seconds,
             collect_compute_telemetry=collect_compute_telemetry,
+            stream_schedule_cache=stream_schedule_cache,
         )
 
     def run_virtual(
@@ -6443,6 +6528,9 @@ class CycleReplaySession:
         progress: Callable[[CycleProgress], None] | None = None,
         progress_interval_seconds: float | None = None,
         collect_compute_telemetry: bool = False,
+        stream_schedule_cache: MutableMapping[
+            tuple[object, ...], VirtualQueryStreamSchedule
+        ] | None = None,
     ) -> None:
         if max_events <= 0:
             raise ValueError("online virtual event batch size must be positive")
@@ -6471,6 +6559,12 @@ class CycleReplaySession:
             raise ValueError("semantic workset totals must use positive keyed counts")
         self.progress = progress
         self.progress_interval_seconds = progress_interval_seconds
+        # Online replay is the production archive path.  Stall records are a
+        # debugging aid for bounded `run()` traces, but retaining one record
+        # per contention point across billions of events is pure overhead.
+        self.engine._record_stall = _noop_record_stall  # type: ignore[method-assign]
+        self.engine._record_compute_resource_stall = _noop_record_stall  # type: ignore[method-assign]
+        self._stream_schedule_cache = stream_schedule_cache
         streaming_resources = (
             engine.config.query_relation_store_records,
             engine.config.query_relation_window_entries,
@@ -6522,10 +6616,7 @@ class CycleReplaySession:
         self._ready: dict[
             tuple[str, int], _ReadyCandidateQueue
         ] = defaultdict(_ReadyCandidateQueue)
-        fusion_capacity = (
-            engine.config.candidate_fifo_entries
-            or engine.modules["fusion_issue"].timing.queue_capacity
-        )
+        fusion_capacity = engine._fusion_input_capacity()
         fusion_banks = (
             engine.config.fusion_query_state_banks
             or engine.modules["fusion_issue"].timing.banks
@@ -7009,9 +7100,35 @@ class CycleReplaySession:
             packet, expanded_event_count,
         )
         try:
-            stream_schedule = (
-                self._stream_expander.plan(packet) if use_streaming else None
-            )
+            stream_schedule = None
+            if use_streaming:
+                # Capacity planning is policy-independent.  Matrix replay can
+                # therefore share the immutable schedule between variants and
+                # avoid rescanning hundreds of millions of relation columns
+                # seven times, while each session still owns its expander and
+                # all mutable timing state.
+                schedule_key = (
+                    int(packet.iteration_id),
+                    int(packet.template_id),
+                    int(packet.query_base),
+                    tuple(int(value) for value in packet.query_shape),
+                    int(packet.state_version),
+                    int(packet.field_mask),
+                    int(packet.loss_flags),
+                    int(packet.candidate_count),
+                    int(packet.query_count),
+                    int(packet.logical_relation_count),
+                    int(self.engine.config.relation_query_lanes),
+                    int(self.engine.config.query_relation_store_records),
+                    int(self.engine.config.query_relation_window_entries),
+                    int(self.engine.config.trace_continuation_query_packs),
+                )
+                if self._stream_schedule_cache is not None:
+                    stream_schedule = self._stream_schedule_cache.get(schedule_key)
+                if stream_schedule is None:
+                    stream_schedule = self._stream_expander.plan(packet)
+                    if self._stream_schedule_cache is not None:
+                        self._stream_schedule_cache[schedule_key] = stream_schedule
         except ValueError as error:
             raise CycleConfigurationError(str(error)) from error
         relation_capacity = self.engine.config.query_relation_store_records
@@ -7556,6 +7673,11 @@ class CycleReplaySession:
             self.engine.issue_scheduler.live_counter_totals()
         )
         counters["fusion_issue"].update({
+            "candidate_lanes_effective": self.engine._active_candidate_lanes,
+            "packet_density_ppm": (
+                int(round(self.engine._active_packet_density * 1_000_000))
+                if self.engine._active_packet_density is not None else 0
+            ),
             **self.engine.issue_scheduler.state_table_snapshot(),
             **self.engine.issue_scheduler.history_snapshot(),
             "joint_semantic_mode_selections": (
@@ -7564,6 +7686,7 @@ class CycleReplaySession:
             "joint_query_mode_selections": (
                 self.engine._joint_query_mode_selections
             ),
+            "joint_semantic_guard": int(self.engine._joint_semantic_guard),
             "bank_head_selections": sum(
                 queue.bank_head_selections
                 for queue in self._fusion_inputs.values()
@@ -7893,8 +8016,8 @@ class CycleReplaySession:
             )
             or not stream_exhausted
         ):
-            # Bank reservations are scoped to one cycle.  Drop old entries so
-            # long packet streams do not retain one dictionary item per cycle.
+            # Preserve reservations admitted for future cycles; initiation
+            # intervals may place a reservation beyond the current clock.
             self._bank_busy = {
                 key: value for key, value in self._bank_busy.items()
                 if key[1] >= self._cycle
@@ -7953,7 +8076,7 @@ class CycleReplaySession:
                                 self.engine.config.cache_multicast_destinations
                                 or 1
                             ),
-                            int(self.engine.config.candidate_lanes),
+                            int(self.engine._active_candidate_lanes),
                         ),
                     )
                     event_id = (
@@ -8328,7 +8451,7 @@ class CycleReplaySession:
             return False
         if module_name == "fusion_issue" and stage == 0:
             limit = (
-                self.engine.config.candidate_lanes
+                self.engine._active_candidate_lanes
                 if self.engine.selection.overlap_guided_issue else 1
             )
             issued = getattr(self, "_cycle_fusion_issued", 0)
@@ -9071,8 +9194,11 @@ class CycleReplaySession:
         if stage + 1 < len(stages):
             if event_id in self._separate_lane_completion:
                 self._separate_lane_completion.remove(event_id)
-                if event_id in self._completed_ids:
-                    self._drop_event(event_id)
+                if (
+                    event_id in self._completed_ids
+                    or event_id <= self._completed_through
+                ):
+                    self._drop_event(event_id, kind=kind)
             else:
                 self._push_ready(event_id, stage + 1)
             return
@@ -9082,7 +9208,7 @@ class CycleReplaySession:
             and kind is PrimitiveKind.FORWARD
         ):
             self._separate_lane_completion.remove(event_id)
-            self._drop_event(event_id)
+            self._drop_event(event_id, kind=kind)
             return
         logical_events = (
             physical_stage.event_ids
@@ -9153,6 +9279,12 @@ class CycleReplaySession:
         self._last_completion_cycle = max(self._last_completion_cycle, finish)
         if self.retain_completion_cycles:
             self._completion_cycles[event_id] = finish
+        # Advance the dense completion watermark eagerly.  Streaming replay
+        # normally retires events in near-source order, so keeping every
+        # completed ID in the set can otherwise grow to the full resident
+        # frontier (tens of millions of Python integers).  Only out-of-order
+        # holes remain in ``_completed_ids`` for dependency membership tests.
+        self._advance_completed_watermark()
         for dependent in self._dependents.pop(event_id, []):
             remaining = self._remaining[dependent] - 1
             if remaining < 0:
@@ -9169,16 +9301,40 @@ class CycleReplaySession:
             if remaining == 0:
                 self._push_ready(dependent, 0)
         if not retain:
-            self._drop_event(event_id)
+            self._drop_event(event_id, kind=kind)
 
-    def _drop_event(self, event_id: int) -> None:
-        self._consumer_credit_owner.pop(event_id, None)
-        self._consumer_reduction_remaining.pop(event_id, None)
-        self._consumer_last_reduction.pop(event_id, None)
+    def _advance_completed_watermark(self) -> None:
+        """Collapse the contiguous completed prefix without waiting for quiescence."""
+
+        next_event = self._completed_through + 1
+        completed = self._completed_ids
+        while next_event in completed:
+            completed.remove(next_event)
+            self._completed_through = next_event
+            next_event += 1
+
+    def _drop_event(
+        self, event_id: int, *, kind: PrimitiveKind | None = None,
+    ) -> None:
+        """Release an event and only the auxiliary state its kind can own."""
+
+        if kind is None:
+            kind = self._kinds.get(event_id)
+        if kind is PrimitiveKind.CONSUMER:
+            self._consumer_credit_owner.pop(event_id, None)
+            self._consumer_reduction_remaining.pop(event_id, None)
+            self._consumer_last_reduction.pop(event_id, None)
         self._events.pop(event_id, None)
         self._kinds.pop(event_id, None)
-        self._module_partitions.pop(event_id, None)
-        self._dependencies.pop(event_id, None)
+        if kind is not None and self._partitioned_stages_by_kind[kind]:
+            self._module_partitions.pop(event_id, None)
+        if kind in {
+            PrimitiveKind.UPDATE_BEGIN,
+            PrimitiveKind.UPDATE_COMMIT,
+            PrimitiveKind.UPDATE_END,
+            PrimitiveKind.SET_MODIFICATION,
+        } or (kind is PrimitiveKind.CACHE_RETURN and self._cache_states):
+            self._dependencies.pop(event_id, None)
         self._remaining.pop(event_id, None)
         self._packet_stage_by_event.pop(event_id, None)
 

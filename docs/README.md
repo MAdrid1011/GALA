@@ -16,7 +16,8 @@ kept outside version control.
 9. [Performance Engineering](08_PERFORMANCE_ENGINEERING.md)
 10. [Quality Validation](09_VALIDATION_AND_ACCEPTANCE.md)
 11. [Implementation Workflow](10_IMPLEMENTATION_WORKFLOW.md)
-12. [Workspace and Assets](WORKSPACE_AND_ASSETS.md)
+12. [Feature Reference](11_FEATURE_REFERENCE.md)
+13. [Workspace and Assets](WORKSPACE_AND_ASSETS.md)
 
 When documents conflict, apply this precedence: project constraints, hardware
 contract, parameter registry, cycle model, model and dataset contract, then

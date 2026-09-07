@@ -11,6 +11,7 @@ from gala_sim.tools.fact_gs_training_probe import (
     COMPILER_VARIANTS,
     FactTrainingProbeError,
     ProbeObservation,
+    _semantic_hot_fraction,
     compare_states,
     run_matrix,
     summarize_matrix,
@@ -46,6 +47,17 @@ def test_compiler_variants_independently_select_the_two_official_paths() -> None
     assert BACKWARD_PATHS["0100"].semantic_hot_relation_fraction == pytest.approx(0.40)
     assert BACKWARD_PATHS["1100"].projection_per_gaussian is True
     assert BACKWARD_PATHS["1100"].volume_per_gaussian is True
+
+
+def test_semantic_hot_fraction_override_is_scoped_and_validated(monkeypatch) -> None:
+    selection = BACKWARD_PATHS["0100"]
+    assert _semantic_hot_fraction(selection) == pytest.approx(0.40)
+    monkeypatch.setenv("GALA_FACT_SEMANTIC_HOT_FRACTION", "0.25")
+    assert _semantic_hot_fraction(selection) == pytest.approx(0.25)
+    monkeypatch.setenv("GALA_FACT_SEMANTIC_HOT_FRACTION", "1.5")
+    with pytest.raises(FactTrainingProbeError, match=r"in \(0, 1\]"):
+        _semantic_hot_fraction(selection)
+    assert _semantic_hot_fraction(BACKWARD_PATHS["1000"]) is None
 
 
 def test_state_comparison_reports_defined_numeric_tolerance() -> None:

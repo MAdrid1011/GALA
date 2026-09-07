@@ -13,9 +13,21 @@ official capture and replay paths.
 
 Pass `representative_archive=True`, or invoke `gala-sim campaign-ablation
 --representative-archive`, to construct a bounded virtual packet archive and
-replay its representative packet window. This is explicitly scoped as
-`quick_cpu_packet_archive_validation`; it validates the production archive
-contract but is not GPU performance evidence.
+replay its representative packet window. The canonical seven-variant
+representative experiment is exposed by `gala-sim representative-ablation`.
+It uses the calibrated R2+Chest window-selection, admission, arbitration, and
+median aggregation policy for every model/dataset combination. It is a complete
+representative-window simulation, not a reduced variant matrix; it remains
+explicitly separate from formal GPU performance evidence.
+
+After the twelve representative documents exist, audit that one policy was
+used everywhere with:
+
+```bash
+gala-sim representative-matrix-audit \
+  --results-root workspace/results \
+  --output workspace/results/representative-ablation-matrix-v1/audit.json
+```
 
 Pass `official_trace=True`, or invoke `gala-sim campaign-ablation
 --official-trace`, to run the selected model's pinned entrypoint with its trace
@@ -23,6 +35,13 @@ hooks and then feed that model-specific trace into the same necessary-bound and
 seven-variant replay stages. Official capture and representative archive modes
 are mutually exclusive. A capture-overhead wall time is retained for audit but
 is never used as the GPU Base latency.
+
+For a substantially faster development pass, add `--fast-capture` to
+`--official-trace`. This captures compact virtual packets, validates the full
+packet/lifecycle stream, selects a dependency-closed representative tile/brick,
+and runs all seven variants on that end-to-end trace. The result scope is
+`representative_speedup_validation` and is never formal GPU evidence; omit the
+flag for the complete official trace workflow.
 
 Compiler-only GPU timing is supplied separately as
 `<measurement-root>/<model>/<dataset>/gpu-compiler-measurement.json`. Pass the
@@ -64,6 +83,31 @@ requires an idle GPU, terminates only its own process group after five minutes
 without trace, CPU, or GPU progress, and preserves at least 1 GiB of free GPU
 memory and 8 GiB of available host memory. Its process report and logs remain
 under the ignored capture directory.
+
+Official adapters use bounded raw-column streaming and avoid materializing a
+second copy of the event columns. For fast development captures, the pinned
+runner also supports compact packets:
+
+R²-Gaussian virtual captures disable its unconditional image-evaluation pass;
+that pass concatenates every train/test projection and can consume several GiB
+of otherwise unused device memory. The R² child process also defaults to
+fragmentation-resistant CUDA allocation (`expandable_segments` with a bounded
+split size). These guards apply only to trace capture and do not change the
+un-instrumented reference or compiler timing paths.
+
+```bash
+python -m gala_sim.adapters.trace_runner \
+  --virtual-capture --virtual-capture-audit-only \
+  --packet-archive-root workspace/traces/<model>/<dataset>/virtual-archive \
+  --capture-config configs/architecture/gala.yaml \
+  --capture-iteration-range START:END --stop-after-capture-range ...
+```
+
+Validate the archive, select a representative packet window, and replay the
+seven variants with `trace-archive-validate`, `representative-packet-plan`,
+`representative-packet-trace`, and `ablation --quick-validation`. Compact
+replay accepts `archive-ablation --max-events` and `--prefetch-chunks` to bound
+memory while overlapping archive decompression with cycle simulation.
 Registered upstream adapters prefer
 `workspace/build/envs/<model>/bin/python` when present. An explicitly supplied
 Python executable has higher priority; the invoking interpreter is only a

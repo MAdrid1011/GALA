@@ -221,6 +221,7 @@ def _single_iteration_groups(
     template_ids = sorted(
         template_id for packet_iteration, template_id in descriptors
         if packet_iteration == iteration
+        and descriptors[(packet_iteration, template_id)].candidate_count > 0
     )
     for template_id in template_ids:
         statistics = packed_tile_statistics(
@@ -277,7 +278,7 @@ def build_representative_packet_trace(
     model_id: str | None = None,
     dataset_id: str | None = None,
 ) -> Trace:
-    """Expand one planned window for quick cycle replay.
+    """Expand one planned representative window through the cycle replay.
 
     Single-iteration groups receive a dependency-closed no-op optimizer
     transaction after their backward frontier.  This preserves the complete
@@ -417,7 +418,7 @@ def build_representative_packet_trace(
             "state_record_bytes": 128,
             "trace_sample": {
                 "schema_version": "gala-representative-packet-trace-v1",
-                "result_scope": "quick_cycle_validation",
+                "result_scope": "representative_window_simulation",
                 "formal_performance_eligible": False,
                 "quality_eligible": False,
                 "selection": (

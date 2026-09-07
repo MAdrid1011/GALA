@@ -451,11 +451,19 @@ class VirtualPacketArchiveReader:
             "index": int(descriptor.packet_index),
         })
 
-    def replay(self, consumer: Any, *, finish: bool = False) -> None:
+    def replay(
+        self, consumer: Any, *, finish: bool = False,
+        prefetch_chunks: int = 1, copy_packet_arrays: bool = True,
+    ) -> None:
         """Feed one independent consumer; callers may replay this reader again."""
+        if prefetch_chunks <= 0:
+            raise ValueError("archive replay prefetch count must be positive")
         if hasattr(consumer, "initialize_gaussians"):
             consumer.initialize_gaussians(self.initial_gaussian_count)
-        for kind, value in self.records():
+        for kind, value in self.records(
+            prefetch_chunks=prefetch_chunks,
+            copy_packet_arrays=copy_packet_arrays,
+        ):
             if kind == "packet":
                 _call(consumer, "accept_query_packet", value)
             elif kind == "lifecycle":
@@ -465,7 +473,10 @@ class VirtualPacketArchiveReader:
         if finish and hasattr(consumer, "finish"):
             consumer.finish()
 
-    def replay_session(self, engine: Any, **kwargs: Any) -> Any:
+    def replay_session(
+        self, engine: Any, *, prefetch_chunks: int = 1,
+        copy_packet_arrays: bool = True, **kwargs: Any,
+    ) -> Any:
         """Create and finish a fresh online session for one policy.
 
         Semantic totals are derived per iteration by the same bounded adapter
@@ -480,7 +491,10 @@ class VirtualPacketArchiveReader:
             **kwargs,
         )
         consumer = BufferedVirtualCycleConsumer(session)
-        self.replay(consumer, finish=True)
+        self.replay(
+            consumer, finish=True, prefetch_chunks=prefetch_chunks,
+            copy_packet_arrays=copy_packet_arrays,
+        )
         return consumer.result
 
     def validate(

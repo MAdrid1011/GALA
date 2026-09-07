@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import argparse
+import ctypes
 from dataclasses import asdict
 import json
 import os
 from pathlib import Path
 import runpy
 import sys
+from typing import Any
 
 from gala_sim.mechanisms import ONLINE_POLICY_NAMES
 
@@ -18,6 +20,56 @@ from .fact_low_memory import (
     install_r2_low_memory_overlay,
 )
 from .trace_capture import TRACE_HOOK_PROFILES, TraceCaptureComplete, TraceSession
+
+
+def _install_virtual_capture_eval_guard() -> object:
+    """Skip upstream image evaluation that is outside the capture contract.
+
+    R2-Gaussian's training script unconditionally appends iteration 1 to its
+    evaluation schedule.  Its evaluator concatenates every train/test image on
+    the GPU, which can exceed the remaining device headroom even though the
+    selected training iteration itself fits.  A profile hook changes only the
+    local ``testing_iterations`` argument at ``training_report`` entry; the
+    training, backward, and trace hooks remain untouched.
+    """
+
+    previous = sys.getprofile()
+
+    def profile(frame: Any, event: str, _arg: Any) -> None:
+        if event != "call" or frame.f_code.co_name != "training_report":
+            return
+        frame.f_locals["testing_iterations"] = ()
+        # CPython keeps function locals in fast slots; synchronize the mapping
+        # update so the callee observes the empty schedule immediately.
+        ctypes.pythonapi.PyFrame_LocalsToFast(
+            ctypes.py_object(frame), ctypes.c_int(1),
+        )
+
+    sys.setprofile(profile)
+    return previous
+
+
+def _restore_profile(previous: object) -> None:
+    sys.setprofile(previous if callable(previous) else None)
+
+
+def _configure_cuda_memory_environment() -> None:
+    """Use bounded CUDA allocator settings before an upstream import.
+
+    Official model entrypoints import torch lazily.  Setting these defaults at
+    the runner boundary therefore also covers direct trace-runner use, where
+    the parent adapter cannot inject an environment.  Callers may override
+    them explicitly for profiling or a model-specific runtime.
+    """
+
+    os.environ.setdefault(
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "expandable_segments:True,max_split_size_mb:128",
+    )
+    # CUDA module loading and cuDNN's plan cache can otherwise consume the
+    # small headroom left after model initialization on 12 GiB devices.
+    os.environ.setdefault("CUDA_MODULE_LOADING", "LAZY")
+    os.environ.setdefault("TORCH_CUDNN_V8_API_LRU_CACHE_LIMIT", "0")
 
 
 def _iteration_range(value: str) -> tuple[int, int]:
@@ -102,8 +154,17 @@ def _parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     args = _parser().parse_args(argv)
+    _configure_cuda_memory_environment()
     state_record_bytes = int(os.environ.get("GALA_TRACE_STATE_RECORD_BYTES", "128"))
-    chunk_events = int(os.environ.get("GALA_TRACE_CHUNK_EVENTS", "65536"))
+    # Larger bounded chunks reduce filesystem calls while keeping the capture
+    # memory bounded.  The official adapter can override this per run.
+    chunk_events = int(os.environ.get("GALA_TRACE_CHUNK_EVENTS", "262144"))
+    fact_raster_record_chunk = int(
+        os.environ.get("GALA_TRACE_FACT_RASTER_CHUNK", "4096")
+    )
+    fact_voxel_record_chunk = int(
+        os.environ.get("GALA_TRACE_FACT_VOXEL_CHUNK", "4096")
+    )
     inactivity_timeout_seconds = float(
         os.environ.get("GALA_TRACE_INACTIVITY_TIMEOUT_SECONDS", "300")
     )
@@ -114,6 +175,8 @@ def main(argv: list[str] | None = None) -> int:
         raise ValueError("GALA_TRACE_STATE_RECORD_BYTES must be positive")
     if chunk_events <= 0:
         raise ValueError("GALA_TRACE_CHUNK_EVENTS must be positive")
+    if fact_raster_record_chunk <= 0 or fact_voxel_record_chunk <= 0:
+        raise ValueError("Fact-GS record chunk sizes must be positive")
     if inactivity_timeout_seconds <= 0:
         raise ValueError("GALA_TRACE_INACTIVITY_TIMEOUT_SECONDS must be positive")
     if progress_interval_seconds <= 0:
@@ -233,6 +296,8 @@ def main(argv: list[str] | None = None) -> int:
         args.trace_output, model_id=args.model_id, dataset_name=args.dataset_id,
         state_record_bytes=state_record_bytes,
         chunk_events=chunk_events, stream_only=args.stream_only,
+        fact_raster_record_chunk=fact_raster_record_chunk,
+        fact_voxel_record_chunk=fact_voxel_record_chunk,
         capture_iteration_range=args.capture_iteration_range,
         stop_after_capture_range=args.stop_after_capture_range,
         virtual_capture=args.virtual_capture,
@@ -245,6 +310,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     low_memory_overlay = None
     exact_runtime_overlay = None
+    previous_profile = None
     original_argv = sys.argv
     completed = False
     installed = False
@@ -262,6 +328,13 @@ def main(argv: list[str] | None = None) -> int:
 
             exact_runtime_overlay = install_exact_runtime_overlay()
             low_memory_overlay = install_exact_low_memory_overlay()
+        # R² unconditionally calls training_report at iteration one.  That
+        # routine concatenates every train/test projection on CUDA and can
+        # exceed the capture process's remaining headroom.  Evaluation is
+        # outside the trace contract, so skip it for every R² trace capture,
+        # including stream-only captures (not only virtual archives).
+        if args.model_id == "r2_gaussian" and (args.virtual_capture or args.stream_only):
+            previous_profile = _install_virtual_capture_eval_guard()
         sys.argv = [str(args.train_script), *args.train_args]
         try:
             runpy.run_path(str(args.train_script), run_name="__main__")
@@ -269,6 +342,8 @@ def main(argv: list[str] | None = None) -> int:
             pass
         completed = True
     finally:
+        if previous_profile is not None:
+            _restore_profile(previous_profile)
         if low_memory_overlay is not None:
             low_memory_overlay.restore()
         if exact_runtime_overlay is not None:

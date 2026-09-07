@@ -12,11 +12,32 @@ from __future__ import annotations
 from dataclasses import dataclass
 import importlib
 import mmap
+import os
 from pathlib import Path
 from types import ModuleType
-from typing import Any, Callable
+from typing import Any, Callable, MutableMapping
 
 import numpy as np
+
+
+def configure_cuda_memory_environment(
+    environment: MutableMapping[str, str] | None = None,
+) -> None:
+    """Install conservative CUDA allocator defaults before importing torch.
+
+    The official models allocate several large, short-lived render buffers.
+    Expandable segments reduce fragmentation, while lazy module loading and a
+    disabled cuDNN plan cache preserve headroom on 12 GiB development GPUs.
+    Explicit caller values remain authoritative.
+    """
+
+    target = os.environ if environment is None else environment
+    target.setdefault(
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "expandable_segments:True,max_split_size_mb:128",
+    )
+    target.setdefault("CUDA_MODULE_LOADING", "LAZY")
+    target.setdefault("TORCH_CUDNN_V8_API_LRU_CACHE_LIMIT", "0")
 
 
 @dataclass(frozen=True)

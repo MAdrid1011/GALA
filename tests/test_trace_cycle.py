@@ -1401,7 +1401,7 @@ def test_semantic_residency_with_worksets_merges_repeated_state_reads() -> None:
     assert combined.module_counters["shared_sram"]["accepted"] == 3
 
 
-def test_joint_compiler_preserves_query_transient_cache_coalescing() -> None:
+def test_joint_compiler_keeps_transient_cache_paths_separate() -> None:
     builder = TraceBuilder()
     requests = [
         builder.emit(TraceEvent(
@@ -1434,8 +1434,10 @@ def test_joint_compiler_preserves_query_transient_cache_coalescing() -> None:
     query = CycleEngine(config, policy="variant:1000").run(trace)
     joint = CycleEngine(config, policy="variant:1100").run(trace)
 
-    assert query.module_counters["semantic_cache"]["memory_requests"] == 1
-    assert joint.module_counters["semantic_cache"]["memory_requests"] == 1
+    # Query load rules do not create a second, non-equivalent residency
+    # mechanism.  Persistent coalescing belongs to the semantic-residency bit.
+    assert query.module_counters["semantic_cache"]["memory_requests"] == 2
+    assert joint.module_counters["semantic_cache"]["memory_requests"] == 2
     assert joint.total_cycles <= query.total_cycles
 
 
@@ -2118,13 +2120,12 @@ def test_semantic_ready_group_priority_selects_ready_leader_in_joint_variant() -
 
     assert candidates("variant:0101") == [10]
     assert candidates("variant:0100") == [10, 1, 11]
-    # Full keeps the semantic leader, then uses its otherwise idle candidate
-    # slots for compatible query work.  The semantic followers remain behind
-    # the leader until the later coordinated-control admission succeeds.
-    assert candidates("variant:1111") == [10, 1, 11]
-    assert candidates("variant:1111", current_support=208) == [10, 1, 11]
-    assert candidates("variant:1111", current_support=209) == [10, 1, 11]
-    assert candidates("variant:1111", previous_support=True) == [10, 1, 11]
+    # Full uses the same semantic leader arbitration as the calibrated
+    # R2+Chest path; it does not expose a speculative hybrid candidate list.
+    assert candidates("variant:1111") == [10]
+    assert candidates("variant:1111", current_support=208) == [10]
+    assert candidates("variant:1111", current_support=209) == [10]
+    assert candidates("variant:1111", previous_support=True) == [10]
     assert candidates("variant:0000") == [10, 1, 11]
     assert candidates("variant:1010") == [10, 1, 11]
 
@@ -2939,9 +2940,13 @@ def test_loaded_architecture_uses_three_independent_144_entry_candidate_fifos() 
     cycle_config = CycleConfig.from_gala(config, _Memory())
 
     assert cycle_config.candidate_fifo_entries == 144
+    assert cycle_config.query_candidate_fifo_entries == 384
     assert cycle_config.fusion_bank_head_lookahead is True
     assert cycle_config.fusion_bank_head_index_bytes == 224
     assert cycle_config.fusion_semantic_bundle_index_bytes == 640
+    assert CycleEngine(cycle_config, policy="variant:1010")._fusion_input_capacity() == 384
+    assert CycleEngine(cycle_config, policy="variant:0101")._fusion_input_capacity() == 144
+    assert CycleEngine(cycle_config, policy="variant:1111")._fusion_input_capacity() == 144
 
 
 def test_event_driven_engine_replays_large_dependency_chain() -> None:

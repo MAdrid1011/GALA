@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import subprocess
@@ -19,6 +20,7 @@ from gala_sim.trace import DeviceTraceSink, Trace, TraceReader, TraceWriter
 
 from .chest import load_chest_manifest
 from .protocol import PreparedRun, ReferenceArtifact, TraceArtifact
+from .trace_process import run_trace_process
 
 
 class TraceCaptureUnavailable(RuntimeError):
@@ -178,10 +180,18 @@ class R2GaussianAdapter(_R2GaussianAdapterBase):
         repository_commit = _repository_commit(repository_root)
         command = (
             run.official_command[0], "-m", "gala_sim.adapters.trace_runner",
-            "--trace-output", str(trace_root), str(run.source_root / "train.py"),
+            "--trace-output", str(trace_root), "--stream-only",
+            str(run.source_root / "train.py"),
             *run.official_command[2:],
         )
         environment = os.environ.copy()
+        # Keep the allocator from reserving a fragmented tail during the
+        # bounded capture window.  This is especially important for Walnut,
+        # whose dense projections leave less than 1 GiB of headroom.
+        environment.setdefault(
+            "PYTORCH_CUDA_ALLOC_CONF",
+            "expandable_segments:True,max_split_size_mb:128",
+        )
         python_path = str(repository_root)
         if environment.get("PYTHONPATH"):
             python_path += os.pathsep + environment["PYTHONPATH"]
@@ -202,7 +212,18 @@ class R2GaussianAdapter(_R2GaussianAdapterBase):
         except (OSError, ValueError, RuntimeError) as error:
             raise TraceCaptureUnavailable(f"captured trace failed validation: {error}") from error
         trace = _bind_trace_identity(trace, run, self.model_commit, repository_commit)
-        TraceWriter().write(trace, trace_root, validate=True)
+        manifest_path = trace_root / "chunk_manifest.json"
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                raise TraceCaptureUnavailable("captured trace chunk manifest is malformed")
+            manifest["metadata"] = dict(trace.metadata)
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=True, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        else:
+            TraceWriter().write(trace, trace_root, validate=True)
         try:
             _push_trace_chunks(trace, sink)
         except (BufferError, RuntimeError, ValueError) as error:
@@ -218,6 +239,40 @@ class R2GaussianAdapter(_R2GaussianAdapterBase):
             }
         )
         return TraceArtifact(trace_root=trace_root, trace=trace, reference=reference)
+
+    def capture_virtual_archive(
+        self, run: PreparedRun, *, archive_root: Path, capture_config: Path,
+        capture_iteration_range: tuple[int, int] = (1, 1),
+    ) -> dict[str, Any]:
+        """Capture compact CUDA packets without materializing a full trace."""
+        repository_root = Path(__file__).resolve().parents[2]
+        capture_root = self.output_root / "virtual-capture"
+        command = (
+            run.official_command[0], "-m", "gala_sim.adapters.trace_runner",
+            "--trace-output", str(capture_root),
+            "--model-id", "r2_gaussian", "--dataset-id", run.dataset_name,
+            "--virtual-capture", "--virtual-capture-audit-only",
+            "--packet-archive-root", str(Path(archive_root)),
+            "--capture-config", str(Path(capture_config)),
+            "--capture-iteration-range",
+            f"{capture_iteration_range[0]}:{capture_iteration_range[1]}",
+            "--stop-after-capture-range", str(run.source_root / "train.py"),
+            *run.official_command[2:],
+        )
+        environment = os.environ.copy()
+        environment.setdefault(
+            "PYTORCH_CUDA_ALLOC_CONF",
+            "expandable_segments:True,max_split_size_mb:128",
+        )
+        environment["PYTHONPATH"] = os.pathsep.join(
+            item for item in (str(repository_root), environment.get("PYTHONPATH")) if item
+        )
+        return run_trace_process(
+            command, cwd=run.source_root, environment=environment,
+            trace_root=capture_root, inactivity_timeout_seconds=300.0,
+            preflight_fn=lambda: self.preflight_environment(environment),
+            prepare_fn=lambda: self.output_root.mkdir(parents=True, exist_ok=True),
+        )
 
     def replay_reductions(self, run: PreparedRun, order: Any) -> ReferenceArtifact:
         raise TraceCaptureUnavailable("functional replay requires a validated trace and reduction order")

@@ -20,6 +20,10 @@ profiles, and result artifacts are stored under an ignored local workspace.
 - Composable model and dataset adapters
 - Compiler and architecture ablation generation
 
+The [feature reference](docs/11_FEATURE_REFERENCE.md) describes the dataflow
+primitives, compiler metadata, hardware modules, and evaluation interfaces in
+one place.
+
 ## Requirements
 
 - Python 3.10 or newer
@@ -151,6 +155,14 @@ gala-sim cycle-replay \
 Every generated result identifies its inputs, configuration, memory backend,
 resource snapshot, event coverage, and comparison baseline. The repository
 does not ship generated performance tables or local run histories.
+
+## Implementation Scope
+
+This package contains the event model, compiler metadata passes, CUDA overlay
+experiments, cycle simulator, model and dataset adapters, and reproduction
+commands. RTL generation, physical design, and power or area estimation are
+outside this repository. Their outputs are not inferred from simulator cycle
+counts.
 
 ## Ramulator 2 Bridge
 

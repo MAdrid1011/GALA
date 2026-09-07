@@ -18,7 +18,10 @@ from typing import Any, Iterator, Sequence
 
 import numpy as np
 
-from gala_sim.adapters.fact_low_memory import install_r2_low_memory_overlay
+from gala_sim.adapters.fact_low_memory import (
+    configure_cuda_memory_environment,
+    install_r2_low_memory_overlay,
+)
 from gala_sim.adapters.stage_profile import GpuStageProfileSession, IterationRange
 from gala_sim.tools.gpu_observation import (
     GpuObservationError,
@@ -287,6 +290,7 @@ def run_probe(
         DEFAULT_MINIMUM_AVAILABLE_HOST_MEMORY_BYTES
     ),
 ) -> dict[str, Any]:
+    configure_cuda_memory_environment()
     if not 0 <= warmup_iterations < requested_iterations <= PUBLISHED_ITERATIONS:
         raise TrainingProbeError("require 0 <= warmup < requested <= 30000 iterations")
     if progress_interval <= 0:
@@ -487,6 +491,21 @@ def run_probe(
             "requested_iterations": requested_iterations,
             "warmup_iterations": warmup_iterations,
             "measured_iterations": measured_iterations,
+            "adaptive_control_schedule": {
+                "densify_from_iteration": int(optimization.densify_from_iter),
+                "densification_interval": int(optimization.densification_interval),
+                "densify_until_iteration": int(optimization.densify_until_iter),
+                "densification_triggered_in_prefix": bool(
+                    requested_iterations > int(optimization.densify_from_iter)
+                    and any(
+                        iteration % int(optimization.densification_interval) == 0
+                        for iteration in range(
+                            int(optimization.densify_from_iter) + 1,
+                            min(requested_iterations, int(optimization.densify_until_iter) - 1) + 1,
+                        )
+                    )
+                ),
+            },
             "included_training_operations": [
                 "projection_forward", "l1", "dssim", "tv", "backward",
                 "adaptive_control", "densification", "adam",

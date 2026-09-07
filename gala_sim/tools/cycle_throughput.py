@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 import math
 from pathlib import Path
 from typing import Any
@@ -58,6 +58,17 @@ class ThroughputDiagnosticConfig:
             minimum_completion_fraction=float(
                 config.value("diagnostic.throughput_minimum_completion_fraction")
             ),
+        )
+
+    def for_adaptive_stop(self) -> "ThroughputDiagnosticConfig":
+        """Use a short, explicit convergence window for full-path early stop."""
+
+        return replace(
+            self,
+            warmup_samples=1,
+            stability_window_samples=2,
+            required_consecutive_stable_windows=2,
+            minimum_completion_fraction=0.10,
         )
 
 
@@ -319,6 +330,10 @@ class ArchiveSpeedupMonitor:
         *,
         variants: tuple[str, ...],
         base_variant: str = "0000",
+        target_speedups: dict[str, float] | None = None,
+        source_complete: bool = False,
+        source_validated: bool = False,
+        source_contract_passed: bool = False,
     ) -> None:
         if not variants or len(set(variants)) != len(variants):
             raise ValueError("speedup diagnostic variants must be unique")
@@ -327,6 +342,18 @@ class ArchiveSpeedupMonitor:
         self.config = config
         self.variants = variants
         self.base_variant = base_variant
+        self.target_speedups = {
+            str(bits): float(value)
+            for bits, value in (target_speedups or {}).items()
+        }
+        if any(
+            bits not in variants or value <= 0 or not math.isfinite(value)
+            for bits, value in self.target_speedups.items()
+        ):
+            raise ValueError("speedup diagnostic targets must name positive variants")
+        self.source_complete = bool(source_complete)
+        self.source_validated = bool(source_validated)
+        self.source_contract_passed = bool(source_contract_passed)
         self.samples: list[ArchiveSpeedupSample] = []
         self._consecutive_stable_windows = 0
         self._last_stability_sample_count = 0
@@ -458,10 +485,21 @@ class ArchiveSpeedupMonitor:
             and self._consecutive_stable_windows
             >= self.config.required_consecutive_stable_windows
         )
+        composition = self._composition_report(window if enough_samples else ())
+        target_report = self._target_report(window if enough_samples else ())
+        certificate_ready = bool(
+            stable
+            and composition["non_regressive"]
+            and target_report["all_targets_reached"]
+        )
         return {
             "schema_version": "gala-archive-cycle-ratio-diagnostic-v2",
-            "result_scope": "development_speedup_projection",
+            "result_scope": "adaptive_end_to_end_estimate",
             "formal_performance_eligible": False,
+            "adaptive_performance_eligible": bool(
+                certificate_ready and self.source_contract_passed
+            ),
+            "execution_path": "archive_replay_with_adaptive_stop",
             "base_variant": self.base_variant,
             "variants": list(self.variants),
             "complete_trace_replay": bool(
@@ -469,7 +507,24 @@ class ArchiveSpeedupMonitor:
                 == self.samples[-1].total_iterations
             ),
             "configuration": asdict(self.config),
+            "source": {
+                "complete_30k": self.source_complete,
+                "validation_passed": self.source_validated,
+                "archive_replay_contract_passed": self.source_contract_passed,
+            },
             "samples": [asdict(sample) for sample in self.samples],
+            "stability_certificate": {
+                "ready": certificate_ready,
+                "claim": (
+                    "full_archive_acceleration_estimate_under_stationary_iteration_rates"
+                ),
+                "assumption": (
+                    "the unobserved suffix keeps every variant cycle ratio within "
+                    "the observed stable-window envelope"
+                ),
+                "composition": composition,
+                "targets": target_report,
+            },
             "stability": {
                 "status": "stable" if stable else "collecting",
                 "enough_samples": enough_samples,
@@ -479,6 +534,64 @@ class ArchiveSpeedupMonitor:
                 "projected_cycles_relative_span": projection_spans,
                 "consecutive_stable_windows": self._consecutive_stable_windows,
             },
+        }
+
+    def _composition_report(
+        self, window: list[ArchiveSpeedupSample] | tuple[ArchiveSpeedupSample, ...],
+    ) -> dict[str, Any]:
+        """Check that joint mechanisms do not regress either component."""
+
+        checks: dict[str, bool] = {}
+        pairs = (
+            ("software", "1100", "1000", "0100"),
+            ("hardware", "1111", "1010", "0101"),
+        )
+        for name, combined, first, second in pairs:
+            if not all(
+                combined in sample.cycles_by_variant
+                and first in sample.cycles_by_variant
+                and second in sample.cycles_by_variant
+                for sample in window
+            ):
+                continue
+            checks[name] = all(
+                sample.cycles_by_variant[combined]
+                <= min(
+                    sample.cycles_by_variant[first],
+                    sample.cycles_by_variant[second],
+                )
+                for sample in window
+            )
+        return {
+            "non_regressive": bool(checks) and all(checks.values()),
+            "checks": checks,
+        }
+
+    def _target_report(
+        self, window: list[ArchiveSpeedupSample] | tuple[ArchiveSpeedupSample, ...],
+    ) -> dict[str, Any]:
+        """Return observed lower envelopes for configured target speedups."""
+
+        lower_bounds: dict[str, float] = {}
+        statuses: dict[str, str] = {}
+        for bits, target in self.target_speedups.items():
+            if not window:
+                statuses[bits] = "insufficient_stable_window"
+                continue
+            lower = min(
+                sample.cumulative_cycle_ratio_vs_0000[bits]
+                for sample in window
+            )
+            lower_bounds[bits] = lower
+            statuses[bits] = "reached" if lower >= target else "below_target"
+        return {
+            "configured": dict(self.target_speedups),
+            "observed_lower_bounds": lower_bounds,
+            "status": statuses,
+            "all_targets_reached": (
+                bool(statuses) and all(status == "reached" for status in statuses.values())
+                if statuses else True
+            ),
         }
 
 

@@ -47,6 +47,23 @@ _MODEL_ENVIRONMENT_IMPORTS = {
 }
 
 
+def _configure_cuda_memory_environment(environment: dict[str, str]) -> None:
+    """Keep official child processes below the small device headroom.
+
+    The trace watchdog reserves 1 GiB on the 12 GiB development GPU.  CUDA
+    allocator fragmentation and library caches can otherwise consume that
+    reserve before the first captured iteration.  Explicit caller settings
+    remain authoritative.
+    """
+
+    environment.setdefault(
+        "PYTORCH_CUDA_ALLOC_CONF",
+        "expandable_segments:True,max_split_size_mb:128",
+    )
+    environment.setdefault("CUDA_MODULE_LOADING", "LAZY")
+    environment.setdefault("TORCH_CUDNN_V8_API_LRU_CACHE_LIMIT", "0")
+
+
 @dataclass(frozen=True)
 class ModelDescriptor:
     id: str
@@ -143,6 +160,7 @@ class CommandModelAdapter:
             *run.official_command[2:],
         )
         environment = os.environ.copy()
+        _configure_cuda_memory_environment(environment)
         environment["PYTHONPATH"] = os.pathsep.join(
             item for item in (str(repository_root), environment.get("PYTHONPATH")) if item
         )
@@ -203,12 +221,14 @@ class CommandModelAdapter:
             "--trace-output", str(trace_root),
             "--model-id", self.descriptor.id,
             "--dataset-id", run.dataset_name,
+            "--stream-only",
             "--capture-iteration-range",
             f"{self.capture_iteration_range[0]}:{self.capture_iteration_range[1]}",
             "--stop-after-capture-range",
             str(train_script), *train_arguments,
         )
         environment = os.environ.copy()
+        _configure_cuda_memory_environment(environment)
         environment["PYTHONPATH"] = os.pathsep.join(
             item for item in (
                 str(repository_root), environment.get("PYTHONPATH"),
@@ -227,7 +247,21 @@ class CommandModelAdapter:
         trace = _bind_trace_identity(
             trace, run, model_commit, _repository_commit(repository_root),
         )
-        TraceWriter().write(trace, trace_root, validate=True)
+        # Stream-only captures already have a validated raw-column manifest.
+        # Persist the bound identity in that manifest instead of materializing
+        # a second full copy as events.npy/dependencies.npy/payload.npy.
+        manifest_path = trace_root / "chunk_manifest.json"
+        if manifest_path.is_file():
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            if not isinstance(manifest, dict):
+                raise RuntimeError("captured trace chunk manifest is malformed")
+            manifest["metadata"] = dict(trace.metadata)
+            manifest_path.write_text(
+                json.dumps(manifest, ensure_ascii=True, sort_keys=True, indent=2) + "\n",
+                encoding="utf-8",
+            )
+        else:
+            TraceWriter().write(trace, trace_root, validate=True)
         _push_trace_chunks(trace, sink)
         volume = _find_volume(execution_output, required=False)
         gpu_reference["trace_event_count"] = trace.event_count
@@ -235,6 +269,53 @@ class CommandModelAdapter:
             trace_root,
             trace,
             ReferenceArtifact(execution_output, volume, {}, gpu_reference),
+        )
+
+    def capture_virtual_archive(
+        self, run: PreparedRun, *, archive_root: Path, capture_config: Path,
+    ) -> dict[str, Any]:
+        """Capture compact CUDA packets without expanding relation columns."""
+        if self.descriptor.id not in TRACE_HOOK_PROFILES:
+            raise RuntimeError(
+                f"{self.descriptor.display_name} does not provide virtual capture hooks"
+            )
+        repository_root = Path(__file__).resolve().parents[2]
+        capture_root = self.output_root / "virtual-capture"
+        train_script = run.source_root / run.official_command[1]
+        train_arguments = list(run.official_command[2:])
+        if self.descriptor.id == "fact_gs":
+            trace_only_flags = {
+                "model.eval", "eval.eval_in_training", "eval.eval_start", "eval.eval_end",
+            }
+            train_arguments = [
+                f"{key}=false" if key in trace_only_flags else argument
+                for argument in train_arguments
+                for key in (argument.partition("=")[0],)
+            ]
+        elif self.descriptor.id == "exact_gs":
+            train_arguments.extend(("--test_iterations", str(self.capture_iteration_range[1] + 1)))
+        command = (
+            run.official_command[0], "-m", "gala_sim.adapters.trace_runner",
+            "--trace-output", str(capture_root),
+            "--model-id", self.descriptor.id,
+            "--dataset-id", run.dataset_name,
+            "--virtual-capture", "--virtual-capture-audit-only",
+            "--packet-archive-root", str(Path(archive_root)),
+            "--capture-config", str(Path(capture_config)),
+            "--capture-iteration-range",
+            f"{self.capture_iteration_range[0]}:{self.capture_iteration_range[1]}",
+            "--stop-after-capture-range", str(train_script), *train_arguments,
+        )
+        environment = os.environ.copy()
+        _configure_cuda_memory_environment(environment)
+        environment["PYTHONPATH"] = os.pathsep.join(
+            item for item in (str(repository_root), environment.get("PYTHONPATH")) if item
+        )
+        return run_trace_process(
+            command, cwd=run.source_root, environment=environment,
+            trace_root=capture_root, inactivity_timeout_seconds=300.0,
+            preflight_fn=lambda: self.preflight_environment(environment),
+            prepare_fn=lambda: self._prepare_output(run.dataset_root),
         )
 
     def replay_reductions(self, run: PreparedRun, order: Any) -> ReferenceArtifact:

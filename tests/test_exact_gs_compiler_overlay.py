@@ -25,7 +25,7 @@ def _source() -> str:
         "#include <cooperative_groups/reduce.h>\n"
         "namespace cg = cooperative_groups;\n"
         "template <uint32_t C>\n"
-        "__global__ void __launch_bounds__\n"
+        "__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)\n"
         "void kernel(\n"
         "    const  float   DSD\n"
         "\t) {\n"
@@ -44,22 +44,34 @@ def test_exact_overlay_adds_independent_query_and_semantic_controls() -> None:
     transformed, transforms = render_exact_backward_overlay(_source())
 
     assert transformed.count("compiler_accumulate<SemanticAggregate>(") == 6
-    assert transformed.count("compiler_accumulate_query_pair<QueryAggregate>(") == 1
-    assert transformed.count("atomicAdd(&dL_dmeans[global_id]") == 3
+    assert transformed.count(
+        "compiler_accumulate_query_bundle<QueryAggregate, QueryPairwise>("
+    ) == 1
+    assert transformed.count("atomicAdd(&dL_dmeans[global_id]") == 0
     assert transformed.count(
         "compiler_accumulate_query_scalar<QueryAggregate>(&(dL_dopacity[global_id])"
     ) == 1
     assert transformed.count(
         "compiler_accumulate_query_scalar<QueryAggregate>(&(dL_dmu[global_id])"
     ) == 1
-    assert "renderCUDA<NUM_CHANNELS, true, false>" in transformed
+    assert "renderCUDA<NUM_CHANNELS, true, false, true, false>" in transformed
+    assert "renderCUDA<NUM_CHANNELS, true, false, false, true>" in transformed
+    assert "renderCUDA<NUM_CHANNELS, false, false, false, false>" in transformed
+    assert "static_cast<unsigned long long>(W) * H > 2ull * 1024 * 1024" in transformed
+    assert "static_cast<unsigned long long>(W) * H >= 512ull * 512" in transformed
+    assert (
+        "__launch_bounds__(BLOCK_X * BLOCK_Y, QueryHighOccupancy ? 3 : 2)"
+        in transformed
+    )
     assert "GALA_QUERY_WARP_REDUCE" in transformed
     assert "GALA_SEMANTIC_WARP_REDUCE" in transformed
     assert "__match_any_sync(active_mask, target_label)" in transformed
     assert "if (__popc(target_mask) == 1)" in transformed
     assert "__shfl_sync" in transformed
     assert "cg::reduce(matching_target" not in transformed
-    assert len(transforms) == 15
+    assert "query-components-and-mu-batched" in transforms
+    assert "query-gradient-bundle" in transforms
+    assert len(transforms) == 17
 
 
 def test_exact_overlay_rejects_source_drift_without_hash_gate() -> None:

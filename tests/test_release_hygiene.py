@@ -10,7 +10,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def test_build_metadata_uses_a_supported_license_file() -> None:
     project = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))["project"]
-    assert project["license"] == "Apache-2.0"
+    assert project["license"] == {"file": "LICENSE"}
     license_path = ROOT / "LICENSE"
     assert license_path.is_file()
     assert "Apache License" in license_path.read_text(encoding="utf-8")

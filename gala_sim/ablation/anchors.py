@@ -14,6 +14,30 @@ SUPPORTED_MODELS = frozenset({
 })
 SUPPORTED_DATASETS = frozenset({"chest", "walnut", "hdtomo_usb"})
 
+# The endpoint estimates were frozen during the R2+Chest calibration.  Keep
+# them in a workload-indexed table even when two workloads currently share the
+# same estimate: this prevents a result from one trace being silently reused
+# for another combination and gives later calibration a stable extension point.
+STATIC_ANCHOR_VERSION = "legacy-static-endpoints-v1"
+ANCHOR_ACCEPTABLE_MIN_FRACTION = 0.90
+_STATIC_ENDPOINTS = {
+    (model_id, dataset_id): {
+        "software": {
+            "1000": 1.254,
+            "0100": 1.282,
+            "1100": 1.482,
+        },
+        "hardware": {
+            "0000": 2.430,
+            "1010": 3.513,
+            "0101": 3.507,
+            "1111": 6.436,
+        },
+    }
+    for model_id in SUPPORTED_MODELS
+    for dataset_id in SUPPORTED_DATASETS
+}
+
 
 @dataclass(frozen=True)
 class StaticAnchor:
@@ -33,17 +57,16 @@ class AnchorGateResult:
     status: str
 
 
-_SOFTWARE_ENDPOINTS_VS_GPU_BASE = {
-    "1000": 1.254,
-    "0100": 1.282,
-    "1100": 1.482,
-}
-_HARDWARE_ENDPOINTS_VS_GPU_BASE = {
-    "0000": 2.430,
-    "1010": 3.513,
-    "0101": 3.507,
-    "1111": 6.436,
-}
+def static_anchor_matrix() -> Mapping[tuple[str, str], Mapping[str, Mapping[str, float]]]:
+    """Return the immutable per-workload endpoint estimate table."""
+
+    return {
+        key: {
+            "software": dict(value["software"]),
+            "hardware": dict(value["hardware"]),
+        }
+        for key, value in _STATIC_ENDPOINTS.items()
+    }
 
 
 def static_anchors(model_id: str, dataset_id: str) -> Mapping[str, StaticAnchor]:
@@ -53,7 +76,13 @@ def static_anchors(model_id: str, dataset_id: str) -> Mapping[str, StaticAnchor]
         raise KeyError(f"unsupported anchor model: {model_id}")
     if dataset_id not in SUPPORTED_DATASETS:
         raise KeyError(f"unsupported anchor dataset: {dataset_id}")
-    base_endpoint = _HARDWARE_ENDPOINTS_VS_GPU_BASE["0000"]
+    try:
+        endpoints = _STATIC_ENDPOINTS[(model_id, dataset_id)]
+    except KeyError as error:
+        raise KeyError(f"unsupported anchor workload: {model_id}/{dataset_id}") from error
+    software_endpoints = endpoints["software"]
+    hardware_endpoints = endpoints["hardware"]
+    base_endpoint = hardware_endpoints["0000"]
     anchors = {
         "0000": StaticAnchor(
             "0000", comparison_baseline("0000"), base_endpoint,
@@ -65,31 +94,58 @@ def static_anchors(model_id: str, dataset_id: str) -> Mapping[str, StaticAnchor]
             bits, comparison_baseline(bits), endpoint,
             f"CLAMP_CUDA_{bits} / GPU_base",
         )
-        for bits, endpoint in _SOFTWARE_ENDPOINTS_VS_GPU_BASE.items()
+        for bits, endpoint in software_endpoints.items()
     })
     anchors.update({
         bits: StaticAnchor(
             bits, comparison_baseline(bits), endpoint / base_endpoint,
             f"ASIC_{bits} / ASIC_A0B0",
         )
-        for bits, endpoint in _HARDWARE_ENDPOINTS_VS_GPU_BASE.items()
+        for bits, endpoint in hardware_endpoints.items()
         if bits != "0000"
     })
     canonical = ("0000", "1000", "1010", "0100", "0101", "1100", "1111")
     return {bits: anchors[bits] for bits in canonical}
 
 
-def compiler_target_speedups() -> Mapping[str, float]:
-    return dict(_SOFTWARE_ENDPOINTS_VS_GPU_BASE)
+def compiler_target_speedups(
+    model_id: str | None = None, dataset_id: str | None = None,
+) -> Mapping[str, float]:
+    """Return compiler targets, optionally scoped to one workload."""
+
+    if (model_id is None) != (dataset_id is None):
+        raise ValueError("model_id and dataset_id must be supplied together")
+    if model_id is None:
+        return dict(_STATIC_ENDPOINTS[("r2_gaussian", "chest")]["software"])
+    anchors = static_anchors(model_id, dataset_id)
+    return {
+        bits: anchors[bits].target_speedup
+        for bits in ("1000", "0100", "1100")
+    }
 
 
-def hardware_target_speedups() -> Mapping[str, float]:
-    anchors = static_anchors("r2_gaussian", "chest")
+def hardware_target_speedups(
+    model_id: str = "r2_gaussian", dataset_id: str = "chest",
+) -> Mapping[str, float]:
+    anchors = static_anchors(model_id, dataset_id)
     return {
         "query": anchors["1010"].target_speedup,
         "residency": anchors["0101"].target_speedup,
         "full": anchors["1111"].target_speedup,
     }
+
+
+def speedup_within_anchor_tolerance(observed: float | None, target: float) -> bool:
+    """Return whether a measured speedup is no more than 10% below its anchor.
+
+    Faster-than-anchor measurements remain valid; the tolerance is a lower
+    reachability bound rather than an upper cap.
+    """
+
+    if observed is None:
+        return False
+    value = float(observed)
+    return math.isfinite(value) and value >= target * ANCHOR_ACCEPTABLE_MIN_FRACTION
 
 
 def assess_upper_bound(

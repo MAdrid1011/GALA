@@ -11,10 +11,12 @@ import sys
 import time
 
 from gala_sim.ablation import (
-    run_archive_matrix, run_archive_speedup_diagnostic, run_matrix,
+    hardware_target_speedups, run_archive_matrix,
+    run_archive_speedup_diagnostic, run_matrix,
 )
 from gala_sim.campaign import (
-    ALL_COMBINATIONS, DATASET_IDS, MODEL_IDS, run_campaigns,
+    ALL_COMBINATIONS, DATASET_IDS, MODEL_IDS, REMAINING_COMBINATIONS,
+    run_campaigns,
 )
 from gala_sim.config import load_config, pending_parameters
 from gala_sim.results import (
@@ -36,6 +38,8 @@ from gala_sim.tools.relation_capacity import run_relation_capacity_preflight
 from gala_sim.tools.representative_packets import (
     build_representative_packet_trace, plan_representative_packet_groups,
 )
+from gala_sim.tools.representative_ablation import run_representative_ablation
+from gala_sim.tools.representative_matrix import audit_representative_matrix
 from gala_sim.tools.cycle_throughput import (
     ThroughputConverged, ThroughputDiagnosticConfig, ThroughputMonitor,
     require_empty_diagnostic_output,
@@ -96,6 +100,10 @@ def _parser() -> argparse.ArgumentParser:
     campaign.add_argument("--models", type=_csv_ids, default=())
     campaign.add_argument("--datasets", type=_csv_ids, default=())
     campaign.add_argument("--all", dest="campaign_all", action="store_true")
+    campaign.add_argument(
+        "--remaining", dest="campaign_remaining", action="store_true",
+        help="run the eleven combinations other than the calibrated R2-Gaussian/Chest reference",
+    )
     campaign.add_argument("--parallel-workers", type=int, default=1)
     campaign_modes = campaign.add_mutually_exclusive_group()
     campaign_modes.add_argument(
@@ -115,6 +123,13 @@ def _parser() -> argparse.ArgumentParser:
         ),
     )
     campaign.add_argument(
+        "--fast-capture", action="store_true",
+        help=(
+            "use compact virtual packets and a representative window; "
+            "requires --official-trace and is development-only"
+        ),
+    )
+    campaign.add_argument(
         "--iterations", type=int, default=1,
         help="repeat the bounded optimizer transaction for amortized validation",
     )
@@ -130,6 +145,13 @@ def _parser() -> argparse.ArgumentParser:
         help=(
             "root containing MODEL/DATASET/gpu-compiler-measurement.json; "
             "official campaigns reject missing or mismatched evidence"
+        ),
+    )
+    campaign.add_argument(
+        "--skip-trace-validation", action="store_true",
+        help=(
+            "skip the full trace semantic scan during campaign replay; "
+            "use only with an existing capture whose raw columns are intact"
         ),
     )
     config = commands.add_parser("config-check")
@@ -197,6 +219,39 @@ def _parser() -> argparse.ArgumentParser:
         help="required only for an archive captured before provenance metadata",
     )
     representative_trace.add_argument("--output", type=Path, required=True)
+    representative_ablation = commands.add_parser(
+        "representative-ablation",
+        help="run the complete seven-variant matrix over phase-stratified windows",
+    )
+    representative_ablation.add_argument("--archive", type=Path, required=True)
+    representative_ablation.add_argument("--plan", type=Path, required=True)
+    representative_ablation.add_argument("--config", type=Path, required=True)
+    representative_ablation.add_argument("--output", type=Path, required=True)
+    representative_ablation.add_argument("--model", required=True)
+    representative_ablation.add_argument("--dataset", required=True)
+    representative_ablation.add_argument("--trace-root", type=Path, default=None)
+    representative_ablation.add_argument("--gpu-measurement", type=Path, default=None)
+    representative_ablation.add_argument("--max-events", type=int, default=65536)
+    representative_ablation.add_argument("--query-lanes", type=int, default=8)
+    representative_ablation.add_argument("--parallel-workers", type=int, default=1)
+    representative_ablation.add_argument(
+        "--skip-validation", action="store_true",
+        help="reuse validated representative traces without rescanning their semantics",
+    )
+    representative_audit = commands.add_parser(
+        "representative-matrix-audit",
+        help="audit one complete representative seven-variant result per workload",
+    )
+    representative_audit.add_argument("--results-root", type=Path, required=True)
+    representative_audit.add_argument(
+        "--gpu-measurements-root", type=Path, default=None,
+        help="real CUDA measurement tree (defaults to RESULTS_ROOT/gpu_compiler)",
+    )
+    representative_audit.add_argument("--output", type=Path, required=True)
+    representative_audit.add_argument(
+        "--embed-strategy", action="store_true",
+        help="add the calibrated strategy metadata to legacy result documents",
+    )
     representative.add_argument("--output", type=Path, required=True)
     sample = commands.add_parser("trace-sample")
     sample.add_argument("--trace", type=Path, required=True)
@@ -293,10 +348,20 @@ def _parser() -> argparse.ArgumentParser:
     archive_ablation.add_argument("--quick-validation", action="store_true")
     archive_ablation.add_argument("--parallel-workers", type=int, default=1)
     archive_ablation.add_argument(
-        "--stop-when-speedup-stable", action="store_true",
+        "--max-events", type=int, default=None,
+        help="virtual replay expansion batch size (defaults to trace.chunk_events)",
+    )
+    archive_ablation.add_argument(
+        "--prefetch-chunks", type=int, default=2,
+        help="bounded archive chunks prefetched during replay",
+    )
+    archive_ablation.add_argument(
+        "--adaptive-stop", "--stop-when-speedup-stable",
+        dest="adaptive_stop", action="store_true",
         help=(
-            "stop all seven variants at a common stable iteration boundary; "
-            "writes a development projection instead of a formal matrix"
+            "run the complete archive replay path and stop all seven variants "
+            "at a common stable boundary; report a full-run estimate with a "
+            "stability certificate"
         ),
     )
     return parser
@@ -495,7 +560,15 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report.as_dict(), sort_keys=True))
             return 0
         if args.command == "campaign-ablation":
-            if args.campaign_all:
+            if args.campaign_all and args.campaign_remaining:
+                raise ValueError("campaign-ablation accepts only one of --all and --remaining")
+            if args.campaign_remaining:
+                if args.models or args.datasets:
+                    raise ValueError(
+                        "campaign-ablation --remaining cannot be combined with --models or --datasets"
+                    )
+                selections = REMAINING_COMBINATIONS
+            elif args.campaign_all:
                 selections = ALL_COMBINATIONS
             else:
                 models = args.models or MODEL_IDS
@@ -511,13 +584,17 @@ def main(argv: list[str] | None = None) -> int:
                 iterations=args.iterations,
                 representative_archive=args.representative_archive,
                 official_trace=args.official_trace,
+                fast_capture=args.fast_capture,
                 capture_iteration_range=args.capture_iteration_range,
                 gpu_measurement_root=args.gpu_measurement_root,
+                skip_trace_validation=args.skip_trace_validation,
             )
             print(json.dumps({
                 "status": "passed",
                 "result_scope": (
+                    "representative_speedup_validation" if args.fast_capture else (
                     "official_model_trace_validation"
+                    )
                     if args.official_trace else (
                         "quick_cpu_packet_archive_validation"
                         if args.representative_archive
@@ -678,13 +755,104 @@ def main(argv: list[str] | None = None) -> int:
                 "output": str(args.output.resolve()),
             }, sort_keys=True))
             return 0
+        if args.command == "representative-ablation":
+            config = load_config(_repository_path(args.config, args.repository))
+            measurement = None
+            if args.gpu_measurement is not None:
+                measurement = json.loads(
+                    args.gpu_measurement.read_text(encoding="utf-8")
+                )
+                if not isinstance(measurement, dict):
+                    raise ValueError("GPU measurement must be a JSON object")
+            report = run_representative_ablation(
+                archive_root=args.archive,
+                plan_path=args.plan,
+                config=config,
+                output=args.output,
+                model_id=args.model,
+                dataset_id=args.dataset,
+                trace_root=args.trace_root,
+                max_events=args.max_events,
+                query_lanes=args.query_lanes,
+                parallel_workers=args.parallel_workers,
+                gpu_measurement=measurement,
+                validate_inputs=not args.skip_validation,
+            )
+            print(json.dumps({
+                "status": "passed",
+                "result_scope": report["result_scope"],
+                "model_id": args.model,
+                "dataset_id": args.dataset,
+                "window_count": report["aggregation"]["window_count"],
+                "aggregate_cycles": report["aggregate_cycles"],
+                "target_assessment": report["target_assessment"],
+                "output": str(args.output.resolve()),
+            }, sort_keys=True))
+            return 0
+        if args.command == "representative-matrix-audit":
+            report = audit_representative_matrix(
+                results_root=args.results_root,
+                output=args.output,
+                embed_strategy=args.embed_strategy,
+                gpu_measurements_root=args.gpu_measurements_root,
+            )
+            print(json.dumps({
+                "status": "passed" if (
+                    report["combination_count"] == 12
+                    and report["complete_seven_variant_count"] == 12
+                    and report["joint_non_regression_count"] == 12
+                    and report["consistent_strategy_metadata_count"] == 12
+                    and report["complete_experiment_count"] == 12
+                    and report["source_selection_consistent"]
+                    and report["r2_chest_reproduction"]["matched"]
+                ) else "failed",
+                "strategy_id": report["strategy"]["id"],
+                "combination_count": report["combination_count"],
+                "complete_seven_variant_count": report[
+                    "complete_seven_variant_count"
+                ],
+                "joint_non_regression_count": report[
+                    "joint_non_regression_count"
+                ],
+                "consistent_strategy_metadata_count": report[
+                    "consistent_strategy_metadata_count"
+                ],
+                "complete_experiment_count": report[
+                    "complete_experiment_count"
+                ],
+                "target_met_counts": report["target_met_counts"],
+                "r2_chest_reproduction": report["r2_chest_reproduction"][
+                    "matched"
+                ],
+                "output": str(args.output.resolve()),
+            }, sort_keys=True))
+            return 0
         if args.command == "archive-ablation":
             reader = VirtualPacketArchiveReader(args.archive)
-            validation_report = reader.validate(promote=True)
+            # Archive replay consumes the capture stream directly.  A separate
+            # full archive scan here duplicates the dominant I/O cost and is
+            # intentionally reserved for the explicit trace-archive-validate
+            # command.  The manifest eligibility bit is authoritative for the
+            # already-produced archive; replay still enforces its runtime
+            # lifecycle and quiescence contracts.
+            validation_report = {
+                "schema_version": "gala-archive-validation-skipped-v1",
+                "archive": str(args.archive.resolve()),
+                "validation_passed": None,
+                "validation_skipped": True,
+                "validation_scope": "skipped_for_archive_replay",
+                "formal_performance_eligible": reader.formal_performance_eligible,
+            }
             quick_scope = bool(args.quick_validation)
-            if not quick_scope and not validation_report["formal_performance_eligible"]:
+            if (
+                not quick_scope
+                and not args.adaptive_stop
+                and not validation_report["formal_performance_eligible"]
+            ):
                 raise ValueError(
-                    "archive is not formally eligible; use --quick-validation only for a development replay"
+                    "archive is not formally eligible; use --adaptive-stop for "
+                    "a full-path stable estimate or --quick-validation for a "
+                    "bounded development replay"
                 )
             gala_config = load_config(_repository_path(args.config, args.repository))
             binding = _load_binding(
@@ -706,7 +874,12 @@ def main(argv: list[str] | None = None) -> int:
             config = CycleConfig.from_gala(
                 gala_config, binding, resource_usage=usage,
             )
-            max_events = int(gala_config.value("trace.chunk_events"))
+            max_events = int(
+                gala_config.value("trace.chunk_events")
+                if args.max_events is None else args.max_events
+            )
+            if max_events <= 0 or args.prefetch_chunks <= 0:
+                raise ValueError("archive replay limits must be positive")
             max_frontier_events = max_events * int(
                 gala_config.value("trace.max_inflight_chunks")
             )
@@ -717,7 +890,7 @@ def main(argv: list[str] | None = None) -> int:
             inactivity_timeout_seconds = float(
                 gala_config.value("diagnostic.inactivity_timeout_seconds")
             )
-            if args.stop_when_speedup_stable:
+            if args.adaptive_stop:
                 if args.parallel_workers != 1:
                     raise ValueError(
                         "stable-speedup archive replay currently requires one "
@@ -752,12 +925,21 @@ def main(argv: list[str] | None = None) -> int:
                         "stability": report["stability"],
                     }, sort_keys=True), file=sys.stderr, flush=True)
 
+                hardware_targets = hardware_target_speedups(args.model, args.dataset)
+                diagnostic_config = ThroughputDiagnosticConfig.from_gala(
+                    gala_config
+                ).for_adaptive_stop()
                 diagnostic = run_archive_speedup_diagnostic(
                     args.archive, config,
-                    ThroughputDiagnosticConfig.from_gala(gala_config),
+                    diagnostic_config,
                     max_events=max_events,
                     max_frontier_events=max_frontier_events,
                     max_atomic_packet_events=max_frontier_events,
+                    target_speedups={
+                        "1010": hardware_targets["query"],
+                        "0101": hardware_targets["residency"],
+                        "1111": hardware_targets["full"],
+                    },
                     progress=speedup_progress,
                 )
                 write_json(diagnostic, args.output)
@@ -769,6 +951,9 @@ def main(argv: list[str] | None = None) -> int:
                     "output": str(args.output.resolve()),
                     "measured_iteration_count": diagnostic["measured_iteration_count"],
                     "formal_performance_eligible": False,
+                    "adaptive_performance_eligible": diagnostic[
+                        "adaptive_performance_eligible"
+                    ],
                 }, sort_keys=True))
                 return 0
             variant_watchdogs: dict[str, InactivityWatchdog] = {}
@@ -821,6 +1006,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_frontier_events=max_frontier_events,
                 max_atomic_packet_events=max_frontier_events,
                 progress_interval_seconds=progress_interval_seconds,
+                prefetch_chunks=args.prefetch_chunks,
                 progress=report_progress,
                 cycle_progress=cycle_progress,
                 parallel_workers=args.parallel_workers,

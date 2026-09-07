@@ -4,7 +4,9 @@ The FaCT-GS rasterizer and voxelizer expose two mathematically equivalent
 backward implementations.  This probe keeps the official Python training loop
 and selects those implementations at runtime, without modifying the pinned
 upstream checkout.  It is intended for bounded prefix measurements, not for a
-published end-to-end training result.
+published end-to-end training result.  The optional
+``GALA_FACT_SEMANTIC_HOT_FRACTION`` environment variable sweeps the ``0100``
+hot-tile coverage while retaining the default value when unset.
 """
 
 from __future__ import annotations
@@ -31,7 +33,10 @@ import yaml
 
 from gala_sim.ablation import composition_assessment
 from gala_sim.ablation.anchors import compiler_target_speedups
-from gala_sim.adapters.fact_low_memory import install_fact_low_memory_overlay
+from gala_sim.adapters.fact_low_memory import (
+    configure_cuda_memory_environment,
+    install_fact_low_memory_overlay,
+)
 from gala_sim.gpu_measurement import (
     build_gpu_compiler_measurement,
     platform_identity_from_isolation,
@@ -78,6 +83,26 @@ class FactTrainingProbeError(RuntimeError):
 
 class _PrefixComplete(RuntimeError):
     """Stop after a completed optimizer step, before endpoint evaluation/save."""
+
+
+def _semantic_hot_fraction(selection: BackwardPathSelection) -> float | None:
+    """Resolve an optional sweep knob without changing the default path."""
+
+    fraction = selection.semantic_hot_relation_fraction
+    override = os.environ.get("GALA_FACT_SEMANTIC_HOT_FRACTION")
+    if override is None or fraction is None:
+        return fraction
+    try:
+        fraction = float(override)
+    except ValueError as error:
+        raise FactTrainingProbeError(
+            "GALA_FACT_SEMANTIC_HOT_FRACTION must be numeric"
+        ) from error
+    if not math.isfinite(fraction) or not 0.0 < fraction <= 1.0:
+        raise FactTrainingProbeError(
+            "GALA_FACT_SEMANTIC_HOT_FRACTION must be in (0, 1]"
+        )
+    return fraction
 
 
 @dataclass
@@ -328,15 +353,17 @@ def _backward_path_overlay(variant: str) -> Iterator[BackwardPathSelection]:
     original_raster = raster_module.rasterize_gaussians
     original_voxel = voxel_module.voxelize_gaussians
 
+    semantic_fraction = _semantic_hot_fraction(selection)
+
     def rasterized(*args: Any, **kwargs: Any) -> Any:
-        if selection.semantic_hot_relation_fraction is not None:
+        if semantic_fraction is not None:
             if len(args) != 8:
                 raise FactTrainingProbeError("FaCT-GS rasterizer call shape changed")
             if set(kwargs) - {"use_per_gaussian_backward"}:
                 raise FactTrainingProbeError("FaCT-GS rasterizer options changed")
             return _semantic_hot_tile_rasterize(
                 *args,
-                hot_relation_fraction=selection.semantic_hot_relation_fraction,
+                hot_relation_fraction=semantic_fraction,
             )
         options = dict(kwargs)
         options["use_per_gaussian_backward"] = selection.projection_per_gaussian
@@ -551,6 +578,7 @@ def run_probe(
 ) -> ProbeObservation:
     """Run a bounded official FaCT-GS prefix from the common initial state."""
 
+    configure_cuda_memory_environment()
     _validate_inputs(
         source_root, dataset_root, artifact_root, requested_iterations,
         warmup_iterations, progress_interval, inactivity_timeout_seconds,
@@ -690,6 +718,7 @@ def run_probe(
         raise FactTrainingProbeError("official FaCT-GS prefix did not expose final gradients")
     measured_iterations = requested_iterations - warmup_iterations
     selection = BACKWARD_PATHS[compiler_variant]
+    resolved_semantic_fraction = _semantic_hot_fraction(selection)
     record = {
         "schema_version": "gala-fact-gs-official-training-probe-v1",
         "status": "passed",
@@ -738,7 +767,7 @@ def run_probe(
             "backward_path_selection": {
                 "projection_per_gaussian": selection.projection_per_gaussian,
                 "volume_per_gaussian": selection.volume_per_gaussian,
-                "semantic_hot_relation_fraction": selection.semantic_hot_relation_fraction,
+                "semantic_hot_relation_fraction": resolved_semantic_fraction,
             },
             "hash_policy": "record_only_no_hash_rejection",
         },
@@ -749,6 +778,7 @@ def run_probe(
 def summarize_matrix(
     observations: Mapping[str, Sequence[ProbeObservation]], *,
     relative_tolerance: float, absolute_tolerance: float,
+    model_id: str = "fact_gs", dataset_id: str | None = None,
 ) -> dict[str, Any]:
     """Validate a serial GPU matrix and derive GPU-relative compiler speedups."""
 
@@ -793,7 +823,10 @@ def summarize_matrix(
             "pre_optimizer_gradient_equivalence": checks,
         }
     baseline_ms = summary["gpu_base"]["median_cuda_elapsed_ms"]
-    targets = compiler_target_speedups()
+    targets = (
+        compiler_target_speedups(model_id, dataset_id)
+        if dataset_id else compiler_target_speedups()
+    )
     for variant, item in summary.items():
         speedup = baseline_ms / item["median_cuda_elapsed_ms"]
         target = targets.get(variant)
@@ -812,6 +845,9 @@ def summarize_matrix(
         for variant_samples in observations.values()
         for sample in variant_samples
     )
+    performance_comparison_eligible = (
+        performance_comparison_eligible and bool(composition["monotonic"])
+    )
     return {
         "schema_version": "gala-fact-gs-gpu-compiler-matrix-v1",
         "created_at": datetime.now(timezone.utc).isoformat(),
@@ -819,6 +855,8 @@ def summarize_matrix(
         "formal_performance_eligible": False,
         "performance_comparison_eligible": performance_comparison_eligible,
         "comparison_baseline": "gpu_base",
+        "model_id": model_id,
+        "dataset_id": dataset_id,
         "joint_mechanism_assessment": composition,
         "numerical_tolerance": {
             "relative": relative_tolerance,
@@ -877,6 +915,8 @@ def run_matrix(
             observations,
             relative_tolerance=relative_tolerance,
             absolute_tolerance=absolute_tolerance,
+            model_id="fact_gs",
+            dataset_id=dataset_id,
         )
         if profile_stages:
             diagnostic = run_probe(
@@ -905,6 +945,8 @@ def run_matrix(
                     diagnostic.record["measurement"]["cuda_elapsed_ms"]
                 ),
                 stage_profile=stage_profile,
+                model_id="fact_gs",
+                dataset_id=dataset_id,
                 coverable_stages={
                     "1000": ("backward",),
                     "0100": ("backward",),

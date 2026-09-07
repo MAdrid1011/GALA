@@ -37,6 +37,8 @@ def analyze_gpu_compiler_coverage(
     stage_profile: Mapping[str, Any],
     coverable_stages: Mapping[str, Sequence[str]],
     target_speedups: Mapping[str, float] | None = None,
+    model_id: str | None = None,
+    dataset_id: str | None = None,
 ) -> dict[str, Any]:
     """Return optimistic stage-coverage bounds for the compiler variants."""
 
@@ -50,7 +52,14 @@ def analyze_gpu_compiler_coverage(
         summaries = stage_profile.get("stage_summaries")
     if not isinstance(summaries, Mapping):
         raise GpuCoverageError("stage profile has no summaries")
-    targets = dict(target_speedups or compiler_target_speedups())
+    if target_speedups is not None and (model_id is not None or dataset_id is not None):
+        raise GpuCoverageError(
+            "pass either explicit target_speedups or a model/dataset identity"
+        )
+    try:
+        targets = dict(target_speedups or compiler_target_speedups(model_id, dataset_id))
+    except (KeyError, ValueError) as error:
+        raise GpuCoverageError("unsupported GPU compiler target workload") from error
     missing_targets = set(GPU_COMPILER_BITS) - set(targets)
     if missing_targets:
         raise GpuCoverageError("compiler coverage targets are incomplete")
@@ -104,5 +113,7 @@ def analyze_gpu_compiler_coverage(
         "bound_kind": "necessary_optimistic_zero_time_stage_bound",
         "comparison_baseline": "gpu_base",
         "diagnostic_only": True,
+        "model_id": model_id,
+        "dataset_id": dataset_id,
         "bounds": bounds,
     }

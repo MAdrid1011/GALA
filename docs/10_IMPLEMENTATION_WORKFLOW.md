@@ -56,6 +56,19 @@ stage mapping, and fixtures. A dataset integration adds a source manifest,
 registered parser, normalization logic, and validation fixtures. Both use the
 same hardware configuration and output contracts.
 
+The continuation command `gala-sim campaign-ablation --remaining` selects the
+eleven combinations other than the calibrated R2-Gaussian/Chest reference.
+Each result records the `legacy-static-endpoints-v1` anchor table and a joint
+mechanism assessment, so a combined-path regression is visible in the output.
+
+The calibrated representative-window workflow is the same experiment for all
+twelve combinations: `representative-ablation` runs the complete seven-policy
+matrix over phase-stratified adjacent windows, while
+`representative-matrix-audit` checks that the strategy and non-regression
+contract are consistent across the resulting documents. Representative
+windows are a trace-preserving workload selection, not a fast or reduced
+ablation path.
+
 Generated runs, acquisition reports, traces, profiles, and measurements remain
 under `workspace/`. The public repository documents interfaces and methods,
 not local execution progress.

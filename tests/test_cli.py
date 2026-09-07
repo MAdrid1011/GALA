@@ -103,6 +103,30 @@ def test_campaign_cli_propagates_official_trace_scope(
     assert report["formal_performance_eligible"] is False
 
 
+def test_campaign_cli_remaining_selects_eleven_combinations(
+    monkeypatch, tmp_path: Path, capsys,
+) -> None:
+    cli = importlib.import_module("gala_sim.cli.main")
+    captured: dict[str, object] = {}
+
+    def fake_run_campaigns(selections, **kwargs):
+        captured["selections"] = tuple(selections)
+        captured.update(kwargs)
+        return ()
+
+    monkeypatch.setattr(cli, "run_campaigns", fake_run_campaigns)
+    assert cli.main([
+        "campaign-ablation", "--remaining", "--workspace",
+        str(tmp_path / "workspace"),
+    ]) == 0
+    report = json.loads(capsys.readouterr().out)
+    selections = captured["selections"]
+    assert isinstance(selections, tuple)
+    assert len(selections) == 11
+    assert ("r2_gaussian", "chest") not in selections
+    assert report["formal_performance_eligible"] is False
+
+
 def test_cli_validates_compact_packet_archive_without_false_formal_promotion(
     tmp_path: Path, capsys,
 ) -> None:

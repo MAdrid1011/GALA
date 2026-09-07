@@ -152,7 +152,7 @@ __device__ __forceinline__ void accumulate_gaussian_gradient_batch(
 \t\t\t}
 \t\t}
 \t}
-\telse if (lane == leader)
+\telse
 \t{
 \t\tsum0 = sum1 = sum2 = sum3 = sum4 = 0.0f;
 \t\tsum5 = sum6 = sum7 = sum8 = sum9 = 0.0f;
@@ -161,16 +161,22 @@ __device__ __forceinline__ void accumulate_gaussian_gradient_batch(
 \t\t{
 \t\t\tconst unsigned source_lane =
 \t\t\t\tstatic_cast<unsigned>(__ffs(remaining) - 1);
-\t\t\tsum0 += __shfl_sync(mask, value0, source_lane);
-\t\t\tsum1 += __shfl_sync(mask, value1, source_lane);
-\t\t\tsum2 += __shfl_sync(mask, value2, source_lane);
-\t\t\tsum3 += __shfl_sync(mask, value3, source_lane);
-\t\t\tsum4 += __shfl_sync(mask, value4, source_lane);
-\t\t\tsum5 += __shfl_sync(mask, value5, source_lane);
-\t\t\tsum6 += __shfl_sync(mask, value6, source_lane);
-\t\t\tsum7 += __shfl_sync(mask, value7, source_lane);
-\t\t\tsum8 += __shfl_sync(mask, value8, source_lane);
-\t\t\tsum9 += __shfl_sync(mask, value9, source_lane);
+\t\t\tconst float peer0 = __shfl_sync(mask, value0, source_lane);
+\t\t\tconst float peer1 = __shfl_sync(mask, value1, source_lane);
+\t\t\tconst float peer2 = __shfl_sync(mask, value2, source_lane);
+\t\t\tconst float peer3 = __shfl_sync(mask, value3, source_lane);
+\t\t\tconst float peer4 = __shfl_sync(mask, value4, source_lane);
+\t\t\tconst float peer5 = __shfl_sync(mask, value5, source_lane);
+\t\t\tconst float peer6 = __shfl_sync(mask, value6, source_lane);
+\t\t\tconst float peer7 = __shfl_sync(mask, value7, source_lane);
+\t\t\tconst float peer8 = __shfl_sync(mask, value8, source_lane);
+\t\t\tconst float peer9 = __shfl_sync(mask, value9, source_lane);
+\t\t\tif (lane == leader)
+\t\t\t{
+\t\t\t\tsum0 += peer0; sum1 += peer1; sum2 += peer2; sum3 += peer3;
+\t\t\t\tsum4 += peer4; sum5 += peer5; sum6 += peer6; sum7 += peer7;
+\t\t\t\tsum8 += peer8; sum9 += peer9;
+\t\t\t}
 \t\t\tremaining &= remaining - 1;
 \t\t}
 \t}
@@ -181,6 +187,249 @@ __device__ __forceinline__ void accumulate_gaussian_gradient_batch(
 \t\tatomicAdd(target4, sum4); atomicAdd(target5, sum5);
 \t\tatomicAdd(target6, sum6); atomicAdd(target7, sum7);
 \t\tatomicAdd(target8, sum8); atomicAdd(target9, sum9);
+\t}
+}
+
+template <typename Group>
+__device__ __forceinline__ void accumulate_gaussian_gradient_batch2(
+\tconst Group& active,
+\tfloat* target0, float value0, float* target1, float value1)
+{
+\tconst unsigned mask = __activemask();
+\tconst unsigned leader = static_cast<unsigned>(__ffs(mask) - 1);
+\tconst unsigned lane =
+\t\t(threadIdx.x + blockDim.x * threadIdx.y +
+\t\t blockDim.x * blockDim.y * threadIdx.z) & 31u;
+\tif (__popc(mask) == 1)
+\t{
+\t\tatomicAdd(target0, value0);
+\t\tatomicAdd(target1, value1);
+\t\treturn;
+\t}
+\tconst unsigned count = __popc(mask);
+\tconst unsigned contiguous = count == 32
+\t\t? 0xffffffffu : (((1u << count) - 1u) << leader);
+\tfloat sum0 = value0, sum1 = value1;
+\tif (mask == contiguous)
+\t{
+\t\tfor (unsigned offset = 1; offset < 32; offset <<= 1)
+\t\t{
+\t\t\tconst float peer0 = __shfl_down_sync(mask, sum0, offset);
+\t\t\tconst float peer1 = __shfl_down_sync(mask, sum1, offset);
+\t\t\tif (lane + offset < 32 && (mask & (1u << (lane + offset))))
+\t\t\t{
+\t\t\t\tsum0 += peer0;
+\t\t\t\tsum1 += peer1;
+\t\t\t}
+\t\t}
+\t}
+\telse
+\t{
+\t\tsum0 = sum1 = 0.0f;
+\t\tfor (unsigned remaining = mask; remaining; remaining &= remaining - 1)
+\t\t{
+\t\t\tconst unsigned source = static_cast<unsigned>(__ffs(remaining) - 1);
+\t\t\tconst float peer0 = __shfl_sync(mask, value0, source);
+\t\t\tconst float peer1 = __shfl_sync(mask, value1, source);
+\t\t\tif (lane == leader) { sum0 += peer0; sum1 += peer1; }
+\t\t}
+\t}
+\tif (lane == leader)
+\t{
+\t\tatomicAdd(target0, sum0);
+\t\tatomicAdd(target1, sum1);
+\t}
+}
+
+template <typename Group>
+__device__ __forceinline__ void accumulate_gaussian_gradient_batch5(
+\tconst Group& active,
+\tfloat* target0, float value0, float* target1, float value1,
+\tfloat* target2, float value2, float* target3, float value3,
+\tfloat* target4, float value4)
+{
+\tconst unsigned mask = __activemask();
+\tconst unsigned leader = static_cast<unsigned>(__ffs(mask) - 1);
+\tconst unsigned lane =
+\t\t(threadIdx.x + blockDim.x * threadIdx.y +
+\t\t blockDim.x * blockDim.y * threadIdx.z) & 31u;
+\tif (__popc(mask) == 1)
+\t{
+\t\tatomicAdd(target0, value0); atomicAdd(target1, value1);
+\t\tatomicAdd(target2, value2); atomicAdd(target3, value3);
+\t\tatomicAdd(target4, value4);
+\t\treturn;
+\t}
+\tconst unsigned count = __popc(mask);
+\tconst unsigned contiguous = count == 32
+\t\t? 0xffffffffu : (((1u << count) - 1u) << leader);
+\tfloat sum0 = value0, sum1 = value1, sum2 = value2;
+\tfloat sum3 = value3, sum4 = value4;
+\tif (mask == contiguous)
+\t{
+\t\tfor (unsigned offset = 1; offset < 32; offset <<= 1)
+\t\t{
+\t\t\tconst float peer0 = __shfl_down_sync(mask, sum0, offset);
+\t\t\tconst float peer1 = __shfl_down_sync(mask, sum1, offset);
+\t\t\tconst float peer2 = __shfl_down_sync(mask, sum2, offset);
+\t\t\tconst float peer3 = __shfl_down_sync(mask, sum3, offset);
+\t\t\tconst float peer4 = __shfl_down_sync(mask, sum4, offset);
+\t\t\tif (lane + offset < 32 && (mask & (1u << (lane + offset))))
+\t\t\t{
+\t\t\t\tsum0 += peer0; sum1 += peer1; sum2 += peer2;
+\t\t\t\tsum3 += peer3; sum4 += peer4;
+\t\t\t}
+\t\t}
+\t}
+\telse
+\t{
+\t\tsum0 = sum1 = sum2 = sum3 = sum4 = 0.0f;
+\t\tfor (unsigned remaining = mask; remaining; remaining &= remaining - 1)
+\t\t{
+\t\t\tconst unsigned source = static_cast<unsigned>(__ffs(remaining) - 1);
+\t\t\tconst float peer0 = __shfl_sync(mask, value0, source);
+\t\t\tconst float peer1 = __shfl_sync(mask, value1, source);
+\t\t\tconst float peer2 = __shfl_sync(mask, value2, source);
+\t\t\tconst float peer3 = __shfl_sync(mask, value3, source);
+\t\t\tconst float peer4 = __shfl_sync(mask, value4, source);
+\t\t\tif (lane == leader)
+\t\t\t{
+\t\t\t\tsum0 += peer0; sum1 += peer1; sum2 += peer2;
+\t\t\t\tsum3 += peer3; sum4 += peer4;
+\t\t\t}
+\t\t}
+\t}
+\tif (lane == leader)
+\t{
+\t\tatomicAdd(target0, sum0); atomicAdd(target1, sum1);
+\t\tatomicAdd(target2, sum2); atomicAdd(target3, sum3);
+\t\tatomicAdd(target4, sum4);
+\t}
+}
+
+template <typename Group>
+__device__ __forceinline__ void accumulate_gaussian_gradient_batch3(
+\tconst Group& active,
+\tfloat* target0, float value0, float* target1, float value1,
+\tfloat* target2, float value2)
+{
+\tconst unsigned mask = __activemask();
+\tconst unsigned leader = static_cast<unsigned>(__ffs(mask) - 1);
+\tconst unsigned lane =
+\t\t(threadIdx.x + blockDim.x * threadIdx.y +
+\t\t blockDim.x * blockDim.y * threadIdx.z) & 31u;
+\tif (__popc(mask) == 1)
+\t{
+\t\tatomicAdd(target0, value0); atomicAdd(target1, value1);
+\t\tatomicAdd(target2, value2);
+\t\treturn;
+\t}
+\tconst unsigned count = __popc(mask);
+\tconst unsigned contiguous = count == 32
+\t\t? 0xffffffffu : (((1u << count) - 1u) << leader);
+\tfloat sum0 = value0, sum1 = value1, sum2 = value2;
+\tif (mask == contiguous)
+\t{
+\t\tfor (unsigned offset = 1; offset < 32; offset <<= 1)
+\t\t{
+\t\t\tconst float peer0 = __shfl_down_sync(mask, sum0, offset);
+\t\t\tconst float peer1 = __shfl_down_sync(mask, sum1, offset);
+\t\t\tconst float peer2 = __shfl_down_sync(mask, sum2, offset);
+\t\t\tif (lane + offset < 32 && (mask & (1u << (lane + offset))))
+\t\t\t{
+\t\t\t\tsum0 += peer0; sum1 += peer1; sum2 += peer2;
+\t\t\t}
+\t\t}
+\t}
+\telse
+\t{
+\t\tsum0 = sum1 = sum2 = 0.0f;
+\t\tfor (unsigned remaining = mask; remaining; remaining &= remaining - 1)
+\t\t{
+\t\t\tconst unsigned source = static_cast<unsigned>(__ffs(remaining) - 1);
+\t\t\tconst float peer0 = __shfl_sync(mask, value0, source);
+\t\t\tconst float peer1 = __shfl_sync(mask, value1, source);
+\t\t\tconst float peer2 = __shfl_sync(mask, value2, source);
+\t\t\tif (lane == leader) { sum0 += peer0; sum1 += peer1; sum2 += peer2; }
+\t\t}
+\t}
+\tif (lane == leader)
+\t{
+\t\tatomicAdd(target0, sum0); atomicAdd(target1, sum1);
+\t\tatomicAdd(target2, sum2);
+\t}
+}
+
+template <typename Group>
+__device__ __forceinline__ void accumulate_gaussian_gradient_batch7(
+\tconst Group& active,
+\tfloat* target0, float value0, float* target1, float value1,
+\tfloat* target2, float value2, float* target3, float value3,
+\tfloat* target4, float value4, float* target5, float value5,
+\tfloat* target6, float value6)
+{
+\tconst unsigned mask = __activemask();
+\tconst unsigned leader = static_cast<unsigned>(__ffs(mask) - 1);
+\tconst unsigned lane =
+\t\t(threadIdx.x + blockDim.x * threadIdx.y +
+\t\t blockDim.x * blockDim.y * threadIdx.z) & 31u;
+\tif (__popc(mask) == 1)
+\t{
+\t\tatomicAdd(target0, value0); atomicAdd(target1, value1);
+\t\tatomicAdd(target2, value2); atomicAdd(target3, value3);
+\t\tatomicAdd(target4, value4); atomicAdd(target5, value5);
+\t\tatomicAdd(target6, value6);
+\t\treturn;
+\t}
+\tconst unsigned count = __popc(mask);
+\tconst unsigned contiguous = count == 32
+\t\t? 0xffffffffu : (((1u << count) - 1u) << leader);
+\tfloat sum0 = value0, sum1 = value1, sum2 = value2, sum3 = value3;
+\tfloat sum4 = value4, sum5 = value5, sum6 = value6;
+\tif (mask == contiguous)
+\t{
+\t\tfor (unsigned offset = 1; offset < 32; offset <<= 1)
+\t\t{
+\t\t\tconst float peer0 = __shfl_down_sync(mask, sum0, offset);
+\t\t\tconst float peer1 = __shfl_down_sync(mask, sum1, offset);
+\t\t\tconst float peer2 = __shfl_down_sync(mask, sum2, offset);
+\t\t\tconst float peer3 = __shfl_down_sync(mask, sum3, offset);
+\t\t\tconst float peer4 = __shfl_down_sync(mask, sum4, offset);
+\t\t\tconst float peer5 = __shfl_down_sync(mask, sum5, offset);
+\t\t\tconst float peer6 = __shfl_down_sync(mask, sum6, offset);
+\t\t\tif (lane + offset < 32 && (mask & (1u << (lane + offset))))
+\t\t\t{
+\t\t\t\tsum0 += peer0; sum1 += peer1; sum2 += peer2; sum3 += peer3;
+\t\t\t\tsum4 += peer4; sum5 += peer5; sum6 += peer6;
+\t\t\t}
+\t\t}
+\t}
+\telse
+\t{
+\t\tsum0 = sum1 = sum2 = sum3 = sum4 = sum5 = sum6 = 0.0f;
+\t\tfor (unsigned remaining = mask; remaining; remaining &= remaining - 1)
+\t\t{
+\t\t\tconst unsigned source = static_cast<unsigned>(__ffs(remaining) - 1);
+\t\t\tconst float peer0 = __shfl_sync(mask, value0, source);
+\t\t\tconst float peer1 = __shfl_sync(mask, value1, source);
+\t\t\tconst float peer2 = __shfl_sync(mask, value2, source);
+\t\t\tconst float peer3 = __shfl_sync(mask, value3, source);
+\t\t\tconst float peer4 = __shfl_sync(mask, value4, source);
+\t\t\tconst float peer5 = __shfl_sync(mask, value5, source);
+\t\t\tconst float peer6 = __shfl_sync(mask, value6, source);
+\t\t\tif (lane == leader)
+\t\t\t{
+\t\t\t\tsum0 += peer0; sum1 += peer1; sum2 += peer2; sum3 += peer3;
+\t\t\t\tsum4 += peer4; sum5 += peer5; sum6 += peer6;
+\t\t\t}
+\t\t}
+\t}
+\tif (lane == leader)
+\t{
+\t\tatomicAdd(target0, sum0); atomicAdd(target1, sum1);
+\t\tatomicAdd(target2, sum2); atomicAdd(target3, sum3);
+\t\tatomicAdd(target4, sum4); atomicAdd(target5, sum5);
+\t\tatomicAdd(target6, sum6);
 \t}
 }
 
@@ -204,6 +453,13 @@ _BATCH_HELPER = (
         "static bool compiler_flag_enabled", 1
     )[0]
 )
+_RASTER_BATCH_HELPERS = _HELPERS[
+    _HELPERS.index(
+        "template <typename Group>\n"
+        "__device__ __forceinline__ void accumulate_gaussian_gradient_batch2"
+    ):
+    _HELPERS.index("static bool compiler_flag_enabled")
+]
 
 _LEGACY_REDUCTION = """\tconst float sum = cg::reduce(active, value, cg::plus<float>());
 \tif (active.thread_rank() == 0)
@@ -258,18 +514,61 @@ _WARP_REDUCTION = """\t// The render loop has one logical Gaussian per active wa
 _QUERY_AGGREGATE_BLOCK = """\t\t\tif constexpr (Aggregate)
 \t\t\t{
 \t\t\t\tauto active = cg::coalesced_threads();
-\t\t\t\taccumulate_gaussian_gradient(active, &dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
-\t\t\t\taccumulate_gaussian_gradient(active, &dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
-\t\t\t\taccumulate_gaussian_gradient(active, &dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
-\t\t\t\taccumulate_gaussian_gradient(active, &dL_dconic2D[global_id].y, -1.0f * gdx * d.y * dL_dG);
-\t\t\t\taccumulate_gaussian_gradient(active, &dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
-\t\t\t\taccumulate_gaussian_gradient(active, &dL_dopacity[global_id], mu * G * dL_dalpha);
-\t\t\t\taccumulate_gaussian_gradient(active, &dL_dmu[global_id], con_o.w * G * dL_dalpha);
+\t\t\t\taccumulate_gaussian_gradient_batch2(active,
+\t\t\t\t\t&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx,
+\t\t\t\t\t&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+\t\t\t\taccumulate_gaussian_gradient_batch5(active,
+\t\t\t\t\t&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG,
+\t\t\t\t\t&dL_dconic2D[global_id].y, -1.0f * gdx * d.y * dL_dG,
+\t\t\t\t\t&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG,
+\t\t\t\t\t&dL_dopacity[global_id], mu * G * dL_dalpha,
+\t\t\t\t\t&dL_dmu[global_id], con_o.w * G * dL_dalpha);
 \t\t\t}
 \t\t\telse
 \t\t\t{
 {baseline}
 \t\t\t}"""
+
+
+_RASTER_SPLIT_AGGREGATE_BLOCK = """\t\t\tauto active = cg::coalesced_threads();
+\t\t\tif constexpr (QueryAggregate && SemanticAggregate)
+\t\t\t{
+\t\t\t\taccumulate_gaussian_gradient_batch5(active,
+\t\t\t\t\t&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx,
+\t\t\t\t\t&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy,
+\t\t\t\t\t&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG,
+\t\t\t\t\t&dL_dconic2D[global_id].y, -1.0f * gdx * d.y * dL_dG,
+\t\t\t\t\t&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
+\t\t\t}
+\t\t\telse
+\t\t\t{
+\t\t\t\tif constexpr (QueryAggregate)
+\t\t\t\t{
+\t\t\t\t\taccumulate_gaussian_gradient_batch2(active,
+\t\t\t\t\t\t&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx,
+\t\t\t\t\t\t&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+\t\t\t\t}
+\t\t\t\telse
+\t\t\t\t{
+\t\t\t\t\tatomicAdd(&dL_dmean2D[global_id].x, dL_dG * dG_ddelx * ddelx_dx);
+\t\t\t\t\tatomicAdd(&dL_dmean2D[global_id].y, dL_dG * dG_ddely * ddely_dy);
+\t\t\t\t}
+\t\t\t\tif constexpr (SemanticAggregate)
+\t\t\t\t{
+\t\t\t\t\taccumulate_gaussian_gradient_batch3(active,
+\t\t\t\t\t\t&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG,
+\t\t\t\t\t\t&dL_dconic2D[global_id].y, -1.0f * gdx * d.y * dL_dG,
+\t\t\t\t\t\t&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
+\t\t\t\t}
+\t\t\t\telse
+\t\t\t\t{
+\t\t\t\t\tatomicAdd(&dL_dconic2D[global_id].x, -0.5f * gdx * d.x * dL_dG);
+\t\t\t\t\tatomicAdd(&dL_dconic2D[global_id].y, -1.0f * gdx * d.y * dL_dG);
+\t\t\t\t\tatomicAdd(&dL_dconic2D[global_id].w, -0.5f * gdy * d.y * dL_dG);
+\t\t\t\t}
+\t\t\t}
+\t\t\tatomicAdd(&dL_dopacity[global_id], mu * G * dL_dalpha);
+\t\t\tatomicAdd(&dL_dmu[global_id], con_o.w * G * dL_dalpha);"""
 
 
 _SEMANTIC_AGGREGATE_BLOCK = """\t\t\tif constexpr (Aggregate)
@@ -307,6 +606,15 @@ _LEGACY_SEMANTIC_TARGETS = (
 )
 
 
+_RASTER_CONTROL_HELPER = """
+static bool gala_compiler_flag_enabled(const char* name)
+{
+\tconst char* value = std::getenv(name);
+\treturn value != nullptr && value[0] == '1' && value[1] == '\\0';
+}
+"""
+
+
 def _fuse_legacy_semantic_calls(source: str) -> str:
     """Fuse the earlier ten-call semantic block when rebuilding an overlay."""
 
@@ -333,6 +641,93 @@ def _fuse_legacy_semantic_calls(source: str) -> str:
         + ");"
     )
     return source[:matches[0].start()] + replacement + source[matches[-1].end():]
+
+
+def _split_raster_controls(source: str) -> str:
+    """Partition projection gradients between query and semantic controls."""
+
+    if "bool QueryAggregate, bool SemanticAggregate" in source:
+        return source
+    template = "template <uint32_t C, bool Aggregate>"
+    if source.count(template) != 1:
+        raise R2CompilerOverlayError(
+            "overlay transform split-raster-controls expected one kernel template"
+        )
+    transformed = source.replace(
+        template,
+        "template <uint32_t C, bool QueryAggregate, bool SemanticAggregate>",
+        1,
+    )
+    block_start = "\t\t\tif constexpr (Aggregate)"
+    if transformed.count(block_start) != 1:
+        raise R2CompilerOverlayError(
+            "overlay transform split-raster-controls expected one aggregate block"
+        )
+    begin = transformed.index(block_start)
+    baseline_end = "atomicAdd(&(dL_dmu[global_id]), con_o.w * G * dL_dalpha);"
+    if baseline_end not in transformed[begin:]:
+        baseline_end = "atomicAdd(&dL_dmu[global_id], con_o.w * G * dL_dalpha);"
+    if baseline_end not in transformed[begin:]:
+        raise R2CompilerOverlayError(
+            "overlay transform split-raster-controls expected the dL_dmu writeback"
+        )
+    baseline_finish = transformed.index(baseline_end, begin) + len(baseline_end)
+    close = "\n\t\t\t}"
+    finish = transformed.index(close, baseline_finish) + len(close)
+    transformed = (
+        transformed[:begin] + _RASTER_SPLIT_AGGREGATE_BLOCK + transformed[finish:]
+    )
+
+    namespace_anchor = "namespace cg = cooperative_groups;\n"
+    if transformed.count(namespace_anchor) != 1:
+        raise R2CompilerOverlayError(
+            "overlay transform split-raster-controls expected one namespace anchor"
+        )
+    helper_insert = _RASTER_CONTROL_HELPER
+    if "void accumulate_gaussian_gradient_batch2(" not in transformed:
+        helper_insert += _RASTER_BATCH_HELPERS
+    transformed = transformed.replace(
+        namespace_anchor, namespace_anchor + helper_insert, 1,
+    )
+
+    enabled = re.search(
+        r"renderCUDA<NUM_CHANNELS,\s*true>\s*<< <grid, block >> >\("
+        r"(?P<args>.*?)\);",
+        transformed,
+        flags=re.DOTALL,
+    )
+    if enabled is None:
+        raise R2CompilerOverlayError(
+            "overlay transform split-raster-controls expected an enabled launch"
+        )
+    launch_begin = transformed.rfind("\n\tif (", 0, enabled.start())
+    function_end = transformed.rfind("\n}")
+    if launch_begin < 0 or function_end < enabled.end():
+        raise R2CompilerOverlayError(
+            "overlay transform split-raster-controls could not bound the launch"
+        )
+    arguments = enabled.group("args").strip()
+
+    def launch(query: bool, semantic: bool) -> str:
+        return (
+            f"\t\trenderCUDA<NUM_CHANNELS, {str(query).lower()}, "
+            f"{str(semantic).lower()}> << <grid, block >>>(\n"
+            f"\t\t\t{arguments});"
+        )
+
+    dispatch = (
+        '\tconst bool query_aggregate = gala_compiler_flag_enabled("GALA_QUERY_WARP_REDUCE");\n'
+        '\tconst bool semantic_aggregate = gala_compiler_flag_enabled("GALA_SEMANTIC_WARP_REDUCE");\n'
+        "\tif (query_aggregate && semantic_aggregate)\n"
+        f"{launch(True, True)}\n"
+        "\telse if (query_aggregate)\n"
+        f"{launch(True, False)}\n"
+        "\telse if (semantic_aggregate)\n"
+        f"{launch(False, True)}\n"
+        "\telse\n"
+        f"{launch(False, False)}"
+    )
+    return transformed[:launch_begin + 1] + dispatch + transformed[function_end:]
 
 
 def _render_backward_overlay(
@@ -455,9 +850,9 @@ def _render_backward_overlay(
 
 
 def render_raster_backward_overlay(source: str) -> tuple[str, tuple[str, ...]]:
-    """Add the query-side aggregation control to the projection backward pass."""
+    """Partition projection aggregation into query and semantic controls."""
 
-    return _render_backward_overlay(
+    transformed, ids = _render_backward_overlay(
         source,
         block_start=(
             "\t\t\t// Update gradients w.r.t. 2D mean position of the Gaussian\n"
@@ -468,6 +863,7 @@ def render_raster_backward_overlay(source: str) -> tuple[str, tuple[str, ...]]:
         aggregate_template=_QUERY_AGGREGATE_BLOCK,
         environment_control="GALA_QUERY_WARP_REDUCE",
     )
+    return _split_raster_controls(transformed), ids + ("split-raster-controls",)
 
 
 def render_voxel_backward_overlay(source: str) -> tuple[str, tuple[str, ...]]:

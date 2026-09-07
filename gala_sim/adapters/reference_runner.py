@@ -23,10 +23,12 @@ def main(argv: list[str] | None = None) -> int:
     if not args.train_script.is_file():
         raise SystemExit(f"training script does not exist: {args.train_script}")
     from .fact_low_memory import (
+        configure_cuda_memory_environment,
         install_exact_low_memory_overlay,
         install_fact_low_memory_overlay,
         install_r2_low_memory_overlay,
     )
+    configure_cuda_memory_environment()
 
     if args.model_id == "r2_gaussian":
         overlay = install_r2_low_memory_overlay()

@@ -205,8 +205,10 @@ def load_gpu_compiler_measurement(
         raise GpuMeasurementError("GPU measurement variants need equal sample counts")
 
     baseline = median_gpu_ms["gpu_base"]
+    speedups: dict[str, float] = {}
     for bits in COMPILER_BITS:
         computed = baseline / median_gpu_ms[bits]
+        speedups[bits] = computed
         claimed = variants[bits].get("speedup_vs_gpu_base")
         if claimed is not None and not math.isclose(
             _positive_float(claimed, f"variants.{bits}.speedup_vs_gpu_base"),
@@ -217,6 +219,13 @@ def load_gpu_compiler_measurement(
             raise GpuMeasurementError(
                 f"GPU measurement variant {bits} has inconsistent speedup"
             )
+    # The combined compiler path must retain the benefit of either component.
+    # This catches stale or hand-edited artifacts from experimental regressions
+    # even when their isolation and numerical checks otherwise look valid.
+    if speedups["1100"] + 1.0e-9 < max(speedups["1000"], speedups["0100"]):
+        raise GpuMeasurementError(
+            "GPU measurement combined variant 1100 regresses a component"
+        )
     return GpuCompilerMeasurement(
         path=path,
         model_id=model_id,

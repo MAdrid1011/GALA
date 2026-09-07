@@ -50,14 +50,26 @@ def test_r2_overlay_adds_independent_query_and_semantic_controls() -> None:
     raster, raster_transforms = render_raster_backward_overlay(_raster_source())
     voxel, voxel_transforms = render_voxel_backward_overlay(_voxel_source())
 
-    assert raster.count("accumulate_gaussian_gradient(active,") == 7
+    assert raster.count("accumulate_gaussian_gradient(active,") == 0
     assert voxel.count("accumulate_gaussian_gradient_batch(active,") == 1
-    assert "else if (lane == leader)" in voxel
+    assert "bool QueryAggregate, bool SemanticAggregate" in raster
+    assert raster.count("void accumulate_gaussian_gradient_batch2(") == 1
+    assert raster.count("void accumulate_gaussian_gradient_batch5(") == 1
+    assert raster.count("void accumulate_gaussian_gradient_batch3(") == 1
+    assert raster.count("accumulate_gaussian_gradient_batch2(active,") == 1
+    assert raster.count("accumulate_gaussian_gradient_batch5(active,") == 1
+    assert raster.count("accumulate_gaussian_gradient_batch3(active,") == 1
+    assert raster.count("accumulate_gaussian_gradient_batch7(active,") == 0
+    assert "renderCUDA<NUM_CHANNELS, true, false>" in raster
+    assert "renderCUDA<NUM_CHANNELS, false, true>" in raster
+    assert "else if (lane == leader)" not in voxel
+    assert "const float peer9 = __shfl_sync" in voxel
     assert "GALA_QUERY_WARP_REDUCE" in raster
     assert "GALA_SEMANTIC_WARP_REDUCE" in voxel
-    assert "renderCUDA<NUM_CHANNELS, true>" in raster
+    assert "GALA_SEMANTIC_WARP_REDUCE" in raster
     assert "renderCUDA<NUM_CHANNELS, false>" in voxel
-    assert len(raster_transforms) == len(voxel_transforms) == 4
+    assert len(raster_transforms) == 5
+    assert len(voxel_transforms) == 4
 
 
 def test_r2_overlay_rejects_source_drift_without_hash_gate() -> None:

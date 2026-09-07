@@ -5,7 +5,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from array import array
 import json
-from typing import Iterable
+import os
+from typing import BinaryIO, Iterable
 from pathlib import Path
 
 import numpy as np
@@ -78,6 +79,7 @@ class ChunkedTraceBuilder:
     chunk_events: int
     chunk_root: Path | None = None
     stream_only: bool = False
+    stream_reclaim_bytes: int = 256 * 1024 * 1024
     _chunks: list[np.ndarray] = field(default_factory=list)
     _chunk_paths: list[Path] = field(default_factory=list, init=False)
     _current: np.ndarray | None = field(default=None, init=False, repr=False)
@@ -90,11 +92,18 @@ class ChunkedTraceBuilder:
     _payload_count: int = field(default=0, init=False, repr=False)
     _dependency_chunk_paths: list[Path] = field(default_factory=list, init=False, repr=False)
     _payload_chunk_paths: list[Path] = field(default_factory=list, init=False, repr=False)
+    _stream_events: BinaryIO | None = field(default=None, init=False, repr=False)
+    _stream_dependencies: BinaryIO | None = field(default=None, init=False, repr=False)
+    _stream_payload: BinaryIO | None = field(default=None, init=False, repr=False)
+    _stream_bytes_since_reclaim: int = field(default=0, init=False, repr=False)
+    _stream_reclaim_count: int = field(default=0, init=False, repr=False)
     _next_event_id: int = 0
 
     def __post_init__(self) -> None:
         if self.chunk_events <= 0:
             raise ValueError("trace chunk capacity must be positive")
+        if self.stream_reclaim_bytes <= 0:
+            raise ValueError("stream reclaim threshold must be positive")
         if self.stream_only and self.chunk_root is None:
             raise ValueError("stream-only mode requires a chunk root")
         if self.chunk_root is not None:
@@ -103,6 +112,32 @@ class ChunkedTraceBuilder:
             if self.stream_only:
                 for suffix in ("events.raw", "dependencies.raw", "payload.raw"):
                     (self.chunk_root.parent / suffix).unlink(missing_ok=True)
+                root = self.chunk_root.parent
+                # Keep the three append-only outputs open for the capture.  A
+                # full CUDA trace can contain thousands of chunks; reopening
+                # each file for every chunk adds measurable syscall and flush
+                # overhead to the hot path.
+                self._stream_events = (root / "events.raw").open(
+                    "wb", buffering=1024 * 1024,
+                )
+                self._stream_dependencies = (root / "dependencies.raw").open(
+                    "wb", buffering=1024 * 1024,
+                )
+                self._stream_payload = (root / "payload.raw").open(
+                    "wb", buffering=1024 * 1024,
+                )
+                for output in (
+                    self._stream_events, self._stream_dependencies,
+                    self._stream_payload,
+                ):
+                    try:
+                        os.posix_fadvise(
+                            output.fileno(), 0, 0, os.POSIX_FADV_SEQUENTIAL,
+                        )
+                    except (AttributeError, OSError):
+                        # The writer remains portable to filesystems/Python
+                        # builds without advisory cache controls.
+                        pass
 
     @property
     def next_event_id(self) -> int:
@@ -114,13 +149,31 @@ class ChunkedTraceBuilder:
         if self.chunk_root is None:
             self._chunks.append(self._current[:self._current_size].copy())
         elif self.stream_only:
-            root = self.chunk_root.parent
-            with (root / "events.raw").open("ab") as output:
-                output.write(self._current[:self._current_size].tobytes())
-            with (root / "dependencies.raw").open("ab") as output:
-                output.write(np.asarray(self._current_dependencies, dtype=dependency_dtype()).tobytes())
-            with (root / "payload.raw").open("ab") as output:
-                output.write(np.asarray(self._current_payload, dtype=np.dtype("<f4")).tobytes())
+            if (
+                self._stream_events is None
+                or self._stream_dependencies is None
+                or self._stream_payload is None
+            ):
+                raise RuntimeError("stream-only outputs are not open")
+            event_view = memoryview(self._current[:self._current_size])
+            dependency_view = memoryview(
+                np.frombuffer(self._current_dependencies, dtype=dependency_dtype())
+            )
+            payload_view = memoryview(
+                np.frombuffer(self._current_payload, dtype=np.dtype("<f4"))
+            )
+            self._stream_events.write(event_view)
+            self._stream_dependencies.write(
+                dependency_view
+            )
+            self._stream_payload.write(
+                payload_view
+            )
+            self._stream_bytes_since_reclaim += (
+                event_view.nbytes + dependency_view.nbytes + payload_view.nbytes
+            )
+            if self._stream_bytes_since_reclaim >= self.stream_reclaim_bytes:
+                self._reclaim_stream_cache()
         else:
             chunk_index = len(self._chunk_paths)
             path = self.chunk_root / f"events_{chunk_index:08d}.npy"
@@ -239,8 +292,8 @@ class ChunkedTraceBuilder:
         payload_base = len(self._payload) if self.chunk_root is None else self._payload_count
 
         if self.chunk_root is None:
-            self._dependencies.frombytes(dependencies.tobytes())
-            self._payload.frombytes(payload.tobytes())
+            self._dependencies.frombytes(memoryview(dependencies).cast("B"))
+            self._payload.frombytes(memoryview(payload).cast("B"))
         start = 0
         while start < event_count:
             if self._current is None:
@@ -248,28 +301,35 @@ class ChunkedTraceBuilder:
                 self._current_size = 0
             capacity = self.chunk_events - self._current_size
             end = min(start + capacity, event_count)
-            rows = np.array(events[start:end], copy=True)
-            rows["event_id"] = event_ids[start:end]
-            rows["dependency_begin"] = dependency_base + dependency_prefix[start:end]
-            rows["dependency_count"] = dependency_counts[start:end]
-            rows["payload_offset"] = payload_base + payload_prefix[start:end]
-            rows["payload_length"] = payload_counts[start:end]
+            destination = self._current[
+                self._current_size:self._current_size + (end - start)
+            ]
+            # Copy the caller's immutable event fields once, then fill the
+            # builder-owned offsets directly in the destination.  The former
+            # temporary ``rows`` array caused a second full structured-column
+            # copy for every capture chunk.
+            destination[...] = events[start:end]
+            destination["event_id"] = event_ids[start:end]
+            destination["dependency_begin"] = (
+                dependency_base + dependency_prefix[start:end]
+            )
+            destination["dependency_count"] = dependency_counts[start:end]
+            destination["payload_offset"] = payload_base + payload_prefix[start:end]
+            destination["payload_length"] = payload_counts[start:end]
             dep_begin = int(dependency_prefix[start])
             dep_end = int(dependency_prefix[end])
             payload_begin = int(payload_prefix[start])
             payload_end = int(payload_prefix[end])
             if self.chunk_root is not None:
                 self._current_dependencies.frombytes(
-                    dependencies[dep_begin:dep_end].tobytes()
+                    memoryview(dependencies[dep_begin:dep_end]).cast("B")
                 )
                 self._current_payload.frombytes(
-                    payload[payload_begin:payload_end].tobytes()
+                    memoryview(payload[payload_begin:payload_end]).cast("B")
                 )
                 self._dependency_count += dep_end - dep_begin
                 self._payload_count += payload_end - payload_begin
-            batch_size = end - start
-            self._current[self._current_size:self._current_size + batch_size] = rows
-            self._current_size += batch_size
+            self._current_size += end - start
             if self._current_size == self.chunk_events:
                 self._flush_current()
             start = end
@@ -284,6 +344,8 @@ class ChunkedTraceBuilder:
             raise ValueError("stream-only builder cannot materialize merged arrays")
         if self.chunk_root is not None:
             self._flush_current()
+            if self.stream_only:
+                self._close_stream_outputs()
             event_metadata = {
                 "schema_version": EVENT_SCHEMA_VERSION,
                 "trace_storage_format": "raw_columns" if self.stream_only else "npy_chunks",
@@ -374,6 +436,40 @@ class ChunkedTraceBuilder:
             payload=payload,
             metadata={"schema_version": EVENT_SCHEMA_VERSION, **(metadata or {})},
         )
+
+    def _close_stream_outputs(self) -> None:
+        outputs = (
+            self._stream_events, self._stream_dependencies, self._stream_payload,
+        )
+        self._stream_events = None
+        self._stream_dependencies = None
+        self._stream_payload = None
+        for output in outputs:
+            if output is not None:
+                output.flush()
+                output.close()
+
+    def _reclaim_stream_cache(self) -> None:
+        """Bound page-cache residency during multi-gigabyte full captures."""
+
+        outputs = tuple(
+            output for output in (
+                self._stream_events, self._stream_dependencies, self._stream_payload,
+            ) if output is not None
+        )
+        for output in outputs:
+            output.flush()
+            try:
+                # DONTNEED is advisory; syncing first makes the written range
+                # clean and therefore reclaimable on Linux.
+                os.fdatasync(output.fileno())
+                os.posix_fadvise(
+                    output.fileno(), 0, 0, os.POSIX_FADV_DONTNEED,
+                )
+            except (AttributeError, OSError):
+                pass
+        self._stream_bytes_since_reclaim = 0
+        self._stream_reclaim_count += 1
 
 
 def _merge_chunk_arrays(

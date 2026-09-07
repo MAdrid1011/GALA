@@ -54,9 +54,23 @@ simulated cycles, wall time, and projected completion. Diagnostic stability is
 evaluated only at quiescent iteration boundaries and requires a configured
 sequence of converged windows.
 
-Stopping after diagnostic convergence produces a diagnostic artifact, not a
-complete cycle result. The ordinary replay path always consumes the full event
-stream.
+The `archive-ablation --adaptive-stop` mode uses the same end-to-end archive
+path as ordinary replay: every observed packet is decoded, expanded, scheduled,
+and sent through the configured memory model for all seven policies. It may
+stop at a common quiescent boundary after the cycle ratios stabilize. The
+result is an `adaptive_end_to_end_estimate` of the complete archive horizon,
+with the observed stable-window envelope and its stationary-iteration
+assumption recorded explicitly. The certificate also rejects a joint policy
+that regresses either component and checks configured hardware anchor lower
+bounds. The archive must carry a passed capture contract and the observed
+prefix must satisfy the certificate before the estimate is marked
+`adaptive_performance_eligible`; a separately validated archive records
+stronger provenance. An exact full-horizon replay remains the separate
+`formal_performance_eligible` result.
+
+The ordinary replay path continues to consume the full event stream. Adaptive
+stopping changes only the stopping horizon, not the event semantics or
+simulated resources of the path that was measured.
 
 ## Parallel Work
 

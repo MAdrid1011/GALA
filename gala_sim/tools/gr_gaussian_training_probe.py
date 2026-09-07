@@ -253,13 +253,10 @@ def run_probe(
                     "query_weights",
                     lambda: _weights(torch, origins, directions, means, scales),
                 )
-            # The closed-form graph gradient is useful when it is the only
-            # enabled mechanism. With query hoisting enabled, autograd over
-            # the cached weights is faster on sparse views and has the same
-            # density derivative, so keep the joint path non-regressive.
-            if closed_form_semantic and (
-                not hoist_query or dataset_id != "hdtomo_usb"
-            ):
+            # Reuse the closed-form graph gradient for the joint path. The
+            # autograd fallback when query hoisting is enabled makes HDTomo's
+            # combined variant regress both independently optimized paths.
+            if closed_form_semantic:
                 loss, gradient = profiler.measure(
                     "closed_form_gradient",
                     lambda: _closed_form_gradient(
@@ -357,6 +354,8 @@ def summarize_matrix(
     *,
     relative_tolerance: float,
     absolute_tolerance: float,
+    model_id: str = "gr_gaussian",
+    dataset_id: str | None = None,
 ) -> dict[str, Any]:
     if tuple(observations) != COMPILER_VARIANTS:
         raise GRTrainingProbeError("matrix must use the four canonical compiler variants")
@@ -400,7 +399,10 @@ def summarize_matrix(
             "samples": [dict(item.record) for item in samples],
         }
     base_ms = summary["gpu_base"]["median_cuda_elapsed_ms"]
-    targets = compiler_target_speedups()
+    targets = (
+        compiler_target_speedups(model_id, dataset_id)
+        if dataset_id else compiler_target_speedups()
+    )
     for variant, item in summary.items():
         speedup = base_ms / item["median_cuda_elapsed_ms"]
         item["speedup_vs_gpu_base"] = speedup
@@ -418,12 +420,15 @@ def summarize_matrix(
         for samples in observations.values()
         for sample in samples
     )
+    eligible = eligible and bool(composition["monotonic"])
     return {
         "schema_version": "gala-gr-gaussian-gpu-compiler-matrix-v1",
         "result_scope": "bounded_cuda_reference_training",
         "formal_performance_eligible": False,
         "performance_comparison_eligible": eligible,
         "comparison_baseline": "gpu_base",
+        "model_id": model_id,
+        "dataset_id": dataset_id,
         "joint_mechanism_assessment": composition,
         "summary": summary,
     }
@@ -475,6 +480,8 @@ def run_matrix(
         observations,
         relative_tolerance=relative_tolerance,
         absolute_tolerance=absolute_tolerance,
+        model_id="gr_gaussian",
+        dataset_id=dataset_id,
     )
     if profile_stages:
         diagnostic = run_probe(
@@ -499,6 +506,8 @@ def run_matrix(
         result["compiler_coverage_bounds"] = analyze_gpu_compiler_coverage(
             total_gpu_ms=float(diagnostic.record["measurement"]["cuda_elapsed_ms"]),
             stage_profile=stage_profile,
+            model_id="gr_gaussian",
+            dataset_id=dataset_id,
             coverable_stages={
                 "1000": ("query_weights",),
                 "0100": ("prediction_and_graph_loss", "backward"),

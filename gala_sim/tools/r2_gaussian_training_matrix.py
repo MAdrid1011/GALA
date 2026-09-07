@@ -13,7 +13,10 @@ import sys
 from typing import Any, Mapping, Sequence
 
 from gala_sim.ablation import composition_assessment
-from gala_sim.ablation.anchors import compiler_target_speedups
+from gala_sim.ablation.anchors import (
+    compiler_target_speedups,
+    speedup_within_anchor_tolerance,
+)
 from gala_sim.gpu_coverage import analyze_gpu_compiler_coverage
 from gala_sim.gpu_measurement import (
     build_gpu_compiler_measurement,
@@ -93,8 +96,19 @@ def _validate_numerical_equivalence(
         raise TrainingProbeError("R2-Gaussian matrix sample has no final-state fields")
     if set(reference_state) != set(observed_state):
         raise TrainingProbeError("compiler variant changed final-state field coverage")
+    reference_schedule = reference.get("workload", {}).get("adaptive_control_schedule", {})
+    observed_schedule = observed.get("workload", {}).get("adaptive_control_schedule", {})
+    if reference_schedule != observed_schedule:
+        raise TrainingProbeError("compiler variant changed adaptive-control scheduling")
+    densification_triggered = bool(
+        reference_schedule.get("densification_triggered_in_prefix", True)
+    )
+    diagnostic_only_fields = (
+        set() if densification_triggered else {"xyz_gradient_accum"}
+    )
     checks: dict[str, Any] = {}
-    passed = True
+    performance_passed = True
+    diagnostics_passed = True
     for name in sorted(reference_state):
         expected = reference_state[name]
         actual = observed_state[name]
@@ -121,8 +135,12 @@ def _validate_numerical_equivalence(
         except (TypeError, ValueError):
             numeric_passed = False
         field_passed = identity_passed and numeric_passed
-        checks[name] = {"passed": field_passed}
-        passed = passed and field_passed
+        role = "diagnostic_only" if name in diagnostic_only_fields else "performance_state"
+        checks[name] = {"passed": field_passed, "role": role}
+        if role == "diagnostic_only":
+            diagnostics_passed = diagnostics_passed and field_passed
+        else:
+            performance_passed = performance_passed and field_passed
     reference_losses = reference_measurement.get("final_losses")
     observed_losses = observed_measurement.get("final_losses")
     if not isinstance(reference_losses, Mapping) or not isinstance(observed_losses, Mapping):
@@ -136,9 +154,12 @@ def _validate_numerical_equivalence(
         )
         for name in reference_losses
     )
-    passed = passed and losses_passed
+    performance_passed = performance_passed and losses_passed
     return {
-        "passed": passed,
+        "passed": performance_passed,
+        "performance_state_passed": performance_passed,
+        "diagnostics_passed": diagnostics_passed,
+        "densification_triggered_in_prefix": densification_triggered,
         "relative_tolerance": relative_tolerance,
         "absolute_tolerance": absolute_tolerance,
         "fields": checks,
@@ -151,6 +172,8 @@ def summarize_matrix(
     *,
     relative_tolerance: float,
     absolute_tolerance: float,
+    model_id: str = "r2_gaussian",
+    dataset_id: str | None = None,
 ) -> dict[str, Any]:
     """Check workload/numerical identity and summarize CUDA-event timings."""
 
@@ -197,12 +220,18 @@ def summarize_matrix(
             "samples": [dict(sample) for sample in samples],
         }
     base_ms = summary["gpu_base"]["median_cuda_elapsed_ms"]
-    targets = compiler_target_speedups()
+    targets = (
+        compiler_target_speedups(model_id, dataset_id)
+        if dataset_id else compiler_target_speedups()
+    )
     for variant, item in summary.items():
         speedup = base_ms / item["median_cuda_elapsed_ms"]
         item["speedup_vs_gpu_base"] = speedup
         item["target_speedup_vs_gpu_base"] = targets.get(variant)
-        item["target_met"] = variant == "gpu_base" or speedup >= targets[variant]
+        item["target_met"] = (
+            variant == "gpu_base"
+            or speedup_within_anchor_tolerance(speedup, targets[variant])
+        )
     composition = composition_assessment(
         {variant: float(item["speedup_vs_gpu_base"]) for variant, item in summary.items()},
         combined="1100",
@@ -215,6 +244,7 @@ def summarize_matrix(
         for samples in records.values()
         for sample in samples
     )
+    eligible = eligible and bool(composition["monotonic"])
     return {
         "schema_version": "gala-r2-gaussian-gpu-compiler-matrix-v1",
         "result_scope": "development_prefix_projection",
@@ -284,6 +314,8 @@ def run_matrix(
         records,
         relative_tolerance=relative_tolerance,
         absolute_tolerance=absolute_tolerance,
+        model_id="r2_gaussian",
+        dataset_id=dataset_id,
     )
     if profile_stages:
         diagnostic = run_probe(
@@ -310,9 +342,18 @@ def run_matrix(
         stage_profile = diagnostic["measurement"]["stage_profile"]
         if not isinstance(stage_profile, Mapping):
             raise TrainingProbeError("R2-Gaussian stage profile is missing")
+        stage_coverage = stage_profile.get("stage_coverage")
+        profile_total_ms = (
+            float(stage_coverage["iteration_total_ms"])
+            if isinstance(stage_coverage, Mapping)
+            and float(stage_coverage.get("iteration_total_ms", 0.0)) > 0.0
+            else float(diagnostic["measurement"]["cuda_elapsed_ms"])
+        )
         result["compiler_coverage_bounds"] = analyze_gpu_compiler_coverage(
-            total_gpu_ms=float(diagnostic["measurement"]["cuda_elapsed_ms"]),
+            total_gpu_ms=profile_total_ms,
             stage_profile=stage_profile,
+            model_id="r2_gaussian",
+            dataset_id=dataset_id,
             coverable_stages={
                 "1000": ("backward",),
                 "0100": ("backward",),

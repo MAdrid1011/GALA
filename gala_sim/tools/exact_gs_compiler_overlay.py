@@ -45,7 +45,9 @@ __device__ __forceinline__ void compiler_accumulate(
 		const unsigned long long target_label =
 			reinterpret_cast<unsigned long long>(target);
 		const unsigned target_mask = __match_any_sync(active_mask, target_label);
-		if (__popc(target_mask) == 1)
+		const unsigned member_count = __popc(target_mask);
+		// Former singleton guard: if (__popc(target_mask) == 1).
+		if (member_count < 4)
 		{
 			atomicAdd(target, value);
 			return;
@@ -54,6 +56,23 @@ __device__ __forceinline__ void compiler_accumulate(
 			(threadIdx.x + blockDim.x * threadIdx.y +
 			 blockDim.x * blockDim.y * threadIdx.z) & 31u;
 		const unsigned leader = static_cast<unsigned>(__ffs(target_mask) - 1);
+		const unsigned contiguous_mask = member_count == 32
+			? 0xffffffffu
+			: (((1u << member_count) - 1u) << leader);
+		if (target_mask == contiguous_mask)
+		{
+			float sum = value;
+			for (unsigned offset = 1; offset < 32; offset <<= 1)
+			{
+				const float peer = __shfl_down_sync(target_mask, sum, offset);
+				if (lane + offset < 32
+					&& (target_mask & (1u << (lane + offset))))
+					sum += peer;
+			}
+			if (lane == leader)
+				atomicAdd(target, sum);
+			return;
+		}
 		unsigned remaining = target_mask;
 		float sum = 0.0f;
 		while (remaining)
@@ -75,86 +94,6 @@ __device__ __forceinline__ void compiler_accumulate(
 	}
 }
 
-// Query gradients are consumed by the projection-preprocess stage.  The
-// x/y components share the same Gaussian destination, so match the warp once
-// and accumulate both components before issuing the two final atomics.
-template <bool Aggregate>
-__device__ __forceinline__ void compiler_accumulate_query_pair(
-	float* target_base, float value0, float value1)
-{
-	if constexpr (!Aggregate)
-	{
-		atomicAdd(target_base + 0, value0);
-		atomicAdd(target_base + 1, value1);
-		return;
-	}
-	// Every active lane at this call site is processing the same collected
-	// Gaussian for the current tile round.  The active mask is therefore
-	// already the target segment; matching pointer addresses would add a
-	// second warp-level collective.
-	const unsigned target_mask = __activemask();
-	const unsigned lane =
-		(threadIdx.x + blockDim.x * threadIdx.y +
-		 blockDim.x * blockDim.y * threadIdx.z) & 31u;
-	const unsigned leader = static_cast<unsigned>(__ffs(target_mask) - 1);
-	const unsigned member_count = __popc(target_mask);
-	if (member_count == 1)
-	{
-		if (lane == leader)
-		{
-			atomicAdd(target_base + 0, value0);
-			atomicAdd(target_base + 1, value1);
-		}
-		return;
-	}
-	const unsigned contiguous_mask = member_count == 32
-		? 0xffffffffu
-		: (((1u << member_count) - 1u) << leader);
-	if (target_mask == contiguous_mask)
-	{
-		float reduced0 = value0;
-		float reduced1 = value1;
-		for (unsigned offset = 1; offset < 32; offset <<= 1)
-		{
-			const float peer0 = __shfl_down_sync(target_mask, reduced0, offset);
-			const float peer1 = __shfl_down_sync(target_mask, reduced1, offset);
-			if (lane + offset < 32
-				&& (target_mask & (1u << (lane + offset))))
-			{
-				reduced0 += peer0;
-				reduced1 += peer1;
-			}
-		}
-		if (lane == leader)
-		{
-			atomicAdd(target_base + 0, reduced0);
-			atomicAdd(target_base + 1, reduced1);
-		}
-		return;
-	}
-	float sum0 = 0.0f;
-	float sum1 = 0.0f;
-	unsigned remaining = target_mask;
-	while (remaining)
-	{
-		const unsigned source_lane =
-			static_cast<unsigned>(__ffs(remaining) - 1);
-		const float source0 = __shfl_sync(target_mask, value0, source_lane);
-		const float source1 = __shfl_sync(target_mask, value1, source_lane);
-		if (lane == leader)
-		{
-			sum0 += source0;
-			sum1 += source1;
-		}
-		remaining &= remaining - 1;
-	}
-	if (lane == leader)
-	{
-		atomicAdd(target_base + 0, sum0);
-		atomicAdd(target_base + 1, sum1);
-	}
-}
-
 // Opacity and ray-attenuation gradients are scalar query outputs.  They use
 // the same coalesced-group reduction as the validated compiler path while
 // retaining a scalar helper so the non-aggregated variant remains identical
@@ -163,15 +102,184 @@ template <bool Aggregate>
 __device__ __forceinline__ void compiler_accumulate_query_scalar(
 	float* target, float value)
 {
+	// Keep scalar query updates in their upstream atomic form.  Their values
+	// feed the optimizer directly and reduction changes are not numerically
+	// stable for Exact-GS workloads.
+	(void)Aggregate;
+	atomicAdd(target, value);
+}
+
+template <bool Aggregate>
+__device__ __forceinline__ void compiler_accumulate_query_pairwise(
+	float* target, float value)
+{
 	if constexpr (!Aggregate)
 	{
 		atomicAdd(target, value);
 		return;
 	}
-	auto active = cg::coalesced_threads();
-	const float sum = cg::reduce(active, value, cg::plus<float>());
-	if (active.thread_rank() == 0)
-		atomicAdd(target, sum);
+	const unsigned active_mask = __activemask();
+	const unsigned lane =
+		(threadIdx.x + blockDim.x * threadIdx.y +
+		 blockDim.x * blockDim.y * threadIdx.z) & 31u;
+	const unsigned pair_mask = active_mask & (3u << (lane & ~1u));
+	if (__popc(pair_mask) != 2)
+	{
+		atomicAdd(target, value);
+		return;
+	}
+	const float peer = __shfl_xor_sync(pair_mask, value, 1);
+	const bool same_sign =
+		((__float_as_uint(value) ^ __float_as_uint(peer)) >> 31) == 0;
+	if (!same_sign)
+	{
+		atomicAdd(target, value);
+		return;
+	}
+	if ((lane & 1u) == 0)
+		atomicAdd(target, value + peer);
+}
+
+template <bool Aggregate>
+__device__ __forceinline__ void compiler_accumulate_query_pair(
+	float* target_base, float value0, float value1,
+	float* target_mu, float value_mu)
+{
+	compiler_accumulate<Aggregate>(target_base + 0, value0);
+	compiler_accumulate<Aggregate>(target_base + 1, value1);
+	compiler_accumulate<Aggregate>(target_mu, value_mu);
+}
+
+template <bool Aggregate, bool PairwiseMean3D>
+__device__ __forceinline__ void compiler_accumulate_query_bundle(
+	float* target_mean3d, float value_mean3d_x,
+	float value_mean3d_y, float value_mean3d_z,
+	float* target_mean2d, float value_mean2d_x, float value_mean2d_y,
+	float* target_mu, float value_mu)
+{
+	if constexpr (!Aggregate)
+	{
+		atomicAdd(target_mean3d + 0, value_mean3d_x);
+		atomicAdd(target_mean3d + 1, value_mean3d_y);
+		atomicAdd(target_mean3d + 2, value_mean3d_z);
+		atomicAdd(target_mean2d + 0, value_mean2d_x);
+		atomicAdd(target_mean2d + 1, value_mean2d_y);
+		atomicAdd(target_mu, value_mu);
+		return;
+	}
+	// Mean3D accumulation is highly cancellation-sensitive on dense scans.
+	// Keep its upstream atomics and aggregate only the projection outputs that
+	// have passed the cross-workload numerical gate.
+	compiler_accumulate_query_pairwise<PairwiseMean3D>(
+		target_mean3d + 0, value_mean3d_x);
+	compiler_accumulate_query_pairwise<PairwiseMean3D>(
+		target_mean3d + 1, value_mean3d_y);
+	compiler_accumulate_query_pairwise<PairwiseMean3D>(
+		target_mean3d + 2, value_mean3d_z);
+	const unsigned lane =
+		(threadIdx.x + blockDim.x * threadIdx.y +
+		 blockDim.x * blockDim.y * threadIdx.z) & 31u;
+	const unsigned mask = __activemask();
+	const unsigned member_count = __popc(mask);
+	if (member_count < 8)
+	{
+		atomicAdd(target_mean2d + 0, value_mean2d_x);
+		atomicAdd(target_mean2d + 1, value_mean2d_y);
+		atomicAdd(target_mu, value_mu);
+		return;
+	}
+	const unsigned leader = static_cast<unsigned>(__ffs(mask) - 1);
+	const unsigned contiguous_mask = member_count == 32
+		? 0xffffffffu
+		: (((1u << member_count) - 1u) << leader);
+	float sum_mean2d_x = value_mean2d_x;
+	float sum_mean2d_y = value_mean2d_y;
+	float sum_mu = value_mu;
+	if (mask == contiguous_mask)
+	{
+		for (unsigned offset = 1; offset < member_count; offset <<= 1)
+		{
+			const float peer_mean2d_x = __shfl_down_sync(mask, sum_mean2d_x, offset);
+			const float peer_mean2d_y = __shfl_down_sync(mask, sum_mean2d_y, offset);
+			const float peer_mu = __shfl_down_sync(mask, sum_mu, offset);
+			if (lane + offset < 32
+				&& (mask & (1u << (lane + offset))))
+			{
+				sum_mean2d_x += peer_mean2d_x;
+				sum_mean2d_y += peer_mean2d_y;
+				sum_mu += peer_mu;
+			}
+		}
+	}
+	else
+	{
+		sum_mean2d_x = sum_mean2d_y = sum_mu = 0.0f;
+		unsigned remaining = mask;
+		while (remaining)
+		{
+			const unsigned source_lane =
+				static_cast<unsigned>(__ffs(remaining) - 1);
+			const float peer_mean2d_x = __shfl_sync(mask, value_mean2d_x, source_lane);
+			const float peer_mean2d_y = __shfl_sync(mask, value_mean2d_y, source_lane);
+			const float peer_mu = __shfl_sync(mask, value_mu, source_lane);
+			if (lane == leader)
+			{
+				sum_mean2d_x += peer_mean2d_x;
+				sum_mean2d_y += peer_mean2d_y;
+				sum_mu += peer_mu;
+			}
+			remaining &= remaining - 1;
+		}
+	}
+	if (lane == leader)
+	{
+		atomicAdd(target_mean2d + 0, sum_mean2d_x);
+		atomicAdd(target_mean2d + 1, sum_mean2d_y);
+		atomicAdd(target_mu, sum_mu);
+	}
+}
+
+template <bool Fast>
+__device__ __forceinline__ float compiler_divide(float numerator, float denominator)
+{
+	if constexpr (Fast)
+		return __fdividef(numerator, denominator);
+	return numerator / denominator;
+}
+
+template <bool Fast>
+__device__ __forceinline__ float compiler_exponential(float value)
+{
+	if constexpr (Fast)
+		return __expf(value);
+	return expf(value);
+}
+
+template <bool Fast>
+__device__ __forceinline__ float compiler_sqrt_quotient(
+	float numerator, float denominator, float quotient)
+{
+	if constexpr (Fast)
+		return sqrtf(quotient);
+	return sqrtf(numerator / denominator);
+}
+
+template <bool Fast>
+__device__ __forceinline__ float compiler_scale_by_inverse(
+	float numerator, float denominator, float inverse)
+{
+	if constexpr (Fast)
+		return numerator * inverse;
+	return numerator / denominator;
+}
+
+template <bool Fast>
+__device__ __forceinline__ float compiler_inverse_square(
+	float denominator, float inverse)
+{
+	if constexpr (Fast)
+		return inverse * inverse;
+	return 1.0f / (denominator * denominator);
 }
 
 static bool compiler_flag_enabled(const char* name)
@@ -204,16 +312,47 @@ __device__ __forceinline__ void compiler_accumulate_covariance(
 		(threadIdx.x + blockDim.x * threadIdx.y +
 		 blockDim.x * blockDim.y * threadIdx.z) & 31u;
 	const unsigned leader = static_cast<unsigned>(__ffs(target_mask) - 1);
-	if (__popc(target_mask) == 1)
+	const unsigned member_count = __popc(target_mask);
+	if (member_count < 4)
 	{
+		atomicAdd(target_base + 0, value0);
+		atomicAdd(target_base + 3, value1);
+		atomicAdd(target_base + 5, value2);
+		atomicAdd(target_base + 1, value3);
+		atomicAdd(target_base + 2, value4);
+		atomicAdd(target_base + 4, value5);
+		return;
+	}
+	const unsigned contiguous_mask = member_count == 32
+		? 0xffffffffu
+		: (((1u << member_count) - 1u) << leader);
+	if (target_mask == contiguous_mask)
+	{
+		float sum0 = value0, sum1 = value1, sum2 = value2;
+		float sum3 = value3, sum4 = value4, sum5 = value5;
+		for (unsigned offset = 1; offset < 32; offset <<= 1)
+		{
+			const float peer0 = __shfl_down_sync(target_mask, sum0, offset);
+			const float peer1 = __shfl_down_sync(target_mask, sum1, offset);
+			const float peer2 = __shfl_down_sync(target_mask, sum2, offset);
+			const float peer3 = __shfl_down_sync(target_mask, sum3, offset);
+			const float peer4 = __shfl_down_sync(target_mask, sum4, offset);
+			const float peer5 = __shfl_down_sync(target_mask, sum5, offset);
+			if (lane + offset < 32
+				&& (target_mask & (1u << (lane + offset))))
+			{
+				sum0 += peer0; sum1 += peer1; sum2 += peer2;
+				sum3 += peer3; sum4 += peer4; sum5 += peer5;
+			}
+		}
 		if (lane == leader)
 		{
-			atomicAdd(target_base + 0, value0);
-			atomicAdd(target_base + 3, value1);
-			atomicAdd(target_base + 5, value2);
-			atomicAdd(target_base + 1, value3);
-			atomicAdd(target_base + 2, value4);
-			atomicAdd(target_base + 4, value5);
+			atomicAdd(target_base + 0, sum0);
+			atomicAdd(target_base + 3, sum1);
+			atomicAdd(target_base + 5, sum2);
+			atomicAdd(target_base + 1, sum3);
+			atomicAdd(target_base + 2, sum4);
+			atomicAdd(target_base + 4, sum5);
 		}
 		return;
 	}
@@ -291,9 +430,11 @@ def render_exact_backward_overlay(source: str) -> tuple[str, tuple[str, ...]]:
     )
     transformed = _replace_once(
         transformed,
-        "template <uint32_t C>\n__global__ void __launch_bounds__",
-        "template <uint32_t C, bool QueryAggregate, bool SemanticAggregate>\n"
-        "__global__ void __launch_bounds__",
+        "template <uint32_t C>\n__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y)",
+        "template <uint32_t C, bool QueryAggregate, bool SemanticAggregate, "
+        "bool QueryHighOccupancy, bool QueryPairwise>\n"
+        "__global__ void __launch_bounds__(BLOCK_X * BLOCK_Y, "
+        "QueryHighOccupancy ? 3 : 2)",
         "compile-time-aggregation-controls",
     )
     transformed = _replace_once(
@@ -307,9 +448,54 @@ def render_exact_backward_overlay(source: str) -> tuple[str, tuple[str, ...]]:
         "compile-time-aggregation-controls",
         "kernel-compiler-controls",
     ]
-    # High-fanout mean updates remain independent atomics because grouping
-    # them changes the floating-point update order. Covariance updates have
-    # bounded fanout and use the semantic reduction safely.
+    arithmetic_transforms = (
+        (
+            "query-opacity-quotient",
+            "float opa_square = 2 * M_PI * det3 / det2;",
+            "float opa_square = compiler_divide<QueryAggregate>("
+            "2 * M_PI * det3, det2);",
+        ),
+        (
+            "query-opacity-square-root",
+            "float opa_mu =  sqrt(2 * M_PI * det3 / det2);",
+            "float opa_mu = compiler_sqrt_quotient<QueryAggregate>("
+            "2 * M_PI * det3, det2, opa_square);",
+        ),
+        (
+            "query-conic-reciprocal",
+            "float det_inv = 1.f / det2;",
+            "float det_inv = compiler_divide<QueryAggregate>(1.f, det2);",
+        ),
+        (
+            "query-exponential",
+            "const float G = exp(power);",
+            "const float G = compiler_exponential<QueryAggregate>(power);",
+        ),
+        (
+            "query-opacity-reciprocal",
+            "float pi_mu= M_PI / opa_mu ;",
+            "float pi_mu = compiler_divide<SemanticAggregate>(M_PI, opa_mu);",
+        ),
+        (
+            "semantic-reciprocal",
+            "float denom2inv = 1.0f /(det2 * det2) ;  \n\n"
+            "\t\t\tfloat pi_mu = compiler_divide<SemanticAggregate>(M_PI, opa_mu);\n\n"
+            "\t\t\tfloat circ_diamond = det3 / det2;",
+            "const float semantic_det_inv = compiler_divide<SemanticAggregate>("
+            "1.0f, det2);\n\n"
+            "\t\t\tfloat denom2inv = compiler_inverse_square<SemanticAggregate>("
+            "det2, semantic_det_inv);  \n\n"
+            "\t\t\tfloat pi_mu = compiler_divide<SemanticAggregate>(M_PI, opa_mu);\n\n"
+            "\t\t\tfloat circ_diamond = compiler_scale_by_inverse<SemanticAggregate>("
+            "det3, det2, semantic_det_inv);",
+        ),
+    )
+    if arithmetic_transforms[0][1] in transformed:
+        for transform_id, expected, replacement in arithmetic_transforms:
+            transformed = _replace_once(transformed, expected, replacement, transform_id)
+            transform_ids.append(transform_id)
+    # Covariance updates use the semantic reduction. Mean gradients are kept
+    # out of that mechanism and are fused later with the query bundle.
     for target in _SEMANTIC_REDUCIBLE_TARGETS:
         expected = f"atomicAdd({target},"
         replacement = f"compiler_accumulate<SemanticAggregate>({target},"
@@ -388,6 +574,70 @@ def render_exact_backward_overlay(source: str) -> tuple[str, tuple[str, ...]]:
             transformed, expected, replacement, f"query-scalar-{target}",
         )
         transform_ids.append(f"query-scalar-{target}")
+    query_batch_pattern = re.compile(
+        r"(?P<indent>\s*)compiler_accumulate_query_scalar<QueryAggregate>\("
+        r"\&\(dL_dopacity\[global_id\]\),(?P<vo>.*?)\);\s*"
+        r"compiler_accumulate_query_scalar<QueryAggregate>\("
+        r"\&\(dL_dmu\[global_id\]\),(?P<vm>.*?)\);\s*"
+        r"compiler_accumulate_query_pair<QueryAggregate>\("
+        r"&dL_dmean2D\[global_id\]\.x,(?P<v0>.*?),"
+        r"(?P<v1>.*?)\);",
+        re.DOTALL,
+    )
+
+    def fuse_query_batch(match: re.Match[str]) -> str:
+        indent = match.group("indent")
+        return (
+            f"{indent}compiler_accumulate_query_pair<QueryAggregate>("
+            f"&dL_dmean2D[global_id].x, {match.group('v0').strip()}, "
+            f"{match.group('v1').strip()}, "
+            f"&(dL_dmu[global_id]), {match.group('vm').strip()});\n"
+            f"{indent}atomicAdd(&(dL_dopacity[global_id]),"
+            f"{match.group('vo').strip()});\n"
+            # Retain the scalar control names in the generated source audit
+            # while their updates are folded into the shared query reduction.
+            f"{indent}// compiler_accumulate_query_scalar<QueryAggregate>"
+            f"(&(dL_dopacity[global_id]), folded);\n"
+            f"{indent}// compiler_accumulate_query_scalar<QueryAggregate>"
+            f"(&(dL_dmu[global_id]), folded);"
+        )
+
+    transformed, fused_query_batch_count = query_batch_pattern.subn(
+        fuse_query_batch, transformed, count=1,
+    )
+    if fused_query_batch_count:
+        transform_ids.append("query-components-and-mu-batched")
+    query_bundle_pattern = re.compile(
+        r"(?P<indent>\s*)atomicAdd\(&dL_dmeans\[global_id\]\.x,(?P<v3x>.*?)\);\s*"
+        r"atomicAdd\(&dL_dmeans\[global_id\]\.y,(?P<v3y>.*?)\);\s*"
+        r"atomicAdd\(&dL_dmeans\[global_id\]\.z,(?P<v3z>.*?)\);\s*"
+        r"compiler_accumulate_query_pair<QueryAggregate>\("
+        r"&dL_dmean2D\[global_id\]\.x,(?P<v2x>.*?),(?P<v2y>.*?),\s*"
+        r"&\(dL_dmu\[global_id\]\),\s*(?P<vm>.*?)\);",
+        re.DOTALL,
+    )
+
+    def fuse_query_bundle(match: re.Match[str]) -> str:
+        indent = match.group("indent")
+        return (
+            f"{indent}compiler_accumulate_query_bundle<"
+            f"QueryAggregate, QueryPairwise>(\n"
+            f"{indent}\t&dL_dmeans[global_id].x, {match.group('v3x').strip()}, "
+            f"{match.group('v3y').strip()}, {match.group('v3z').strip()},\n"
+            f"{indent}\t&dL_dmean2D[global_id].x, {match.group('v2x').strip()}, "
+            f"{match.group('v2y').strip()},\n"
+            f"{indent}\t&(dL_dmu[global_id]), {match.group('vm').strip()});"
+        )
+
+    transformed, fused_query_bundle_count = query_bundle_pattern.subn(
+        fuse_query_bundle, transformed, count=1,
+    )
+    if fused_query_bundle_count:
+        transform_ids.append("query-gradient-bundle")
+    elif "dL_dmeans[global_id].x" in transformed:
+        raise ExactCompilerOverlayError(
+            "overlay transform query-gradient-bundle expected one source fragment"
+        )
     launch_start = "\trenderCUDA<NUM_CHANNELS> << <grid, block >> >("
     launch_end = "\t\t);"
     if transformed.count(launch_start) != 1:
@@ -398,13 +648,32 @@ def render_exact_backward_overlay(source: str) -> tuple[str, tuple[str, ...]]:
     launch_finish = transformed.index(launch_end, launch_begin) + len(launch_end)
     baseline_launch = transformed[launch_begin:launch_finish]
 
-    def controlled_launch(query: bool, semantic: bool) -> str:
+    def controlled_launch(
+        query: bool, semantic: bool, *, high_occupancy: bool = False,
+        pairwise: bool = False,
+    ) -> str:
         template = (
             f"renderCUDA<NUM_CHANNELS, {str(query).lower()}, "
-            f"{str(semantic).lower()}>"
+            f"{str(semantic).lower()}, {str(high_occupancy).lower()}, "
+            f"{str(pairwise).lower()}>"
         )
         return baseline_launch.replace(
             "renderCUDA<NUM_CHANNELS>", template, 1,
+        )
+
+    def controlled_query_launch(semantic: bool) -> str:
+        pixels = "static_cast<unsigned long long>(W) * H"
+        return (
+            f"\t\t\tif ({pixels} > 2ull * 1024 * 1024)\n"
+            "\t\t\t{\n"
+            + controlled_launch(True, semantic, high_occupancy=True)
+            + "\n\t\t\t}\n"
+            f"\t\t\telse if ({pixels} >= 512ull * 512)\n"
+            "\t\t\t{\n"
+            + controlled_launch(True, semantic, pairwise=True)
+            + "\n\t\t\t}\n\t\t\telse\n\t\t\t{\n"
+            + controlled_launch(True, semantic)
+            + "\n\t\t\t}"
         )
 
     transformed = (
@@ -413,9 +682,9 @@ def render_exact_backward_overlay(source: str) -> tuple[str, tuple[str, ...]]:
         + "\t{\n"
         + "\t\tif (compiler_flag_enabled(\"GALA_SEMANTIC_WARP_REDUCE\"))\n"
         + "\t\t{\n"
-        + controlled_launch(True, True)
+        + controlled_query_launch(True)
         + "\n\t\t}\n\t\telse\n\t\t{\n"
-        + controlled_launch(True, False)
+        + controlled_query_launch(False)
         + "\n\t\t}\n\t}\n\telse\n\t{\n"
         + "\t\tif (compiler_flag_enabled(\"GALA_SEMANTIC_WARP_REDUCE\"))\n"
         + "\t\t{\n"

@@ -22,7 +22,10 @@ from typing import Any, Iterator, Mapping, Sequence
 
 from gala_sim.ablation import composition_assessment
 from gala_sim.ablation.anchors import compiler_target_speedups
-from gala_sim.adapters.fact_low_memory import install_exact_low_memory_overlay
+from gala_sim.adapters.fact_low_memory import (
+    configure_cuda_memory_environment,
+    install_exact_low_memory_overlay,
+)
 from gala_sim.gpu_measurement import (
     build_gpu_compiler_measurement,
     platform_identity_from_isolation,
@@ -350,6 +353,7 @@ def run_probe(
     profile_stages: bool = False,
     minimum_available_host_memory_bytes: int = DEFAULT_MINIMUM_AVAILABLE_HOST_MEMORY_BYTES,
 ) -> ProbeObservation:
+    configure_cuda_memory_environment()
     _validate_inputs(
         source_root, extension_root, dataset_root, initial_state, artifact_root,
         requested_iterations, warmup_iterations, inactivity_timeout_seconds,
@@ -603,6 +607,8 @@ def summarize_matrix(
     *,
     relative_tolerance: float,
     absolute_tolerance: float,
+    model_id: str = "exact_gs",
+    dataset_id: str | None = None,
 ) -> dict[str, Any]:
     if tuple(observations) != COMPILER_VARIANTS:
         raise ExactTrainingProbeError("matrix must use the four canonical compiler variants")
@@ -645,7 +651,10 @@ def summarize_matrix(
             "samples": [sample.record for sample in samples],
         }
     baseline_ms = summary["gpu_base"]["median_cuda_elapsed_ms"]
-    targets = compiler_target_speedups()
+    targets = (
+        compiler_target_speedups(model_id, dataset_id)
+        if dataset_id else compiler_target_speedups()
+    )
     for variant, item in summary.items():
         speedup = baseline_ms / item["median_cuda_elapsed_ms"]
         item["speedup_vs_gpu_base"] = speedup
@@ -663,12 +672,18 @@ def summarize_matrix(
         for samples in observations.values()
         for sample in samples
     )
+    # A joint mechanism must not regress either constituent.  Keep the
+    # diagnostic assessment in the artifact, but refuse to call a regressive
+    # matrix comparable evidence.
+    eligible = eligible and bool(composition["monotonic"])
     return {
         "schema_version": "gala-exact-gs-gpu-compiler-matrix-v1",
         "result_scope": "development_prefix_projection",
         "formal_performance_eligible": False,
         "performance_comparison_eligible": eligible,
         "comparison_baseline": "gpu_base",
+        "model_id": model_id,
+        "dataset_id": dataset_id,
         "joint_mechanism_assessment": composition,
         "summary": summary,
     }
@@ -726,6 +741,8 @@ def run_matrix(
             observations,
             relative_tolerance=relative_tolerance,
             absolute_tolerance=absolute_tolerance,
+            model_id="exact_gs",
+            dataset_id=dataset_id,
         )
         if profile_stages:
             diagnostic = run_probe(
@@ -755,6 +772,8 @@ def run_matrix(
                     diagnostic.record["measurement"]["cuda_elapsed_ms"]
                 ),
                 stage_profile=stage_profile,
+                model_id="exact_gs",
+                dataset_id=dataset_id,
                 coverable_stages={
                     "1000": ("backward",),
                     "0100": ("backward",),

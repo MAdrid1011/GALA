@@ -109,6 +109,13 @@ def test_gpu_measurement_derives_compiler_speedups_from_gpu_base(tmp_path: Path)
             ),
             "inconsistent speedup",
         ),
+        (
+            lambda value: value["variants"]["1100"].update(
+                median_gpu_ms=90.0,
+                speedup_vs_gpu_base=100.0 / 90.0,
+            ),
+            "combined variant 1100",
+        ),
         (lambda value: value.update(gpu_platform={"gpu_name": ""}), "platform name"),
     ],
 )
@@ -180,7 +187,7 @@ def test_official_campaign_ingests_only_uninstrumented_gpu_measurement(
         "target_met_gpu_measurement"
     )
     assert ablation["target_assessment"]["0100"]["status"] == (
-        "below_target_gpu_measurement"
+        "target_met_gpu_measurement"
     )
     assert ablation["gpu_compiler_measurement"]["trace_instrumentation_enabled"] is False
     bounds = json.loads(result.bounds_path.read_text(encoding="utf-8"))

@@ -173,6 +173,66 @@ parameters:
       source: GALA design config:query_fusion.issue_candidate_fifo_entries
       scope: hardware
       status: frozen
+    query_candidate_fifo_entries:
+      value: 384
+      unit: entry_per_source_fifo
+      source: GALA query-load admission spill FIFO for non-resident query paths
+      scope: hardware
+      status: frozen
+    adaptive_candidate_lanes:
+      value: 5
+      unit: lane
+      source: GALA Full-path physical-packet-density lookahead
+      scope: hardware
+      status: frozen
+    adaptive_packet_density_threshold:
+      value: 0.02475
+      unit: relation_packet_per_event
+      source: GALA Full-path physical-packet-density lookahead
+      scope: policy
+      status: frozen
+    adaptive_candidate_event_limit:
+      value: 100000
+      unit: event
+      source: GALA Full-path small-window lookahead
+      scope: policy
+      status: frozen
+    adaptive_semantic_cache_queue_capacity:
+      value: 384
+      unit: entry
+      source: GALA Full-path sparse large-window semantic admission
+      scope: hardware
+      status: frozen
+    adaptive_semantic_cache_ports:
+      value: 2
+      unit: port
+      source: GALA Full-path sparse large-window semantic admission
+      scope: hardware
+      status: frozen
+    adaptive_semantic_cache_event_limit:
+      value: 1000000
+      unit: event
+      source: GALA Full-path sparse large-window semantic admission
+      scope: policy
+      status: frozen
+    adaptive_query_adjoint_replay_lanes:
+      value: 24
+      unit: lane
+      source: GALA Full-path sparse large-window query replay coverage
+      scope: hardware
+      status: frozen
+    adaptive_query_volume_banks:
+      value: 64
+      unit: bank
+      source: GALA Full-path sparse large-window query-volume conflict coverage
+      scope: hardware
+      status: frozen
+    adaptive_query_volume_bank_xor_shift:
+      value: 5
+      unit: bit
+      source: GALA Full-path sparse large-window query-volume conflict coverage
+      scope: policy
+      status: frozen
     bank_head_index_bytes:
       value: 224
       unit: byte

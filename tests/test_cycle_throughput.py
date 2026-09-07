@@ -113,6 +113,14 @@ def test_early_stop_diagnostic_requires_empty_output(tmp_path) -> None:
         require_empty_diagnostic_output(empty)
 
 
+def test_adaptive_stop_uses_short_explicit_convergence_window() -> None:
+    adaptive = _config().for_adaptive_stop()
+    assert adaptive.warmup_samples == 1
+    assert adaptive.stability_window_samples == 2
+    assert adaptive.required_consecutive_stable_windows == 2
+    assert adaptive.minimum_completion_fraction == pytest.approx(0.10)
+
+
 def test_archive_speedup_monitor_requires_common_stable_intervals() -> None:
     monitor = ArchiveSpeedupMonitor(
         _config(), variants=("0000", "1010", "1111"),
@@ -138,6 +146,40 @@ def test_archive_speedup_monitor_requires_common_stable_intervals() -> None:
         "0000": 1.0, "1010": 1.25, "1111": 2.0,
     }
     assert report["formal_performance_eligible"] is False
+
+
+def test_archive_speedup_monitor_emits_adaptive_full_run_certificate() -> None:
+    monitor = ArchiveSpeedupMonitor(
+        _config(),
+        variants=("0000", "1000", "1010", "0100", "0101", "1100", "1111"),
+        target_speedups={"1010": 1.2, "0101": 1.2, "1111": 1.8},
+        source_complete=True,
+        source_validated=True,
+        source_contract_passed=True,
+    )
+    report = {}
+    for iteration in range(1, 6):
+        report = monitor.observe(
+            iteration_id=iteration,
+            completed_iterations=iteration,
+            total_iterations=10,
+            completed_events=iteration * 100,
+            cycles_by_variant={
+                "0000": iteration * 100,
+                "1000": iteration * 90,
+                "1010": iteration * 80,
+                "0100": iteration * 85,
+                "0101": iteration * 75,
+                "1100": iteration * 70,
+                "1111": iteration * 50,
+            },
+        )
+    assert report["result_scope"] == "adaptive_end_to_end_estimate"
+    assert report["execution_path"] == "archive_replay_with_adaptive_stop"
+    assert report["stability_certificate"]["ready"] is True
+    assert report["adaptive_performance_eligible"] is True
+    assert report["stability_certificate"]["composition"]["non_regressive"] is True
+    assert report["stability_certificate"]["targets"]["all_targets_reached"] is True
 
 
 def test_archive_speedup_monitor_rejects_recent_phase_change() -> None:

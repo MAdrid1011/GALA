@@ -8,6 +8,7 @@ import numpy as np
 
 from gala_sim.campaign import (
     ALL_COMBINATIONS,
+    REMAINING_COMBINATIONS,
     _campaign_result_root,
     _expand_trace_iterations,
     _first_prepared_root,
@@ -42,6 +43,14 @@ def _prepared_dataset(root: Path, dataset_id: str) -> None:
 def test_all_campaign_identifiers_are_explicit_and_unique() -> None:
     assert len(ALL_COMBINATIONS) == 12
     assert len(set(ALL_COMBINATIONS)) == 12
+
+
+def test_remaining_campaign_selection_excludes_only_calibrated_reference() -> None:
+    assert len(REMAINING_COMBINATIONS) == 11
+    assert ("r2_gaussian", "chest") not in REMAINING_COMBINATIONS
+    assert set(REMAINING_COMBINATIONS) == set(ALL_COMBINATIONS) - {
+        ("r2_gaussian", "chest"),
+    }
 
 
 def test_campaign_result_root_keeps_iteration_variants_separate(tmp_path: Path) -> None:

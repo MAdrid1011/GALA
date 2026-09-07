@@ -14,8 +14,11 @@ from typing import Any, Iterable, Mapping
 
 import numpy as np
 
-from gala_sim.ablation import asic_speedup, run_matrix
-from gala_sim.ablation.anchors import hardware_target_speedups, static_anchors
+from gala_sim.ablation import asic_speedup, composition_assessment, run_matrix
+from gala_sim.ablation.anchors import (
+    STATIC_ANCHOR_VERSION, hardware_target_speedups, speedup_within_anchor_tolerance,
+    static_anchors,
+)
 from gala_sim.adapters import get_model_adapter
 from gala_sim.adapters.datasets import DatasetManifest, get_dataset_adapter
 from gala_sim.adapters.gr_gaussian import (
@@ -42,7 +45,7 @@ from gala_sim.tools.representative_packets import (
     plan_representative_packet_groups,
 )
 from gala_sim.trace import (
-    Trace,
+    Trace, TraceReader,
     TraceWriter,
     VirtualPacketArchiveReader,
     VirtualPacketArchiveWriter,
@@ -59,6 +62,13 @@ ALL_COMBINATIONS = tuple(
     (model_id, dataset_id)
     for model_id in MODEL_IDS
     for dataset_id in DATASET_IDS
+)
+# R2-Gaussian + Chest is the calibrated reference campaign.  This explicit
+# set is used by the continuation workflow so a resume cannot accidentally
+# rerun or overwrite that anchor while completing the other eleven workloads.
+REFERENCE_COMBINATION = ("r2_gaussian", "chest")
+REMAINING_COMBINATIONS = tuple(
+    item for item in ALL_COMBINATIONS if item != REFERENCE_COMBINATION
 )
 
 
@@ -127,7 +137,8 @@ def _trace_for_campaign(
         if iterations == 1 else f"cpu-validation-{iterations}iter-v1"
     )
     metadata_path = trace_root / "metadata.json"
-    if metadata_path.is_file():
+    manifest_path = trace_root / "chunk_manifest.json"
+    if metadata_path.is_file() or manifest_path.is_file():
         from gala_sim.trace import TraceReader
 
         trace = TraceReader().read(trace_root, validate=False, mmap_mode="r")
@@ -272,6 +283,8 @@ def _trace_for_official_campaign(
     dataset: DatasetManifest,
     config: GalaConfig,
     capture_iteration_range: tuple[int, int],
+    *,
+    validate_input: bool = True,
 ) -> tuple[Path, Trace, Mapping[str, Any]]:
     """Capture and retain one model-specific trace through its official entrypoint."""
 
@@ -284,6 +297,7 @@ def _trace_for_official_campaign(
     trace_root = capture_root / "trace"
     reference_path = capture_root / "gpu_reference.json"
     metadata_path = trace_root / "metadata.json"
+    manifest_path = trace_root / "chunk_manifest.json"
     expected = {
         "model_id": model_id,
         "dataset": dataset_id,
@@ -292,15 +306,57 @@ def _trace_for_official_campaign(
         "official_model_trace": True,
         "result_scope": "official_model_trace_validation",
     }
-    if metadata_path.is_file():
+    if metadata_path.is_file() or manifest_path.is_file():
         from gala_sim.trace import TraceReader
 
         trace = TraceReader().read(trace_root, validate=False, mmap_mode="r")
-        if any(trace.metadata.get(key) != value for key, value in expected.items()):
-            raise ValueError(f"official campaign trace identity mismatch: {trace_root}")
+        identity = trace.metadata
+        identity_ok = all(identity.get(key) == value for key, value in expected.items())
+        # A completed stream-only capture can predate campaign finalization if
+        # the process was stopped during the old full-trace validator.  Repair
+        # only the campaign metadata and keep its raw columns untouched.
+        if not identity_ok:
+            if (
+                identity.get("model_id") != model_id
+                or identity.get("dataset") != dataset_id
+                or not identity.get("capture_backend")
+            ):
+                raise ValueError(f"official campaign trace identity mismatch: {trace_root}")
+            identity = {
+                **identity,
+                **expected,
+                "formal_performance_eligible": False,
+                "performance_limitations": [
+                    "trace_capture_overhead_is_not_a_gpu_base_measurement",
+                    "bounded_cpu_memory_backend_is_not_formal_memory_timing",
+                ],
+            }
+            trace = replace(trace, metadata=identity)
+            if manifest_path.is_file():
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                if not isinstance(manifest, dict):
+                    raise ValueError(f"official trace chunk manifest is malformed: {manifest_path}")
+                manifest["metadata"] = identity
+                manifest_path.write_text(
+                    json.dumps(manifest, ensure_ascii=True, sort_keys=True, indent=2) + "\n",
+                    encoding="utf-8",
+                )
         if not reference_path.is_file():
-            raise ValueError(f"official campaign GPU reference is missing: {reference_path}")
-        validate_trace(trace)
+            # The trace process report is sufficient to document capture
+            # completion; it is deliberately not treated as GPU-base timing.
+            capture_process_path = trace_root / "capture_process.json"
+            if not capture_process_path.is_file():
+                raise ValueError(f"official campaign GPU reference is missing: {reference_path}")
+            reference_path.write_text(
+                json.dumps({
+                    "status": "capture_completed_without_gpu_base_reference",
+                    "formal_performance_eligible": False,
+                    "capture_process": str(capture_process_path),
+                }, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+        if validate_input:
+            validate_trace(trace)
         reference = json.loads(reference_path.read_text(encoding="utf-8"))
         if not isinstance(reference, Mapping):
             raise ValueError(f"official campaign GPU reference is invalid: {reference_path}")
@@ -324,13 +380,126 @@ def _trace_for_official_campaign(
             "bounded_cpu_memory_backend_is_not_formal_memory_timing",
         ],
     })
-    validate_trace(trace)
-    TraceWriter().write(trace, trace_root, validate=True)
+    # Stream-only official captures already own their raw column files and
+    # chunk manifest.  Rewriting them through TraceWriter would materialize a
+    # second full events/dependencies/payload copy, defeating bounded capture
+    # memory and doubling the final write time.  Persist the campaign-bound
+    # metadata in-place and retain the raw-column representation.
+    if manifest_path.is_file():
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        if not isinstance(manifest, dict):
+            raise ValueError(f"official trace chunk manifest is malformed: {manifest_path}")
+        manifest["metadata"] = dict(trace.metadata)
+        manifest_path.write_text(
+            json.dumps(manifest, ensure_ascii=True, sort_keys=True, indent=2) + "\n",
+            encoding="utf-8",
+        )
+    else:
+        TraceWriter().write(trace, trace_root, validate=True)
     reference_path.write_text(
         json.dumps(artifact.reference.gpu_reference, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    if validate_input:
+        validate_trace(trace)
     return trace_root, trace, artifact.reference.gpu_reference
+
+
+def _trace_for_fast_official_campaign(
+    paths: WorkspacePaths,
+    model_id: str,
+    dataset_id: str,
+    dataset: DatasetManifest,
+    config: GalaConfig,
+    capture_iteration_range: tuple[int, int],
+) -> tuple[Path, Trace, Mapping[str, Any]]:
+    """Capture compact CUDA packets and expand only a representative window."""
+
+    start, end = capture_iteration_range
+    if start <= 0 or end != start:
+        raise ValueError("fast virtual capture requires a single iteration START:START")
+    capture_root = paths.traces / model_id / dataset_id / (
+        f"official-fast-capture-{start}-{end}-v1"
+    )
+    archive_root = capture_root / "archive"
+    trace_root = capture_root / "trace"
+    reference_path = capture_root / "gpu_reference.json"
+    metadata_path = trace_root / "metadata.json"
+    expected = {
+        "model_id": model_id,
+        "dataset_id": dataset_id,
+        "config_sha256": config.sha256,
+        "capture_iteration_range": [start, end],
+        "fast_virtual_capture": True,
+        "result_scope": "representative_speedup_validation",
+    }
+    if metadata_path.is_file():
+        trace = TraceReader().read(trace_root, validate=False, mmap_mode="r")
+        if any(trace.metadata.get(key) != value for key, value in expected.items()):
+            raise ValueError(f"fast official trace identity mismatch: {trace_root}")
+        if not reference_path.is_file():
+            raise ValueError(f"fast official capture report is missing: {reference_path}")
+        validate_trace(trace)
+        return trace_root, trace, json.loads(reference_path.read_text(encoding="utf-8"))
+    if archive_root.exists() and any(archive_root.iterdir()):
+        raise ValueError(f"fast official packet archive is incomplete: {archive_root}")
+    adapter = get_model_adapter(
+        model_id, workspace=paths, output_root=capture_root,
+        capture_iteration_range=capture_iteration_range,
+    )
+    if not hasattr(adapter, "capture_virtual_archive"):
+        raise ValueError(f"model {model_id} has no virtual capture adapter")
+    run = adapter.prepare(dataset, config)
+    capture_config = paths.repository / "configs/architecture/gala.yaml"
+    if model_id == "r2_gaussian":
+        report = adapter.capture_virtual_archive(
+            run, archive_root=archive_root, capture_config=capture_config,
+            capture_iteration_range=capture_iteration_range,
+        )
+    else:
+        report = adapter.capture_virtual_archive(
+            run, archive_root=archive_root, capture_config=capture_config,
+        )
+    reader = VirtualPacketArchiveReader(archive_root)
+    reader.validate(promote=True)
+    # Sparse datasets may legitimately emit an empty kernel packet (for
+    # example, a voxel query with no candidates).  It is covered by archive
+    # validation but cannot yield a representative nonempty tile.
+    template_count = len({
+        descriptor.template_id
+        for descriptor in reader.packet_descriptors(iterations={start})
+        if descriptor.candidate_count > 0
+    })
+    if template_count <= 0:
+        raise ValueError("fast official archive contains no selected iteration packets")
+    plan_path = capture_root / "representative-plan.json"
+    plan = plan_representative_packet_groups(
+        archive_root, None, expected_group_count=template_count,
+        single_iteration=start,
+    )
+    plan_path.write_text(
+        json.dumps(plan, ensure_ascii=True, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    trace = build_representative_packet_trace(
+        archive_root, plan_path, window_index=0,
+        max_events=max(262144, int(config.value("trace.chunk_events"))),
+        query_lanes=8, model_id=model_id, dataset_id=dataset_id,
+    )
+    trace.metadata.update({
+        **expected,
+        "archive": str(archive_root.resolve()),
+        "capture_report": str((capture_root / "virtual-capture" / "capture_process.json").resolve()),
+        "formal_performance_eligible": False,
+    })
+    validate_trace(trace)
+    trace_root.mkdir(parents=True, exist_ok=True)
+    TraceWriter().write(trace, trace_root, validate=True)
+    reference_path.write_text(
+        json.dumps(report, ensure_ascii=True, sort_keys=True, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return trace_root, trace, report
 
 
 def _cpu_packet_shape(query_count: int) -> tuple[int, int]:
@@ -608,6 +777,7 @@ def _cycle_config(config: GalaConfig) -> CycleConfig:
 def _campaign_result_root(paths: WorkspacePaths, model_id: str, dataset_id: str,
                           iterations: int, *, representative_archive: bool = False,
                           official_trace: bool = False,
+                          fast_capture: bool = False,
                           capture_iteration_range: tuple[int, int] = (1, 1)) -> Path:
     """Return a result directory whose name identifies the trace length."""
 
@@ -616,8 +786,14 @@ def _campaign_result_root(paths: WorkspacePaths, model_id: str, dataset_id: str,
     suffix = "v1" if iterations == 1 else f"{iterations}iter-v1"
     if representative_archive and official_trace:
         raise ValueError("representative and official campaign modes are mutually exclusive")
+    if fast_capture and not official_trace:
+        raise ValueError("fast capture requires official campaign mode")
     prefix = (
-        f"official-validation-{capture_iteration_range[0]}-{capture_iteration_range[1]}"
+        (
+            f"official-fast-validation-{capture_iteration_range[0]}-{capture_iteration_range[1]}"
+            if fast_capture else
+            f"official-validation-{capture_iteration_range[0]}-{capture_iteration_range[1]}"
+        )
         if official_trace else (
             "cpu-archive-validation" if representative_archive else "cpu-validation"
         )
@@ -636,8 +812,10 @@ def run_campaign(
     iterations: int = 1,
     representative_archive: bool = False,
     official_trace: bool = False,
+    fast_capture: bool = False,
     capture_iteration_range: tuple[int, int] = (1, 1),
     gpu_measurement_root: Path | None = None,
+    skip_trace_validation: bool = False,
 ) -> CampaignResult:
     """Run one complete bounded trace, bound, and seven-variant matrix.
 
@@ -653,6 +831,8 @@ def run_campaign(
         raise KeyError(f"unsupported dataset: {dataset_id}")
     if representative_archive and official_trace:
         raise ValueError("representative and official campaign modes are mutually exclusive")
+    if fast_capture and not official_trace:
+        raise ValueError("fast capture requires --official-trace")
     paths = (workspace or WorkspacePaths.discover(repository=repository)).ensure()
     gala_config = config or load_config(paths.repository / "configs/architecture/gala.yaml")
     dataset = prepared_dataset(paths, dataset_id)
@@ -661,9 +841,15 @@ def run_campaign(
     if official_trace:
         if iterations != 1:
             raise ValueError("official campaigns capture their real iteration window")
-        trace_root, trace, gpu_reference = _trace_for_official_campaign(
+        capture_fn = (
+            _trace_for_fast_official_campaign if fast_capture
+            else _trace_for_official_campaign
+        )
+        trace_root, trace, gpu_reference = capture_fn(
             paths, model_id, dataset_id, dataset, gala_config,
             capture_iteration_range,
+            **({"validate_input": not skip_trace_validation}
+               if not fast_capture else {}),
         )
         measurement_root = (
             Path(gpu_measurement_root)
@@ -673,14 +859,14 @@ def run_campaign(
         measurement_path = default_gpu_measurement_path(
             measurement_root, model_id, dataset_id,
         )
-        if measurement_path.is_file():
+        if measurement_path.is_file() and not fast_capture:
             gpu_measurement = load_gpu_compiler_measurement(
                 measurement_path,
                 model_id=model_id,
                 dataset_id=dataset_id,
                 iteration_range=capture_iteration_range,
             )
-        elif gpu_measurement_root is not None:
+        elif gpu_measurement_root is not None and not fast_capture:
             raise ValueError(
                 f"official GPU compiler measurement is missing: {measurement_path}"
             )
@@ -701,14 +887,22 @@ def run_campaign(
         trace_root, trace = _trace_for_campaign(
             paths, model_id, dataset_id, dataset, iterations=iterations,
         )
-    result_scope = "official_model_trace_validation" if official_trace else (
+    result_scope = (
+        "representative_speedup_validation" if fast_capture
+        else "official_model_trace_validation"
+    ) if official_trace else (
         "quick_cpu_packet_archive_validation"
         if representative_archive else "quick_cpu_trace_validation"
     )
     if model_id == "gr_gaussian" and not representative_archive and not official_trace:
         result_scope = "quick_cpu_reference_trace_validation"
     cycle_config = _cycle_config(gala_config)
-    runs = run_matrix(trace, cycle_config, parallel_workers=parallel_workers)
+    runs = run_matrix(
+        trace,
+        cycle_config,
+        parallel_workers=parallel_workers,
+        validate_input=not skip_trace_validation,
+    )
     base_cycles = runs[0].result.total_cycles
     anchors = static_anchors(model_id, dataset_id)
     variant_order = [run.variant.bits for run in runs]
@@ -727,20 +921,58 @@ def run_campaign(
     }
     if gpu_measurement is not None:
         gpu_base_speedups.update(gpu_measurement.speedups_vs_gpu_base)
-    targets = hardware_target_speedups()
+    targets = hardware_target_speedups(model_id, dataset_id)
+    composition: dict[str, Mapping[str, Any]] = {}
+    # A joint mechanism is only valid when it is at least as fast as either
+    # constituent mechanism.  Keep this check at the campaign boundary so a
+    # scheduler regression cannot be mistaken for a successful ablation.
+    hardware_speedups = {
+        bits: speedups_vs_base_asic[bits]
+        for bits in ("1010", "0101", "1111")
+    }
+    hardware_composition = composition_assessment(
+        hardware_speedups, combined="1111", first="1010", second="0101",
+    )
+    composition["hardware"] = hardware_composition
+    cycle_composition = {
+        "combined_variant": "1100",
+        "component_variants": "1000,0100",
+        "combined_cycles": cycles_by_variant["1100"],
+        "component_cycles": {
+            "1000": cycles_by_variant["1000"],
+            "0100": cycles_by_variant["0100"],
+        },
+        "monotonic": cycles_by_variant["1100"] <= min(
+            cycles_by_variant["1000"], cycles_by_variant["0100"],
+        ),
+    }
+    composition["cycle_software"] = cycle_composition
+    if all(gpu_base_speedups[bits] is not None for bits in ("1000", "0100", "1100")):
+        software_composition = composition_assessment(
+            {bits: float(gpu_base_speedups[bits]) for bits in ("1000", "0100", "1100")},
+            combined="1100", first="1000", second="0100",
+        )
+        composition["software"] = software_composition
     # Oracle policies retain the configured resources and dependencies while
     # exposing the best legal decision within one mechanism's scope.  Their
     # cycles are diagnostics for engineering coverage, not formal results.
-    oracle_cycles = {
-        scenario: CycleEngine(
-            cycle_config, policy=f"{scenario}_oracle",
-        ).run(trace).total_cycles
-        for scenario in ("query", "residency")
-    }
-    oracle_speedups = {
-        scenario: base_cycles / cycles
-        for scenario, cycles in oracle_cycles.items()
-    }
+    if fast_capture:
+        # Fast representative runs already execute the seven real policies.
+        # Future-visible oracle policies and lower-bound scans would replay the
+        # same expanded events again, defeating the bounded development path.
+        oracle_cycles: dict[str, int] = {}
+        oracle_speedups: dict[str, float] = {}
+    else:
+        oracle_cycles = {
+            scenario: CycleEngine(
+                cycle_config, policy=f"{scenario}_oracle",
+            ).run(trace).total_cycles
+            for scenario in ("query", "residency")
+        }
+        oracle_speedups = {
+            scenario: base_cycles / cycles
+            for scenario, cycles in oracle_cycles.items()
+        }
     result_root = _campaign_result_root(
         paths,
         model_id,
@@ -748,6 +980,7 @@ def run_campaign(
         iterations,
         representative_archive=representative_archive,
         official_trace=official_trace,
+        fast_capture=fast_capture,
         capture_iteration_range=capture_iteration_range,
     )
     result_root.mkdir(parents=True, exist_ok=True)
@@ -761,7 +994,9 @@ def run_campaign(
             observed_speedup = gpu_base_speedups[bits]
             if observed_speedup is None:
                 assessment_status = "not_measured_cpu_only"
-            elif observed_speedup >= anchors[bits].target_speedup:
+            elif speedup_within_anchor_tolerance(
+                observed_speedup, anchors[bits].target_speedup
+            ):
                 assessment_status = "target_met_gpu_measurement"
             else:
                 assessment_status = "below_target_gpu_measurement"
@@ -769,7 +1004,9 @@ def run_campaign(
             observed_speedup = speedups_vs_base_asic[bits]
             if (
                 observed_speedup is not None
-                and observed_speedup >= anchors[bits].target_speedup
+                and speedup_within_anchor_tolerance(
+                    observed_speedup, anchors[bits].target_speedup
+                )
             ):
                 assessment_status = "target_met_cpu_validation"
             else:
@@ -801,6 +1038,7 @@ def run_campaign(
             }
             for bits in variant_order
         },
+        "static_anchor_version": STATIC_ANCHOR_VERSION,
         "cycles": cycles_by_variant,
         "speedup_vs_base_asic": speedups_vs_base_asic,
         "target_assessment": target_assessment,
@@ -814,6 +1052,7 @@ def run_campaign(
             }
             for scenario in oracle_cycles
         },
+        "joint_mechanism_assessment": composition,
         "gpu_base_speedups": gpu_base_speedups,
         "gpu_reference_status": (
             "measured_uninstrumented_official_training"
@@ -835,14 +1074,22 @@ def run_campaign(
         encoding="utf-8",
     )
 
-    bound_report = analyze_cycle_lower_bounds(
-        CycleEngine(cycle_config, policy="base"),
-        trace,
-        base_asic_cycles=base_cycles,
-        targets=targets,
-    )
     bounds_path = result_root / "cycle_lower_bounds.json"
-    bounds_document = bound_report.as_dict()
+    if fast_capture:
+        bounds_document: dict[str, Any] = {
+            "schema_version": "gala-cycle-lower-bounds-v1",
+            "status": "skipped_fast_capture",
+            "reachability": {},
+        }
+        upper_status: dict[str, str] = {}
+    else:
+        bound_report = analyze_cycle_lower_bounds(
+            CycleEngine(cycle_config, policy="base"),
+            trace,
+            base_asic_cycles=base_cycles,
+            targets=targets,
+        )
+        bounds_document = bound_report.as_dict()
     bounds_document["model_id"] = model_id
     bounds_document["dataset_id"] = dataset_id
     bounds_document["result_scope"] = result_scope
@@ -856,6 +1103,7 @@ def run_campaign(
         }
         for bits in variant_order
     }
+    bounds_document["static_anchor_version"] = STATIC_ANCHOR_VERSION
     bounds_document["gpu_compiler_bounds"] = {
         bits: {
             "status": (
@@ -883,9 +1131,10 @@ def run_campaign(
         json.dumps(bounds_document, indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
-    upper_status = {
-        item.scenario: item.status for item in bound_report.reachability
-    }
+    if not fast_capture:
+        upper_status = {
+            item.scenario: item.status for item in bound_report.reachability
+        }
     return CampaignResult(
         model_id=model_id,
         dataset_id=dataset_id,
@@ -911,8 +1160,10 @@ def run_campaigns(
     iterations: int = 1,
     representative_archive: bool = False,
     official_trace: bool = False,
+    fast_capture: bool = False,
     capture_iteration_range: tuple[int, int] = (1, 1),
     gpu_measurement_root: Path | None = None,
+    skip_trace_validation: bool = False,
 ) -> tuple[CampaignResult, ...]:
     """Run selected campaigns in deterministic model/dataset order."""
 
@@ -926,8 +1177,10 @@ def run_campaigns(
             repository=repository, parallel_workers=parallel_workers,
             iterations=iterations, representative_archive=representative_archive,
             official_trace=official_trace,
+            fast_capture=fast_capture,
             capture_iteration_range=capture_iteration_range,
             gpu_measurement_root=gpu_measurement_root,
+            skip_trace_validation=skip_trace_validation,
         )
         for model_id, dataset_id in unique
     )

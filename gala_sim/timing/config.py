@@ -185,6 +185,16 @@ class CycleConfig:
     query_state_entries: int | None = None
     fusion_query_state_banks: int | None = None
     candidate_fifo_entries: int | None = None
+    query_candidate_fifo_entries: int | None = None
+    adaptive_candidate_lanes: int | None = None
+    adaptive_packet_density_threshold: float | None = None
+    adaptive_candidate_event_limit: int | None = None
+    adaptive_semantic_cache_queue_capacity: int | None = None
+    adaptive_semantic_cache_ports: int | None = None
+    adaptive_semantic_cache_event_limit: int | None = None
+    adaptive_query_adjoint_replay_lanes: int | None = None
+    adaptive_query_volume_banks: int | None = None
+    adaptive_query_volume_bank_xor_shift: int | None = None
     fusion_bank_head_lookahead: bool | None = None
     fusion_bank_head_index_bytes: int | None = None
     fusion_semantic_bundle_index_bytes: int | None = None
@@ -251,6 +261,60 @@ class CycleConfig:
         )
         if any(value is not None and value <= 0 for value in optional_fusion_values):
             raise ValueError("optional fusion port values must be positive")
+        if (
+            self.adaptive_candidate_lanes is not None
+            and self.adaptive_candidate_lanes < self.candidate_lanes
+        ):
+            raise ValueError(
+                "adaptive candidate width cannot be smaller than the base width"
+            )
+        if (
+            self.adaptive_packet_density_threshold is not None
+            and not 0 < self.adaptive_packet_density_threshold < 1
+        ):
+            raise ValueError("adaptive packet density threshold must be in (0, 1)")
+        if (
+            self.adaptive_candidate_event_limit is not None
+            and self.adaptive_candidate_event_limit <= 0
+        ):
+            raise ValueError("adaptive candidate event limit must be positive")
+        if (
+            self.adaptive_semantic_cache_queue_capacity is not None
+            and self.adaptive_semantic_cache_queue_capacity <= 0
+        ):
+            raise ValueError("adaptive semantic cache queue capacity must be positive")
+        if (
+            self.adaptive_semantic_cache_ports is not None
+            and self.adaptive_semantic_cache_ports <= 0
+        ):
+            raise ValueError("adaptive semantic cache ports must be positive")
+        if (
+            self.adaptive_semantic_cache_event_limit is not None
+            and self.adaptive_semantic_cache_event_limit <= 0
+        ):
+            raise ValueError("adaptive semantic cache event limit must be positive")
+        if (
+            self.adaptive_query_adjoint_replay_lanes is not None
+            and self.query_adjoint_replay_lanes is not None
+            and self.adaptive_query_adjoint_replay_lanes < self.query_adjoint_replay_lanes
+        ):
+            raise ValueError("adaptive query replay width cannot be smaller than the base width")
+        if (
+            self.adaptive_query_volume_banks is not None
+            and self.query_volume_banks is not None
+            and self.adaptive_query_volume_banks < self.query_volume_banks
+        ):
+            raise ValueError("adaptive query volume banks cannot be smaller than the base width")
+        if (
+            self.adaptive_query_volume_banks is not None
+            and self.adaptive_query_volume_banks & (self.adaptive_query_volume_banks - 1)
+        ):
+            raise ValueError("adaptive query volume bank count must be a power of two")
+        if (
+            self.adaptive_query_volume_bank_xor_shift is not None
+            and self.adaptive_query_volume_bank_xor_shift <= 0
+        ):
+            raise ValueError("adaptive query volume XOR shift must be positive")
         if any(
             value is not None and value <= 0
             for value in (
@@ -262,6 +326,11 @@ class CycleConfig:
             raise ValueError("relation support lane count must be positive")
         if self.candidate_fifo_entries is not None and self.candidate_fifo_entries <= 0:
             raise ValueError("candidate FIFO capacity must be positive")
+        if (
+            self.query_candidate_fifo_entries is not None
+            and self.query_candidate_fifo_entries <= 0
+        ):
+            raise ValueError("query candidate FIFO capacity must be positive")
         if (
             self.fusion_bank_head_index_bytes is not None
             and self.fusion_bank_head_index_bytes <= 0
@@ -479,6 +548,50 @@ class CycleConfig:
         if not config.ready:
             config.require_ready()
         compute_templates = _compute_templates_from_gala(config)
+        try:
+            adaptive_candidate_lanes = int(
+                config.value("issue.adaptive_candidate_lanes")
+            )
+            adaptive_packet_density_threshold = float(
+                config.value("issue.adaptive_packet_density_threshold")
+            )
+        except (KeyError, TypeError, ValueError):
+            adaptive_candidate_lanes = None
+            adaptive_packet_density_threshold = None
+        try:
+            adaptive_candidate_event_limit = int(
+                config.value("issue.adaptive_candidate_event_limit")
+            )
+        except (KeyError, TypeError, ValueError):
+            adaptive_candidate_event_limit = None
+        try:
+            adaptive_semantic_cache_queue_capacity = int(
+                config.value("issue.adaptive_semantic_cache_queue_capacity")
+            )
+            adaptive_semantic_cache_ports = int(
+                config.value("issue.adaptive_semantic_cache_ports")
+            )
+            adaptive_semantic_cache_event_limit = int(
+                config.value("issue.adaptive_semantic_cache_event_limit")
+            )
+        except (KeyError, TypeError, ValueError):
+            adaptive_semantic_cache_queue_capacity = None
+            adaptive_semantic_cache_ports = None
+            adaptive_semantic_cache_event_limit = None
+        try:
+            adaptive_query_adjoint_replay_lanes = int(
+                config.value("issue.adaptive_query_adjoint_replay_lanes")
+            )
+            adaptive_query_volume_banks = int(
+                config.value("issue.adaptive_query_volume_banks")
+            )
+            adaptive_query_volume_bank_xor_shift = int(
+                config.value("issue.adaptive_query_volume_bank_xor_shift")
+            )
+        except (KeyError, TypeError, ValueError):
+            adaptive_query_adjoint_replay_lanes = None
+            adaptive_query_volume_banks = None
+            adaptive_query_volume_bank_xor_shift = None
         clusters = int(config.value("top.num_pods")) * int(
             config.value("compute.clusters_per_pod")
         )
@@ -503,6 +616,28 @@ class CycleConfig:
                    ),
                    candidate_fifo_entries=int(
                        config.value("issue.candidate_fifo_entries")
+                   ),
+                   query_candidate_fifo_entries=int(
+                       config.value("issue.query_candidate_fifo_entries")
+                   ),
+                   adaptive_candidate_lanes=adaptive_candidate_lanes,
+                   adaptive_packet_density_threshold=(
+                       adaptive_packet_density_threshold
+                   ),
+                   adaptive_candidate_event_limit=adaptive_candidate_event_limit,
+                   adaptive_semantic_cache_queue_capacity=(
+                       adaptive_semantic_cache_queue_capacity
+                   ),
+                   adaptive_semantic_cache_ports=adaptive_semantic_cache_ports,
+                   adaptive_semantic_cache_event_limit=(
+                       adaptive_semantic_cache_event_limit
+                   ),
+                   adaptive_query_adjoint_replay_lanes=(
+                       adaptive_query_adjoint_replay_lanes
+                   ),
+                   adaptive_query_volume_banks=adaptive_query_volume_banks,
+                   adaptive_query_volume_bank_xor_shift=(
+                       adaptive_query_volume_bank_xor_shift
                    ),
                    fusion_bank_head_lookahead=config.value(
                        "issue.bank_head_lookahead"
